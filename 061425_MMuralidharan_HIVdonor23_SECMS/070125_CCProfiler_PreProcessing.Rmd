@@ -1,0 +1,582 @@
+---
+title: "070125_CCProfiler_PreProcessing"
+author: "Martin Gordon"
+date: "2025-07-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Now that we used MSS summarixation, lets load the data into `CCprofielr` and see if we can get the differential analysis pipeline running
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(viridis)
+library(pracma)
+library(magick)
+library(eulerr)
+library(CCprofiler)
+library(parallel)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+Read in MSS processed intensity data
+```{r}
+pep.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_D3_MSstatsSmmarization_data/2025_07_01_hiv.d123.mss.peptide.csv.gz')
+```
+
+Drop non proteotypic peptides
+(Ensure that a peptide sequence does not map to more than one protein group per sample)
+```{r}
+pep.dt <- pep.dt[!grepl(';', protein)]
+#  there are nearly 7k peptides that map to more than one protein.... I see issues downstream when merging traces, but for now just ensure they are absent per sample
+pep.dt[, length(unique(protein)), by=.(sequence)][V1 > 1]
+
+# no multimappers per sample.. proceed as is for now
+pep.dt[, length(unique(protein)), by=.(sequence, sample)][V1 > 1]
+```
+The report contains peptides with modifications
+ccprofiler doesnt 'like' these modifications; (seems to toss them (at least in the subset I tested) in data wrangling steps in downstream functions, causing checks to fail) 
+remove these modifications and summarize peptide intensities
+```{r}
+# .*? lazy matching; to first instance of ']'
+pep.dt[, sequence_simplified := gsub("\\[.*?\\]", "", sequence)]
+
+# sanity check 
+pep.dt[grepl('[[]()]', sequence_simplified)]
+
+pep.dt <- pep.dt[, .(intensity=sum(intensity, na.rm=T)), by=.(sample, fraction, protein, sequence_simplified)]
+setnames(pep.dt, 'sequence_simplified', 'sequence')
+
+# now we have simplified; lets see if any peptides map to more than one protein per sample
+# if so remve
+
+# no peptides remaining match to multiple proteins in asingle sample; may be issues when we merge the traces though...
+pep.dt[,length(unique(protein)), by=.(sample,sequence)][V1 > 1]
+fwrite(pep.dt, ScriptAndDatedFileName('hiv.d123.mss.peptide.noMods.csv.gz'))
+```
+
+**Important**
+CCprofiler differential analysis module is very specific on input requirements and provides little guidance/helpful error messages
+Ensure:
+i) there are no missing fractions in the data
+ii) You fractions are numbered 1 -> n fractions
+iii) non-proteotypic peptides have been removed
+iv) peptide sequences with modifications have been removed
+
+Before proceeding, ensure that there are no missing fractions in the data
+```{r}
+all(pep.dt[, length(unique(fraction)), by=sample]$V1) == 72
+
+# uneven number of fractions
+ggplot(pep.dt[, length(unique(fraction)), by=sample], aes(x=sample, y=V1)) +
+         geom_bar(stat='identity')
+```
+Identify the missing fractions in each sample
+```{r}
+shared.fract <-  sort(Reduce(intersect, split(pep.dt[,unique(fraction), by=sample]$V1,pep.dt[,unique(fraction), by=sample]$sample)))
+missing.fraction <- setdiff(seq(1,72,1), shared.fract)
+length(missing.fraction) #8 
+
+pep.dt[fraction %in% missing.fraction, length(unique(sample)), by=.(fraction, sample)]
+
+# find samples msissing at least one fraction
+samples.missingfract <- pep.dt[, .SD[fraction %in% missing.fraction, length(unique(fraction))], by=sample][V1 < 8,]$sample
+samples.missingfract
+```
+Lets 'impute' the missing fractions
+For now we willl just add columns of NA and allow `CCprofiler` to handle the imputation downstream
+
+```{r}
+pep.allfract.dt <- lapply(split(pep.dt, pep.dt$sample), function(x){
+  
+  fractions <- seq(1,72,1) # edit this to the N fractions in your data
+  
+  mat <- dcast(x, sequence~fraction, value.var='intensity') %>% 
+    as.matrix(rownames=1)
+  mat <- mat[, match(fractions, colnames(mat)), drop=FALSE]
+
+  colnames(mat) <- fractions # remove NA
+  dt <- setDT(reshape2::melt(mat))
+  setnames(dt, c('sequence', 'fraction', 'intensity'))
+  return(dt)
+}) %>% rbindlist(idcol='sample')
+
+pep.allfract.dt[, sequence := as.character(sequence)]
+
+# 72 fractions detected
+pep.allfract.dt[, length(unique(fraction)), by=sample]
+
+# add the protein id to the table
+pep.allfract.dt[pep.dt, protein := i.protein, on=.(sample, sequence)]
+pep.allfract.dt <- pep.allfract.dt[, .(sample, fraction, protein, sequence, intensity)]
+
+pep.allfract.dt[!is.na(intensity), length(unique(protein)), by=.(sample,fraction)]
+
+pep.allfract.dt[is.na(intensity), intensity := 0]
+```
+
+Read in the mw calibrations 
+```{r}
+mw.dt <- fread("./data/HIV_Infection_CD4T_cells/SEC_Profiles/D1-D3-cal_SRT.txt")
+setnames(mw.dt, new=c('std_elu_fractions', 'std_weights_kDa'))
+mw.dt <- mw.dt[, .(std_weights_kDa, std_elu_fractions)]
+
+
+calibration = calibrateMW(mw.dt,
+                          PDF=T,
+                          plot=TRUE)
+```
+
+Prepare an annotation fileto add to the trace object
+```{r}
+anno.dt <- pep.allfract.dt[, .(filename=paste0(sample, '.fraction',fraction), fraction_number=fraction, sample)] %>% 
+  unique()
+anno.dt[, c('condition_id', 'replicate_id') := tstrsplit(sample, '_', keep=c(1,2))]
+anno.dt[, fraction_number := as.integer(fraction_number)]
+```
+
+Prepare the design object
+```{r}
+design.dt <- anno.dt[, .(Sample_name=sample,
+                         Condition=condition_id,
+                         Replicate=as.integer(replicate_id)
+                         )] %>% 
+  unique()
+```
+
+Create the CCprofiler `tracelist` object
+
+```{r}
+cores <- parallel::detectCores() - 2
+
+samples <- unique(anno.dt$sample)
+
+traces_list <- pbapply::pblapply(samples, function(x){
+  message(x) #just need these two cols I think
+  ann <- anno.dt[grepl(x, filename), .(filename, fraction_number)]
+  setkey(ann,fraction_number) # order by fract number 
+  
+  pep.in <- pep.allfract.dt[, .(protein_id=protein, peptide_id=sequence, filename=paste0(sample, '.fraction', fraction), intensity)]
+  data <- pep.in[grepl(x, filename),]
+  data <- merge(data, ann, by=c("filename"))
+  setkey(data,fraction_number)
+  data[, fraction_number:= NULL]
+
+  traces <- importPCPdata(input_data=data, fraction_annotation=ann)
+  return(traces)
+}, cl=cores)
+
+names(traces_list) = samples
+class(traces_list) <- "tracesList"
+
+saveRDS(traces_list, ScriptAndDatedFileName('hiv.d123.peptide.allmissingfrac.traces.rds'))
+traces_list <- readRDS('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/070125_CCProfiler_PreProcessing_data/2025_07_02_hiv.d123.peptide.allmissingfrac.traces.rds')
+```
+
+*optional* annotate protein traces with uniprot/function info
+read in old `idMapper` file and use this to map
+ensure there is one unique row per protein
+```{r}
+idMapper <- fread('/Users/martingordon/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_23_id.mappers.csv.gz')
+id.anno <- unique(idMapper[,.(protein_id=protein, gene, org, mw_da=mw)])
+
+# avoid trying to annotations toproteins missing from traces obj or will fail 
+overlap <- intersect(id.anno$protein_id, pep.dt$protein)
+id.anno <- id.anno[protein_id %in% overlap]
+
+id.anno <- id.anno[gene != 'NaN'] # all of the isoforms? What can I do with these? drop fro now..
+#id.anno <- id.anno[!grepl(';', protein)]
+
+# only one repcord per uniprot; not perfect, but unfortunately 
+id.anno <- id.anno[,.SD[1], by=protein_id]
+```
+
+not used... trying to match uniprot format; think need to only keep proteotypic records
+```{r}
+#id.anno[!grepl(';', protein_id)]
+# make the mw uniprot format
+id.anno[, mw_test1 := lapply(mw_da, function(x){
+  mw.vec <- as.numeric(unlist(strsplit(x, ';')))
+  format(round(mw.vec), big.mark=",", scientific=FALSE) %>% 
+    paste0(., collapse=';')
+}), by=.I]
+
+# boht are identical
+id.anno[, mw_test2 := {
+  mw.vec <- strsplit(mw_da, ";")
+  vapply(mw.vec, function(x) {
+       paste0(format(round(as.numeric(x)), big.mark=",", scientific=FALSE), collapse=";")
+  }, character(1))
+}]
+
+id.anno[, mw := mw_test2]
+id.anno[, c('mw_da', 'mw_test1', 'mw_test2') := NULL]
+```
+
+Ensure there are not duplicate records in the annotation table!
+```{r}
+traces_list <- annotateTraces(traces=traces_list,
+                            trace_annotation=id.anno,
+                            traces_id_column = "protein_id",
+                            trace_annotation_id_column = "protein_id",
+                            trace_annotation_mass_column = "mw_da",
+                            uniprot_mass_format = FALSE,
+                            replace_whitespace = TRUE)
+```
+# annotate the MW
+```{r}
+traces_list <- annotateMolecularWeight(traces_list, calibration)
+```
+
+## QC & data inspection
+
+cross correlation to see how well the different samples align
+shift the fractions + and - lag and see how well all fractions correlate
+Find the offset with best correlations; 
+Uninfect2 to Infect3 is only comparison that is not aligned -1 shift best scoring, but close... all other samples 'aligned'
+```{r}
+# alignment fails if we try to do it on all the fractions as the fractions are not shared across all conditions... lets just find shared fractions across conditions for simple test
+shared.fractions <- Reduce(intersect, sapply(traces_list, function(x) colnames(x$traces), simplify=F)) %>% 
+  head(., -1) # drop id col
+
+traces_list$Challenged_1$traces
+
+examplePeptideTracesList$int_r1$traces
+
+# the first frations are quite noisy; restrict to the >= 15
+traces_subset <- subset(traces_list, fraction_ids=seq(20,70,1))
+
+alignTraces(traces_subset, min_lag = -5, max_lag = 5, plot=T, PDF=T, name ='AllSamples.allfract.crossCorr.plot')
+```
+plot the global peptide intesnities of the 
+```{r}
+plotGlobalIntensities(traces_list, plot = T, PDF=T, name='AllSamples.globalintensities.plot')
+```
+
+find missing values and impute by fitting a spline to the data
+```{r}
+#' Find missing values
+#' (defined as having identifications in left and right neigbouring fractions):
+traces_wMissing <- findMissingValues(traces_list,
+                                 bound_left = 1,
+                                 bound_right = 1,
+                                 consider_borders = TRUE)
+
+#' Impute NA values by fitting a spline: (what is the boundary used for curve fitting?)
+traces_wImp <- imputeMissingVals(traces_wMissing, method = "spline")
+
+#' Plot imputation summary; fails due to melt function need to prefix with reshape2
+plotImputationSummary(traces_wMissing, 
+                      traces_wImp, 
+                      PDF = T,
+                      plot_traces = T,
+                      name='AllSamples.imputationSummary.plot',
+                      max_n_traces = 2)
+
+saveRDS(traces_wImp,  ScriptAndDatedFileName('hiv.d123.peptide.traces.allfract.wImpute.rds'))
+traces_wImp <- readRDS('./070125_CCProfiler_PreProcessing_data/2025_07_02_hiv.d123.peptide.traces.allfract.wImpute.rds')
+```
+
+plot function above failed due to out of date pckage dependency. Try loading the daff package and using that function
+```{r}
+# can plot the differences in the two matrices/objects using this snippet (from CCprofiler vignette)
+library(daff) # for plotting the differences in the matrices
+render_diff(diff_data(traces_wMissing$Challenged_1$traces, traces_wImp$Challenged_1$traces))
+```
+## Normalization
+Normalizes peptide intensities across conditions/replicates using cyclic loess normalization
+sliding window across sec fractions and fits a loess curve across conditions/replicates to that interval
+Each sample is normalized to the average of all the samples within that trace/window
+Takes the average value of the fit across each peptide/fraction
+This normalization take a a *long* time with many samples... 
+
+We dont want to normalize across donors; split into donor sets and process individually
+```{r}
+traces_d2 <- traces_wImp[grepl('_2', names(traces_wImp))]
+class(traces_d2) <- "tracesList"
+
+traces_d1 <- traces_wImp[grepl('_1', names(traces_wImp))]
+class(traces_d1) <- "tracesList"
+
+traces_d3 <- traces_wImp[grepl('_3', names(traces_wImp))]
+class(traces_d3) <- "tracesList"
+```
+still not working...
+I think the issue here may be really noisy peptides...
+
+I think we also need to remove protein gorups 
+```{r}
+traces_norm_d2 <-  normalizeByCyclicLoess(traces_d2, 
+                       window = 3, 
+                       step = 1, 
+                       plot = TRUE, 
+                       PDF = TRUE, 
+                       name = "d2_normalizeByCyclicLoess")
+
+saveRDS(traces_norm_d2, ScriptAndDatedFileName('d2.peptide.traces.norm.rds'))
+
+traces_norm_d1 <-  normalizeByCyclicLoess(traces_d1, 
+                       window = 3, 
+                       step = 1, 
+                       plot = TRUE, 
+                       PDF = TRUE, 
+                       name = "d1_normalizeByCyclicLoess")
+
+saveRDS(traces_norm_d1, ScriptAndDatedFileName('d1.peptide.traces.norm.rds'))
+
+traces_norm_d3 <-  normalizeByCyclicLoess(traces_d3, 
+                       window = 3, 
+                       step = 1, 
+                       plot = TRUE, 
+                       PDF = TRUE, 
+                       name = "d3_normalizeByCyclicLoess")
+
+saveRDS(traces_norm_d3, ScriptAndDatedFileName('d3.peptide.traces.norm.rds'))
+```
+Run for all normalized 
+```{r}
+traces_norm <- normalizeByCyclicLoess(traces_list = traces_wImp, 
+                       window = 3, 
+                       step = 1, 
+                       plot = TRUE, 
+                       PDF = TRUE, 
+                       name = "allSamples_normalizeByCyclicLoess")
+
+saveRDS(traces_norm, ScriptAndDatedFileName('allsamples.peptide.traces.norm.rds'))
+```
+
+**Next steps**
+Want to work with the individual donors and see
+
+plot the normalized values
+
+I think combining the peptides issue may be with the peptides mapping to more than one protein
+```{r}
+traces_d2 <- readRDS('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/070125_CCProfiler_PreProcessing_data/2025_07_02_d2.peptide.traces.norm.rds')
+#' # Assess total intensity after normalization
+plotGlobalIntensities(traces_norm, plot = T, PDF=T, name = "allSamples.IntensitySummary_postNormalization")
+
+#' # Filter by consecutive IDs and sibling peptide correlation
+# Combine all traces for filtering:
+undebug(combineTracesMutiCond)
+
+test <- examplePeptideTracesList 
+class(test) <- "tracesList"
+
+test
+traces_combined <- combineTracesMutiCond(traces_d2)
+
+traces_d2
+
+traces_combined
+
+# Filter by consecutive IDs:
+pepTracesConsIds <- filterConsecutiveIdStretches(traces_combined,
+                                                 min_stretch_length = 3,
+                                                 remove_empty = T)
+
+# Filter by maximum correlation for outlier removal:
+pepTracesMaxCorr <- filterByMaxCorr(pepTracesConsIds,
+                                cutoff = 0.5,
+                                plot = T, PDF = T)
+
+# Filter by consecutive SPC:
+pepTracesSPC <- filterBySibPepCorr(pepTracesMaxCorr,
+                                   absolute_spcCutoff = 0.2,
+                                   plot = T, PDF = T)
+
+#' # Subset pepTracesNormalized to valid peptides selected 
+#' by consecutive filtering and SPC cutoff
+validPeps <- unique(pepTracesSPC$trace_annotation$id)
+
+traces_filtered <- lapply(traces_norm, function(x){
+  subset(x, trace_subset_ids=validPeps)
+})
+class(traces_filtered) <- "tracesList"
+
+#' Update traces with additional metrics for each fraction:
+traces_filtered <- updateTraces(traces_filtered)
+
+#' Inspect traces list:
+summary(traces_filtered)
+
+saveRDS(traces_filtered, ScriptAndDatedFileName("allsamples.peptide.traces.norm.filtered.rds"))
+```
+
+**not used**
+```{r}
+# these are identical also 
+identical(traces_d2$Uninfected_2$trace_annotation$id, 
+          traces_d2$Uninfected_2$traces$id)
+
+
+
+traces_d2$Infected_2$trace_annotation
+traces_d2$Infected_2$traces
+
+
+```
+
+
+first test, subset to donor2, take 100 peptides, set trace and trace annotation id to char 
+```{r}
+traces_d2 <- traces_wImp[grepl('_2', names(traces_wImp))]
+class(traces_d2) <- "tracesList"
+
+# as another type of test, lets use only the proteotypic proteins 
+proteo.pep <- pep.allfract.dt[, unique(sequence)]
+proteo.prot <- pep.dt[, unique(protein)]
+pep.subset <- sample(proteo.pep, 1000)
+
+traces_d2 <- subset(traces_d2,  fraction_ids=seq(1,20, 1))
+traces_d2 <- subset(traces_d2,  trace_subset_ids = pep.subset, trace_subset_type='id')
+
+# for some reason, the id col has been set as factor in one dt and chr in other that causes amthcing 
+identical(as.character(c('a','b','c')),as.factor(c('a','b', 'c'))) # for example
+
+class(traces_d2) <- "tracesList"
+```
+
+
+**Warning**
+
+```{r}
+# this set of proteins are consistently causing the issue here... why?
+problematic.prots <- c( "[Acetyl (Protein N-term)]AEMDPVAEFPQPPGAAR","[Acetyl (Protein N-term)]AETYDFLFK","[Acetyl (Protein N-term)]ALMQELYSTPASR","[Acetyl (Protein N-term)]AYSQGGGKK",
+                        "[Acetyl (Protein N-term)]LLSVPLLLGLLGLAVAEPAVYFK","[Acetyl (Protein N-term)]MDSPGYNC[Carbamidomethyl (C)]FVDKDK", "[Acetyl (Protein N-term)]SAEVPEAASAEEQKEMEDKVTSPEK","[Acetyl (Protein N-term)]TTLVLDNGAYNAK")
+
+problematic.prots
+
+pep.allfract.dt[sequence %in% problematic.prots, unique(protein)]
+
+ggplot(pep.allfract.dt[grepl('_2', sample) & sequence %in% problematic.prots], aes(x=fraction, y=log2(intensity), group=protein, color=protein)) +
+  geom_point() +
+  geom_line() +
+  facet_grid(sample~.)
+
+
+
+traces_d2$Challenged_2$trace_annotation[!id %in% problematic.prots][grepl('^\\[', id)]
+```
+
+The normalization function will fail unless the fraction names = 1 -> len(fractions)
+
+I think a smarter 
+
+```{r}
+test.trace <- examplePeptideTracesList
+
+test.trace$int_r1$traces
+
+
+traces_d2
+
+test<- examplePeptideTracesList
+class(test) <- 'tracesList'
+
+
+debug(normalizeByCyclicLoess)
+# subset to donor two and subset to a smaller fraction size to see if ewr still hiut the erro
+# this will fail but take the RDS object created in the function and wrangle it into the expected format
+# so wia
+traces_norm <-  normalizeByCyclicLoess(traces_d2, 
+                       window = 3, 
+                       step = 1, 
+                       plot = TRUE, 
+                       PDF = TRUE, 
+                       name = "d2_normalizeByCyclicLoess")
+
+
+test$int_r1$traces %>% str()
+test$int_r1$fraction_annotation %>% str()
+test$int_r1$trace_annotation %>% str()
+```
+
+```{r}
+
+traces_d2$Infected_2$traces %>% str()
+traces_d2$Infected_2$fraction_annotation %>% str()
+traces_d2$Infected_2$trace_annotation %>% str()
+```
+
+
+```{r}
+#' Normalize intensity values across samples
+#' Not sure if it is a good idea to pool replicates here; maybe we should keep hte donors seperate? For now leave as is to get it running
+traces_norm <- normalizeByCyclicLoess(traces_wImp, 
+                                      window = 3, 
+                                      step = 1, 
+                                      plot = TRUE, 
+                                      PDF = TRUE, 
+                                      name = "normalizeByCyclicLoess")
+
+
+
+View(normalizeByCyclicLoess)
+saveRDS(traces_norm,  ScriptAndDatedFileName('hiv.d123.peptide.traces.normalized.rds'))
+```
+plot intensities again after normalization
+```{r}
+#' # Assess total intensity after normalization
+plotGlobalIntensities(traces_norm, plot = T, PDF=T, name = "AllSamples.globalintensities.postNormalization.plot")
+```
+
+peptide filtering; remove peptide traces with:
+- < 5 consec fraction detections
+- max pair corr < .5
+- sister peptide cor avg < 0.2
+```{r}
+#' # Filter by consecutive IDs and sibling peptide correlation
+# Combine all traces for filtering:
+traces_combined <- combineTracesMutiCond(traces_norm)
+
+
+# Filter by consecutive IDs:
+pepTracesConsIds <- filterConsecutiveIdStretches(traces_combined,
+                                                 min_stretch_length = 5,
+                                                 remove_empty = T)
+
+# Filter by maximum correlation for outlier removal:
+pepTracesMaxCorr <- filterByMaxCorr(pepTracesConsIds,
+                                cutoff = 0.5,
+                                plot = T, PDF = T)
+
+# Filter by consecutive SPC:
+pepTracesSPC <- filterBySibPepCorr(pepTracesMaxCorr,
+                                   absolute_spcCutoff = 0.2,
+                                   plot = T, PDF = T)
+
+
+#' # Subset pepTracesNormalized to valid peptides selected 
+#' by consecutive filtering and SPC cutoff
+validPeps <- unique(pepTracesSPC$trace_annotation$id)
+pepTracesList_filtered <- lapply(pepTracesNormalized, function(x){
+  subset(x, trace_subset_ids=validPeps)
+})
+class(pepTracesList_filtered) <- "tracesList"
+
+#' Update traces with additional metrics for each fraction:
+pepTracesList_filtered <- updateTraces(pepTracesList_filtered)
+
+```
+
+

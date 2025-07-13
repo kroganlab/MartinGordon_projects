@@ -1,0 +1,1294 @@
+---
+title: "111824_plotsForKroganWeekly"
+author: "Martin Gordon"
+date: "2024-11-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Use the DESEq2 output results with new contrasts to generate the plots for Krogan weekly
+Here we want to  create i) QC plots (scatterplots of counts; maybe available already)
+A PCA to show sample dispersion
+
+For results:
+volcanoplot of individual contrasts (at gene level)
+norm counts of control vs FC on the Y axis
+
+annotation: clinvar and mut annotation: show the distributions of FC values
+Also annotate the gene tiling plot with clinvAR mutants
+
+```{r}
+library(data.table)
+library(parallel)
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(viridis)
+library(dendextend) # for dendogram modifications
+library(DESeq2)
+library(patchwork)
+library(ggrepel)
+library(tidymodels)
+library(readxl)
+library(ggridges)
+library(RColorBrewer)
+library(gggenes)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+# clinvical variant color palette
+col.pal <- c(brewer.pal(8, "Blues"), 'grey')
+# prot domian palette
+domain.pal <- randomcoloR::distinctColorPalette(k=15)
+```
+Read in the clivnar annotation work the guide mutant annotation and the DESeq2 results
+```{r}
+sgrna.dt <- read_xlsx('./docs/PIK3CA pathway base editing.xlsx', sheet=1) %>%  
+  as.data.table()
+sgrna.dt[, Gene := toupper(Gene)]
+sgrna.dt[Gene %like% 'INTERGENIC', Gene := 'Intergenic']
+sgrna.dt[Gene %like% 'NON-TARGET', Gene := 'Non-targeting']
+
+
+#merge the guide annotation to this .. already done
+<- <- merge(de.dt, sgrna.dt[,.(Guide, Gene, guideID = `Sl No`)], by.x='rn', by.y='guideID', all.x=T)
+
+# annotated data
+guides.anno <- fread('./110724_annotateCRISPRguides_Functions_data/2024_11_15_guides.mutant.anno.collapsed.txt')
+
+# new guide annotation with position included
+# take the first postition (left align the guides)
+guides.new.anno <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/110724_annotateCRISPRguides_Functions_data/2024_11_20_guides.mutant.anno.collapsed.txt')
+guides.new.anno[, first_peptide_pos :=  stringr::str_extract(peptide_position, '[0-9]+'), by=.I]
+guides.new.anno[, first_nuc_pos :=  stringr::str_extract(nucelotide_position, '[0-9]+'), by=.I]
+
+clinvar.anno <- fread('./110724_annotateCRISPRguides_Functions_data/2024_11_14_guides.clinvar.anno.collapsed.txt')
+clinvar.anno.long <- fread('./110724_annotateCRISPRguides_Functions_data/2024_11_14_guides.clinvar.anno.long.txt')
+
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/111824_plotsForKroganWeekly_data/2024_11_18_PWcomparisons.csv')
+setnames(de.dt, old=c('rn', 'Guide', 'Gene'), new=c('id', 'guide', 'gene'))
+
+# merge with our mutation annotationinformation
+de.dt <- merge(de.dt, guides.new.anno[, .(guide, editor, gene_start, gene_end,  transcript_start, transcript_end, genome_index, 
+                                          ref_codon, alt_codon, nucelotide_position,ref_peptide, alt_peptide, peptide_position, 
+                                          nuc_mutant_id, pep_mutant_id, first_peptide_pos, first_nuc_pos,
+                                          splice.site, mutant_type, most_severe_mutant, most_common_mutant)], by.x=c('guide', 'editor'), by.y=c('guide', 'editor'), all.x=T)
+
+#add clinvar annotations
+de.dt <- merge(de.dt, clinvar.anno[,.(guide, editor, hgvs, clinicalSignificance, nuc_site, ref_prot, alt_prot, prot_site)], by.x=c('guide', 'editor'), by.y=c('guide', 'editor'), all.x=T)
+```
+
+Tidy the de.dt results
+```{r}
+de.dt[abs(log2FoldChange) >= 1 & pvalue < 0.005, sig := ifelse(log2FoldChange > 0, 'up', 'down')]
+fwrite(de.dt, ScriptAndDatedFileName('deseq.pwcomparisons.allAnno.csv'))
+```
+
+N sig hits; look at this for each of the contrasts
+```{r}
+# breakdown by contrast
+g <- ggplot(de.dt[,.N, by=.(sig, contrast, editor, numeratorTimepoint)][sig != 'not',], aes(x=reorder(contrast, as.numeric(numeratorTimepoint)), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~editor, scales='free') +
+  ggtitle('Significant sgRNA') +
+  ylab('N sgRNA (Log2FC >= 1 & pvalue < 0.005)') +
+  xlab('Contrast') +
+  scale_color_manual(values=c('up'="#E31A1C", 'down'="dodgerblue2", 'not'='grey')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=7))
+g
+BackupAsPDF(g, 'nSigHits.barplot')
+
+# breakdown by contrast
+g <- ggplot(de.dt[grepl('LibraryRep', contrast),.N, by=.(sig, contrast, editor, numeratorTimepoint)][sig != 'not',], aes(x=reorder(contrast, as.numeric(numeratorTimepoint)), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~editor, scales='free') +
+  ggtitle('Significant sgRNA vs Library Day0') +
+  ylab('N sgRNA (Log2FC >= 1 & pvalue < 0.005)') +
+  xlab('Contrast') +
+  scale_color_manual(values=c('up'="#E31A1C", 'down'="dodgerblue2", 'not'='grey')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=7))
+g
+BackupAsPDF(g, 'nSigHitsvsLibraryT0.barplot')
+
+# breakdown by contrast
+g <- ggplot(de.dt[grepl('vs_DMSO', contrast),.N, by=.(sig, contrast, editor, numeratorTimepoint)][sig != 'not',], aes(x=reorder(contrast, as.numeric(numeratorTimepoint)), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~editor, scales='free') +
+  ggtitle('Significant sgRNA vs DMSO') +
+  ylab('N sgRNA (Log2FC >= 1 & pvalue < 0.005)') +
+  xlab('Contrast') +
+  scale_color_manual(values=c('up'="#E31A1C", 'down'="dodgerblue2", 'not'='grey')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=7))
+g
+
+BackupAsPDF(g, 'nSigHitsvsDMSO.barplot')
+```
+Breakdown by contrast and gene
+```{r}
+# breakdown by contrast and gene
+g <- ggplot(de.dt[,.N, by=.(sig, Gene, contrast, editor, numeratorTimepoint)][sig != 'not',], aes(x=editor, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_grid(Gene~contrast) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & p.value < 0.005)') +
+ scale_color_manual(values=c('up'="#E31A1C", 'down'="dodgerblue2", 'not'='grey')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        strip.text.x = element_text(size=6))
+g
+BackupAsPDF(g, 'nSigHit.GeneContrast.breakdown', dimensions=c(17,8))
+
+
+# same plot, but no intergenic or non-targeting
+g <- ggplot(de.dt[Gene %in% c('MTOR','AKT1', 'PIK3CA', 'PTEN'),.N, by=.(sig, Gene, contrast, editor, numeratorTimepoint)][sig != 'not',], aes(x=editor, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_grid(Gene~contrast) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & p.value < 0.005)') +
+  scale_color_manual(values=c('up'="#E31A1C", 'down'="dodgerblue2", 'not'='grey')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        strip.text.x = element_text(size=6))
+g
+BackupAsPDF(g, 'nSigHit.GeneContrast.noControls.breakdown', dimensions=c(17,8))
+
+
+g <- ggplot(de.dt[Gene %in% c('MTOR','AKT1', 'PIK3CA', 'PTEN') & grepl('vs_DMSO', contrast),.N, by=.(sig, Gene, contrast, editor, numeratorTimepoint)][sig != 'not',], aes(x=editor, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_grid(Gene~contrast) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & p.value < 0.005)') +
+  scale_color_manual(values=c('up'="#E31A1C", 'down'="dodgerblue2", 'not'='grey')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        strip.text.x = element_text(size=7))
+g
+BackupAsPDF(g, 'nSigHit.GeneContrast.vsDMSO.breakdown')
+
+g <- ggplot(de.dt[Gene %in% c('MTOR','AKT1', 'PIK3CA', 'PTEN') & grepl('vs_Lib', contrast),.N, by=.(sig, Gene, contrast, editor, numeratorTimepoint)][sig != 'not',], aes(x=editor, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_grid(Gene~contrast) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & p.value < 0.005)') +
+  scale_color_manual(values=c('up'="#E31A1C", 'down'="dodgerblue2", 'not'='grey')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        strip.text.x = element_text(size=6))
+g
+BackupAsPDF(g, 'nSigHit.GeneContrast.vsLibrary.breakdown', dimensions = c(9.5,6))
+```
+volcanoplots
+
+# faceted by gene/contrast
+```{r}
+de.dt[!is.na(ref_prot) & ref_prot != 'NA', clinvar_label := paste0(ref_prot,':',prot_site,':',alt_prot)]
+
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[contrast == x,]
+  
+  g <- ggplot(subdt, aes(x=log2FoldChange, y=-log10(pvalue), color=sig, label=clinvar_label)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not' & !is.na(ref_prot)], show.legend = F, size=2, max.overlaps = 20) +
+  facet_wrap(~gene, ncol=3, scales='free_y') +
+  ggtitle(x) +
+  ylab('-log10 p-value') +
+  xlab('Log2 Fold Change') +
+  scale_color_manual(values=c('up'="#E31A1C", 'down'="dodgerblue2", 'not'='grey')) +
+  theme_classic() 
+  
+  g
+  #BackupAsPDF(g, paste0('volcanoplots_individual/genomic_location/',x ,'.volcanoplots'), dimensions=c(10,8))
+})
+```
+
+Lets see how clinvar seperates the groups; color by clinvar annotation
+Create new col with most severe and also most common mutant type per guid
+```{r}
+
+# need to tidy clinvar label or will throw errors if not in the supplied dt
+de.dt[,clinvar_cs := clinicalSignificance]
+de.dt[is.na(clinvar_cs), clinvar_cs := 'no annotation']
+
+clinvar.severity <- data.table(Consequence =c(
+                        'Pathogenic',
+                        'Likely pathogenic',
+                        'Pathogenic/Likely pathogenic',
+                        'Conflicting classifications of pathogenicity',
+                        'Uncertain significance',
+                        'Likely benign',
+                        "Benign/Likely benign",
+                        'Benign',
+                        'not provided',
+                        'no annotation'))
+
+
+de.dt[, clinvar_mostSevere := getMostSevereVariant(clinvar_cs, rankingDT=clinvar.severity), by=.I]
+de.dt[, clinvar_mostCommon := getMostCommonVariant(clinvar_cs, rankingDT=clinvar.severity), by=.I]
+```
+
+Collapse the volcanoplots to one per contrast and color sig by most significant mutant
+
+```{r}
+col.pal <- c(brewer.pal(8, "Blues"), 'grey')
+library(RColorBrewer)
+
+
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[contrast == x,]
+  subdt[, newSig := clinvar_mostCommon]
+  subdt[(sig == 'not' | clinvar_mostCommon %in% c('no annotation', 'not provided')), newSig := 'Not significant and/or annotated']
+  
+  print(unique(subdt$newSig))
+  
+  g <- ggplot(subdt, aes(x=log2FoldChange, y=-log10(pvalue), color=newSig, label=clinvar_label)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not' & !is.na(ref_prot)], show.legend = F, size=2, max.overlaps = 20) +
+ # facet_wrap(~gene, ncol=3, scales='free_y') +
+  ggtitle(x) +
+  ylab('-log10 p-value') +
+  xlab('Log2 Fold Change') +
+  #scale_color_brewer(type='seq', palette=1, name='Clinvar Clinical Significance') +
+  scale_color_manual(values=col.pal) +
+  scale_color_manual(values=c("Benign"=col.pal[1], "Benign/Likely benign"=col.pal[2], "Likely benign"=col.pal[3], 
+                              "Uncertain significance"=col.pal[4], "Conflicting classifications of pathogenicity"=col.pal[5],
+                              "Likely pathogenic"=col.pal[6], "Pathogenic/Likely pathogenic"=col.pal[7], "Pathogenic"=col.pal[8], 'Not significant and/or annotated'=col.pal[9])) +
+  theme_classic() 
+
+  #BackupAsPDF(g, paste0('volcanoplots_individual/mutantSeverityCol/',x ,'.volcanoplots'), dimensions=c(6,5))
+})
+
+
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[contrast == x,]
+  subdt[, newSig := clinvar_mostCommon]
+  subdt[(sig == 'not' | clinvar_mostCommon %in% c('no annotation', 'not provided')), newSig := 'Not significant and/or annotated']
+  
+
+  g <- ggplot(subdt, aes(x=log2FoldChange, y=-log10(pvalue), color=newSig, label=clinvar_label)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not' & !is.na(ref_prot)], show.legend = F, size=2, max.overlaps = 20) +
+  facet_wrap(~gene, ncol=3, scales='free_y') +
+  ggtitle(x) +
+  ylab('-log10 p-value') +
+  xlab('Log2 Fold Change') +
+  #scale_color_brewer(type='seq', palette=1, name='Clinvar Clinical Significance') +
+  scale_color_manual(values=col.pal) +
+  scale_color_manual(name='Clinvar clinical significance',values=c("Benign"=col.pal[1], "Benign/Likely benign"=col.pal[2], "Likely benign"=col.pal[3], 
+                              "Uncertain significance"=col.pal[4], "Conflicting classifications of pathogenicity"=col.pal[5],
+                              "Likely pathogenic"=col.pal[6], "Pathogenic/Likely pathogenic"=col.pal[7], "Pathogenic"=col.pal[8], 'Not significant and/or annotated'=col.pal[9])) +
+  theme_classic() 
+
+  BackupAsPDF(g, paste0('volcanoplots_individual/mutantSeverityCol/',x ,'_geneFacet_clinvarAnno.volcanoplots'), dimensions=c(11,7))
+})
+
+  #scale_color_manual(values=c("Benign"="#DCCCC3", "Benign/Likely benign"="#83B1D3", "Likely benign"="#D5CD6E", 
+   #                           "Uncertain significance"="#BE8ED4", "Conflicting classifications of pathogenicity"="#8EDEC4",
+    #                          "Likely pathogenic"='darkorange4', "Pathogenic/Likely pathogenic"="#FB9A99", "Pathogenic"="#DF6F76", 'Not significant and/or annotated'='grey'))
+```
+Ridge plots of most common mutant
+```{r}
+de.dt[, most_common_mutant := factor(most_common_mutant, levels=c("splice-acceptor", "splice-donor", "nonsense", "missense", "utr", "intron", "silent"))]
+de.dt[, most_severe_mutant := factor(most_severe_mutant, levels=c("splice-acceptor", "splice-donor", "nonsense", "missense", "utr", "intron", "silent"))]
+
+lapply(unique(de.dt$contrast), function(x){
+
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & contrast == x,]
+    # take tidy the naming convention
+    
+    lapply(unique(sub.dt$gene), function(y){
+      
+     g <- ggplot(sub.dt[gene == y & !clinvar_mostSevere %in% c('no annotation', 'not provided'),], aes(x=log2FoldChange, fill=clinvar_mostSevere)) + #,  height = after_stat(density))) +
+      geom_density(alpha=0.7) +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+     # scale_x_continuous(labels=seq(-4,4,1)) +
+      ggtitle(paste(y, x, sep=' ')) +
+      scale_fill_manual(values=col.pal) +
+      facet_grid(clinvar_mostSevere~editor) +
+      theme_ridges() +
+      theme(strip.text.y=element_blank(),
+            axis.text.y = element_blank()
+            ) +
+      guides(fill= guide_legend('Category'))
+    g
+    BackupAsPDF(g, paste0('ridgeplots/clinvar_anno/bygene_mostSevereMutant/',x,'.', y, '.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions = c(10,8))
+    })
+})
+
+#collapsed clinvar plot
+lapply(unique(de.dt$contrast), function(x){
+
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & contrast == x,]
+    # take tidy the naming convention
+    
+     g <- ggplot(sub.dt[!clinvar_mostSevere %in% c('no annotation', 'not provided'),], aes(x=log2FoldChange, fill=clinvar_mostSevere)) +
+      geom_density(alpha=0.7) +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+     # scale_x_continuous(labels=seq(-4,4,1)) +
+      ggtitle(paste(x, sep=' ')) +
+      scale_fill_manual(values=col.pal) +
+      facet_grid(clinvar_mostSevere~editor) +
+      theme_ridges() +
+      theme(strip.text.y=element_blank(),
+            axis.text.y = element_blank()
+            ) +
+      guides(fill= guide_legend('Category'))
+    g
+    BackupAsPDF(g, paste0('ridgeplots/clinvar_anno/collapsed/',x,'.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions = c(10,8))
+})
+```
+
+Proportional barplots; for each experiment, compare the background clinvar distribution to the sig hits
+
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+
+    # splitting out by gene
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & !clinvar_mostSevere %in% c('no annotation', 'not provided') & contrast == x,]
+    
+    # define significance trheshold
+    sub.dt[, sig := 'no']
+    sub.dt[abs(log2FoldChange) >= 1, sig := 'yes']
+    
+    sub.dt <- sub.dt[, .N, by=.(gene,clinvar_mostSevere, sig)]
+    
+    g <- ggplot(sub.dt, aes(fill=clinvar_mostSevere, y=N, x=sig)) +
+      geom_bar(position='fill', stat='identity') +
+      facet_wrap(~gene) +
+      ylab('Proportion') +
+      xlab('Significant (LFC > 1)') +
+      scale_fill_manual(values=clinvar.pal, name='Clinvar category') +
+      ggtitle(x) +
+      theme_bw()
+    g
+   #BackupAsPDF(g, paste0('stacked_barplots/LFC_threshold/',x,'.clinvarProportions.barplot'))
+      
+})
+
+
+lapply(unique(de.dt$contrast), function(x){
+
+    # splitting out by gene
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & !clinvar_mostSevere %in% c('no annotation', 'not provided') & contrast == x,]
+    
+    # define significance trheshold
+    sub.dt[, sig := 'no']
+    sub.dt[abs(log2FoldChange) >= 1 & pvalue < 0.005, sig := 'yes']
+    
+    sub.dt <- sub.dt[, .N, by=.(gene,clinvar_mostSevere, sig)]
+    
+    g <- ggplot(sub.dt, aes(fill=clinvar_mostSevere, y=N, x=sig)) +
+      geom_bar(position='fill', stat='identity') +
+      facet_wrap(~gene) +
+      ylab('Proportion') +
+      xlab('Significant (LFC > 1 & pvalue < 0.005)') +
+      scale_fill_manual(values=col.pal, name='Clinvar category') +
+      ggtitle(x) +
+      theme_bw()
+  g  
+  BackupAsPDF(g, paste0('stacked_barplots/LFC_pval_threshold/',x,'.clinvarProportions.LFCpvalThreshold.barplot'))
+})
+
+
+lapply(unique(de.dt$contrast), function(x){
+
+    # splitting out by gene
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & !clinvar_mostSevere %in% c('no annotation', 'not provided') & contrast == x,]
+    
+    # define significance trheshold
+    sub.dt[, sig := 'no']
+    sub.dt[abs(log2FoldChange) >= 1 & pvalue < 0.005, sig := 'yes']
+    
+    sub.dt <- sub.dt[, .N, by=.(gene,clinvar_mostSevere, sig, editor)]
+    
+    g <- ggplot(sub.dt, aes(fill=clinvar_mostSevere, y=N, x=sig)) +
+      geom_bar(position='fill', stat='identity') +
+      facet_grid(gene~editor) +
+      ylab('Proportion') +
+      xlab('Significant (LFC > 1 & pvalue < 0.005)') +
+      scale_fill_manual(values=col.pal, name='Clinvar category') +
+      ggtitle(x) +
+      theme_bw() +
+      theme(axis.text.x=element_text(angle=90))
+  g  
+  #BackupAsPDF(g, paste0('stacked_barplots/LFC_pval_threshold/',x,'.clinvarProportions.LFCpvalThreshold.barplot'))
+})
+```
+
+pvalues from fishers exact test; need to adjust this probably (adjust our sets and also)
+matrix fisher test only works on 2*2 table.. for now assigning all possible pathogenic to one set and all the possible benign to the other
+```{r}
+
+fisher.dt <- lapply(unique(de.dt$contrast), function(x){
+
+    # splitting out by gene
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & !clinvar_mostSevere %in% c('Uncertain significance', 'Conflicting classifications of pathogenicity',
+                                                                                              'no annotation', 'not provided') & contrast == x,]
+    # define significance trheshold
+    sub.dt[, sig := 'no']
+    sub.dt[abs(log2FoldChange) >= 1 & pvalue < 0.05, sig := 'yes']
+    sub.dt[, clinvar_category := ifelse(grepl('pathogenic|Pathogenic', clinvar_mostSevere), 'Pathogenic', 'Benign')]
+    
+    sub.dt <- sub.dt[, .N, by=.(gene, clinvar_category, sig)]
+    
+    # this is the input to our table
+    lapply(unique(sub.dt$gene), function(y){
+      
+      fisher.set <- sub.dt[gene == y,]
+      
+      fisher.mat <- dcast(fisher.set, sig~clinvar_category, value.var='N') %>% 
+        as.matrix(rownames=1)
+      
+      # convert NA to 0
+      fisher.mat[is.na(fisher.mat)] <- 0
+      
+      if ( dim(fisher.mat)[1] != 2 | dim(fisher.mat)[2] !=2 ){
+        
+        return(data.table(name=interaction(x,y),
+                           pvalue='NA'))
+        
+      } else {
+      
+        #using fishers as some cells have count lower than 5
+        test <- fisher.test(fisher.mat)
+        return(data.table(name=interaction(x,y),
+                          pvalue=test$p.value
+                         ))
+      }
+    
+    }) %>% 
+      rbindlist()
+}) %>% rbindlist()
+
+
+fisher.dt
+#fwrite(fisher.dt[,.(contrast, gene, pvalue)], ScriptAndDatedFileName('clinvarProportions.fisherTest.csv'))
+```
+
+**todo**
+Scatterplot plot with significant hits highlighted - DONE 
+Scatterplots of the counts of two replicates - Later
+Tiling plot
+
+1. Lets do scatterplots of the FCs?
+
+scatterplots of LFC for comparisons; annotate the significant mutants (label the significant ones with their substitution and position)
+
+```{r}
+library(ggpubr)
+library(tidy)
+
+# contrast pairs for PW comparisons
+contrast.pairs <-  data.table(Var1 = c("Alpelisib_22_vs_LibraryRep_0", "Alpelisib_22_vs_LibraryRep_0", "Alpelisib_22_vs_DMSO_22"),
+                              Var2 = c("Paxalisib_22_vs_LibraryRep_0", "DMSO_22_vs_LibraryRep_0",     "Paxalisib_22_vs_DMSO_22")) 
+ 
+apply(contrast.pairs, 1,  function(x){
+
+  subdt <- de.dt
+  
+  lapply(unique(subdt$editor), function(y){
+
+    dt <- dcast(de.dt[gene %in% c('MTOR', 'PIK3CA', 'PTEN', 'AKT1') & contrast %in% x & editor == y,], id+gene+ref_prot+alt_prot+prot_site~contrast, value.var = c('log2FoldChange', 'pvalue'))
+    print(dt)
+    
+    setnames(dt, new=c('sgrna', 'gene', 'ref_prot',  'alt_prot', 'prot_site', 'log2FC.x', 'log2FC.y', 'pvalue.x', 'pvalue.y'))
+    dt[, label := ifelse(abs(log2FC.x) > 1 & abs(log2FC.y) > 1, 'abs(LFC) > 1 both conditions',
+                              ifelse(abs(log2FC.x) > 1 & abs(log2FC.y)  < 1, 'abs(LFC) > 1 x-axis condition',
+                                     ifelse(abs(log2FC.y) > 1 & abs(log2FC.x)  < 1, 'abs(LFC) > 1 y-axis condition', 'abs(LFC) < 1')))]
+     
+    g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=paste0(gene,'::',ref_prot,':', prot_site, ':', alt_prot))) +
+      geom_point(size=1) +
+      geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+      geom_hline(yintercept = c(-1,1), linetype=2, alpha=0.4) +
+      scale_color_manual(values=c('abs(LFC) > 1 x-axis condition'='#35B779FF','abs(LFC) > 1 y-axis condition'="#FDE725FF", 'abs(LFC) < 1'='grey','abs(LFC) > 1 both conditions'="#440154FF")) +
+      ggrepel::geom_text_repel(data=dt[(abs(log2FC.x) > 1 & pvalue.x < 0.005 & !is.na(ref_prot) & ref_prot != 'NA') | (abs(log2FC.y) > 1 & pvalue.y < 0.005 & !is.na(ref_prot) & ref_prot != 'NA'),],size = 3, max.overlaps = 10, segment.alpha=0.5, segment.linetype=2, show.legend = F) +
+      xlab(paste(x[1], 'log2 fold change',sep=' ')) +
+      ylab(paste(x[2], 'log2 fold change',sep=' ')) +
+      ggtitle(paste0('Treatment comparisons ', y, ' editor')) + 
+      theme_bw() +
+      coord_obs_pred()
+  
+  #add cor score
+  g <- g + stat_cor(data=dt, aes(x=log2FC.x, y=log2FC.y, label=..r.label..), method='pearson', inherit.aes = F)
+  g
+  #BackupAsPDF(g, paste0('scatterplots/',x[1], '__', x[2], '.', y,'.log2FC.clinvVar.anno.scatterplots'))
+  })
+})
+
+```
+
+Tiling plots
+
+First simple tileplots with the clinvar edits annotated; 
+
+```{r}
+de.dt$clinvar_mostSevere %>% unique()
+
+lapply(unique(de.dt$contrast), function(x){
+
+    # splitting out by gene
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & !is.na(hgvs) & clinvar_mostSevere != 'not provided' & contrast == x,]
+    sub.dt[, `:=`(prot_site = as.numeric(prot_site), 
+                  clinvar_lab = paste0(ref_prot, ':',prot_site,':', alt_prot))]
+    
+    g <- ggplot(sub.dt, aes(x=prot_site, y=log2FoldChange, fill=clinvar_mostSevere, shape=editor, label=clinvar_lab)) +
+    geom_segment(aes(x=prot_site, xend=prot_site, y=0, yend=log2FoldChange), color="grey") +
+    geom_point(aes(size=-log10(pvalue))) +
+    geom_hline(yintercept=c(-1,1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    facet_wrap(~gene, ncol=1, scales='free') +
+    ggtitle(x) +
+    xlab('amino acid residue') +
+    ylab('LFC') +
+    ggrepel::geom_text_repel(data=sub.dt[clinvar_mostSevere %in% c('Pathogenic', 'Likely pathogenic', 
+                                                                   'Pathogenic/Likely pathogenic', 'Conflicting classifications of pathogenicity') &
+                                           gene %in% c("AKT1","MTOR","PIK3CA","PTEN") & abs(log2FoldChange) > 1,], 
+                             show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 20, size=2) +
+    #ggrepel::geom_text_repel(data=sub.dt[gene %in% c("AKT1","MTOR","PIK3CA","PTEN") & abs(log2FoldChange) > 1,], 
+    #                       show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 20, size=2) +
+    #scale_fill_manual(values=c("LFC < -1"="dodgerblue2","LFC > 1"="#E31A1C", "abs(LFC) < 1"='grey')) +
+    scale_fill_manual(values=col.pal, name='Clinvar category') +
+    scale_size_continuous(breaks=c(0,2,6,10), range=c(1.5,6)) +
+    scale_shape_manual(values = 21:22) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+   g 
+  #BackupAsPDF(g, paste0('tileplots/clinvar/clinvar_simple/',x,'.lollipop'), dimensions=c(16,7))
+})
+
+```
+
+I think this maybe looks ok, but we need to annotate the domains or not helpful...
+
+```{r}
+library(biomaRt)
+genes.dt <- data.table(transcriptID=c('ENST00000371953', 'ENST00000361445', 'ENST00000649815', 'ENST00000263967'),
+                       gene=c('PTEN', 'MTOR', 'AKT1', 'PIK3CA'))
+
+domains.dt <- fetchInterProtDomains(gene = genes.dt$gene, tID = genes.dt$transcriptID)
+genes.dt$gene
+
+#subset to uniprot domains
+domains.oi <- c('Tensin_phosphatase', 'Tensin_C2-dom', 'Tyr_Pase_AS',
+                'PH_domain', 'Prot_kinase_dom', 'AGC-kinase_C',
+                'PIK-rel_kinase_FAT', 'FRB_dom','TOR_cat','PI3/4_kinase_cat_dom', 'FATC_dom',
+                'Serine/threonine-protein kinase TOR, catalytic domain','FATC domain', 
+                'PI3K_ABD', 'PI3K_Ras-bd_dom', 'PI3K-type_C2_dom', 'PI3/4_kinase_cat_dom')
+
+domains.dt <- domains.dt[interpro_short_description %in% domains.oi,]
+
+# for foverlap merging with other sites
+setkey(domains.dt, external_gene_name,interpro_start,interpro_end)
+
+domains.dt[, interpro_name := paste0(interpro_description, ' (', external_gene_name, ')')]
+```
+
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+
+    # splitting out by gene
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & !is.na(hgvs) & clinvar_mostSevere != 'not provided' & contrast == x,]
+    sub.dt[, `:=`(prot_site = as.numeric(prot_site), 
+                  clinvar_lab = paste0(ref_prot, ':',prot_site,':', alt_prot))]
+    
+    sub.dt[, start := as.numeric(prot_site)]
+    sub.dt[, end := as.numeric(prot_site)]
+    # want this for the domain labelling
+    merge.dt <- foverlaps(sub.dt[!is.na(start)], domains.dt, type='any', by.x=c('gene','start', 'end'))
+  
+    # combine this with the domains.dt
+    g <- ggplot(merge.dt, aes(x=prot_site, y=log2FoldChange, shape=editor, label=clinvar_lab, color=clinvar_mostSevere)) +
+    geom_segment(aes(x=prot_site, xend=prot_site, y=0, yend=log2FoldChange), color="grey") +
+    geom_point(aes(size=-log10(pvalue))) +
+    geom_gene_arrow(aes(xmin=interpro_start, xmax=interpro_end, y=-4, fill=interpro_description), 
+                    color='black', arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+    geom_hline(yintercept=c(-1,1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    facet_wrap(~gene, ncol=1, scales='free') +
+    ggtitle(x) +
+    xlab('Amino acid residue') +
+    ylab('Log2 fold change') +
+    ggrepel::geom_text_repel(data=sub.dt[clinvar_mostSevere %in% c('Pathogenic', 'Likely pathogenic','Pathogenic/Likely pathogenic', 'Conflicting classifications of pathogenicity') &
+                                           gene %in% c("AKT1","MTOR","PIK3CA","PTEN") & abs(log2FoldChange) > 1,], 
+                           show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 20, size=3.5) +
+    scale_color_manual(values=col.pal, name='Clinvar category') +
+    scale_fill_manual(values=domain.pal, name='Interpro Domain') +
+    scale_size_continuous(breaks=c(0,2,6,10), range=c(2,8)) +
+    scale_shape_manual(values = c(16,15)) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           color = guide_legend(override.aes = list(shape=16)))
+
+   g <- g + expand_limits(x=0)
+   BackupAsPDF(g, paste0('tileplots/clinvar/clinvar_domainAnno_changeShape/',x,'.lollipop'), dimensions=c(18,12))
+})
+```
+
+Ok, now try do the same thing with our mutations
+use the left aligned position, color by mutantSeverity, label clinvar variants
+
+# for now this is overplotted and is cause
+# need to fix x-axis problem keeps saying continuous value supplied....
+```{r}
+
+# losing our splice site info doing this... probably need to be more careful assigning position in the function.. maybe if donor, acceptor assign closest cds base for this purpose..
+de.dt[is.na(first_peptide_pos), unique(mutant_type)]
+de.dt[!is.na(first_peptide_pos), unique(most_severe_mutant)]
+
+
+
+lapply(unique(de.dt$contrast), function(x){
+
+    # splitting out by gene
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & !is.na(first_peptide_pos),] 
+    
+    sub.dt[, `:=`(first_peptide_pos = as.numeric(first_peptide_pos), 
+                  clinvar_lab = paste0(ref_prot, ':',prot_site,':', alt_prot))]
+
+    sub.dt[, start := first_peptide_pos]
+    sub.dt[, end := first_peptide_pos]
+    sub.dt[, mutant_category := 'not sig']
+    sub.dt[abs(log2FoldChange) >= 1 & pvalue < 0.005, mutant_category := most_severe_mutant]
+    
+    # want this to overlap the domain labels
+    merge.dt <- foverlaps(sub.dt[!is.na(start)], domains.dt, type='any', by.x=c('gene','start', 'end'))
+    print(unique(merge.dt$mutant_category))
+    # combine this with the domains.dt
+    g <- ggplot(merge.dt, aes(x=first_peptide_pos, y=log2FoldChange, shape=editor, label=clinvar_lab, color=mutant_category)) +
+    geom_segment(aes(x=first_peptide_pos, xend=first_peptide_pos, y=0, yend=log2FoldChange), color="grey") +
+    geom_point(aes(size=-log10(pvalue))) +
+    geom_gene_arrow(aes(xmin=interpro_start, xmax=interpro_end, y=-4, fill=interpro_description), 
+                    color='black', arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+    geom_hline(yintercept=c(-1,1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    facet_wrap(~gene, ncol=1, scales='free') +
+    ggtitle(x) +
+    xlab('Amino acid residue') +
+    ylab('Log2 fold change') +
+    ggrepel::geom_text_repel(data=sub.dt[clinvar_mostSevere %in% c('Pathogenic', 'Likely pathogenic','Pathogenic/Likely pathogenic', 'Conflicting classifications of pathogenicity') &
+                                           gene %in% c("AKT1","MTOR","PIK3CA","PTEN") & abs(log2FoldChange) > 1.5,], 
+                           show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 10, size=3.5) +
+    #scale_color_brewer(type='qual', palette=2, name='Mutation category') +
+    scale_color_manual(values=c('not sig' = 'grey', 'missense'='#CAB2D6', 'nonsense'='#FB9A99','splice-donor'='skyblue2', 'splice-acceptor'='khaki2', 'silent'='palegreen2')) +
+    scale_fill_manual(values=domain.pal, name='Interpro Domain') +
+    scale_size_continuous(breaks=c(0,2,6,10), range=c(1,6)) +
+    scale_shape_manual(values = c(15,16)) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           color = guide_legend(override.aes = list(shape=16)))
+
+   g <- g + expand_limits(x=0)
+   #BackupAsPDF(g, paste0('tileplots/mutantAnno/domainAnno/',x,'.lollipop'), dimensions=c(20,12))
+})
+
+```
+How does it look if we drop the geom segements? Just draw the point
+
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+
+    # splitting out by gene
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & !is.na(first_peptide_pos),] 
+    
+    sub.dt[, `:=`(first_peptide_pos = as.numeric(first_peptide_pos), 
+                  clinvar_lab = paste0(ref_prot, ':',prot_site,':', alt_prot))]
+
+    sub.dt[, start := first_peptide_pos]
+    sub.dt[, end := first_peptide_pos]
+    sub.dt[, mutant_category := 'not sig']
+    sub.dt[abs(log2FoldChange) >= 1 & pvalue < 0.005, mutant_category := most_severe_mutant]
+    
+    # want this to overlap the domain labels
+    merge.dt <- foverlaps(sub.dt[!is.na(start)], domains.dt, type='any', by.x=c('gene','start', 'end'))
+    print(unique(merge.dt$mutant_category))
+    # combine this with the domains.dt
+    g <- ggplot(merge.dt, aes(x=first_peptide_pos, y=log2FoldChange, shape=editor, label=clinvar_lab, color=mutant_category)) +
+    geom_point(aes(size=-log10(pvalue))) +
+    geom_gene_arrow(aes(xmin=interpro_start, xmax=interpro_end, y=-4, fill=interpro_description), 
+                    color='black', arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+    geom_hline(yintercept=c(-1,1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    facet_wrap(~gene, ncol=1, scales='free') +
+    ggtitle(x) +
+    xlab('Amino acid residue') +
+    ylab('Log2 fold change') +
+    ggrepel::geom_text_repel(data=sub.dt[clinvar_mostSevere %in% c('Pathogenic', 'Likely pathogenic','Pathogenic/Likely pathogenic', 'Conflicting classifications of pathogenicity') &
+                                           gene %in% c("AKT1","MTOR","PIK3CA","PTEN") & abs(log2FoldChange) > 1.5,], 
+                           show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 10, size=3.5) +
+    #scale_color_brewer(type='qual', palette=2, name='Mutation category') +
+    scale_color_manual(values=c('not sig' = 'grey', 'missense'='#CAB2D6', 'nonsense'='#FB9A99','splice-donor'='skyblue2', 'splice-acceptor'='khaki2', 'silent'='palegreen2')) +
+    scale_fill_manual(values=domain.pal, name='Interpro Domain') +
+    scale_size_continuous(breaks=c(0,2,6,10), range=c(1,6)) +
+    scale_shape_manual(values = c(15,16)) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           color = guide_legend(override.aes = list(shape=16)))
+
+   g <- g + expand_limits(x=0)
+   BackupAsPDF(g, paste0('tileplots/mutantAnno/dotplots/',x,'.dotplots'), dimensions=c(20,12))
+})
+
+
+```
+
+
+*112724*
+Heatmap of the sig guides in each of the comparisons; just plot vs library day 0 values for Bemax and Abe8e seperately
+
+```{r}
+de.dt %>% head()
+```
+
+
+*Todo*
+I think we want to pull out the countsfor the interesting sites (pass threholds, overlap clinvar etc )and create a heatmap for the sig hits from this set; how 'good' do these look
+Run an interaction analysis; what genes have an interaction effect between timepoint and treatment? These could be the really interesting sites we want to focus on....
+Look for mutational hotspots; we have our mutant annotations
+
+
+```{r}
+abe8e.sig <- de.dt[editor == 'abe8e' & gene %in% c('MTOR', 'AKT1','PTEN','PIK3CA') & sig != 'not', unique(id)]
+bemax.sig <- de.dt[editor == 'bemax' & gene %in% c('MTOR', 'AKT1','PTEN','PIK3CA') & sig != 'not', unique(id)]
+
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(c(abe8e.anno$most_common_mutant, bemax.anno$most_common_mutant))))
+names(col.pal) <- unique(c(abe8e.anno$most_common_mutant, bemax.anno$most_common_mutant))
+col.dt <- data.table(name=names(col.pal), col=col.pal)
+
+# read in the normalized count matrices
+abe8e.mat <- counts(readRDS('161024_PWComparisons_DESeq2_data/abe8e.dds.obj')) %>% 
+  vst()
+
+bemax.mat <- counts(readRDS('161024_PWComparisons_DESeq2_data/bemax.dds.obj')) %>% 
+  vst()
+
+
+abe8e.submat <- sweep(abe8e.mat, 1, apply(abe8e.mat[, grepl('librep', colnames(abe8e.mat))], 1, median))
+bemax.submat <- sweep(bemax.mat, 1, apply(bemax.mat[, grepl('librep', colnames(bemax.mat))], 1, median)) 
+
+abe8e.submat <- abe8e.submat[rownames(abe8e.submat) %in% abe8e.sig, !grepl('librep', colnames(abe8e.submat))]
+bemax.submat <- bemax.submat[rownames(bemax.submat) %in% bemax.sig, !grepl('librep', colnames(bemax.submat))]
+
+
+abe8e.anno <- de.dt[id %in% abe8e.sig & editor == 'abe8e', .(id, gene, most_severe_mutant, most_common_mutant)] %>% 
+  unique()
+bemax.anno <- de.dt[id %in% bemax.sig & editor == 'bemax', .(id, gene, most_severe_mutant, most_common_mutant)] %>% 
+  unique()
+
+abe8e.anno <- abe8e.anno[match(rownames(abe8e.submat),id),]
+bemax.anno <- bemax.anno[match(rownames(bemax.submat),id),]
+
+
+set.seed(4)
+hm <- Heatmap(bemax.submat, 
+        row_split = bemax.anno$gene,
+        column_split = gsub("bemax_|_[12]{1}$", '', colnames(bemax.submat)),
+        name='counts/\nlibrary day0',
+        border=T,
+        right_annotation = rowAnnotation('mutation consequence'=bemax.anno$most_common_mutant),
+        show_column_names = F,
+        row_title_gp=gpar(fontsize=10, fontface = "bold"),
+        column_title_gp=gpar(fontsize=12, fontface = "bold"),
+        show_row_names = F)
+hm
+
+BackupAsPDF(draw(hm, column_title='BEMAX contrasts vs Library Day 0'), 'bemax.vsDay0Lib.heatmap', dimensions=c(9,11))
+
+
+
+set.seed(4)
+hm <- Heatmap(abe8e.submat, 
+        row_split = abe8e.anno$gene,
+        column_split = gsub("abe8e_|_[12]{1}$", '', colnames(abe8e.submat)),
+        name='counts/\nlibrary day0',
+        border=T,
+        right_annotation = rowAnnotation('mutation consequence'=abe8e.anno$most_common_mutant),
+        show_column_names = F,
+        row_title_gp=gpar(fontsize=10, fontface = "bold"),
+        column_title_gp=gpar(fontsize=12, fontface = "bold"),
+        show_row_names = F)
+hm
+
+BackupAsPDF(draw(hm, column_title='ABE8E contrasts vs Library Day 0'), 'abe8e.vsDay0Lib.heatmap', dimensions=c(9,11))
+```
+
+
+
+```{r}
+de.dt[gene == 'PTEN' & !is.na(hgvs)]
+
+which(seq.list[['PTEN']]$genome_idx == 87864506)
+
+seq.list[['PTEN']]$translate_idx[37]
+
+
+```
+
+Function to return coding index and transcript idx
+```{r}
+getNucleotideandPeptidePosition <- function(GRCh38_position, gene, strand, seqDB){
+  
+  seqDB <- seqDB[[gene]]
+  GRCh38_position <- as.numeric(GRCh38_position)
+  
+  nuc_idx <- which(seqDB$genome_idx == GRCh38_position)
+  
+  if(length(nuc_idx) == 0){
+    message('Nucleotide position provided does align to CDS..')
+    return(list(nucleotide='', peptide=''))
+  } 
+  
+  pep_idx <- seqDB$translate_idx[nuc_idx]
+  
+  if (as.character(strand) == '1'){
+  
+    return(list(nucleotide=nuc_idx, 
+             peptide=pep_idx))
+    
+  } else if (as.character(strand) == '-1') {
+    return(list(nucleotide=length(seqDB$translate_idx) - nuc_idx + 1, 
+             peptide=length(seqDB$peptide_idx) - pep_idx + 1))
+  }
+}
+
+colnames(test.dt)
+
+
+test.dt %>% head(n=20)
+test.dt %>% colnames()
+```
+
+# write a function to i) take a site as input, string split the positions,
+# an easier way is to expand the genome index column, run on each row and then collapse again I think...
+```{r}
+test <- copy(de.dt)
+
+
+colnames(de.dt)
+# just get the genome
+idx.expanded <- test.dt[, lapply(.SD, function(x) unlist(tstrsplit(x, ";"))), .SDcols = c("genome_index"), by = .(guide, editor, id, gene)]
+idx.expanded[, strand := ifelse(gene %in% c('MTOR','AKT1'), '-1', '1')]
+
+idx.expanded[, c('nucleotide_pos', 'peptide_pos') := getNucleotideandPeptidePosition(genome_index, gene=gene, strand=strand, seqDB = seq.db),by=.I]
+idx.expanded[37,]
+test[1:10, lapply(genome_index, function(x){
+  
+  g.idx <- strsplit(x, ';')[[1]]
+  print(gene)
+  print(strand)
+  for (i in g.idx){
+    print(i)
+    getNucleotideandPeptidePosition(i, gene=gene, strand=strand, seqDB=seq.db)
+  }
+})]
+
+
+
+getNucleotideandPeptidePosition(11228933, gene='MTOR', strand=-1, seqDB=seq.db)
+
+test[1:10, lapply(genome_index, function(x) {
+  g.idx <- strsplit(x, ';')[[1]]
+  print(paste("Gene:", gene))
+  print(paste("Strand:", strand))
+  
+  for (i in g.idx) {
+    print(i)
+    tryCatch({
+      getNucleotideandPeptidePosition(i, gene = gene, strand = strand, seqDB = seq.db)
+    }, error = function(e) {
+      print(paste("Error:", e$message))
+    })
+  }
+})]
+```
+
+
+
+Testing.. looks good so far, but may need a more robust run
+```{r}
+# both look good for now
+# works perfectly for pos strand genes, but neg strand genes we need to reverse
+getNucleotideandPeptidePosition(87965467, gene='PTEN', strand=1, seqDB=seq.db) #
+# negs now look good.. may need more testing long term, but look ok for now
+getNucleotideandPeptidePosition(11213521, gene='MTOR', strand=-1, seqDB=seq.db)
+getNucleotideandPeptidePosition(104770352, gene='AKT1', strand=-1, seqDB=seq.db)
+
+# look at neg sense gene too
+guides.dt[gene=='PTEN' & guide_strand == 'antisense']
+guides.dt[gene=='PTEN' & guide_strand == 'sense']
+
+# 
+clinvar.anno[gene=='MTOR' & guide_strand == 'antisense']
+clinvar.anno[gene=='MTOR' & guide_strand == 'sense']
+
+# look good, but no harm to take extra look at the clinvar location matching, although I think position was available already and correct
+getNucleotideandPeptidePosition(11109363, gene='MTOR', strand=-1, seqDB=seq.db)
+getNucleotideandPeptidePosition(104770352, gene='AKT1', strand=-1, seqDB=seq.db)
+```
+
+
+
+Repeat with our mutant annotation
+Need to check some of the splice site annotations and ensure these boundaries are correct
+
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & contrast == x,]
+    # take tidy the naming convention
+    
+    lapply(unique(sub.dt$gene), function(y){
+      
+     g <- ggplot(sub.dt[gene == y & !is.na(most_severe_mutant) & most_severe_mutant != 'nonsense',], aes(x=log2FoldChange, fill=most_severe_mutant)) + #,  height = after_stat(density))) +
+      geom_density(alpha=0.7) +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+     # scale_x_continuous(labels=seq(-4,4,1)) +
+      ggtitle(paste(y, x, sep=' ')) +
+      #scale_fill_manual(values=col.pal) +
+      scale_fill_viridis_d(option=2) +
+      facet_grid(most_severe_mutant~editor) +
+      theme_ridges() +
+      theme(strip.text.y=element_blank(),
+            axis.text.y = element_blank()
+            ) +
+      guides(fill= guide_legend('Category'))
+    g
+    #BackupAsPDF(g, paste0('ridgeplots/mutant_anno/bygene_mostSevereMutant/',x,'.', y, '.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions = c(10,8))
+    })
+})
+
+#collapsed clinvar plot
+lapply(unique(de.dt$contrast), function(x){
+
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & contrast == x,]
+    # take tidy the naming convention
+    
+     g <- ggplot(sub.dt[ !is.na(most_severe_mutant) & most_severe_mutant != 'nonsense',], aes(x=log2FoldChange, fill=most_severe_mutant)) +
+      geom_density(alpha=0.7) +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+     # scale_x_continuous(labels=seq(-4,4,1)) +
+      ggtitle(paste(x, sep=' ')) +
+      scale_fill_viridis_d(option=2) +
+      facet_grid(most_severe_mutant~editor) +
+      theme_ridges() +
+      theme(strip.text.y=element_blank(),
+            axis.text.y = element_blank()
+            ) +
+      guides(fill= guide_legend('Category'))
+    g
+    BackupAsPDF(g, paste0('ridgeplots/mutant_anno/collapsed/',x,'.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions = c(10,8))
+})
+```
+
+Tiling plots for each gene
+First read in the gene metadata
+
+Could just show the clinvar variants and ignore our mutant set for now?
+```{r}
+test.dt <- de.dt[!is.na(hgvs)]
+
+# easiest way to test is to check out annotations match the clinvar set
+test.dt[gene == 'PTEN'][order()]
+
+
+
+```
+
+To do; need to map the genome index to position in the gene
+For now maybe subtract the guide
+```{r}
+
+```
+
+
+Do the same ridge plots but with clinvar annotations
+
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+
+    sub.dt <- de.dt[gene %in% c('MTOR','PIK3CA', 'PTEN', 'AKT1') & contrast == x,]
+    # take tidy the naming convention
+    
+    lapply(unique(sub.dt$gene), function(y){
+      
+     g <- ggplot(sub.dt[gene == y & most_common_mutant != 'nonsense',], aes(x=log2FoldChange, fill=most_common_mutant)) + #,  height = after_stat(density))) +
+      geom_density(alpha=0.7) +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+     # scale_x_continuous(labels=seq(-4,4,1)) +
+      #ggtitle(paste('PIK3CA', title, sep=' ')) +
+     # ggtitle(plotTitle) +
+      ggtitle(paste('PIK3CA', x, sep=' ')) +
+      scale_fill_viridis_d(option=2) +
+      facet_grid(most_common_mutant~editor) +
+      theme_ridges() +
+      theme(strip.text.y=element_blank(),
+            axis.text.y = element_blank()
+            ) +
+      guides(fill= guide_legend('Category'))
+    g
+   # BackupAsPDF(g, paste0('ridgeplots/clinvar_anno/bygene_mostSevereMutant/',x,'.', y, '.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions = c(10,8))
+    })
+})
+```
+
+
+
+
+
+Heatmaps also available 
+
+scatterplots pw correlations
+For later... not NB now stick to requested plots
+
+```{r}
+library(ggpubr) # could also use geom_annotate..
+library(tidymodels)
+
+source('~/Documents/utils/mg_utils/r_utils/plottingHelperFunctions.R')
+
+# do a all by all scatterplot comparison
+contrast.pairs <-  UniqueFactorCombos(de.dt$contrast, allow.dups = F, sep=',')
+
+
+# write our custom contrast apirs
+contrast.pairs <- contrast.pairs[(grepl('bemax', Var1) & grepl('bemax', Var2))| (grepl('abe8e',Var1) & grepl('abe8e',Var2)),]
+
+
+contrast.pairs <-  data.table(Var1 = c("abe8e_Alpelisib_22-vs-abe8e_librep_0", "abe8e_Alpelisib_22-vs-abe8e_librep_0", "abe8e_Alpelisib_22-vs-abe8e_librep_0", "abe8e_Paxalisib_22-vs-abe8e_librep_0",
+                                      "bemax_Alpelisib_22-vs-bemax_librep_0", "bemax_Alpelisib_22-vs-bemax_librep_0", "bemax_Alpelisib_22-vs-bemax_librep_0",  "bemax_Paxalisib_22-vs-bemax_librep_0"),
+                             Var2 = c("abe8e_Alpelisib_7-vs-abe8e_librep_0",  "abe8e_control_22-vs-abe8e_librep_0", "abe8e_Paxalisib_22-vs-abe8e_librep_0", "abe8e_control_22-vs-abe8e_librep_0",
+                                      "bemax_Alpelisib_7-vs-bemax_librep_0", "bemax_control_22-vs-bemax_librep_0" , "bemax_Paxalisib_22-vs-bemax_librep_0", "bemax_control_22-vs-bemax_librep_0"))
+
+de.dt
+
+apply(contrast.pairs,1,  function(x){
+  
+  print(x)
+  dt <- dcast(de.dt[contrast %in% x,], sgrna+Gene~contrast, value.var = c('LFC','sig'))
+  # print
+  setnames(dt, new=c('sgRNA', 'gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+
+  
+  # could try nested if else but not working v well....
+  #dt[, label := 'not sig']
+  #dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  #dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  #dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'both sig']
+  
+    # create a col factor for 
+  dt[, label := ifelse(sig.x != 'not' & sig.y != 'not', 'both sig',
+                            ifelse(sig.x != 'not' & sig.y == 'not', 'x-axis sig',
+                                   ifelse(sig.x == 'not' & sig.y != 'not', 'y-axis sig',
+                                          'not sig')))]
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=sgRNA)) +
+    geom_point() +
+    geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-1,1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('x-axis sig'='#35B779FF', 'y-axis sig'="#FDE725FF", 'not sig'='grey', 'both sig'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not sig',],size = 2, max.overlaps = 20, segment.alpha=0.5, segment.linetype=2, show.legend = F) +
+    xlab(paste(x[1], 'log2 fold change',sep=' ')) +
+    ylab(paste(x[2], 'log2 fold change',sep=' ')) +
+    ggtitle(paste('Fold Change Comparisons')) + 
+    theme_bw()
+  
+  #add cor score
+  g <- g + stat_cor(data=dt, aes(x=log2FC.x, y=log2FC.y, label=..r.label..), method='pearson', inherit.aes = F)
+  
+  g
+  #BackupAsPDF(g, paste0('scatterplots/',x[1], '__', x[2],'.log2FC.scatterplots.'))
+})
+
+```
+
+
+
+
+
+MA plot; return to this but not using right now
+
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[contrast == x,]
+  
+  g <- ggplot(subdt, aes(x=log2(baseMean), y=log2FoldChange, color=clinvar_mostSevere, label=clinvar_label)) +
+  geom_point() +
+  geom_hline(yintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not' & !is.na(ref_prot)], show.legend = F, size=2, max.overlaps = 20) +
+  ggtitle(x) +
+  ylab('Log2 Fold Change') +
+  xlab('Log2 mean expression') +
+  #scale_color_manual(values=c('Pathogenic'="#E31A1C", 'Likely pathogenic'="lightpink",  'Benign'="dodgerblue2")) +
+  theme_classic() 
+  
+  g
+  #BackupAsPDF(g, paste0('MAplots_contrast/', x ,'.maplot'), dimensions=c(10,8))
+})
+```
+Boxplots of clinvar annotations for both sets; look at t
+
+Question to ask: are clinvar annotations enriched in the upregulated set of results?
+Need a hypogeometric test; test not sig vs sig for all and see if statistically significant difference
+
+
+make plot of clinvar log2FC distributions
+Dont include the not annotated set
+```{r}
+de.dt[, clinvar_mostSevere := factor(clinvar_mostSevere, levels=c("no annotation", "not provided", "Benign", "Benign/Likely benign", "Likely benign", 
+                                                        "Uncertain significance", "Conflicting classifications of pathogenicity",
+                                                        "Likely pathogenic", "Pathogenic/Likely pathogenic", "Pathogenic"))]
+
+de.dt[, clinvar_mostCommon := factor(clinvar_mostCommon, levels=c("no annotation", "not provided", "Benign", "Benign/Likely benign", "Likely benign", 
+                                                        "Uncertain significance", "Conflicting classifications of pathogenicity",
+                                                        "Likely pathogenic", "Pathogenic/Likely pathogenic", "Pathogenic"))]
+
+g <- ggplot(de.dt[!clinvar_mostCommon %in% c('no annotation', 'not provided') & grepl('Lib', contrast),], aes(y=(log2FoldChange), x=clinvar_mostCommon, fill=clinvar_mostCommon)) +
+  geom_boxplot() +
+  facet_grid(~editor, scales='free_x') +
+  ylab('Log2 Fold Change') +
+  xlab('') +
+  ggtitle('Fold Change distributions vs Library D0') +
+  scale_fill_brewer(type='seq', palette=1, name='Clinvar Clinical Significance') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x=element_blank())
+
+BackupAsPDF(g, 'FC.distributions.clinvarAnno.boxplots', dimensions = c(9,6))
+
+g <- ggplot(de.dt[!clinvar_mostCommon %in% c('no annotation', 'not provided') & grepl('Lib', contrast) & pvalue < 0.1,], aes(y=(log2FoldChange), x=clinvar_mostCommon, fill=clinvar_mostCommon)) +
+  geom_boxplot() +
+  facet_grid(~editor, scales='free_x') +
+  ylab('Log2 Fold Change') +
+  xlab('') +
+  ggtitle('Fold Change distributions vs Library D0') +
+  scale_fill_brewer(type='seq', palette=1, name='Clinvar Clinical Significance') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x=element_blank())
+
+g
+BackupAsPDF(g, 'FC.distributions.clinvarAnno.pvalFilter.boxplots', dimensions = c(9,6))
+```
+
+
+Look at the DMSO plots
+```{r}
+g <- ggplot(de.dt[!clinvar_mostCommon %in% c('no annotation', 'not provided') & grepl('_vs_DMSO', contrast),], aes(y=(log2FoldChange), x=clinvar_mostCommon, fill=clinvar_mostCommon)) +
+  geom_boxplot() +
+  facet_grid(~editor, scales='free_x') +
+  ylab('Log2 Fold Change') +
+  xlab('') +
+  ggtitle('Fold Change distributions vs DMSO') +
+  scale_fill_brewer(type='seq', palette=1, name='Clinvar Clinical Significance') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x=element_blank())
+
+g
+BackupAsPDF(g, 'FC.distributions.clinvarAnno.vsDMSO.boxplots', dimensions = c(9,6))
+
+g <- ggplot(de.dt[!clinvar_mostCommon %in% c('no annotation', 'not provided') & grepl('_vs_DMSO', contrast) & pvalue < 0.1,], aes(y=(log2FoldChange), x=clinvar_mostCommon, fill=clinvar_mostCommon)) +
+  geom_boxplot() +
+  facet_grid(~editor, scales='free_x') +
+  ylab('Log2 Fold Change') +
+  xlab('') +
+  ggtitle('Fold Change distributions vs DMSO') +
+  scale_fill_brewer(type='seq', palette=1, name='Clinvar Clinical Significance') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x=element_blank())
+
+g
+BackupAsPDF(g, 'FC.distributions.clinvarAnno.vsDMSO.pvalFilter.boxplots', dimensions = c(9,6))
+```
+Another visualization;plot the contrasts 
+
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[contrast == x,]
+
+  g <- ggplot(subdt[!clinvar_mostCommon %in% c('no annotation', 'not provided'),], aes(y=(log2FoldChange), x=clinvar_mostCommon, fill=clinvar_mostCommon)) +
+  geom_boxplot(outliers = FALSE) +
+  geom_hline(yintercept = c(-1,1), linetype=2, alpha=0.4) +
+  facet_grid(~editor, scales='free_x') +
+  ylab('Log2 Fold Change') +
+  xlab('') +
+  ggtitle(x) +
+  scale_fill_brewer(type='seq', palette=1, name='Clinvar Clinical Significance') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x=element_blank())
+ # g <- g + coord_cartesian(ylim=c(-3,3))
+  g
+  #BackupAsPDF(g, paste0('clinvar_boxplots/', x ,'.boxplots'))
+})
+```
+
+Another way to visualize this; lets 
+
+```{r}
+g <- ggplot(de.dt[!clinvar_mostCommon %in% c('no annotation', 'not provided') & grepl('_vs_DMSO', contrast),], aes(y=(log2FoldChange), x=clinvar_mostCommon, fill=clinvar_mostCommon)) +
+  geom_boxplot() +
+  facet_grid(~editor, scales='free_x') +
+  ylab('Log2 Fold Change') +
+  xlab('') +
+  ggtitle('Fold Change distributions vs DMSO D0') +
+  scale_fill_brewer(type='seq', palette=1, name='Clinvar Clinical Significance') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x=element_blank())
+
+g
+BackupAsPDF(g, 'FC.distributions.clinvarAnno.vsDMSO.pvalFilter.boxplots', dimensions = c(9,6))
+```
+
+
+012225- 
+Write out a simplified file format with the contrasts and names 
+
+```{r}
+fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/111824_plotsForKroganWeekly_data/2025_01_22_deseq.pwcomparisons.allAnno.csv') 
+```
+
+
+

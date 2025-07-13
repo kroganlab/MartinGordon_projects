@@ -1,0 +1,1000 @@
+---
+title: "010725_plotsForKroganWeekly"
+author: "Martin Gordon"
+date: "2025-01-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(ggbeeswarm)
+library(ggrepel)
+library(patchwork)
+library(readxl)
+library(circlize)
+library(ComplexHeatmap)
+library(randomcoloR)
+library(scales) #for muted colors
+library(eulerr)
+
+# this is for the Venn diagram plots
+library(ggvenn)
+library(ggVennDiagram) # main diff to above is you can quantify overlapping regions
+
+#Ben utils
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+
+# helper scripts for module/network export etc
+source ("/Users/martingordon/Documents/utils/mg_utils/r_utils/HelperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+```
+
+Read in the WGCNA data: module assignment from the WGCNA run
+```{r}
+module.assignment <- readRDS('./output/gpcr.11.receptors.moduleAssignment.Rdata')
+exp.mat <- readRDS('./output/gpcr.11.receptors.exp.mat.Rdata') # the expression matrix used as input for each of these
+
+clust.genes <- fread('./output/wgcna.clustergenes.adjmat.csv')
+```
+
+Quick look at the data; seems like the same module info
+```{r}
+Heatmap(exp.mat,
+        cluster_columns = F,
+        cluster_column_slices = T,
+        show_row_names = F,
+        border=T,
+        column_split = tstrsplit(colnames(exp.mat), "[_.]")[[1]],
+        )   
+```
+
+```{r}
+protQuant <- fread('data/2022_08_17_ProteinLevelData.lib.csv.gz')
+
+group.noi <- protQuant[!GROUP %like% c("DOR|KOR|MOR|MRX2|MRX4|NK1R|NPFFR1|NPY1R|PTGER1|PTGER4|QRFPR|DOR"),unique(GROUP)]
+
+protQuant <- protQuant[!GROUP %in% group.noi, ]
+protQuant <- protQuant[!GROUP %like% "MOR_LG94",]
+
+protQuant[, `:=`(timeStr = str_extract(GROUP,'[0-9]{2}$'),
+                 receptor = gsub("_[0-9]{2}$", '', protQuant$GROUP)
+               )]
+
+setorder(protQuant, receptor, Protein, timeStr)
+
+protQuant[, batchControlled := LogIntensities - median(LogIntensities, na.rm = TRUE), by = .(Protein, receptor, SUBJECT)]
+protQuant[, vsTimeZero := batchControlled - mean(batchControlled[timeStr == timeStr[!is.na(batchControlled)][1] ]), by = .(Protein, receptor)]
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+```
+
+```{r}
+# max shift across timepoints per protein/receptor
+protQuant[, maxshiftVsT0 :=  ifelse(max(vsTimeZero) > abs(min(vsTimeZero)), max(vsTimeZero), min(vsTimeZero)), by=.(Protein,receptor)]
+# find the timepoint wihtt he maximum shift
+protQuant[, maxshiftVsT0_timepoint :=  ifelse(maxshiftVsT0 == vsTimeZero, 'yes', 'no'), by=.(Protein,receptor)]
+```
+
+```{r}
+names(clust.genes) <- c('gene', 'Cluster')
+
+
+# now add the cluster info to the protQuant; subset to this 
+protQuant <- merge(protQuant, clust.genes, by='gene', all.x=F)
+protQuant[receptor == 'MOR_DAMGO', receptor := 'MOR']
+
+# use this to filter and calculate the median value per module/receptor
+protQuant[, medianClustervsT0 := median(maxshiftVsT0, na.rm=T), by=.(Cluster,receptor)]
+```
+
+```{r}
+# add this for cluster coloring 
+col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD")  #"#999933" '#DDCC77' "grey"
+
+
+# heatmap annotation\
+row_ha <- HeatmapAnnotation(receptor=protQuant$receptor, 
+                        col=list(receptor = c("DOR"=col.pal[1], 'KOR'=col.pal[2], 'MOR'=col.pal[3], 'MRX2'=col.pal[4], 'MRX4'=col.pal[5], 'NK1R'=col.pal[6], 'NPFFR1'=col.pal[7], 'NPY1R'=col.pal[8], 'PTGER1'=col.pal[9], 'PTGER4'=col.pal[10], 'QRFPR'=col.pal[11])) )
+
+p.mat <- dcast(protQuant, Cluster~receptor, value.var = 'medianClustervsT0', fun.aggregate = unique) %>% 
+  as.matrix(rownames='Cluster') 
+
+
+ha <- Heatmap(p.mat, top_annotation =row_ha,
+          name = "max log2(intensity/\nmean(timeZero))")
+
+rownames(p.mat) <- c('C1 Endosome trafficking', 'C2 PM structure/adhesion', 'C3 Actin cytoskeleton', 'C4 Golgi trafficking', 'C5 G-Protein coupled receptor signalling', 
+                     'C6 Protein Kinase C', 'C7 Clathrin', 'C8 Cytoplasmic stress granule', 'C9 Actin polymerization', 'C10 Cell morphogenesis', 'C11 RNA processing')
+
+ha <- Heatmap(p.mat, 
+              top_annotation =row_ha,
+              border=T,
+              name = "cluster median/\ntimeZero",
+              row_names_gp = gpar(fontsize=8)
+          )
+BackupAsPDF(ha, 'clusterMedian.heatmap', format='png')
+```
+Lets plot an example of what this looks like
+
+```{r}
+protQuant[, cluster_label := fcase(Cluster == 'cluster1', 'C1 Endosome trafficking',
+                              Cluster == 'cluster2', 'C2 PM structure/adhesion',
+                              Cluster == 'cluster3', 'C3 Actin cytoskeleton',
+                              Cluster == 'cluster4', 'C4 Golgi trafficking',
+                              Cluster == 'cluster5', 'C5 G-Protein coupled receptor signalling',
+                              Cluster == 'cluster6', 'C6 Protein Kinase C',
+                              Cluster == 'cluster7', 'C7 Clathrin',
+                              Cluster == 'cluster8', 'C8 Cytoplasmic stress granule',
+                              Cluster == 'cluster9', 'C9 Actin polymerization',
+                              Cluster == 'cluster10', 'C10 Cell morphogenesis',
+                              Cluster == 'cluster11', 'C11 RNA processing'
+                              )]
+```
+
+
+```{r}
+
+# calculate the median shift vs T0 per timepoint/cluster/receptor
+protQuant[, medianVsTimeZero := median(vsTimeZero, na.rm=T), by=.(Cluster, receptor, timeStr)]
+protQuant[, GO.terms := cluster_label]
+
+protQuant$GO.terms <- factor(protQuant$GO.terms, levels=c("C1 Endosome trafficking", "C2 PM structure/adhesion","C3 Actin cytoskeleton","C4 Golgi trafficking","C5 G-Protein coupled receptor signalling","C6 Protein Kinase C",
+                                                          "C7 Clathrin", "C8 Cytoplasmic stress granule", "C9 Actin polymerization", "C10 Cell morphogenesis","C11 RNA processing"))
+
+# save the protQuant table to file 
+fwrite(protQuant, ScriptAndDatedFileName('proteinQuant.anno.csv.gz'))
+```
+
+```{r}
+
+g <- ggplot(protQuant[!is.na(Cluster)], aes(x=timeStr, y=medianVsTimeZero, group=receptor, color=receptor)) + 
+  stat_summary(fun = "median", geom = "line") +
+  scale_color_manual(values = col.pal) + 
+  ggtitle('Median expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~GO.terms, scales='free_y', ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   strip.text = element_text(size = 6))
+
+g
+BackupAsPDF(g, 'medianVsT0.modulenamepanel.with0line.linechart.', dimensions = c(8,8))
+
+g <- ggplot(protQuant[!is.na(Cluster)], aes(x=timeStr, y=medianVsTimeZero, group=GO.terms, color=GO.terms)) + 
+  stat_summary(fun = "median", geom = "line") +
+  scale_color_manual(values = col.pal) + 
+  ggtitle('Median expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~receptor, scales='free_y', ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   strip.text = element_text(size = 6))
+
+g
+
+BackupAsPDF(g, 'medianVsT0.receptornamepanel.with0line.linechart.', dimensions = c(8,8))
+```
+Subset to cluster 1, cluster 6
+
+```{r}
+cluster.oi <- c('cluster1', 'cluster6')
+
+g <- ggplot(protQuant[Cluster %in% cluster.oi,], aes(x=timeStr, y=vsTimeZero, group=receptor, color=receptor)) + 
+  geom_smooth(stat = 'summary', fun.y = median, se =TRUE, show.legend = T, aes(fill=receptor), alpha=0.4) +
+  scale_color_manual(values = col.pal) + 
+  scale_fill_manual(values = col.pal) + 
+  ggtitle('Median expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~cluster_label, ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   strip.text = element_text(size = 6)) +
+  guides(color=guide_legend(override.aes=list(fill=NA))) # allows you to modify sections of the legend
+
+g 
+BackupAsPDF(g, 'clusters.oi.wSE.scales.fixed.linechart')
+
+
+g <- ggplot(protQuant[Cluster %in% cluster.oi,], aes(x=timeStr, y=vsTimeZero, group=receptor, color=receptor)) + 
+  geom_smooth(stat = 'summary', fun.y = median, se =TRUE, show.legend = T, aes(fill=receptor, alpha=0.2)) +
+  scale_color_manual(values = col.pal) + 
+  scale_fill_manual(values = col.pal) + 
+  ggtitle('Median expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~cluster_label, scales='free_y', ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   strip.text = element_text(size = 6)) +
+  guides(color=guide_legend(override.aes=list(fill=NA))) # allows you to modify sections of the legend
+
+g 
+BackupAsPDF(g, 'clusters.oi.wSE.scales.free.linechart')
+
+g <- ggplot(protQuant[Cluster %in% cluster.oi,], aes(x=timeStr, y=vsTimeZero, group=receptor, color=receptor)) + 
+  #geom_smooth(stat = 'summary', fun.y = median, se =TRUE) +
+  stat_summary(fun = median, geom="line", se=T) +
+  #stat_summary(fun = "median", geom = "line", se=TRUE) +
+  scale_color_manual(values = col.pal) + 
+  ggtitle('Median expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~cluster_label, ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   strip.text = element_text(size = 6))
+g
+BackupAsPDF(g, 'clusters.oi.scales.fixed.linechart')
+```
+plot the max shift vs T0; include a red dot if this tp is the max shift vs t0
+Can try add red points for the max shift; easeir to share table to annotate
+
+```{r}
+protQuant[,.N, by=maxshiftVsT0_timepoint]
+
+
+protQuant[Cluster %in% cluster.oi & maxshiftVsT0_timepoint == 'yes',.(medianVsTimeZero), by=.(cluster_label,receptor, timeStr)]
+
+g <- ggplot(protQuant[Cluster %in% cluster.oi,], aes(x=timeStr, y=vsTimeZero, group=receptor, color=receptor, shape=maxshiftVsT0_timepoint)) + 
+  stat_summary(fun = median, geom="line") +
+  scale_color_manual(values = col.pal) + 
+  ggtitle('Median expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~cluster_label, ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   strip.text = element_text(size = 6))
+g
+
+protQuant[Cluster %in% cluster.oi & maxshiftVsT0_timepoint == 'yes',]
+
+#fwrite(protQuant[, .N, by=.(maxshiftVsT0_timepoint, receptor, cluster_label, timeStr)][maxshiftVsT0_timepoint == 'yes', .(receptor, cluster_label, timepoint_maxShiftvsT0=timeStr)], ScriptAndDatedFileName('maxShiftTPvsT0.csv'))
+
+```
+
+Try a different visualization of the heatmap.. use this vs T0, then take the max shift
+
+```{r}
+# calculate the median shift vs T0 per cluster, per receptor, per timepoint
+protQuant[, medianVsTimeZero := median(vsTimeZero, na.rm=T), by=.(Cluster, receptor, timeStr)]
+
+protQuant[,medianVsTimeZero, by=.(Cluster, receptor, timeStr)] %>% 
+  unique() %>% 
+  .[Cluster == 'cluster8']
+
+
+# get the maximum shift vs t0 basically taking the max timepoint value
+maxShift.mat <- dcast(protQuant, receptor~cluster_label, value.var = 'medianVsTimeZero', fun.aggregate = function(x){x[which.max(abs(x))]}) %>% 
+  as.matrix(rownames='receptor') %>% 
+  t()
+
+# sanity check; checking in both directions
+protQuant[,.N, by=.(Cluster, receptor, timeStr, medianVsTimeZero)][Cluster == 'cluster10' & receptor == 'DOR']
+protQuant[,.N, by=.(Cluster, receptor, timeStr, medianVsTimeZero)][Cluster == 'cluster1' & receptor == 'DOR']
+```
+plot the max shift per timepoint
+
+```{r}
+# reorder so it matches the rownames of p.mat if not clustering..
+maxShift.mat <- maxShift.mat[rownames(p.mat),]
+
+
+rownames(p.mat)
+maxShift.mat
+
+ha <- Heatmap(maxShift.mat, 
+              top_annotation =row_ha,
+              border=T,
+              name = "cluster median vs T0\n(max shift)",
+              row_names_gp = gpar(fontsize=8)
+          )
+
+ha
+BackupAsPDF(ha, 'maxShift.clusterMedian.vsT0.heatmap', format='pdf')
+```
+
+01-21-25
+---
+Plot requests for Qiongyu, lets
+First the data driven heatmap with clustering enforce in the columns
+Also need to split the row groups based on wgcna order
+```{r}
+# order here is DOR, KOR, MOR, MRX2, MRX4, NK1R, NPFFR1, NPY1R, PTGR1 PTGR4, QRFPR
+col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD")  #"#999933" '#DDCC77' "grey"
+# this is Qiopngyus new palette
+receptorColors <- c(
+DOR = "#99CCFF",
+KOR = "#66CCFF",
+MOR = "#3399FF",
+MRX2 = "#FF9900",
+MRX4 = "#FF6666",
+NK1R = "#FF6633",
+NPFFR1 = "#9EBCDA",
+NPY1R = "#0099CC",
+PTGER1 = "#FFCCCC",
+PTGER4 = "#85CB9C",
+QRFPR = "#FF9999")
+
+
+split <- factor(module.assignment, levels=c('1','2','3','4','5','6','7','8','9','10','11'))
+
+# add wgcna module annotation
+row_ha <- rowAnnotation(modules=modules.adj, 
+                        #set any annotaiton settings for CH 
+                        annotation_legend_param = list(modules = list(
+                       	ncol = 2, 
+                       	at = split_level,
+                       	title = "wgcna modules")),
+                        #setting annotation cols
+                        col=list(modules = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3],
+                                                       '4'=col.pal[4], '5'=col.pal[5], '6'=col.pal[6], 
+                                                       '7'=col.pal[7], '8'=col.pal[8],'9'=col.pal[9], 
+                                                       '10'=col.pal[10], '11'=col.pal[11])))
+
+
+Heatmap(exp.mat,
+        cluster_column_slices = T,
+        cluster_columns=F,
+        show_row_names = F,
+        border=T,
+        column_split = factor(tstrsplit(colnames(exp.mat), "[_.]")[[1]]),
+        )   
+
+```
+tidier version of the plot
+```{r}
+library(RColorBrewer)
+
+
+# add split order
+split <- factor(modules.adj, levels=c('1','2','3','4','5','6','7','8','9','10','11'))
+#split <- factor(modules.tom, levels=c('1','2','3','4','5','6'))
+
+split_level = intersect(1:11, split)
+
+# add wgcna module annotation
+# not using right now.. maybe try set names?
+row_ha <- rowAnnotation(modules=module.assignment, 
+                        #set any annotaiton settings for CH 
+                        annotation_legend_param = list(modules = list(
+                       	ncol = 2, 
+                       	at = split_level,
+                       	title = "wgcna modules")),
+                        #setting annotation cols
+                        col=list(modules = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3],
+                                                       '4'=col.pal[4], '5'=col.pal[5], '6'=col.pal[6], 
+                                                       '7'=col.pal[7], '8'=col.pal[8],'9'=col.pal[9], 
+                                                       '10'=col.pal[10], '11'=col.pal[11])))
+
+tp.pal <- brewer.pal(5,'Blues')
+names(tp.pal) <- unique(tstrsplit(colnames(exp.mat), "[_.]")[[2]])
+
+col_ha <- HeatmapAnnotation(receptor=tstrsplit(colnames(exp.mat), "[_.]")[[1]],
+                            timepoint=tstrsplit(colnames(exp.mat), "[_.]")[[2]],
+                            col=list(receptor=receptorColors, timepoint=tp.pal))
+
+
+hm <- Heatmap(exp.mat, cluster_columns = FALSE, 
+         cluster_column_slices = T,
+         show_row_names = F,
+         show_column_names = F,
+         top_annotation = col_ha,
+         #right_annotation = row_ha,
+         split = split,
+         col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+         border=T,
+         name = "log2(intensity/\nmean(timeZero))",
+         column_split = tstrsplit(colnames(exp.mat), "[_.]")[[1]],
+         na_col = 'darkgrey',
+         row_title =("M %s"),
+         row_title_side = 'right',
+         #row_title =sprintf("%d Proteins",
+         #                   nrow(exp.mat)),
+         column_names_gp = gpar (fontsize= 3),
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=12))
+
+hm
+BackupAsPDF(hm, 'wgcna.modules.firstPass.heatmap', dimensions = c(9,6))
+
+
+
+# want to cluster between groups, not within
+column_split = tstrsplit(colnames(exp.mat), "[_.]")[[1]]
+
+# here we are clustering means between different groups but not chaning the cluster order
+dend = cluster_between_groups(exp.mat, column_split)
+
+# try to reproduce but cluster the 
+hm <- Heatmap(exp.mat, 
+         cluster_columns = dend,
+         cluster_column_slices = T,
+         cluster_row_slices = T,
+         show_row_names = F,
+         show_column_names = F,
+         top_annotation = col_ha,
+         split = split,
+         col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+         border=T,
+         name = "log2(intensity/\nmean(timeZero))",
+         column_split = 11, # need to specify the number of groups to split into 
+         na_col = 'darkgrey',
+         #row_title =sprintf("%d Proteins",
+         #                   nrow(exp.mat)),
+         row_title =("M %s"),
+         row_title_side = 'right',
+         row_title_gp = gpar(fontsize=8),
+         column_names_gp = gpar (fontsize= 3),
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=12))
+
+BackupAsPDF(hm,  'wgcna.modules.colSlicesClustered.heatmap', dimensions = c(9,8))
+#column_split = tstrsplit(colnames(exp.mat), "[_.]")[[1]],
+```
+The col clustering just doesnt look so great, instead apply the ordering from the summary plot
+Looks good, but now we want to collapse and just take the average of each group and plot that
+
+```{r}
+exp.dt <- reshape2::melt(exp.mat) %>% as.data.table()
+setnames(exp.dt, new=c('Protein', 'sample', 'value'))
+         
+exp.dt[, c('receptor', 'timepoint', 'batchID') := tstrsplit(sample, "[_.]", keep = c(1,2,4))] 
+
+exp.dt[, .N, by=.(sample, receptor, timepoint, batchID)]
+exp.dt[, GROUP := paste0(receptor, '_', timepoint)]
+
+# convert back to wide, first w/o agg fucntion to ensure it is converted correclty
+collapse.mat <- dcast(exp.dt, Protein~GROUP, value.var = 'value', fun.aggregate = mean, na.rm=T) %>% 
+  as.matrix(rownames='Protein')
+
+fwrite(exp.dt, ScriptAndDatedFileName('11.receptor.vsT0.csv'))
+
+
+collapse.dt <- reshape2::melt(collapse.mat)
+setnames(collapse.dt, old=c('Protein', 'GROUP', 'vsTimeZero'))
+
+
+fwrite(collapse.dt, ScriptAndDatedFileName('11.receptor.collapsed.vsT0.csv'))
+```
+
+adjust column clustering and order
+```{r}
+# need to adjust the column annotations
+names(tp.pal) <- unique(tstrsplit(colnames(collapse.mat), "[_.]")[[2]])
+
+col_ha <- HeatmapAnnotation(receptor=tstrsplit(colnames(collapse.mat), "[_.]")[[1]],
+                            timepoint=tstrsplit(colnames(collapse.mat), "[_.]")[[2]],
+                            col=list(receptor=receptorColors, timepoint=tp.pal))
+
+
+# want to cluster between groups, not within
+column_split = tstrsplit(colnames(collapse.mat), "[_.]")[[1]]
+# here we are clustering means between different groups but not chaning the cluster order
+dend = cluster_between_groups(collapse.mat, column_split)
+
+
+ tstrsplit(colnames(collapse.mat), "[_.]")[[1]]
+
+View(cluster_between_groups)
+
+# try to reproduce but cluster the 
+hm <- Heatmap(collapse.mat, 
+         cluster_columns = dend,
+         cluster_column_slices = T,
+         cluster_row_slices = F,
+         show_row_names = F,
+         show_column_names = F,
+         top_annotation = col_ha,
+         split = split,
+         col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+         border=T,
+         name = "log2(intensity/\nmean(timeZero))",
+         column_split = 11, # need to specify the number of groups to split into 
+         na_col = 'darkgrey',
+         row_title ="M %s",
+         row_title_side = 'right',
+         row_title_gp = gpar(fontsize=8),
+         column_names_gp = gpar (fontsize= 3),
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=12))
+
+BackupAsPDF(hm,  'wgcna.modules.collapsed.colSlicesClustered.heatmap', dimensions = c(9,7))
+```
+
+recluster trying pca order and/or heatmap summary
+
+```{r}
+summary.order <- c('QRFPR', 'NK1R', 'MRX4', 'PTGER1', 'NPY1R', 'PTGER4', 'KOR', 'NPFFR1', 'MRX2', 'MOR', 'DOR')
+
+
+tstrsplit(colnames(collapse.mat), "[_.]")[[1]]
+
+# try to reproduce but cluster the 
+hm <- Heatmap(collapse.mat, 
+         cluster_columns = F,
+         cluster_column_slices = F,
+         cluster_row_slices = T,
+         show_row_names = F,
+         show_column_names = F,
+         top_annotation = col_ha,
+         split = split,
+         column_split = factor(tstrsplit(colnames(collapse.mat), "[_.]")[[1]], levels=summary.order),
+         col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+         border=T,
+         name = "log2(intensity/\nmean(timeZero))",
+         na_col = 'darkgrey',
+         row_title ="M %s",
+         row_title_side = 'right',
+         row_title_gp = gpar(fontsize=8),
+         column_names_gp = gpar (fontsize= 3),
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=12))
+
+BackupAsPDF(hm,  'wgcna.modules.collapsed.summaryMatOrdered.heatmap', dimensions = c(9,7))
+```
+Try an order that just makes sense to us to view
+
+```{r}
+pca.order <- c('DOR', 'MOR', 'KOR', 'NPY1R','MRX2', 'NK1R', 'PTGER4', 'PTGER1', 'MRX4', 'QRFPR', 'NPFFR1')
+
+# try to reproduce but cluster the 
+hm <- Heatmap(collapse.mat, 
+         cluster_columns = F,
+         cluster_column_slices = F,
+         cluster_row_slices = T,
+         show_row_names = F,
+         show_column_names = F,
+         top_annotation = col_ha,
+         split = split,
+         column_split = factor(tstrsplit(colnames(collapse.mat), "[_.]")[[1]], levels=pca.order),
+         col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+         border=T,
+         name = "log2(intensity/\nmean(timeZero))",
+         na_col = 'darkgrey',
+         row_title ="M %s",
+         row_title_side = 'right',
+         row_title_gp = gpar(fontsize=8),
+         column_names_gp = gpar (fontsize= 3),
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=12))
+hm
+BackupAsPDF(hm,  'wgcna.modules.collapsed.pca1Ordered.heatmap', dimensions = c(9,7))
+```
+alphabetical order
+
+```{r}
+# try to reproduce but cluster the 
+hm <- Heatmap(collapse.mat, 
+         cluster_columns = F,
+         cluster_column_slices = F,
+         cluster_row_slices = T,
+         show_row_names = F,
+         show_column_names = F,
+         top_annotation = col_ha,
+         split = split,
+         column_split = factor(tstrsplit(colnames(collapse.mat), "[_.]")[[1]]),
+         col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+         border=T,
+         name = "log2(intensity/\nmean(timeZero))",
+         na_col = 'darkgrey',
+         row_title ="M %s",
+         row_title_side = 'right',
+         row_title_gp = gpar(fontsize=8),
+         column_names_gp = gpar (fontsize= 3),
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=12))
+hm
+BackupAsPDF(hm,  'wgcna.modules.collapsed.alphabeticalOrdered.heatmap', dimensions = c(9,6))
+```
+Regeenrating the lineplots with the divergent color scale
+
+```{r}
+cluster.oi <- c('cluster1', 'cluster6')
+
+g <- ggplot(protQuant[Cluster %in% cluster.oi,], aes(x=timeStr, y=vsTimeZero, group=receptor, color=receptor, label=receptor)) + 
+  geom_smooth(stat = 'summary', fun.y = median, se =TRUE, show.legend = T, aes(fill=receptor, alpha=0.2)) +
+  scale_color_manual(values = receptorColors) + 
+  scale_fill_manual(values = receptorColors) + 
+  ggtitle('Median expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  stat_summary(data=protQuant[Cluster %in% cluster.oi & timeStr == '30',], stat = 'summary', fun.y = median, geom='text', size=3,
+                   hjust = -.05, position = position_nudge(x = .05)) +
+  #geom_dl()
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~cluster_label, scales='free_y', ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   panel.spacing.x = unit(2.5, "lines"),
+   plot.margin = margin(0.1, 2.6, 0.1, 0.1, "cm"), 
+   strip.text = element_text(size = 6)) +
+  guides(color=FALSE,
+         fill=FALSE,
+         alpha=FALSE) +
+    coord_cartesian(clip='off') # allow labels to enter canvas boundaries
+
+g 
+BackupAsPDF(g, 'clusters.oi.wSE.scales.free.receptorCol.linechart')
+
+```
+Figure 2D; median shift modules, reverse clust order so overexpressed at the top of the set
+
+```{r}
+receptors=tstrsplit(colnames(collapse.mat), "[_.]")[[1]] %>% 
+  unique()
+
+row_ha <- HeatmapAnnotation(receptor=receptors, 
+                        col=list(receptor=receptorColors))
+
+
+# calculate the median shift vs T0 per cluster, per receptor, per timepoint
+protQuant[, medianVsTimeZero := median(vsTimeZero, na.rm=T), by=.(Cluster, receptor, timeStr)]
+
+protQuant[,medianVsTimeZero, by=.(Cluster, receptor, timeStr)] %>% 
+  unique() %>% 
+  .[Cluster == 'cluster8']
+
+
+# get the maximum shift vs t0 basically taking the max timepoint value
+maxShift.mat <- dcast(protQuant, receptor~cluster_label, value.var = 'medianVsTimeZero', fun.aggregate = function(x){x[which.max(abs(x))]}) %>% 
+  as.matrix(rownames='receptor') %>% 
+  t()
+
+# sanity check; checking in both directions
+protQuant[,.N, by=.(Cluster, receptor, timeStr, medianVsTimeZero)][Cluster == 'cluster10' & receptor == 'DOR']
+protQuant[,.N, by=.(Cluster, receptor, timeStr, medianVsTimeZero)][Cluster == 'cluster1' & receptor == 'DOR']
+
+# function to cluster w NA values
+hc <- clusterWNA(maxShift.mat)
+hc$order <- rev(hc$order)
+
+ha <- Heatmap(maxShift.mat, 
+              cluster_rows = hc,
+              top_annotation =row_ha,
+              border=T,
+              name = "cluster maximum shift vs T0",
+              row_names_gp = gpar(fontsize=8))
+ha
+BackupAsPDF(ha, 'maxShift.clusterMedian.vsT0.revOrder.heatmap', format='pdf', dimensions = c(8,5))
+```
+finally plot of the positive controls; just do linecharts and heatmaps
+Use a random set of colors
+
+Figure S2E: line charts of positive control proteins (ARRB2, EEA1, and PRKD2) for 11 GPCRs, or heatmap
+```{r}
+genes.oi <- c('ARRB2', 'EEA1','PRKD2')
+
+protQuant[gene %in% 'PRKD2',]
+
+g <- ggplot(protQuant[gene %in% genes.oi,], aes(x=timeStr, y=vsTimeZero, group=receptor, color=receptor, label=receptor)) + 
+ geom_smooth(stat = 'summary', fun.y = mean, se =TRUE, show.legend = T, aes(fill=receptor, alpha=0.2)) +
+  scale_color_manual(values = receptorColors) + 
+  scale_fill_manual(values = receptorColors) + 
+  ggtitle('ARBB2, EEA1 & PKRD2 mean expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  stat_summary(data=protQuant[gene %in% genes.oi & timeStr == '30',], stat = 'summary', fun.y = median, geom='text', size=3,
+                   hjust = -.05, position = position_nudge(x = .05)) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~gene, scales='free_y', ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   panel.spacing.x = unit(2.5, "lines"),
+   plot.margin = margin(0.1, 2.6, 0.1, 0.1, "cm"), 
+   strip.text = element_text(size = 6)) +
+   guides(color=FALSE,
+         fill=FALSE,
+         alpha=FALSE) +
+  coord_cartesian(clip='off') # allow labels to enter canvas boundaries
+
+g 
+BackupAsPDF(g, 'posControls.wSE.scalesFree.receptorCol.linechart', dimensions = c(12,7))
+
+# turn off the SE as quite noisy at points
+g <- ggplot(protQuant[gene %in% genes.oi,], aes(x=timeStr, y=vsTimeZero, group=receptor, color=receptor, label=receptor)) + 
+ geom_smooth(stat = 'summary', fun.y = mean, se =FALSE, show.legend = T, aes(fill=receptor, alpha=0.2)) +
+  scale_color_manual(values = receptorColors) + 
+  scale_fill_manual(values = receptorColors) + 
+  ggtitle('ARBB2, EEA1 & PKRD2 mean expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  stat_summary(data=protQuant[gene %in% genes.oi & timeStr == '30',], stat = 'summary', fun.y = median, geom='text', size=3,
+                   hjust = -.05, position = position_nudge(x = .05)) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~gene, scales='free_y', ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   panel.spacing.x = unit(2.5, "lines"),
+   plot.margin = margin(0.1, 2.6, 0.1, 0.1, "cm"), 
+   strip.text = element_text(size = 6)) +
+   guides(color=FALSE,
+         fill=FALSE,
+         alpha=FALSE) +
+  coord_cartesian(clip='off') # allow labels to enter canvas boundaries
+
+g 
+BackupAsPDF(g, 'posControls.woSE.scalesFree.receptorCol.linechart', dimensions = c(12,7))
+
+
+
+g <- ggplot(protQuant[gene %in% genes.oi,], aes(x=timeStr, y=vsTimeZero, group=receptor, color=receptor, label=receptor)) + 
+  geom_smooth(stat = 'summary', fun.y = mean, se =TRUE, show.legend = T, aes(fill=receptor, alpha=0.2)) +
+  scale_color_manual(values = receptorColors) + 
+  scale_fill_manual(values = receptorColors) + 
+  ggtitle('ARBB2, EEA1 & PKRD2 mean expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  stat_summary(data=protQuant[gene %in% genes.oi & timeStr == '30',], stat = 'summary', fun.y = median, geom='text', size=1.5,
+                   hjust = -.05, position = position_nudge(x = .05)) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~gene, ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   axis.title.x = element_text(size=8),
+   axis.text.x=element_text(size=6),
+   axis.title.y = element_text(size=8),
+   axis.text.y=element_text(size=6),
+   plot.title = element_text(size=8, face = 'bold'),
+   panel.spacing.x = unit(2.5, "lines"),
+   plot.margin = margin(0.1, 2.6, 0.1, 0.1, "cm"), 
+   strip.text = element_text(size =6)) +
+   guides(color=FALSE,
+         fill=FALSE,
+         alpha=FALSE) +
+  coord_cartesian(clip='off') # allow labels to enter canvas boundaries
+g 
+
+BackupAsPDF(g, 'posControls.wSE.scalesFixed.receptorCol.linechart', dimensions = c(7.3,2))
+
+
+g <- ggplot(protQuant[gene %in% genes.oi,], aes(x=timeStr, y=vsTimeZero, group=receptor, color=receptor, label=receptor)) + 
+  geom_smooth(stat = 'summary', fun.y = mean, se =TRUE, show.legend = T, aes(fill=receptor, alpha=0.2)) +
+  scale_color_manual(values = receptorColors) + 
+  scale_fill_manual(values = receptorColors) + 
+  ggtitle('ARBB2, EEA1 & PKRD2 mean expression vs Time 0') +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  #stat_summary(data=protQuant[gene %in% genes.oi & timeStr == '30',], stat = 'summary', fun.y = median, geom='text', size=1.5,
+  #                 hjust = -.05, position = position_nudge(x = .05)) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~gene, ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   legend.title = element_text(size = 6),  # Adjust legend title size
+   legend.text = element_text(size = 5),   # Adjust legend text size
+   legend.key.size = unit(0.3, "cm"),       # Adjust legend key size
+   axis.title.x = element_text(size=8),
+   axis.text.x=element_text(size=6),
+   axis.title.y = element_text(size=8),
+   axis.text.y=element_text(size=6),
+   plot.title = element_text(size=8, face = 'bold'),
+   panel.spacing.x = unit(2.5, "lines"),
+   plot.margin = margin(0.1, 2.6, 0.1, 0.1, "cm"), 
+   strip.text = element_text(size =6)) +
+   guides(color=guide_legend(override.aes=list(fill='white', size = 1)),
+          fill=FALSE,
+          alpha=FALSE) +
+  coord_cartesian(clip='off') # allow labels to enter canvas boundaries
+g 
+
+BackupAsPDF(g, 'posControls.wSE.scalesFixed.receptorCol.wLegend.linechart', dimensions = c(7.3,2))
+```
+
+020325- location specific detrended data
+Use this to make a paired heatmap with our LFC vs T0 
+
+Readin the vs cyto and filter to this protein set
+```{r}
+loc.dt <- fread('./output/2025_02_03_LocationSpecificProteinsVsCyto.csv')
+
+bg.mat <- dcast(loc.dt, protein~bg, value.var = "log2FCvsCyto") %>% 
+  as.matrix(rownames = "protein")
+
+# read in the collapse matrix 
+collapse.mat <- fread('./010725_plotsForKroganWeekly_data/2025_01_22_11.receptor.collapsed.vsT0.csv') %>% 
+  dcast(Protein~GROUP, value.var = 'vsTimeZero') %>% 
+  as.matrix(rownames='Protein')
+
+# like 93% of proteins in both samples so great!
+nrow(collapse.mat[rownames(collapse.mat) %in%  rownames(bg.mat),])/nrow(bg.mat)
+
+# take this set of 
+submat <- collapse.mat[rownames(collapse.mat) %in% rownames(bg.mat),]
+bg.mat <- bg.mat[rownames(bg.mat) %in% rownames(submat),]
+
+
+# split the rows by location specific signal
+locations <- unique(loc.dt[, .(protein, specificTo)])[rownames(bg.mat), specificTo, on = "protein"]
+```
+
+colors 
+```{r}
+# this is Qiopngyus new palette
+receptorColors <- c(
+DOR = "#99CCFF",
+KOR = "#66CCFF",
+MOR = "#3399FF",
+MRX2 = "#FF9900",
+MRX4 = "#FF6666",
+NK1R = "#FF6633",
+NPFFR1 = "#9EBCDA",
+NPY1R = "#0099CC",
+PTGER1 = "#FFCCCC",
+PTGER4 = "#85CB9C",
+QRFPR = "#FF9999")
+
+
+col_ha <- HeatmapAnnotation(receptor=tstrsplit(colnames(submat), "[_.]")[[1]],
+                            timepoint=tstrsplit(colnames(submat), "[_.]")[[2]],
+                            col=list(receptor=receptorColors, timepoint=tp.pal))
+```
+
+
+combine with the collapse matrix plot
+
+```{r}
+# using the pca order plot
+#pca.order <- c('DOR', 'MOR', 'KOR', 'NPY1R','MRX2', 'NK1R', 'PTGER4', 'PTGER1', 'MRX4', 'QRFPR', 'NPFFR1')
+
+hm1 <- Heatmap (bg.mat, 
+                row_split = locations, 
+                border=T,
+                row_title_rot = 0, 
+                show_row_names = FALSE,
+                name = "log2FC\nvs Cyto",
+                column_names_gp = gpar (fontsize= 8),
+                col = circlize::colorRamp2(breaks = seq(from = -2, to = 2
+                                                        , length.out = 11),
+                                    colors = rev(RColorBrewer::brewer.pal(11, "RdGy"))))
+
+
+
+# try to reproduce but cluster the 
+hm2 <- Heatmap(submat, 
+         cluster_columns = F,
+         cluster_column_slices = F,
+         cluster_row_slices = T,
+         show_row_names = F,
+         show_column_names = F,
+         top_annotation = col_ha,
+         column_split = factor(tstrsplit(colnames(submat), "[_.]")[[1]], levels=pca.order),
+         col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+         border=T,
+         name = "log2(intensity/\nmean(timeZero))",
+         na_col = 'darkgrey',
+         row_title ="M %s",
+         row_title_side = 'right',
+         row_title_gp = gpar(fontsize=8),
+         column_names_gp = gpar (fontsize= 3),
+         column_title_gp = gpar (fontsize= 9))
+
+
+BackupAsPDF(draw(hm1 + hm2, ht_gap = unit(c(3), "mm")), 'locationMarkers.LFCvsT0andLFCvsCyto.heatmap', dimensions = c(10,6))
+
+RColorBrewer::display.brewer.all()
+```
+regenerate with the full dataset to capture the missing proteins
+```{r}
+# read in DEA results for filtering
+mss <- fread('data/2022_08_31_NiceFitsPower3.csv')
+# read in exp data
+p.quant <- fread('data/2022_08_17_ProteinLevelData.lib.csv.gz')
+
+
+# fix the groups with an underscore in them MOR_LG and MOR_DAMGO to MOR.DAMGO
+p.quant[, GROUP := gsub ("_([A-Z])", ".\\1", GROUP)]
+# add some new identifier cols
+p.quant[, `:=`(timeStr = str_extract(GROUP,'[0-9]{2}$'),
+               receptor = gsub("_[0-9]{2}$", '', p.quant$GROUP)
+               )]
+
+group.noi <- p.quant[!GROUP %like% c("DOR|KOR|MOR|MRX2|MRX4|NK1R|NPFFR1|NPY1R|PTGER1|PTGER4|QRFPR|DOR"),unique(GROUP)]
+p.quant <- p.quant[!GROUP %in% group.noi, ]
+p.quant <- p.quant[!GROUP %like% "MOR.LG94",]
+p.quant[GROUP %like% 'MOR[.]DAMGO', GROUP := gsub("[.]DAMGO", "", GROUP)]
+
+# take vs t0 scores
+p.quant[, batchControlled := LogIntensities - median(LogIntensities, na.rm = TRUE), by = .(Protein, receptor, SUBJECT)]
+p.quant[, vsTimeZero := batchControlled - mean(batchControlled[timeStr == timeStr[!is.na(batchControlled)][1] ]), by = .(Protein, receptor)]
+
+full.mat <- dcast(p.quant, Protein~GROUP, value.var = 'vsTimeZero', fun.aggregate = mean,na.rm=T) %>% 
+  as.matrix(rownames='Protein')
+
+
+# reload location dt
+loc.dt <- fread('./output/2025_02_03_LocationSpecificProteinsVsCyto.csv')
+
+bg.mat <- dcast(loc.dt, protein~bg, value.var = "log2FCvsCyto") %>% 
+  as.matrix(rownames = "protein")
+
+marker.mat <- full.mat[rownames(full.mat) %in% rownames(bg.mat),]
+
+# split the rows by location specific signal
+locations <- unique(loc.dt[, .(protein, specificTo)])[rownames(bg.mat), specificTo, on = "protein"]
+
+
+hm1 <- Heatmap (bg.mat, 
+                row_split = locations, 
+                border=T,
+                row_title_rot = 0, 
+                show_row_names = FALSE,
+                name = "log2FC\nvs Cyto",
+                column_names_gp = gpar (fontsize= 8),
+                col = circlize::colorRamp2(breaks = seq(from = -2, to = 2
+                                                        , length.out = 11),
+                                    colors = rev(RColorBrewer::brewer.pal(11, "RdGy"))))
+
+
+
+# try to reproduce but cluster the 
+hm2 <- Heatmap(marker.mat, 
+         cluster_columns = F,
+         cluster_column_slices = F,
+         cluster_row_slices = T,
+         show_row_names = F,
+         show_column_names = F,
+         top_annotation = col_ha,
+         column_split = factor(tstrsplit(colnames(marker.mat), "[_.]")[[1]], levels=pca.order),
+         col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+         border=T,
+         name = "log2(intensity/\nmean(timeZero))",
+         na_col = 'darkgrey',
+         row_title ="M %s",
+         row_title_side = 'right',
+         row_title_gp = gpar(fontsize=8),
+         column_names_gp = gpar (fontsize= 3),
+         column_title_gp = gpar (fontsize= 9))
+
+
+BackupAsPDF(draw(hm1 + hm2, ht_gap = unit(c(3), "mm")), 'locationMarkers.LFCvsT0andLFCvsCyto.heatmap', dimensions = c(10,6))
+```
+
+looks good; 
+```{r}
+Heatmap(submat, cluster_rows = F, cluster_columns = F) +
+  Heatmap(test.mat, cluster_rows = F, cluster_columns = F)
+
+
+rownames
+```
+

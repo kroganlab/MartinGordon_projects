@@ -1,0 +1,660 @@
+---
+title: "061724_AViDD_WGCNA_rerun"
+author: "Martin Gordon"
+date: "2024-06-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## AViDD dataset rerun WGCNA processing
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(ggrepel)
+library(readxl)
+library(viridis)
+library(viridis)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj
+library(scales)
+library(seqinr)
+library(WGCNA)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+Read in the normalised data and ms out results
+
+```{r}
+mss.dt  <- fread('~/Documents/projects/052924_ARichards_AViDD_Murine/061324_AViDD_AB_rerun_data/2024_06_18_mss.pwcontrasts.cleanDat.csv')
+p.quant <- fread('~/Documents/projects/052924_ARichards_AViDD_Murine/061324_AViDD_AB_rerun_data/2024_06_17_svaCorrected.pquant.csv')
+setnames(p.quant, new=c('Protein', 'sample', 'LogIntensities'))
+```
+
+Map to gene IDs
+```{r}
+# want to tidy this function to automatically map IDs to datatable
+fetchSomethingFromBioMart(ids = p.quant$Protein, 
+                          species='MOUSE',
+                          attributes=c("ensembl_gene_id", "ensembl_peptide_id_version", "external_gene_name"),
+                          filters="ensembl_peptide_id_version")
+
+# so this works to filter the datatable 
+IDmapping.dt <- fetchSomethingFromBioMart(ids = p.quant$Protein, species='MOUSE', attributes=c('external_gene_name', 'ensembl_peptide_id_version'), filters = 'ensembl_peptide_id_version')
+
+p.quant <- merge(x=p.quant, y=IDmapping.dt, by.x='Protein', by.y='ensembl_peptide_id_version', all.x=T)
+p.quant[, gene := ifelse(is.na(external_gene_name), Protein, external_gene_name)]
+```
+
+drop samples not used in the DE analysis due to noise
+convert to matrix 
+5222 proteins retained in the matrix
+Dropped samples: "Nirmatrelvir_4d.1","Vehicle_7d.2","x4516_7d.1","x4516_7d.3"
+```{r}
+p.mat <- dcast(p.quant[!sample %in% c("Nirmatrelvir_4d.1","Vehicle_7d.2","x4516_7d.1","x4516_7d.3"),], gene~sample, value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='gene')
+```
+
+# subtract Mock expression values and look at some other contrasts
+```{r}
+p.quant[,c("status", "rep") := tstrsplit(sample, "[.]", keep = c(1,2)) ]
+p.quant[, c("treatment", "timepoint") := tstrsplit(status, '[_]', keep=c(1,2)) ]
+p.quant[status == 'Mock', timepoint := 'NA']
+
+# calculate difference vsMock
+p.quant[, vsMock := LogIntensities - mean(LogIntensities[status == 'Mock'], na.rm=T), by=.(Protein)]
+
+fwrite(p.quant, ScriptAndDatedFileName('input.ProteinInts.clean.csv'))
+```
+
+```{r}
+p.quant <- fread('/Users/martingordon/Documents/projects/052924_ARichards_AViDD_Murine/061724_AViDD_AB_WGCNA_rerun_data/2024_06_18_input.ProteinInts.clean.csv')
+
+# drop outlier samples
+p.quant <- p.quant[!sample %in% c("Nirmatrelvir_4d.1","Vehicle_7d.2","x4516_7d.1","x4516_7d.3"),]
+```
+Looks ok.. proceed as is 
+```{r}
+ggplot(p.quant, aes(x=paste0(status,'.',rep), y=LogIntensities, fill=status)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90))
+```
+Get matrix of protein intensity values
+```{r}
+p.mat <- dcast(p.quant, Protein~paste0(status,'.',rep), value.var = 'vsMock') %>% 
+  as.matrix(rownames='Protein')
+```
+
+Question: should we filter only to genes that are DE? 
+maybe leave as is for now and can retry
+
+```{r}
+hm <- Heatmap(p.mat, 
+              cluster_rows = T, 
+              cluster_columns = F,
+              name='vsMock',
+              na_col = 'darkgrey',
+              column_split = gsub('.[0-9]+$', '', colnames(p.mat)), 
+              row_title=sprintf('%s proteins', nrow(p.mat)), 
+              show_row_names = F, 
+              column_names_gp = gpar(fontsize=5), 
+              column_title_gp = gpar(fontsize = 8))
+
+BackupAsPDF(draw(hm, column_title='WGCNA input'), 'wgcna.input.mat')
+```
+filter the p.quant dataset by the set of nominally significant results
+```{r}
+prots.oi <- mss.dt[pvalue < 0.05, unique(Protein)]
+length(prots.oi)
+```
+
+```{r}
+p.mat <- dcast(p.quant[Protein %in% prots.oi,], Protein~paste0(status,'.',rep), value.var = 'vsMock') %>% 
+  as.matrix(rownames='Protein')
+```
+
+Question: should we filter only to genes that are DE? 
+maybe leave as is for now and can retry
+
+```{r}
+hm <- Heatmap(p.mat, 
+              cluster_rows = T, 
+              cluster_columns = F,
+              name='vsMock',
+              na_col = 'darkgrey',
+              column_split = gsub('.[0-9]+$', '', colnames(p.mat)), 
+              row_title=sprintf('%s proteins', nrow(p.mat)), 
+              show_row_names = F, 
+              column_names_gp = gpar(fontsize=5), 
+              column_title_gp = gpar(fontsize = 8))
+
+BackupAsPDF(draw(hm, column_title='WGCNA input'), 'wgcna.input.mat', dimensions = c(12,8))
+```
+Try another round of tmp normalisation first and lets look at the output
+Looks better, but worth the extra round of correction
+
+```{r}
+tmp <- medpolish(p.mat)
+
+tmp.dt <- data.table(sample = names(tmp$col),
+                     offset = tmp$col)
+
+p.quant <- merge(p.quant, y=tmp.dt, by.x='sample', by.y='sample', all.x=T)
+p.quant[,tmp.LogIntensities := LogIntensities - offset]
+p.quant[, tmp.vsMock := tmp.LogIntensities - mean(tmp.LogIntensities[status == 'Mock'], na.rm=T), by=.(Protein)]
+
+
+ggplot(p.quant, aes(x=paste0(status, '.', rep), y=tmp.LogIntensities, fill=status)) +
+  geom_boxplot()
+```
+
+```{r}
+p.mat <-dcast(p.quant[Protein %in% prots.oi,], Protein~sample, value.var = 'tmp.vsMock') %>% 
+  as.matrix(rownames='Protein')
+
+#p.mat <- sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T))
+
+hm <- Heatmap(p.mat, 
+              cluster_rows = T, 
+              cluster_columns = F,
+              name='vsMock',
+              na_col = 'darkgrey',
+              column_split = gsub('.[0-9]+$', '', colnames(p.mat)), 
+              row_title=sprintf('%s proteins', nrow(p.mat)), 
+              show_row_names = F, 
+              column_names_gp = gpar(fontsize=5), 
+              column_title_gp = gpar(fontsize = 8))
+
+BackupAsPDF(draw(hm, column_title='WGCNA input'), 'wgcna.input.tmpNorm.mat', dimensions = c(12,8))
+```
+I think the tmp norm set looks much better.. .rerun the WGCNA on this then return to the DE analysis and run before executing the workflow
+
+```{r}
+submat <- p.mat[, grep('Mock', colnames(p.mat), invert=T)]
+
+hm <- Heatmap(submat, 
+              cluster_rows = T, 
+              cluster_columns = F,
+              name='vsMock',
+              na_col = 'darkgrey',
+              column_split = gsub('.[0-9]+$', '', colnames(submat)), 
+              row_title=sprintf('%s proteins', nrow(submat)), 
+              show_row_names = F, 
+              column_names_gp = gpar(fontsize=5), 
+              column_title_gp = gpar(fontsize = 8))
+
+BackupAsPDF(draw(hm, column_title='WGCNA input'), 'wgcna.input.noMock.mat', dimensions=c(14,12))
+```
+
+Look at the sample clustering 
+```{r}
+#Group data in a dendogram to check outliers
+sampleTree = hclust(dist(t(submat)), method = "average")
+
+pdf(file = "/Users/martingordon/Documents/projects/052924_ARichards_AViDD_Murine/061724_AViDD_AB_WGCNA_rerun_data/pdfs/sampleClustering.pdf", width = 12, height = 9); 
+par(cex = 0.6)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering", sub="", xlab="", cex.lab = 1.5, 
+     cex.axis = 1.5, cex.main = 2)
+#Plot a line showing the cut-off
+abline(h = 56, col = "red") #This value of 31000 was chosen based on my data, you need to check the best value to your data
+
+dev.off()
+```
+Now that we have looked at the samples, lets checkout the genes we have selected
+```{r}
+gsg <- goodSamplesGenes(t(submat))
+summary(gsg)
+gsg$allOK
+```
+```{r}
+net.in <- t(submat)
+
+s.thres <- data.table(pickSoftThreshold(net.in)$fitIndices)
+
+s.thres %>%  
+  ggplot(aes(x=Power, y=SFT.R.sq)) + 
+  geom_point() +
+  geom_hline(yintercept = 0.8, color='darkred', linetype=2) +
+  geom_hline(yintercept = 0.9, color='darkred', linetype=2) +
+  labs(y="Scale Free Topology Model Fit, signed R^2") +
+  theme_classic()
+
+s.thres %>%  
+  ggplot(aes(x=Power, y=mean.k.)) + 
+  geom_point() +
+  labs(y='Mean Connectivity') +
+  theme_classic() 
+```
+softThreshold 4-5 seems like a decent choice for this..
+
+```{r}
+softPower = 4 #Chosen in the graphs before
+adj.mat = adjacency(net.in, power = softPower, corFnc = 'bicor', type = "signed") #Calculating the adjacency matrix
+#help(adjacency )
+```
+
+Define our topological overlap matrix
+```{r}
+TOM <- TOMsimilarity(adj.mat)
+TOM.dissimilarity <- 1-TOM
+
+#creating the dendrogram 
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average") 
+#plotting the dendrogram
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity", 
+labels = FALSE, hang = 0.04)
+```
+At a quick snapshot seems like some nice clustering visible and also quite distinct to other 
+```{r}
+hm <- Heatmap(TOM[1:2000,1:2000], cluster_rows = T, cluster_columns=T, name='similarity', column_title = 'TOM similarity matrix', show_row_names = F, show_column_names = F)
+BackupAsPDF(hm, 'tom.mat.st4.')
+```
+
+Detected 20 modules
+Lets look at these and plot the average expression of each of these
+```{r}
+Modules <- cutreeDynamic(dendro = geneTree, distM = TOM.dissimilarity, deepSplit = 2, pamRespectsDendro = FALSE, minClusterSize = 30)
+table(Modules)
+# make a datatable of the module assignments
+modules.dt <- data.table(Protein=rownames(adj.mat),
+                         Module=as.character(Modules))
+
+modules.dt <- merge(modules.dt, IDmapping.dt, by.x='Protein', by.y='ensembl_peptide_id_version', all.x=T)
+setnames(modules.dt, new=c('Protein', 'Module', 'gene'))
+
+fwrite(modules.dt, ScriptAndDatedFileName('tmpNorm.sp4.module.assignments.deepSplit2.csv'))
+```
+
+```{r}
+
+# get color palette for the modules
+col.pal <- c(
+  "dodgerblue2", 
+  "#E31A1C", # red
+  "green4",
+  "#6A3D9A", # purple
+  "#FF7F00", # orange
+  "black", "gold1",
+  "skyblue2", "#FB9A99", # lt pink
+  "palegreen2",
+  "#CAB2D6", # lt purple
+  "#FDBF6F", # lt orange
+  "gray70", "khaki2",
+  "maroon", "orchid1", "deeppink1", "blue1", "steelblue4",
+  "darkturquoise", "green1", "yellow4", "yellow3",
+  "darkorange4", "brown"
+)
+
+modules.tom <- as.character(Modules)
+
+# add wgcna module annotation
+row_ha <- rowAnnotation(wgcna.modules=modules.tom, col=list(modules.tom = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3], '4'=col.pal[4], '5'=col.pal[5], 
+                                                                              '6'=col.pal[6], '7'=col.pal[7], '8'=col.pal[8], '9'=col.pal[9], '10'=col.pal[10],
+                                                                              '11'=col.pal[11], '12'=col.pal[12], '13'=col.pal[13])))
+
+# add split order
+split <- factor(modules.tom, levels=c('1','2','3','4','5','6','7','8','9','10','11','12','13'))
+
+hm <- Heatmap(submat, 
+              cluster_columns = FALSE, 
+              show_row_names = FALSE,
+              split = split,
+              right_annotation = row_ha,
+              name = "Ints vs Mock",
+              column_split = tstrsplit(colnames(submat), "[.]")[[1]],
+              na_col = 'darkgrey',
+              row_title =sprintf("%d Proteins",
+                            nrow(submat)),
+              row_names_gp = gpar (fontsize= 1),
+              column_names_gp = gpar (fontsize= 3),
+              cluster_row_slices = F,
+              column_title_gp = gpar (fontsize= 7))
+hm
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+
+BackupAsPDF(hm, 'heatmap.wgcna.modules.ordered',dimensions=c(12,16))
+```
+```{r}
+# safe color pallete from https://stackoverflow.com/questions/9563711/r-color-palettes-for-many-data-classes
+
+col.subset <- c(col.pal[1], col.pal[2], col.pal[3], col.pal[4], col.pal[5], col.pal[15], col.pal[7], col.pal[8], col.pal[9], col.pal[10], col.pal[11],col.pal[12],col.pal[13])
+
+modules.tom <- as.character(Modules)
+
+# add wgcna module annotation
+row_ha <- rowAnnotation(wgcna.modules=modules.tom, col=list(wgcna.modules = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3], '4'=col.pal[4], '5'=col.pal[5], 
+                                                                              '6'=col.pal[15], '7'=col.pal[7], '8'=col.pal[8], '9'=col.pal[9], '10'=col.pal[10],
+                                                                              '11'=col.pal[11], '12'=col.pal[12], '13'=col.pal[13])))
+
+# add split order
+split <- factor(modules.tom, levels=c('"1','2','3','4','5','6','7','8','9','10','11','12','13'))
+
+hm <- Heatmap(submat, 
+              cluster_columns = FALSE, 
+              split = split,
+              right_annotation = row_ha,
+              name = "Ints vs Mock",
+              column_split = tstrsplit(colnames(submat), "[.]")[[1]],
+              na_col = 'darkgrey',
+              row_title =sprintf("%d Proteins",
+                            nrow(submat)),
+              row_names_gp = gpar (fontsize= 1),
+              column_names_gp = gpar (fontsize= 3),
+              cluster_row_slices = T,
+              show_row_names = F,
+              column_title_gp = gpar (fontsize= 7))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+
+BackupAsPDF(hm, 'heatmap.wgcna.modules.sigGnes.ordered',dimensions=c(12,16))
+```
+
+Lets subset to modules we are interested in 
+Run GO enrichment to identify interesting modules 
+
+```{r}
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(dbName = 'org.Mm.eg.db', ontology = "ALL", keyType = "SYMBOL")
+```
+
+```{r}
+# our background? only genes used for WGCNA analysis
+universe <- unique(modules.dt$gene)
+
+enrich.dt <- enricherOnGroups(modules.dt, groupColumns = 'Module', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'Module')
+
+simp.enrich$simplified[, Module := factor(Module, levels=c('1','2','3','4','5','6','7','8','9','10','11','12','13'))]
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'Module', topN = 8, title='GO enrichment WGCNA modules', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 8, cluster_columns =F)
+
+BackupAsPDF(ht, 'go.enrichment.wgcna.modules.sigGenes.ordered', dimensions=c(14,12))
+```
+merge the module and p.quant tables 
+
+```{r}
+p.quant <- merge(p.quant[Protein %in% prots.oi,], modules.dt[,-c('gene')], by='Protein')
+```
+
+Create a top annotation for the modules
+```{r}
+
+p.quant[, moduleMean := mean(tmp.vsMock), by=.(sample,Module)]
+
+# get the average per module/sample
+sumMat <- dcast(p.quant, Module~sample, value.var = 'tmp.vsMock', fun.aggregate = mean) %>% 
+  as.matrix(rownames='Module')
+
+rownames(sumMat) <- factor(rownames(sumMat), levels=c('1','2','3','4','5','6','7','8','9','10','11','12','13'))
+
+mod.order <- c('1','2','3','4','5','6','7','8','9','10','11','12','13')
+
+sumMat <- sumMat[mod.order, grep('Mock', colnames(sumMat), invert = T, value = T)]
+
+
+topAnnotation <- HeatmapAnnotation(moduleAverage = anno_lines(t(sumMat),
+                                   gp = gpar(col = col.subset),
+                                   add_points = TRUE, 
+                                   pt_gp = gpar(col = col.subset)),  
+                                   which = "column",
+                                   height = unit(5, "cm"))
+
+hm <- Heatmap(submat, 
+              cluster_columns = FALSE, 
+              right_annotation = row_ha,
+              top_annotation = topAnnotation,
+              name = "Ints vs Mock",
+              na_col = 'darkgrey',
+              split = split,
+              row_title =sprintf("%d Proteins",
+                            nrow(submat)),
+              row_names_gp = gpar (fontsize= 1),
+              column_names_gp = gpar (fontsize= 6),
+              cluster_row_slices = F,
+              show_row_names = F,
+              column_title_gp = gpar (fontsize= 7))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+
+BackupAsPDF(hm, 'heatmap.wgcna.modules.sigGnes.ordered',dimensions=c(22,22))   
+```
+Name the clusters 
+```{r}
+
+# now need to name these module genes according to their enrichment profiles
+modules.dt[, enrichModules := factor(ifelse(Module %in% c('9','10','13'), Module, 
+                                      ifelse(Module == '1', '1 (Organic acid metabolic processes)',
+                                             ifelse(Module == '2', '2 (Transmembrane receptor protein kinase activity)',
+                                                    ifelse(Module == '3', '3 (Translation)',
+                                                      ifelse(Module == '4', '4 (MHC protein complex)',       
+                                                           ifelse(Module == '5', '5 (Immunoglobulin complex)',
+                                                                ifelse(Module == '6', '6 (Response to interferon-beta)',
+                                                                  ifelse(Module == '7', '7 (Oxidative phosphorylation)',
+                                                                         ifelse(Module == '8', '8 (Endopeptidase inhibitor activity)',
+                                                                                ifelse(Module == '11', '11 (Endosome)',
+                                                                                       ifelse(Module == '12', '12 (ATP-dependent activity)',
+                                                                                       ''))))))))))) )]
+# sanity check
+modules.dt[,.N, by=.(Module,enrichModules)]
+
+
+modules.tom <- as.character(modules.dt$enrichModules)
+
+# add split order
+split <- factor(modules.tom, levels=c('1 (Organic acid metabolic processes)', '2 (Transmembrane receptor protein kinase activity)', '3 (Translation)',
+                                      '4 (MHC protein complex)','5 (Immunoglobulin complex)', '6 (Response to interferon-beta)', '7 (Oxidative phosphorylation)',
+                                      '8 (Endopeptidase inhibitor activity)', '9', '10', '11 (Endosome)','12 (ATP-dependent activity)', '13'))
+
+# add wgcna module annotation
+row_ha <- rowAnnotation(wgcna.modules=modules.tom, 
+                        col=list(wgcna.modules = c('1 (Organic acid metabolic processes)'=col.pal[1], '2 (Transmembrane receptor protein kinase activity)'=col.pal[2], '3 (Translation)'=col.pal[3],
+                                      '4 (MHC protein complex)'=col.pal[4],'5 (Immunoglobulin complex)'=col.pal[5], '6 (Response to interferon-beta)'=col.pal[6], '7 (Oxidative phosphorylation)'=col.pal[7],
+                                      '8 (Endopeptidase inhibitor activity)'=col.pal[8], '9'=col.pal[9], '10'=col.pal[10], '11 (Endosome)'=col.pal[11],'12 (ATP-dependent activity)'=col.pal[12], '13'=col.pal[13])))
+
+hm <- Heatmap(submat, 
+              cluster_columns = FALSE, 
+              split = split,
+              cluster_row_slices = F,
+              right_annotation = row_ha,
+              name = "Ints vs Mock",
+              column_split = tstrsplit(colnames(submat), "[.]")[[1]],
+              na_col = 'darkgrey',
+              row_title =sprintf("%d Proteins",
+                            nrow(submat)),
+              row_names_gp = gpar (fontsize= 1),
+              column_names_gp = gpar (fontsize= 3),
+              show_row_names = F,
+              column_title_gp = gpar (fontsize= 7))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+
+hm
+BackupAsPDF(hm, 'heatmap.wgcna.modules.sigGnes.anno.ordered',dimensions=c(22,22))  
+```
+Calculate the moduleEigengenes/PC1 of the data
+```{r}
+# Get Module Eigengenes per cluster
+MEs0 <- moduleEigengenes(t(submat), modules.dt$Module)$eigengenes
+colnames(MEs0) <- paste0('ME',levels(modules.dt$enrichModules))
+```
+
+Heatmap of the module eigenProteins
+```{r}
+# create annotation
+ann <- data.table(treatment=sub("_.+", "", colnames(t(MEs0))),
+                  timepoint=ifelse(grepl("[247]d", colnames(t(MEs0))), str_extract(colnames(t(MEs0)), "[247]d"), 'na'))
+
+colours <- list('timepoint' = c('na' = '#4477AA', '2d'='#66CCEE', '4d'="#228833", '7d'="#CCBB44"),
+                'treatment' =c('Nirmatrelvir' = col.pal[1], 'Vehicle'=col.pal[2], 'x4516'=col.pal[3], 'x4673'=col.pal[4]))
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+hm <- Heatmap(t(MEs0),
+        name='module PCs',
+        top_annotation = colAnn,
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=7),
+        column_split = gsub('_.+','',colnames(t(MEs0))),
+        #column_split = gsub('.[1-6]$','',colnames(t(MEs0))),
+        cluster_columns = FALSE)
+hm
+BackupAsPDF(hm, 'ME.PC1.heatmap',dimensions=c(12,6))
+```
+Lets collapse our input matrix to mean per group and then plot boxplots of the distributions of the genes in that module
+
+```{r}
+fmat.dt <- setDT(reshape2::melt(submat, value.name = 'LogInts.vs.Mock'))
+setnames(fmat.dt, new=c('Protein', 'sample', 'LogInts.vs.Mock'))
+
+fmat.dt[, GROUP := gsub('[.][1-6]$','',sample)]
+
+# convert to aggregated matrix
+agg.mat <- dcast(fmat.dt, Protein~GROUP, value.var = 'LogInts.vs.Mock', fun.aggregate = mean, na.rm=T) %>% 
+  as.matrix(rownames='Protein')
+```
+ok, now want to seperate by timepoint (or order by timepoint) and then look at the distributions of the interesting modules as boxplots
+Also, share the files with the enrichment results for each module and the protein assignments
+
+```{r}
+# add boxplot annotation of each of module ME
+topAnnotation <- HeatmapAnnotation('2 (Transmembrane receptor protein kinase activity)' = anno_boxplot(agg.mat[rownames(agg.mat) %in% modules.dt[Module == '2', Protein],],
+                                   gp = gpar(fill = col.pal[2])),
+                                   '5 (Immunoglobulin complex)' = anno_boxplot(agg.mat[rownames(agg.mat) %in% modules.dt[Module == '5', Protein],],
+                                   gp = gpar(fill = col.pal[5])),
+                                  '8 (Endopeptidase inhibitor activity)' = anno_boxplot(agg.mat[rownames(agg.mat) %in% modules.dt[Module == '5', Protein],],
+                                   gp = gpar(fill = col.pal[8])),
+                                   treatment = gsub('_.+$','', colnames(agg.mat)),
+                                   which = "column",
+                                   height = unit(15, "cm"))
+
+hm <- Heatmap(agg.mat, 
+        column_split = str_extract(colnames(agg.mat), '[247]d'),
+        show_row_names = F,
+        name='Ints. vs Mock',
+        top_annotation = topAnnotation,
+        split = split,
+        cluster_row_slices = F,
+        right_annotation = row_ha,
+        row_title = sprintf('%s Proteins', nrow(agg.mat)),
+        cluster_columns = F)
+
+hm
+BackupAsPDF(hm, 'heatmap.wgcna.modules.sigGnes.moduleBoxplots.anno.ordered',dimensions=c(23,22)) 
+
+
+# treatment split
+hm <- Heatmap(agg.mat, 
+        column_split = gsub('_[247]d','', colnames(agg.mat)),
+        show_row_names = F,
+        name='Ints. vs Mock',
+        top_annotation = topAnnotation,
+        split = split,
+        cluster_row_slices = F,
+        right_annotation = row_ha,
+        row_title = sprintf('%s Proteins', nrow(agg.mat)),
+        cluster_columns = F)
+
+hm
+BackupAsPDF(hm, 'heatmap.wgcna.modules.sigGnes.moduleBoxplots.treatSplit.anno.ordered',dimensions=c(23,22)) 
+
+MEs0
+```
+
+Lets split this heatmap differently and plot the MEs of the interesting modules at the top
+
+```{r}
+# just subset to the interesting modules
+modules.oi <- c('ME2 (Transmembrane receptor protein kinase activity)', 'ME5 (Immunoglobulin complex)','ME8 (Endopeptidase inhibitor activity)')
+
+subME <- MEs0[, modules.oi]
+subME
+ME.subset <- c(col.pal[2], col.pal[5], col.pal[8])
+
+# add linechart annotation of each of module ME
+topAnnotation <- HeatmapAnnotation(moduleEigenProtein = anno_lines(subME,
+                                   gp = gpar(col = ME.subset),
+                                   add_points = TRUE, 
+                                   pt_gp = gpar(col = ME.subset)), 
+                                   timepoint = str_extract(rownames(subME), "[247]d"),
+                                   gp = gpar(col = c('na' = '#4477AA', '2d'='#66CCEE', '4d'="#228833", '7d'="#CCBB44")),
+                                   which = "column",
+                                   height = unit(5, "cm"))
+
+hm <- Heatmap(submat, 
+              cluster_columns = FALSE, 
+              split = split,
+              cluster_row_slices = F,
+              show_row_names = F,
+              right_annotation = row_ha,
+              top_annotation = topAnnotation,
+              name = "Ints vs Mock",
+              column_split = tstrsplit(colnames(submat), "_")[[1]],
+              na_col = 'darkgrey',
+              row_title =sprintf("%d Proteins",
+                            nrow(submat)),
+              row_names_gp = gpar (fontsize= 1),
+              column_names_gp = gpar (fontsize=9),
+              #show_row_names = F,
+              column_title_gp = gpar (fontsize= 12))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+
+BackupAsPDF(hm,  'heatmap.wgcna.modules.sigGnes.ME.anno.ordered',dimensions=c(23,22)) 
+```
+# Write out the modules for the group to inspect
+
+```{r}
+fwrite(modules.dt, ScriptAndDatedFileName('tmpNorm.sp4.deepSplit2.modules.csv'))
+```
+
+
+
+## Not useds
+------
+
+```{r}
+output <- EnsemblIDsToSymbol(unique(p.quant$Protein), seqType = 'PROTEIN', species='MOUSE', attributes=c('external_gene_name', 'ensembl_peptide_id_version'), filters = 'ensembl_peptide_id_version')
+
+test <- EnsemblIDsToSymbol(p.quant$Protein, seqType = 'PROTEIN', species='MOUSE', attributes=c('external_gene_name', 'ensembl_peptide_id_version'), filters = 'ensembl_peptide_id_version')
+```
+
+```{r}
+
+tmp <- medpolish(p.mat)
+
+tmp.dt <- data.table(sample=names(tmp$col),
+                     offset=tmp$col)
+
+p.quant <- merge(x=p.quant, y=tmp.dt, by='sample')
+p.quant[, newLogIntensities := LogIntensities - offset]
+```

@@ -1,0 +1,473 @@
+---
+title: "062425_HIV.d123.ccprofiler.QCandpreprocessing"
+author: "Martin Gordon"
+date: "2025-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+The differential analysis doesnt seem to work well combining the different donors due to huge batch/run differences
+Just split into three lists and process seperately
+
+```{r packages}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(viridis)
+library(pracma)
+library(magick)
+library(eulerr)
+library(CCprofiler)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+Read in the peptide traces obj and split into the different donor sets
+
+Just read it in and drop the subgroups... like below, ugly, but (hopefully) preserves the structure
+```{r}
+pep.traces <- readRDS('./062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_24_hiv.d123.huAnnotated.peptide.traces.rds')
+
+pep.traces$Challenged_2 <- NULL
+pep.traces$Challenged_3 <- NULL
+pep.traces$Infected_2 <- NULL
+pep.traces$Infected_3 <- NULL
+pep.traces$Uninfected_2 <- NULL
+pep.traces$Uninfected_3 <- NULL
+
+saveRDS(pep.traces, ScriptAndDatedFileName('hiv.d1.ccprofiler.peptide.traces.rds'))
+pep.traces <- readRDS('./062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_24_hiv.d123.huAnnotated.peptide.traces.rds')
+
+pep.traces$Challenged_1 <- NULL
+pep.traces$Challenged_3 <- NULL
+pep.traces$Infected_1 <- NULL
+pep.traces$Infected_3 <- NULL
+pep.traces$Uninfected_1 <- NULL
+pep.traces$Uninfected_3 <- NULL
+pep.traces
+
+saveRDS(pep.traces, ScriptAndDatedFileName('hiv.d2.ccprofiler.peptide.traces.rds'))
+
+# ditto rep3...
+pep.traces <- readRDS('./062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_24_hiv.d123.huAnnotated.peptide.traces.rds')
+
+pep.traces$Challenged_2 <- NULL
+pep.traces$Challenged_1 <- NULL
+pep.traces$Infected_2 <- NULL
+pep.traces$Infected_1 <- NULL
+pep.traces$Uninfected_2 <- NULL
+pep.traces$Uninfected_1 <- NULL
+pep.traces
+
+saveRDS(pep.traces, ScriptAndDatedFileName('hiv.d3.ccprofiler.peptide.traces.rds'))
+rm(pep.traces)
+```
+alright drop the original and preprocess the other 3 objects 
+
+```{r}
+traces.donors.ls <- list(
+  donor1=readRDS(ScriptAndDatedFileName('hiv.d1.ccprofiler.peptide.traces.rds')),
+  donor2=readRDS(ScriptAndDatedFileName('hiv.d2.ccprofiler.peptide.traces.rds')),
+  donor3=readRDS(ScriptAndDatedFileName('hiv.d3.ccprofiler.peptide.traces.rds')))
+```
+
+```{r}
+traces.donors.ls[[1]]$Challenged_1
+
+
+examplePeptideTraces 
+```
+
+QC on the donor sets
+Within donor groups the alignemts look at cross correlation across fractions
+```{r}
+lapply(names(traces.donors.ls), function(x) alignTraces(traces.donors.ls[[x]], min_lag = -5, max_lag = 5, plot=T, PDF=T, name = paste0(x, '.crossCorr.plot')))
+```
+plot global intensites as proxy for extraction efficiency
+
+```{r}
+lapply(names(traces.donors.ls), function(x) plotGlobalIntensities(traces.donors.ls[[x]],plot=T, PDF=T, name = paste0(x, '.globalInts.plot')))
+```
+find missing values (those with values in flanking fractions)
+replaces 0 with NA so these values can then be imputed
+```{r}
+# want vals in left and right borders
+traces.donors.ls.mv <- lapply(names(traces.donors.ls), function(x) findMissingValues(traces.donors.ls[[x]], 
+                                                              bound_left = 1,
+                                                              bound_right = 1, 
+                                                              consider_borders = TRUE
+                                                              ))
+names(traces.donors.ls.mv) <- names(traces.donors.ls)
+```
+
+now impute the missing values by fityting a spline
+
+```{r}
+# want vals in left and right borders
+traces.donors.ls.imp <- lapply(names(traces.donors.ls.mv), function(x) imputeMissingVals(traces.donors.ls.mv[[x]], 
+                                                              method = 'spline'
+                                                              ))
+
+names(traces.donors.ls.imp) <- names(traces.donors.ls.mv)
+names(traces.donors.ls.imp)
+```
+plot the imputation success; package output of date.
+Needs updating...
+
+```{r}
+lapply(names(traces.donors.ls.imp), function(x) plotImputationSummary(traces.donors.ls.mv[[x]], 
+                                                                      traces.donors.ls.imp[[x]], 
+                                                                      PDF=F,
+                                                                      plot_traces = T, max_n_traces = 2
+                                                                      ))
+```
+```{r}
+pepTracesNormalized <- normalizeByCyclicLoess(pepTracesImp, window = 3, step = 1, plot = TRUE, PDF = TRUE, name = "normalizeByCyclicLoess")
+```
+
+Save the imputed values
+```{r}
+lapply(names(traces.donors.ls.imp), function(x) saveRDS(traces.donors.ls.imp[[x]], ScriptAndDatedFileName(paste0(x, '.hiv.pep.traces.impute.rds'))))
+```
+read in the imputed values
+```{r}
+traces.donors.ls.imp <- list(donor1=readRDS('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062425_HIV.d123.ccprofiler.QCandpreprocessing_data/2025_06_24_donor1.hiv.pep.traces.impute.rds'),
+                             donor2=readRDS('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062425_HIV.d123.ccprofiler.QCandpreprocessing_data/2025_06_24_donor2.hiv.pep.traces.impute.rds'),
+                             donor3=readRDS('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062425_HIV.d123.ccprofiler.QCandpreprocessing_data/2025_06_24_donor3.hiv.pep.traces.impute.rds'))
+```
+
+## 06-24-25
+Tidy the ints values; just summarize features to peptides and clean the peptide names
+
+```{r}
+pep.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_24_ccprofiler.peptidesInt.input.csv.gz')
+
+pep.dt[, pep_id := gsub('_|_[.][0-9]{1,2}$', '', peptide_id)]
+pep.dt[, pep_ints := sum(intensity, na.rm=T), by=.(pep_id, protein_id, filename)]
+
+sum.dt <- pep.dt[, .(protein_id, peptide_id=pep_id, filename, intensity=pep_ints)] %>% 
+  unique()
+
+fwrite(sum.dt, ScriptAndDatedFileName('ccprofiler.sum.peptidesInt.input.csv.gz'))
+```
+Now input this set and see if it works
+prepare the fraction annotation info, include sample, condition and replicate id
+```{r}
+anno.dt <- pep.dt[, .(filename, fraction_number=filename)] %>% 
+  unique() %>% 
+  .[, c('sample', 'fraction_number') := tstrsplit(filename, '[.]', keep=c(1,2))]
+
+anno.dt[, c('condition_id', 'replicate_id') := tstrsplit(sample, '_', keep=c(1,2))]
+anno.dt[, fraction_number := as.integer(fraction_number)]
+
+```
+Design matrix; prepare this for the differential comparisons
+Should consist of i)Sample_name (chr), ii)Condition(chr) and iii) Replicate(int)
+
+```{r}
+design.dt <- anno.dt[, .(Sample_name=sample,
+                         Condition=condition_id,
+                         Replicate=as.integer(replicate_id)
+                         )] %>% 
+  unique()
+```
+
+```{r}
+mw.dt <- fread("./data/HIV_Infection_CD4T_cells/SEC_Profiles/D1-D3-cal_SRT.txt")
+setnames(mw.dt, new=c('std_elu_fractions', 'std_weights_kDa'))
+mw.dt <- mw.dt[, .(std_weights_kDa, std_elu_fractions)]
+
+
+calibration = calibrateMW(mw.dt,
+                          PDF=T,
+                          plot=TRUE)
+```
+
+test CCprofiler input import; these two seem to match? Why is the function failing? it seems to drop a number of the fractions...
+```{r}
+sum.dt[grepl('Challenged_1', filename)]$filename %>% unique() == 
+anno.dt[grepl('Challenged_1', filename), .(filename, fraction_number)]$filename %>% unique()
+
+
+
+test.pcp.long <- sum.dt[grepl('Challenged_1', filename)]
+
+
+setkey(test.pcp.long)
+test.anno <- anno.dt[grepl('Challenged_1', filename), .(filename, fraction_number)]
+setkey(test.anno, fraction_number)
+
+m.test.pcp.long <- merge(test.pcp.long, test.anno, by='filename')
+setkey(m.test.pcp.long,fraction_number)
+m.test.pcp.long[, fraction_number:= NULL]
+
+# order of filenames need to match in both tables
+test.import <- importPCPdata(input_data=test.pcp.long,
+                             fraction_annotation=test.anno)
+
+```
+can we annotate the test import? see if works
+```{r}
+idMapper <- fread('/Users/martingordon/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_23_id.mappers.csv.gz')
+
+idMapper[,  peptide_id := gsub('_|_[.][0-9]{1,2}$', '', peptide)]
+idMapper <- idMapper[, .(protein_id=protein, gene, mw, org)] %>% 
+  unique() %>% 
+  .[, head(.SD, 1), by=protein_id]
+
+test.import.anno <- annotateTraces(traces = test.import, 
+                                   trace_annotation = idMapper, 
+                                   traces_id_column = "protein_id", 
+                                   trace_annotation_id_column = "protein_id",
+                                   trace_annotation_mass_column = "mw", 
+                                   uniprot_mass_format = FALSE, 
+                                   replace_whitespace = TRUE)
+# annotate MW
+test.import.anno <- annotateMolecularWeight(test.import.anno, calibration)
+```
+
+Try the imputation and normalization to see if it works as expected
+Find missing values
+```{r}
+
+test.import.ms <-  findMissingValues(test.import.anno,
+                                 bound_left = 1,
+                                 bound_right = 1,
+                                 consider_borders = TRUE)
+```
+now impute the missing values
+```{r}
+test.import.imp <- imputeMissingVals(test.import.ms, method = "spline")
+```
+fails due to melt function... again.. need to prefix with reshape2::
+```{r}
+plotImputationSummary(test.import.imp, test.import.imp, PDF = F,
+                      plot_traces = T, max_n_traces = 2)
+```
+```{r}
+test.import.norm <- normalizeByCyclicLoess(test.import.imp, window = 3, step = 1, plot = TRUE, PDF = TRUE, name = "normalizeByCyclicLoess")
+```
+ok, test the pipeline with just two conditions
+
+```{r}
+
+#' # Import traces list
+#samples <- unique(anno.dt$sample)
+samples <- c('Infected_1', 'Uninfected_1')
+# Import data as traces object for each sample
+traces_list <- lapply(samples,function(x){
+  message(x) #just need these two cols I think
+  ann <- anno.dt[grepl(x, filename), .(filename, fraction_number)]
+  setkey(ann,fraction_number)
+  
+  data <- sum.dt[grepl(x, filename),]
+  data <- merge(data, ann, by=c("filename"))
+  setkey(data,fraction_number)
+  data[, fraction_number:= NULL]
+
+  traces <- importPCPdata(input_data=data,fraction_annotation=ann, rm_decoys = FALSE)
+  return(traces)
+})
+
+names(traces_list) = samples
+class(traces_list) <- "tracesList"
+```
+
+annotate with IDmapper info
+
+```{r}
+test.import.anno <- annotateTraces(traces = traces_list, 
+                                   trace_annotation = idMapper, 
+                                   traces_id_column = "protein_id", 
+                                   trace_annotation_id_column = "protein_id",
+                                   trace_annotation_mass_column = "mw", 
+                                   uniprot_mass_format = FALSE, 
+                                   replace_whitespace = TRUE)
+```
+
+find missing and label NA
+```{r}
+test.import.ms <- findMissingValues(traces_list,
+                  bound_left = 1,
+                  bound_right = 1, 
+                  consider_borders = TRUE
+                  )
+
+test.import.ms
+```
+
+impute 
+```{r}
+test.import.imp <-imputeMissingVals(test.import.ms, method = "spline")
+```
+normalization; only two sample test; failed at same issue, *but* have what looks like a decent rds obj with correct looking peptide ids, so its a start..
+continue from here tomorrow after cleaning up 
+```{r}
+
+debug(normalizeByCyclicLoess)
+test.import.norm <- normalizeByCyclicLoess(test.import.imp, window = 3, step = 1, plot = TRUE, PDF = TRUE, name = "normalizeByCyclicLoess")
+
+
+readRDS('./combi_table_norm.rds')
+```
+
+Issue: mismatch between trace and trace annotation obj. Why are some duplicated?
+Pulled these from function:
+Issue is; duplicated peptides assigned to different proteins. Will result in different number of records in the peptideTraces object.... how is this resolved?
+
+```{r}
+length(trace.ids)
+length(trace.anno.ids)
+which(trace.ids != trace.anno.ids)
+
+trace.ids.dt <- data.table(trace.ids)[,.N, by=trace.ids]
+trace.anno.dt <- data.table(trace.anno.ids)[,.N, by=trace.anno.ids]
+
+trace.anno.dt
+trace.ids.dt
+trace.anno.dt[, .(id=trace.anno.ids, anno.N=N)]
+
+# these are the problematic peptide IDs.. why are these duplicated? Is this issue only with this sample?
+dupPeptides <- merge(trace.anno.dt[, .(id=trace.anno.ids, anno.N=N)], trace.ids.dt[, .(id=trace.ids, trace.N=N)], by='id') %>% 
+  .[anno.N != trace.N, id]
+
+
+
+traces_list$Infected_1$trace_annotation[id %in% dupPeptides]
+
+```
+
+
+
+normalize intensities
+method? cyclic loess;
+```{r}
+library(parallel)
+ncores <- parallel::detectCores() - 2
+
+assignInNamespace("melt", reshape2::melt, ns = "CCprofiler")
+
+# lets try run apply in parallel
+traces.donors.ls.norm <- lapply(names(traces.donors.ls.imp), function(x) normalizeByCyclicLoess(traces.donors.ls.imp[[x]], 
+                                                                                                window = 3, 
+                                                                                                step = 1, 
+                                                                                                plot = FALSE, 
+                                                                                                PDF = FALSE, 
+                                                                                                name = paste0(x,".normalization.plots")))
+```
+
+
+Drop the ID col
+```{r}
+testForTracelist <- function (tracesList, type = NULL, additionalItems = NULL) 
+{
+    if (!class(tracesList) == "tracesList") {
+        stop("Object is not of class tracesList")
+    }
+    if (is.null(names(tracesList))) 
+        stop("TracesList must consist of named traces objects. No names detected.")
+    res <- lapply(tracesList, function(traces) {
+        if (!all(c("traces", "trace_type", "trace_annotation", 
+            "fraction_annotation") %in% names(traces))) {
+            stop("At least one traces object doesn't contain all necessary items: traces, trace_type, trace_annotation, and fraction_annotation.")
+        }
+        if (!is.null(type)) {
+            if (type != traces$trace_type) {
+                stop("At least one traces object is of wrong type. Please check your input traces.")
+            }
+        }
+        if (!identical(traces$traces$id, traces$trace_annotation$id)) {
+            stop("In at least one traces object: IDs in traces and trace_annotation are not identical.")
+        }
+        if (!identical(names(traces$traces), c(traces$fraction_annotation$id, 
+            "id"))) {
+            stop("In at least one traces object: Fractions in traces and fraction_annotation are not identical.")
+        }
+        if (!is.null(additionalItems)) {
+            contained <- (additionalItems %in% names(traces))
+            if (!all(contained)) {
+                stop(paste0("Required entries not found: ", additionalItems[!contained]))
+            }
+        }
+    })
+}
+```
+
+```{r}
+class(test.trace) <- 'tracesList'
+testForTracelist(test.trace)
+```
+
+
+Here is the error 
+
+Error in FUN(X[[i]], ...) : 
+  At least one traces object doesn't contain all necessary items: traces, trace_type, trace_annotation, and fraction_annotation.
+5.
+stop("At least one traces object doesn't contain all necessary items: traces, trace_type, trace_annotation, and fraction_annotation.")
+4.
+FUN(X[[i]], ...)
+3.
+lapply(tracesList, function(traces) {
+if (!all(c("traces", "trace_type", "trace_annotation", "fraction_annotation") %in%
+names(traces))) {
+stop("At least one traces object doesn't contain all necessary items: traces, trace_type, trace_annotation, and fraction_annotation.") ...
+2.
+.tracesListTest(traces_list_norm, type = "peptide")
+1.
+normalizeByCyclicLoess(test.trace, window = 3, step = 1)
+
+
+test a single list obj to normalize
+```{r}
+test <- normalizeByCyclicLoess(traces.donors.ls.imp$donor1, window = 3, step = 1, plot=FALSE, PDF=FALSE)
+
+undebug(normalizeByCyclicLoess)
+normalizeByCyclicLoess(traces.donors.ls.imp$donor1, window = 3, step = 1, plot=FALSE, PDF=FALSE)
+
+
+traces.donors.ls.imp$donor1$Challenged_1
+normalizeByCyclicLoess()
+```
+
+Other option; maybe it is bc we are using traces not peptide lvl info? Sum the intensities across features to arise at peptide lvl
+
+```{r}
+test.trace$Infected_1$traces <- head(test.trace$Infected_1$traces, 10)
+test.trace$Uninfected_1$traces <- head(test.trace$Uninfected_1$traces, 10)
+
+test <- normalizeByCyclicLoess(traces.donors.ls.imp$donor1, window = 3, step = 1, plot=FALSE, PDF=FALSE)
+```
+
+
+Lets try something different.. overwrite the package use of `melt` to specify reshape2::melt (this might be risky, but lets try otherwise wont work..)
+```{r}
+devtools::install('/Users/martingordon/modifiedPackages/CCprofiler_localMods')
+```
+
+```{r}
+pep.dt
+melt(traces.donors.ls.imp$donor1$Challenged_1$traces, )
+getAnywhere(normalizeByCyclicLoess)
+```
+
+
+
+

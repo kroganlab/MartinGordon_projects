@@ -1,0 +1,703 @@
+---
+title: "WGCNA_GProteinCorrelations"
+author: "Martin Gordon"
+date: "2024-08-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## We have a set of modules from WGCNA that look quite distinct expression patterns
+To try connect the modules to putative GProteins specific for these modules, lets take the modules, summarise these values and correlate these modules with the GProtein classification schemes
+Definitely an argument to drop cluster 11; looks very noisy
+Check the ME plots match the modules
+
+
+
+**Notes**
+Make sure module assignments match! Doesnt make sense for example that Mod1 is not ver strongly correlated with any group, but 
+```{r}
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(WGCNA)
+library(magrittr)
+library(preprocessCore) # quantile normalisation
+library(stringr)
+library(matrixStats)
+library(simplifyEnrichment)
+library(fmsb)
+library(readxl)
+library(ggbeeswarm)
+library(ggrepel)
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# wgcna mod color pal
+col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD")  #"#999933" '#DDCC77' "grey"
+```
+
+Save these for later; new names for the modules
+
+```{r}
+mod.names <-  data.table(cluster = paste0('cluster', seq(1,11,1)),
+                         moduleName = c('C1 Endosome trafficking', 'C2 PM structure/adhesion', 'C3 Actin cytoskeleton', 
+                                        'C4 Golgi trafficking', 'C5 G-Protein coupled receptor signalling', 'C6 Protein Kinase C',
+                                        'C7 Clathrin', 'C8 Cytoplasmic stress granule','C9 Actin polymerization', 
+                                        'C10 Cell morphogenesis', 'C11 RNA processing'))
+
+
+#fwrite(mod.names, ScriptAndDatedFileName('moduleNamesforUse.txt'))
+
+#mod.names <- fread('~/Documents/projects/082423_QLi_GPR_WGCNA/WGCNA_GProteinCorrelation_data/2024_08_27_moduleNamesforUse.txt')
+mod.names <- fread('~/Documents/projects/082423_QLi_GPR_WGCNA/WGCNA_GProteinCorrelation_data/2024_08_27_moduleNamesforUse.txt')
+```
+
+
+From GPCR_WGCNA markdown
+15/09/23
+The matrix used to generate the 11 receptor data is saved under './output/gpcr.11.receptors.adj.mat.Rdata'
+Module assignments saved under './output/gpcr.11.receptors.moduleAssignment.Rdata'
+
+
+#saveRDS(sig.p.mat,file = './output/gpcr.11.receptors.exp.mat.Rdata') # the expression m
+
+Load in these groups 
+```{r}
+p.mat <- readRDS('./output/gpcr.11.receptors.exp.mat.Rdata')
+
+module.assignment <- readRDS('./output/gpcr.11.receptors.moduleAssignment.Rdata')
+module.assignment
+
+
+p.mat
+
+iupar.cor <- fread('./output/cluster.cor.med.shiftvsT0.iupar.csv') 
+pred.cor <- fread('./data/cluster.cor.med.shiftvsT0.predicted.csv')
+
+submat <- as.matrix(iupar.cor, rownames='cluster')
+
+# matching order int he matrix to the dt
+# first argument to match is the order you want to assign
+submat <- submat[match(mod.names$cluster,rownames(submat)),]
+
+rownames(submat) <- mod.names$moduleName
+
+hm <- Heatmap(submat, 
+        row_km = 2, 
+        row_names_gp = gpar(fontsize=10),
+        border=T, 
+        name='Pearsons r',
+        column_title = 'WGCNA Module IUPAR correlations',
+        cell_fun = function(j, i, x, y, width, height, fill) {
+        if(submat[i, j] >= 0.6 | submat[i, j] <= -0.6){
+            grid.text(sprintf("%.2f", submat[i, j]), x, y, gp = gpar(fontface='bold', fontsize = 10, col='white'))
+          } else {
+            grid.text(sprintf("%.2f", submat[i, j]), x, y, gp = gpar(fontsize = 10, col='black'))
+          }})
+hm
+BackupAsPDF(hm,'IUPAR.medianShiftvsTo.heatmap')
+```
+Lets look at the prediction correlations
+
+```{r}
+submat <- as.matrix(pred.cor, rownames='cluster')
+
+submat <- submat[match(mod.names$cluster,rownames(submat)),]
+
+rownames(submat) <- mod.names$moduleName
+
+hm <- Heatmap(submat, 
+        row_km = 2, 
+        row_names_gp = gpar(fontsize=10),
+        border=T, 
+        name='Pearsons r',
+        column_title = 'WGCNA Module GProtein classification',
+        cell_fun = function(j, i, x, y, width, height, fill) {
+        if(submat[i, j] > 0.6 | submat[i, j] < -0.6){
+            grid.text(sprintf("%.1f", submat[i, j]), x, y, gp = gpar(fontface='bold', fontsize = 10, col='white'))
+          } else {
+            grid.text(sprintf("%.1f", submat[i, j]), x, y, gp = gpar(fontsize = 10, col='black'))
+          }})
+
+hm
+BackupAsPDF(hm,'Predicted.medianShiftvsTo.heatmap', dimensions=c(8,8))
+```
+I think correlating this median Shift may be an issue; lets look at a different measurement to try capture trends
+ME is 1st PC
+We want to read in the WGCNA results; identify the module eigengenes for each group ( or just calculate the first PC) and then correlate this with the pred and iupar scores
+Next step then is to find the most central genes in each module, or correlate that modules genes with the 
+
+```{r}
+MEs <- fread('./output/11.receptors.moduleEigengenes.wrownames.csv')
+MEs
+ME.mat <- as.matrix(MEs, rownames = 'V1')
+colnames(ME.mat) <- paste0('cluster',gsub('ME', '', colnames(ME.mat)))
+
+ME.mat <- ME.mat[, match(mod.names$cluster, colnames(ME.mat))]
+
+colnames(ME.mat) <-  paste('ME', mod.names$moduleName)
+
+```
+
+plot the module eigengene scores for each sample
+
+```{r}
+ann.dt <- data.table(rn = rownames(ME.mat))
+ann.dt[, c('receptor', 'timepoint') := tstrsplit(rn, '_', keep=c(1,2))]
+ann.dt[, batch := str_extract(rn, '[0-9]{1,2}$')]
+
+#set up a color palette
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(ann.dt$timepoint)))
+names(col.pal) <- unique(ann.dt$timepoint)
+
+colAnn <- HeatmapAnnotation(timepoint=ann.dt$timepoint,
+                            col = list(timepoint=col.pal))
+
+
+submat <- t(ME.mat)
+# also want to add a GPCR classification
+hm <- Heatmap(submat,
+        column_split = ann.dt$receptor,
+        border=T,
+        cluster_rows = F,
+        name='module Eigengene (1st PC)',
+        top_annotation = colAnn,
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=5),
+        row_names_gp = gpar(fontsize=6))
+        
+hm
+
+BackupAsPDF(hm, 'moduleEigengenes.sampleCor.noRowClust.heatmap', dimensions=c(14,6))
+```
+Probably a little too much going on. Get an mean aggregated matrix and plot that
+Looks good add some extra annotation
+
+```{r}
+# now change the variance
+MEs[, c('receptor', 'timepoint') := tstrsplit(V1, '_', keep=c(1,2))]
+MEs[, batch := str_extract(V1, '[0-9]{1,2}$')]
+MEs
+
+MEs.long.dt <- setDT(reshape2::melt(MEs, id.vars = c('V1', 'receptor', 'timepoint', 'batch')))
+
+
+ME.sum.mat <- dcast(MEs.long.dt, paste(receptor,timepoint, sep='_')~variable, value.var = 'value', fun.aggregate = mean, na.rm=T)  %>% 
+  as.matrix(rownames=1)
+
+# match col order 
+ME.sum.mat <- ME.sum.mat[, match(gsub('cluster', '', mod.names$cluster), gsub('ME', '',colnames(ME.sum.mat)))]
+colnames(ME.sum.mat) <- paste('ME', mod.names$moduleName)
+
+ann.dt <- data.table(rn = rownames(ME.sum.mat))
+ann.dt[, c('receptor', 'timepoint') := tstrsplit(rn, '_', keep=c(1,2))]
+
+# lets prepare the annotation
+colAnn <- HeatmapAnnotation(timepoint=ann.dt$timepoint,
+                            gprotein=ifelse(grepl('DOR|MOR|KOR|NPY1R|NPFFR1', rownames(ME.sum.mat)), 'Gi/Go',
+                                            ifelse(grepl('MRX2|QRFPR', rownames(ME.sum.mat)), 'Gi/Go & Gq/G11',
+                                                   ifelse(grepl('MRX4|PTGER1', rownames(ME.sum.mat)), 'Gq/G11',
+                                                          ifelse(grepl('NK1R', rownames(ME.sum.mat)), 'Gq/G11 & Gs', 'Gs')))), 
+                            col = list(timepoint=col.pal,
+                                       gprotein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue', 'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')))
+                                       
+submat <- t(ME.sum.mat)
+# also want to add a GPCR classification
+hm <- Heatmap(submat,
+        column_split = gsub('_[0-9]{1,2}','', colnames(submat)),
+        border=T,
+        name='module Eigengene (1st PC)',
+        top_annotation = colAnn,
+        cluster_columns = F,
+        cluster_rows = F,
+        show_column_names = F,
+        column_names_gp = gpar(fontsize=5),
+        row_names_gp = gpar(fontsize=6))
+        
+hm
+BackupAsPDF(hm, 'moduleEigengenes.sampleCor.noRowClust.heatmap', dimensions=c(14,6))
+```
+Identifying important genes in out network(s)
+First define Gene significance; 
+absolute value of correlation between gene and trait (Gi/Go,Gq/G11,Gs) and then define Module membership (correlation between gene and eigengene)
+
+
+```{r}
+pred <- fread("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/predictionScores.txt")
+iupar <- data.table(read_xlsx("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/IUPHAR_11GPCRs_Gprotein_class_primary.xlsx"))
+
+
+exp.long <- melt(exp, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+pred.long <- melt(pred, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+
+# convert to long format
+iupar.long <- melt(iupar, id.vars = 'GPCR', measure.vars = grep('GPCR', colnames(iupar), invert=T),  variable.name = "GProtein", value.name = "score") %>% 
+  .[, score := as.numeric(score)] 
+```
+
+```{r scores.list}
+scores.list <- list(pred = pred.long,
+                    iupar = iupar.long)
+```
+
+Convert the scores to a matrix
+
+```{r}
+scores.mat <- lapply(scores.list, function(x){
+  dcast(x, GProtein~GPCR, value.var = 'score') %>% 
+    as.matrix(rownames = 'GProtein')
+})
+```
+change the colnames to reflect the mss nomenclature
+
+```{r}
+scores.mat <- lapply(scores.mat, function(x){
+  colnames(x) <- c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+  return(x)
+})
+
+lapply(scores.mat, colnames)
+```
+Maybe some kind of module IUPAR classification plot?
+Again, to calculate module-trait correlations
+
+```{r}
+mss.out <- fread('./data/2022_08_31_NiceFitsPower3.csv')
+mss.out[receptor == 'MOR.DAMGO', receptor := 'MOR']
+
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+
+# filter to sig genes or strong movers and reorder
+sig.genes <- mss.out[pvalue < 0.005 & abs(log2FC) > log2(1.5) & receptor != 'MOR.LG94', unique(gene) ]
+exp.mat <- exp.mat[rownames(exp.mat) %in% sig.genes,]
+
+colnames(exp.mat) %in% colnames(scores.mat[[1]])
+
+exp.mat <- exp.mat[, match(colnames(scores.mat[[1]]), colnames(exp.mat))]
+colnames(exp.mat) == colnames(scores.mat[[1]])
+```
+
+Now run the PW correlations between genes and GProtein group
+
+```{r}
+scor.list <- lapply(scores.mat, function(x){
+  
+  cor(t(exp.mat), t(x), use= "pairwise.complete.obs") # cluster by row, so keep rownames as receptor
+})
+
+
+cor.long <- lapply(scor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "gene")
+  return(x)
+})
+
+# jsut work with this for now; these are correlations between the genes and proteins
+iupar.cor <- cor.long$iupar
+
+#fwrite(cor.long$iupar, ScriptAndDatedFileName('geneSignificance.IUPAR.groups.csv'))
+iupar.gs.dt <- fread('~/Documents/projects/082423_QLi_GPR_WGCNA/WGCNA_GProteinCorrelation_data/2024_08_29_geneSignificance.IUPAR.groups.csv')
+```
+
+Now correlate the individual genes with the module MEs
+
+```{r}
+# check the colnames match
+colnames(t(ME.mat)) == colnames(p.mat)
+
+# correlate each gene with the module eigengene 
+module.membership <- cor(t(p.mat), ME.mat, use='pairwise.complete.obs')
+
+# convert to DT
+mm.dt <- reshape2::melt(module.membership)
+setnames(mm.dt, new=c('Protein', 'module', 'module R (pearson)'))
+mm.dt[, gene := multiUniprots2multiGenes(Protein, species='HUMAN')]
+
+#fwrite(mm.dt, ScriptAndDatedFileName('moduleMembership.Rscores.csv'))
+mm.dt <- fread('~/Documents/projects/082423_QLi_GPR_WGCNA/WGCNA_GProteinCorrelation_data/2024_08_29_moduleMembership.Rscores.csv')
+```
+
+create a module assignment parameter
+```{r}
+module.assignment.dt <- data.table(Protein = rownames(p.mat),
+                                   Module = module.assignment)
+
+module.assignment.dt[, gene := multiUniprots2multiGenes(Protein,species='HUMAN')]
+# use this from now on for data
+#fwrite(module.assignment.dt, ScriptAndDatedFileName('moduleAssignments.csv'))
+module.assignment.dt <- fread('~/Documents/projects/082423_QLi_GPR_WGCNA/WGCNA_GProteinCorrelation_data/2024_08_29_moduleAssignments.csv')
+
+comb.dt <- merge(x=mm.dt, y=dcast(iupar.gs.dt, gene~GProtein, value.var='R'), by='gene')
+setnames(comb.dt, new=c('gene', 'module', 'module_R', 'protein', 'Gi/Go', 'Gq/G11', 'Gs'))
+
+
+ggplot(comb.dt[module == 'ME C1 Endosome trafficking', ], aes(x=module_R, y=`GiGo/`)) +
+  geom_point()
+
+module.assignment.dt <- data.table(Protein = rownames(p.mat),
+                                   Module = module.assignment
+                                   )
+
+module.assignment.dt[, gene := multiUniprots2multiGenes(Protein,species='HUMAN')]
+```
+Combine the module assignments and the gene significance plots and plot the conditions
+
+Calculate pvalues of the MM and GS correlations
+
+```{r}
+
+
+help("corPvalueStudent")
+comb.dt <- merge(x=comb.dt, y=module.assignment.dt[, -c('Protein')], by='gene', all=T)
+setnames(comb.dt,  new=c('gene', 'moduleName', 'moduleR', 'protein', 'R_GiGo', 'R_GqG11', 'R_Gs', 'geneModuleAssignment'))
+
+comb.dt[, moduleID := tstrsplit(moduleName, ' ', keep=c(2))]
+comb.dt[, moduleID := gsub('C', '', moduleID)]
+
+exp.mat[rownames(exp.mat) %in% comb.dt[is.na(moduleName),]$gene,]
+
+exp.mat[rownames(exp.mat) %in% comb.dt[is.na(moduleName), unique(gene)],]
+
+comb.dt[, moduleName := factor(moduleName, levels=c("ME C1 Endosome trafficking","ME C2 PM structure/adhesion","ME C3 Actin cytoskeleton","ME C4 Golgi trafficking",
+                                                    "ME C5 G-Protein coupled receptor signalling","ME C6 Protein Kinase C","ME C7 Clathrin","ME C8 Cytoplasmic stress granule", 
+                                                    "ME C9 Actin polymerization","ME C10 Cell morphogenesis","ME C11 RNA processing"))]
+
+comb.dt <- melt(comb.dt, measure.vars= c('R_GiGo','R_GqG11','R_Gs'))
+setnames(comb.dt, old=c('variable', 'value'), new=c('IUPAR', 'R score'))
+setnames(comb.dt, old=c('R score'), new=c('IUPAR_R'))
+
+g <- ggplot(comb.dt[moduleID == geneModuleAssignment,], aes(x=moduleR, y=IUPAR_R, label=gene, color=moduleName)) +
+  geom_point(size=1) +
+  ggrepel::geom_text_repel(data=comb.dt[moduleID == geneModuleAssignment & IUPAR_R > 0.5 & moduleR > 0.75,], max.overlaps = 30, segment.alpha=0.3, segment.color='black', size=2) +
+  geom_vline(xintercept=0.75, alpha=0.4, linetype=2) +
+  geom_hline(yintercept = 0.5, alpha=0.4, linetype=2) +
+  xlim(c(0,1)) +
+  ggtitle('Module membership vs Gene Significance') +
+  xlab('Module Membership (R)') +
+  ylab('Gene significance (R )') +
+  scale_color_manual(values=col.pal) +
+  ggh4x::facet_grid2(moduleName~IUPAR) +
+  theme_bw()
+g
+BackupAsPDF(g, 'GSvsMM.scatterplot', dimensions = c(14,24))
+```
+
+
+
+
+```{r}
+
+# coordinator function for generating radar plots: see https://stackoverflow.com/questions/42562128/ggplot2-connecting-points-in-polar-coordinates-with-a-straight-line-2#42572133
+coord_radar <- function (theta = "x", start = 0, direction = 1) {
+  theta <- match.arg(theta, c("x", "y"))
+  r <- if (theta == "x") "y" else "x"
+  ggproto("CordRadar", CoordPolar, theta = theta, r = r, start = start, 
+          direction = sign(direction),
+          is_linear = function(coord) TRUE)
+}
+
+radar.data <- protQuant[!is.na(Cluster)][, .(receptor, GO.terms, medianMaxShiftvsT0)] %>%  
+  unique()
+
+g <- ggplot(radar.data, aes(x=GO.terms, y=medianMaxShiftvsT0, group=receptor, color=receptor)) + 
+  stat_summary(fun = "median", geom = "line") +
+  scale_color_manual(values = col.pal) + 
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+ # facet_wrap(~receptor, ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   strip.text = element_text(size = 6)) +
+  coord_radar() +
+  
+g
+
+```
+
+
+
+i) Other idea for plot; summarise the ME per receptor and correlate this with IUPAR classifications.. how to do this
+ii) plot gene  significance vs module membershape (trait vs module gene correlation)
+iii)
+
+For now try collapse the info in ME
+Take the max value in each group/row; biggest deviation to T0 i guess
+Summarise to max value in each
+
+
+
+Don't bother with this summarisation to one value per module/receptor
+
+```{r}
+ME.sum.mat <- dcast(MEs.long.dt, receptor~variable, value.var = 'value', fun.aggregate = max, na.rm=T)  %>% 
+  as.matrix(rownames=1)
+
+# match col order 
+ME.sum.mat <- ME.sum.mat[, match(gsub('cluster', '', mod.names$cluster), gsub('ME', '',colnames(ME.sum.mat)))]
+colnames(ME.sum.mat) <- paste('ME', mod.names$moduleName)
+
+ann.dt <- data.table(rn = rownames(ME.sum.mat))
+
+# lets prepare the annotation
+colAnn <- HeatmapAnnotation(
+                            gprotein=ifelse(grepl('DOR|MOR|KOR|NPY1R|NPFFR1', rownames(ME.sum.mat)), 'Gi/Go',
+                                            ifelse(grepl('MRX2|QRFPR', rownames(ME.sum.mat)), 'Gi/Go & Gq/G11',
+                                                   ifelse(grepl('MRX4|PTGER1', rownames(ME.sum.mat)), 'Gq/G11',
+                                                          ifelse(grepl('NK1R', rownames(ME.sum.mat)), 'Gq/G11 & Gs', 'Gs')))), 
+                            col = list(timepoint=col.pal,
+                                       gprotein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue', 'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')))
+                                       
+submat <- t(ME.sum.mat)
+# also want to add a GPCR classification
+hm <- Heatmap(submat,
+        border=T,
+        clustering_distance_rows = 'pearson',
+        clustering_distance_columns = 'pearson',
+        name='module Eigengene (1st PC)',
+        top_annotation = colAnn,
+        cluster_columns = T,
+        col=colorRamp2(breaks=c(0,0.4), c('white', 'red')),
+        show_column_names = T,
+        column_names_gp = gpar(fontsize=5),
+        row_names_gp = gpar(fontsize=6))
+        
+hm
+BackupAsPDF(hm, 'moduleEigengenes.sampleCor.heatmap', dimensions=c(14,6))
+```
+I dont know if this does a good job of capturing the trends... maybe try take max in either direction?
+Or take the IUPAR/Pred scores, multiply by 5
+
+Correlate scores with ME
+```{r}
+scor.list <- lapply(scores.mat, function(x){
+  
+  mat.x <- submat[, colnames(x)]
+  colnames(mat.x) == colnames(x)
+  
+  print(mat.x)
+  print(t(x))
+  cor(mat.x, t(x), use= "pairwise.complete.obs") # cluster by row, so keep rownames as receptor
+})
+
+
+lapply(scor.list, function(x)Heatmap(x))
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "cluster")
+  return(x)
+})
+```
+
+Tried creating protein groups for got the predictiion scores, maybe ask Qiongyu, but leave out for now
+
+```{r}
+gprotein.grps <- data.table(gprotein     = c('GNAI3', 'GNAI1', 'GNAZ',  'GNAO1', 'GNA12', 'GNA13', 'GNAQ', 'GNA14', 'GNA15', 'GNAS',  'GNAL'),
+                            gprotein_family = c('Gi', 'Gi', 'Gi', '', 'G12', 'G13', 'Gq', 'Gq', 'Gq', 'Gs'))
+```
+
+
+Write out boht matrices incase I want to make changes
+
+```{r}
+#fwrite(as.data.table(ME.sum.mat, keep.rownames = T), ScriptAndDatedFileName('ME.meanAggregate.matrix.txt'))
+#fwrite(as.data.table(ME.mat, keep.rownames = T), ScriptAndDatedFileName('ME.matrix.txt'))
+```
+
+```{r}
+
+# now change the variance
+MEs[, c('receptor', 'timepoint') := tstrsplit(V1, '_', keep=c(1,2))]
+MEs[, batch := str_extract(V1, '[0-9]{1,2}$')]
+
+
+# now take the average of the receptor, timepoint combos
+MEs[receptor == 'DOR' & timepoint == '00',]
+MEs
+MEs[, grep('V1|ME', colnames(MEs), value=T)]
+```
+
+Plot a heatmap of the MEs of each module; these are the PCs of each, so lets see if any MEs associate with particular groups
+
+```{r}
+ggplot(MEs, aes(x=ME1, y=ME2, colour = timepoint)) +
+  geom_point() +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept=0)
+
+MEs.long.dt <- setDT(reshape2::melt(MEs, id.vars = c('V1', 'receptor', 'timepoint', 'batch')))
+
+ggplot(MEs.long.dt, aes(x=receptor, y=value, color=timepoint)) +
+  geom_point() +
+  facet_wrap(~variable)
+```
+
+
+
+```{r}
+ann.dt <- data.table(rn = rownames(ME.mat))
+ann.dt[, c('receptor', 'timepoint') := tstrsplit(rn, '_', keep=c(1,2))]
+ann.dt[, batch := str_extract(rn, '[0-9]{1,2}$')]
+
+#set up a color palette
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(ann.dt$timepoint)))
+names(col.pal) <- unique(ann.dt$timepoint)
+
+colAnn <- HeatmapAnnotation(timepoint=ann.dt$timepoint,
+                            col = list(timepoint=col.pal))
+
+# also want to add a GPCR classification
+
+hm <- Heatmap(t(ME.mat),
+        column_split = ann.dt$receptor,
+        border=T,
+        name='module Eigengene (1st PC)',
+        top_annotation = colAnn,
+        column_order = ann.dt$rn,
+        column_names_gp = gpar(fontsize=5)
+        )
+hm
+
+
+scores.mat
+```
+
+
+Get table of the module assignments
+
+```{r}
+modAssignments <- fread('./WGCNA_GProteinCorrelation_data/2024_08_29_moduleAssignments.csv')
+modAssignments[, Module:= as.character(Module)]
+
+mod.names[, Module := gsub('cluster', '', cluster)]
+
+modAssignments <- merge(modAssignments, y=mod.names[,.(Module,moduleName)], by='Module')
+
+fwrite(modAssignments[, .(Module,Protein, gene, NProtsInModule = .N), by=moduleName], ScriptAndDatedFileName('modAssignments.csv'))
+```
+
+
+
+
+
+
+**Not used**
+
+plot the median Shift (not vs T0)
+
+```{r}
+
+-log10(0.005)
+iupar.cor <- fread('./output/cluster.cor.med.log2FC.iupar.csv') 
+pred.cor <- fread('./data/cluster.cor.med.log2FC.predicted.csv')
+
+submat <- as.matrix(iupar.cor, rownames='cluster')
+
+hm <- Heatmap(submat, 
+        row_km = 2, 
+        border=T, 
+        name='Pearsons r',
+        column_title = 'WGCNA Module IUPAR classification',
+        cell_fun = function(j, i, x, y, width, height, fill) {
+        if(submat[i, j] >= 0.6 | submat[i, j] <= -0.6){
+            grid.text(sprintf("%.2f", submat[i, j]), x, y, gp = gpar(fontface='bold', fontsize = 10, col='white'))
+          } else {
+            grid.text(sprintf("%.2f", submat[i, j]), x, y, gp = gpar(fontsize = 10, col='black'))
+          }},
+        row_title = "KM cluster %s")
+hm
+BackupAsPDF(hm,'IUPAR.medianShift.heatmap')
+
+
+# plot the same for the predicted classification
+submat <- as.matrix(pred.cor, rownames='cluster')
+
+
+hm <- Heatmap(submat, 
+        row_km = 2, 
+        border=T, 
+        name='Pearsons r',
+        column_title = 'WGCNA Module GProtein classification',
+        cell_fun = function(j, i, x, y, width, height, fill) {
+        if(submat[i, j] >= 0.6 | submat[i, j] <= -0.6){
+            grid.text(sprintf("%.2f", submat[i, j]), x, y, gp = gpar(fontface='bold', fontsize = 10, col='white'))
+          } else {
+            grid.text(sprintf("%.2f", submat[i, j]), x, y, gp = gpar(fontsize = 10, col='black'))
+          }},
+        row_title = "KM cluster %s")
+hm
+BackupAsPDF(hm,'pred.medianShift.heatmap')
+
+```
+
+Now do the PW correlations to each of the  prediciton scores
+
+```{r}
+# correlate t with each
+cor.list <- lapply(scores.mat, function(x){
+  cor(t(ME.mat), t(x), use= "pairwise.complete.obs") # cluster by row, so keep rownames as receptor
+})
+
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "cluster")
+  return(x)
+})
+```
+
+
+
+
+This is the WGCNA data; lets retry the correlation work to see what we are recovering
+
+```{r}
+pred <- fread("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/predictionScores.txt")
+exp <- fread ("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/experimentalScores.txt")
+iupar <- data.table(read_xlsx("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/IUPHAR_11GPCRs_Gprotein_class_primary.xlsx"))
+
+
+exp.long <- melt(exp, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+pred.long <- melt(pred, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+
+# convert to long format
+iupar.long <- melt(iupar, id.vars = 'GPCR', measure.vars = grep('GPCR', colnames(iupar), invert=T),  variable.name = "GProtein", value.name = "score") %>% 
+  .[, score := as.numeric(score)] 
+```
+
+```{r scores.list}
+scores.list <- list(pred = pred.long,
+                    iupar = iupar.long)
+```
+
+Convert the scores to a matrix
+
+```{r}
+scores.mat <- lapply(scores.list, function(x){
+  dcast(x, GProtein~GPCR, value.var = 'score') %>% 
+    as.matrix(rownames = 'GProtein')
+})
+```
+change the colnames to reflect the mss nomenclature
+
+```{r}
+scores.mat <- lapply(scores.mat, function(x){
+  colnames(x) <- c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+  return(x)
+})
+```
+
+
+```{r}
+readRDS('./output/wgcna.clustergeens.adjmat.Rdata')
+```
+

@@ -1,0 +1,133 @@
+---
+title: "120424_mapSigSitesToPDB"
+author: "Martin Gordon"
+date: "2024-12-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Mapping the RRA significant sites to the PDB so we can visualize with ChimeraX
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(bio3d)
+library(magrittr)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+```
+
+Reading in the alphafold pdb list 
+```{r}
+fpaths <- dir('./data', pattern = "*.pdb", full.names = T)
+
+pdb.list <- lapply(fpaths, function(x){
+  bio3d::read.pdb(x)
+  })
+
+names(pdb.list) <- c('AKT1', 'PIK3CA', 'MTOR', 'PTEN')
+
+af.pdb.list <- pdb.list
+
+```
+
+Read in the two significant sites
+```{r}
+sig.downreg.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/112124_mutantHotspots_data/2024_12_04_pten.pik3ca.downregulatedSites.topScores.csv')
+sig.upreg.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/112124_mutantHotspots_data/2024_12_04_pten.pik3ca.upregulatedSites.topScores.csv')
+
+
+# focus on the PTEN upregulated set
+g <- ggplot(data=sig.upreg.dt[contrast %in% c('Alpelisib_22_vs_DMSO_22', 'Alpelisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_DMSO_22') & gene == 'PTEN'][,.N, by=peptide_position], 
+       aes(x=peptide_position, y=N, label=peptide_position)) +
+  geom_point() +
+  geom_text_repel(data=sig.upreg.dt[contrast %in% c('Alpelisib_22_vs_DMSO_22', 'Alpelisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_DMSO_22') & gene == 'PTEN'][,.N, by=peptide_position][N > 2,]) +
+  ylab('N signficant hotspots across comparisons') +
+  ggtitle('PTEN Treatments vs Day22 hotspot positions') +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'PTEN.nSigHotSpots.dotplot')
+
+```
+Do a lollipop plot (are these things close in linear space?)
+```{r}
+# focus on the PTEN upregulated set
+g <- ggplot(data=sig.upreg.dt[contrast %in% c('Alpelisib_22_vs_DMSO_22', 'Alpelisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_DMSO_22') & gene == 'PTEN'][,.N, by=peptide_position], 
+       aes(x=peptide_position, y=N, label=peptide_position)) +
+  geom_segment(aes(x=peptide_position, xend=peptide_position, y=0, yend=N), color="darkgrey") +
+  geom_point(color='#1F968BFF', size=2.5) +
+  geom_text_repel(data=sig.upreg.dt[contrast %in% c('Alpelisib_22_vs_DMSO_22', 'Alpelisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_DMSO_22') & gene == 'PTEN'][,.N, by=peptide_position][N > 2,]) +
+  ylab('N signficant hotspots across comparisons') +
+  ggtitle('PTEN Treatments vs Day22 hotspot positions') +
+  theme_bw()
+BackupAsPDF(g, 'PTEN.nSigHotSpots.lollipopChart', dimensions=c(8,6))
+```
+Next question, what sites are disrupted in specific treatments
+
+```{r}
+g <- ggplot(data=sig.upreg.dt[contrast %in% c('Alpelisib_22_vs_DMSO_22', 'Alpelisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_DMSO_22') & gene == 'PTEN'][,.N, by=peptide_position], 
+       aes(x=peptide_position, y=N, label=peptide_position)) +
+  geom_segment(aes(x=peptide_position, xend=peptide_position, y=0, yend=N), color="darkgrey") +
+  geom_point(color='#1F968BFF', size=2.5) +
+  geom_text_repel(data=sig.upreg.dt[contrast %in% c('Alpelisib_22_vs_DMSO_22', 'Alpelisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_DMSO_22') & gene == 'PTEN'][,.N, by=peptide_position][N > 2,]) +
+  ylab('N signficant hotspots across comparisons') +
+  ggtitle('PTEN Treatments vs Day22 hotspot positions') +
+  theme_bw()
+
+g
+```
+
+Now we want to take these sites, color them by FC and then see if they tend to cluster in physical space on the model and if these sites are found in the interaction region
+Create a datatable that runs from 1: len gene
+```{r}
+subdt <- sig.upreg.dt[contrast %in% c('Alpelisib_22_vs_DMSO_22', 'Alpelisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_LibraryRep_0', 'Paxalisib_22_vs_DMSO_22') & gene == 'PTEN'][,.SD[which.max(log2FoldChange)], by=peptide_position]
+
+gene.idx <- list(PTEN = data.table(peptide_position=seq(1,403, 1))) %>% 
+  rbindlist(idcol='gene')
+
+# merge this with our sig site, any NA give a zero value
+hotspot.merge.dt <- merge(subdt, gene.idx, by=c('gene', 'peptide_position'), all.x=T, all.y=T)
+
+# change the score to reflect the log2FC score 
+hotspot.merge.dt[, residue_score := 0]
+hotspot.merge.dt[!is.na(log2FoldChange), residue_score := log2FoldChange]
+
+hotspot.merge.dt[!is.na(log2FoldChange), unique(peptide_position)]
+```
+
+Adjust the PDB to reflect the 
+
+```{r}
+
+gene.pdb <- af.pdb.list[['PTEN']]
+# get the pdb structure as a dt
+gene.pdb.dt <- as.data.table(gene.pdb$atom)
+    
+# get the correct cols 
+cols.oi <- colnames(gene.pdb.dt)
+      
+# safer merge as only considers overlpaping resiudes
+gene.pdb.dt <- merge(gene.pdb.dt, hotspot.merge.dt[, .(resno=peptide_position, residue_score)], by='resno', all.x=T)
+
+gene.pdb.dt[, `:=`(b=residue_score, old.b = b)]
+
+gene.pdb.dt <- gene.pdb.dt[, ..cols.oi]
+     
+# save the new b-factor scores
+gene.pdb$atom <- gene.pdb.dt
+      
+# write out the modified pdb
+bio3d::write.pdb(gene.pdb, file=paste0('/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/output/pdbs/pten.22dTreatVsCtrls.hotspotLFCscores.pdb'))
+```
+
+

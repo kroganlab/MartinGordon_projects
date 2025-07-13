@@ -1,0 +1,116 @@
+---
+title: "050925_preparePCprophetInput"
+author: "Martin Gordon"
+date: "2025-05-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview 
+
+Request to run the size HIV donor samples through PCprophet
+Don't smooth/normalize etc, just pass in 'as is'
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(magick)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("../../utils/mg_utils/r_utils/SEC_MS_utils.mgupdate.R") # map hu to mm 
+```
+
+Read in the spectronuat protein summarization for each of the samples
+
+```{r}
+sec.list <- list(cd4_infected_1 = fread('./data/Donor-1-032825/D1-Challenged-Infected-Plasmid-Library/20250429_183001_D1_Challenged-Infected_Plasmid-lib_042325_Protein_Report.tsv', header = T),
+                 cd4_challenged_1 = fread('data/Donor-1-032825/D1-Challenged-Uninfected-Plasmid-Library/20250424_112234_D1_Challenged_Uninfected_Plasmid_Lib_032825_Protein_Report.tsv', header = T),
+                 cd4_uninfected_1 = fread('./data/Donor-1-032825/D1-Mock-Uninfected-Plasmid-Library/20250430_155438_D1_Unchallenged_032825_Plasmid_Lib_Protein_Report.tsv', header = T),
+                 cd4_uninfected_2 = fread('./data/Donor-2-041725/D2-Mock-Uninfected-Plasmid-Library/20250506_102206_D2-Uninfected-Plasmid-Lib_041125_Protein_Report.tsv', header=T),
+                 cd4_infected_2 = fread('./data/Donor-2-041725/D2-Challenged-Infected-Plasmid-Library/20250505_174034_D2-Challenged-Infected-041125_Plasmid_Lib_Protein_Report.tsv', header = T),
+                 cd4_challenged_2 = fread('./data/Donor-2-041725/D2-Challenged-Uninfected-Plasmid-Library/20250506_101239_D2-Challenged-Uninfected-Plasmid-Lib-041125_Protein_Report.tsv', header=T)
+                 )
+```
+
+```{r}
+lapply(sec.list, colnames)
+sec.list <- lapply(sec.list, function(x) rmSpectronautCols(x, cols.noi = c("PG.MolecularWeight", "PG.Organisms", "PG.ProteinDescriptions")))
+```
+
+```{r}
+checkSpectronautCols <- function(dt, fractionColpattern='\\[[0-9]{1,2}]', fractionStr='(?<=Frac-)[0-9]{1,2}'){
+  fractionCols <- grep(fractionColpattern, colnames(dt), value=T)
+  fractID <-  stringr::str_extract(fractionCols, fractionStr)
+  print(fractID)
+  
+  print(all(fractID == as.character(seq(1,72,1))))
+  #leadingID <-  str_extract(fractionCols,"(?<=[)[0-9]{1,2}(?=<])")
+}
+```
+
+All cols look good and match fracitons 1-72
+```{r}
+lapply(sec.list, function(x){checkSpectronautCols(x, fractionStr = "[0-9]{1,3}(?=.PG)" ) })
+```
+Now conver the matrix to intensities
+```{r}
+convertToPCprophetMatrix <- function(dt, fractionColpattern='\\[[0-9]{1,2}]', fractionStr='(?<=Frac-)[0-9]{1,2}'){
+  
+  fractionCols <- grep(fractionColpattern, colnames(dt), value=T)
+  fractID <-  stringr::str_extract(fractionCols, fractionStr)
+  stopifnot(length(fractionCols) == length(fractID))
+  
+  colorder <- c('GN', 'ID', fractID)
+  setnames(dt, old=c('PG.ProteinAccessions', 'PG.Genes', fractionCols), new=c('ID', 'GN', fractID)) 
+  
+  message('converting to matrix and removing zeros')
+  dt[, matID := paste0(GN, '__', ID)]
+  mat <- as.matrix(dt[, -c('GN','ID')], rownames='matID')
+  mat[is.na(mat)] <- 0
+  
+  fractID <- as.character(order(as.numeric(fractID))) # ensure correct fraction order
+  stopifnot(all(as.numeric(fractID) == seq(1,72,1)))
+  colorder <- c('GN', 'ID', fractID)
+  print(colorder)
+  
+  # convert bsck to DT
+  dt.mat <- as.data.table(mat, keep.rownames = T)
+  #print(dt.mat)
+  #print(colnames(dt.mat))
+  dt.mat[, c('GN', 'ID') := tstrsplit(rn, '__', keep=c(1,2))]
+  dt.mat[, rn := NULL]
+  return(dt.mat[, ..colorder])
+}
+```
+
+```{r}
+test <- copy(sec.list)
+
+pcp.list <- lapply(sec.list, function(x) convertToPCprophetMatrix(x, fractionStr='[0-9]{1,2}(?=.PG)'))
+```
+
+```{r}
+lapply(pcp.list, head)
+```
+Save output
+
+```{r}
+lapply(names(pcp.list), function(x) { fwrite(pcp.list[[x]], sep='\t', ScriptAndDatedFileName(paste0(x, '.spectronaut.pcpinmat.txt')))})
+```
+Read in the uniprot file and save as a text file 
+
+```{r}
+hu.hiv.uniprot <- readxl::read_xlsx('~/Library/CloudStorage/Box-Box/HIV_Infection_CD4T_cells/Donor-2-041725/050725_mw_uniprot_HIV_Human.xlsx')
+fwrite(hu.hiv.uniprot, sep='\t', ScriptAndDatedFileName('hu.hiv.uniprot.mw.txt'))
+```
+

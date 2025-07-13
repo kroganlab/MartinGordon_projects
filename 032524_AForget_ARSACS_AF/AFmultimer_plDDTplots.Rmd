@@ -1,0 +1,279 @@
+---
+title: "plddt_plots_AFmultimer"
+author: "Martin Gordon"
+date: "2024-05-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## some plots of the plDDT for AF multimer
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(jsonlite) # convert json to do
+library(stringr)
+library(gggenes) # draw gene segements
+library(patchwork) # combine plots
+library(ComplexHeatmap)
+library(circlize)
+library(bio3d) # open pdb
+library(usedist)#package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj
+
+
+#library(rjson) # for reading in the R json files
+library(jsonlite)
+library(RColorBrewer)
+
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("../../utils/bp_utils/manageScriptData.R")
+```
+
+Read in the pdb files and generate a plot for each 
+Functions
+
+```{r}
+loadPDBAtoms <- function(path){
+  pdb <- bio3d::read.pdb(path)
+  atoms <- pdb$atom
+  setDT(atoms)
+  atoms[, idx := .I]
+  return (atoms[])
+}
+
+
+
+# minB = lower bound of atoms to include in distance, from both ends of comparison.
+#         Assume plddt, where higher is better
+interChainResDistance <- function(atoms, minBStart = 0, minBStop = 25){
+  # all by all atom distance
+        atomDistance <- dist(atoms[, .(x,y,z)])
+  
+  # build pairwise table of distances between chains
+  # loop over chains, and compare all atoms to that chain, skipping those within that chain
+  .oneChain <- function(curChain){
+    curChain.idx <- which (atoms$chain == curChain & atoms$b > minBStop)
+    atomdist <- atoms[chain != curChain & b > minBStart, 
+                      .(chain, resno, eleno, b, otherChain = curChain, distance = min(usedist::dist_get(atomDistance, idx, curChain.idx))),
+                      by = .(idx)] 
+    residues <- atomdist[, .(distance = min(distance), bfactor = mean(b)), by = .(chain, resno, otherChain)]
+    residues[]
+    }
+  
+  resLong <- rbindlist(lapply(unique(atoms$chain), .oneChain))
+  resLong[]
+}
+```
+
+```{r}
+pdb.files <- dir(path='./output/ranked_pdb', pattern ='*.pdb', recursive=T, full.names = T)
+
+
+# mods to keep 
+pdb.dt <- data.table(path=pdb.files)
+pdb.dt[, pair := gsub('_ranked_0.pdb', '', basename(path))]
+```
+read in the PDB files
+```{r}
+# function to read in 
+loadPDBAtoms <- function(path){
+  pdb <- bio3d::read.pdb(path)
+  atoms <- pdb$atom
+  setDT(atoms)
+  atoms[, idx := .I]
+  return (atoms[])
+}
+
+pdb.list <- lapply(pdb.dt$path, function(x){
+  dt <- loadPDBAtoms(x)
+  return(dt)
+})
+names(pdb.list) <- pdb.dt$pair
+```
+lets just look at the output of this package..
+```{r}
+res.list <- lapply(pdb.list, function(x){interChainResDistance(x)})
+
+res.dt <- rbindlist(res.list, idcol = 'pair')
+
+res.dt[, protein := gsub("__[A-Za-z0-9_]+","", pair)]
+res.dt[, otherProtein := str_extract(pair, '(?<=__)[A-Z0-9]+')]
+
+res.dt[, gene := gsub('Q9NZJ4', 'SACS', protein)]
+res.dt[, otherGene := multiUniprots2multiGenes(otherProtein)]
+```
+
+now plot the plddt scores per site 
+First read in the plddt scores
+
+```{r}
+res.dt<- fread('./output/comb.atomDist.csv')
+
+# add annotation to data 
+res.dt[, proteinName := ifelse(chain == 'A', gsub("__[A-Za-z0-9_]+","", pair),  str_extract(pair, '(?<=__)[A-Z0-9]+')) ]
+res.dt
+```
+
+```{r}
+uniquePairs <-  res.dt[, unique(pair)]
+
+lapply(uniquePairs[1:5], function(x){
+  
+  p <- ggplot (res.dt[pair == x, ], aes(x = resno, y = distance, color = bfactor)) + 
+    geom_line(lwd = 1, alpha = 0.5, ) +
+    geom_point(alpha = 1, stroke = NA) +
+  #coord_cartesian(xlim = c(0,400)) +
+  scale_y_log10(name = "distance (Angstroms)") +
+  #coord_cartesian(ylim = c(.1,20)) +
+  #scale_y_continuous( ) +
+  facet_grid(otherGene~gene, scales = "free", space = "free_x") +
+  scale_color_gradientn("plDDT", limits = c(0,100), colors = c(red = "#FE0012",
+                                                      orange = "#FFA42B",
+                                                      yellow = "#FFFD42","#FFFD42",
+                                                      palegreen = "palegreen2",
+                                                      blue = "lightblue","lightblue",#"#6097E8",
+                                                      darkBlue = "#001DF9"),
+                        values = c(0, .5, 0.7,0.75,0.8,0.85, 0.9, 1.0)) +
+  
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, max(res.dt$resno, na.rm = TRUE), by = 200)) +
+  ggrepel::geom_text_repel(aes(label = resno))
+
+p
+})
+```
+just write function to iterate through list and do all
+
+```{r}
+
+pdb.files <- dir(path='./output/ranked_pdb', pattern ='*.pdb', recursive=T, full.names = T)
+# subet to just useful set
+pdb.files <- grep('Q9NZJ4SUB', pdb.files, invert = T, value = T)
+
+
+lapply(pdb.files, function(x){
+
+  chainMapping <- c(A = gsub('Q9NZJ4_', 'SACS_', str_extract(x,'Q9NZJ4_[A-Z0-9]+')),
+                    B = multiUniprots2multiGenes(str_extract(x, '(?<=__)[A-Z0-9]+')) )
+  
+  atoms <- loadPDBAtoms(x)
+  atoms[, protein := chainMapping[chain]]
+  
+  # interchain distance
+  res.long <- interChainResDistance(atoms)
+  res.long[, gene := chainMapping[chain]]
+  res.long[, otherGene := chainMapping[otherChain]]
+
+  p <- ggplot (res.long, aes(x = resno, y = distance, color = bfactor)) + 
+  geom_line(lwd = 1, alpha = 0.5) +
+  geom_point(alpha = 1, stroke = NA) +
+  #coord_cartesian(xlim = c(0,400)) +
+  scale_y_log10(name = "distance (Angstroms)") +
+  #coord_cartesian(ylim = c(.1,20)) +
+  #scale_y_continuous( ) +
+  geom_hline(yintercept = 4.0) + 
+  ggtitle(paste0(chainMapping['A'], '-', chainMapping['B'])) +
+  facet_grid(otherGene~gene, scales = "free") +
+  force_panelsizes(cols = c(0.5,0.5)) +
+  scale_color_gradientn("plDDT", limits = c(0,100), colors = c(red = "#FE0012",
+                                                      orange = "#FFA42B",
+                                                      yellow = "#FFFD42","#FFFD42",
+                                                      palegreen = "palegreen2",
+                                                      blue = "lightblue","lightblue",#"#6097E8",
+                                                      darkBlue = "#001DF9"),
+                        values = c(0, .5, 0.7,0.75,0.8,0.85, 0.9, 1.0)) +
+  
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, max(res.long$resno, na.rm = TRUE), by = 200)) +
+  ggrepel::geom_text_repel(aes(label = resno))
+
+  BackupAsPDF(p, paste0(chainMapping['A'], '-', chainMapping['B'], '_angDist.linechart'), dimensions = c(10,6))
+})
+```
+
+Look at the json files of te
+
+```{r}
+models <- dir(path='/Users/martingordon/Documents/projects/032524_AForget_ARSACS_AF/output/rank0_json/pkl_attr_json', pattern="*attr.json", full.names = T)
+
+af.mods <- lapply(models, function(x){jsonlite::fromJSON(x) })
+
+
+mods.protNames <- str_extract(models, 'Q9NZJ4_[A-Z0-9_]+__[A-Z0-9]+') %>% 
+  strsplit(., '__')
+
+mods.protNames <- lapply(mods.protNames, function(x){
+  chainA = gsub('Q9NZJ4_', 'SACS_', x[1])
+  chainB = multiUniprots2multiGenes(x[2])
+  return(paste0(chainA,'__', chainB))
+}) %>%  unlist()
+
+names(af.mods) <- mods.protNames
+
+
+test <- unlist(strsplit("SACS_DNAJ__SPTBN2", '__'))
+
+
+ ifelse(af.mods[[1]][[1]]$entity_id == 1, test[1], test[2])
+```
+
+generate the PAE heatmaps
+
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(k=2)
+
+lapply(seq_along(af.mods), function(x,n,i){
+  
+  # get name of comparison
+  protNames <- unlist(strsplit(n[[i]], '__'))
+  
+  # set up matrix
+  mat <- x[[i]][[1]]$pae
+  rownames(mat) <- x[[i]][[1]]$residue_index
+  colnames(mat) <- x[[i]][[1]]$residue_index
+
+  #simplify dim names; if not in 
+  rownames(mat) <- ifelse(rownames(mat) %in% seq(1, nrow(mat), by=35), rownames(mat), '')
+  colnames(mat) <- ifelse(rownames(mat) %in% seq(1, nrow(mat), by=35), rownames(mat), '')
+  
+  anno.dt <- ifelse(x[[i]][[1]]$entity_id == 1, protNames[1], protNames[2])
+  
+  hm1 <- Heatmap(mat, 
+                cluster_rows = FALSE, 
+                cluster_columns = FALSE,
+                column_title = paste0(n[[i]]),
+                show_row_names = T, 
+                row_names_gp = gpar(fontsize=5),
+                column_names_gp = gpar(fontsize=5),
+                show_column_names = T,
+                name='Predicted Aligned Error (Angstroms)')
+
+          #Heatmap(x[[i]][[1]]$entity_id,
+        hm2 <-Heatmap(anno.dt,
+          name='Protein',
+          col=structure(col.pal, names=unique(anno.dt)),
+          #col=structure(col.pal, names=unique( x[[i]][[1]]$entity_id)),
+          width=unit(0.5, 'cm'))
+   
+   draw(hm2+hm1)
+  BackupAsPDF(draw(hm2+hm1), paste0(n[[i]], '.pae.heatmap'), dimensions=c(7,5))
+  
+},x=af.mods, n=names(af.mods))
+```
+Draw a pLDDT plot
+
+```{r}
+names(af.mods)
+
+anno.dt <- ifelse(af.mods[[1]][[1]]$entity_id == 1, gsub('Q9NZJ4_', 'SACS_', str_extract(names(af.mods),'Q9NZJ4_[A-Z0-9]+')),
+                    multiUniprots2multiGenes(str_extract(names(af.mods), '(?<=__)[A-Z0-9]+')) )
+
+anno.dt %>%  unique()
+```
+
+

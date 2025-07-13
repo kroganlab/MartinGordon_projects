@@ -1,0 +1,108 @@
+---
+title: "031125_Bridge2AI_RF2-PPI_APMSOverlap"
+author: "Martin Gordon"
+date: "2025-03-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(hrbrthemes)
+
+source('~/Documents/utils/bp_utils/ManageScriptData.R')
+source('~/Documents/utils/bp_utils/UniprotIDMapping.R')
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    linewidth = 1),
+        axis.text.x = element_text(angle=90,size=6)
+        )
+```
+
+read in the AF2 and RosettaFold2 scores
+```{r}
+af2.ppi <- fread('./data/AF_scores')
+rs2.ppi <- fread('./data/RF_scores')
+```
+
+```{r}
+setnames(rs2.ppi, new=c('pair', 'rs2.score'))
+setnames(af2.ppi, new=c('pair', 'af2.score'))
+
+comb.ppi <- merge(x=rs2.ppi, y=af2.ppi, by='pair', all.x=T)
+comb.ppi[, c('protein1', 'protein2') := tstrsplit(pair, '_', keep = c(1,2))]
+comb.ppi[, c('gene1', 'gene2') := multiUniprots2multiGenes(.SD, species='HUMAN'), .SDcols = c('protein1', 'protein2')]
+
+#fwrite(comb.ppi, ScriptAndDatedFileName('rf2.af2.ppiScores.csv.gz'))
+```
+
+
+```{r}
+comb.ppi <- fread('~/Documents/projects/031125_MBennett_Bridge2AI_APMSOverlapRF2-PPI/031125_Bridge2AI_RF2-PPI_APMSOverlap_data/2025_03_11_rf2.af2.ppiScores.csv.gz')
+```
+
+
+read in the B2AI data
+
+```{r}
+apms.dt <- readxl::read_xlsx('./data/HiTAG_ALFAP_result_9X_ppi_MSstats_T-test.xlsx', skip=1, col_names = T) %>% 
+  setDT()
+#remove bg
+#apms.dt <- apms.dt[Bait != 'HEK293T']
+
+# get the bait protein
+apms.dt
+
+apms.dt[, baitProtein := translateGeneName2Uniprot(gsub('9X[_]', '', Bait), species='HUMAN')]
+apms.dt[, unique(baitProtein)]
+
+apms.dt %>% colnames()
+apms.dt[!is.na(rf2.scores)]
+# make a ppi ordered pair 
+prots.oi <- apms.dt$baitProtein %>% 
+  unique()
+
+# just subset to the bait set
+subdt <- comb.ppi[protein1 %in% prots.oi | protein2 %in% prots.oi,]
+
+# create a pairOrdered col (orderppi alpahbetically)
+apms.dt[, pairOrdered := paste0(sort(c(Prey, baitProtein)), collapse = "_"), by=.I]
+subdt[, pairOrdered := paste0(sort(c(protein1, protein2)), collapse = "_"), by=.I]
+#merge apms dt with the rf2 and af2 scores
+apms.dt <- merge(x=apms.dt, y=subdt[,.(pairOrdered, rs2.score, af2.score)], by='pairOrdered', all.x=T)
+
+# only 11k interactions found in the shared results
+setdiff(apms.dt[is.na(rs2.score), unique(Bait)], apms.dt[!is.na(rs2.score), unique(Bait)])
+apms.dt[,baitProtein := NULL]
+
+
+apms.dt
+
+#fwrite(apms.dt, ScriptAndDatedFileName('HiTAG_ALFAP_result_9X_ppi_MSstats_T-test.rf2-ppiAnnotated.csv.gz'))
+
+test <- fread('~/Documents/projects/031125_MBennett_Bridge2AI_APMSOverlapRF2-PPI/031125_Bridge2AI_RF2-PPI_APMSOverlap_data/2025_03_11_HiTAG_ALFAP_result_9X_ppi_MSstats_T-test.rf2-ppiAnnotated.csv.gz')
+
+ggplot(test[!is.na(rs2.score), .N, by=Bait], aes(x=Bait, y=N)) +
+  geom_bar(stat='identity') +
+  customTheme
+```
+
+

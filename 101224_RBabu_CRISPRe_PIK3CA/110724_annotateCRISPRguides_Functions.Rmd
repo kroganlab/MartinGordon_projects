@@ -1,0 +1,1589 @@
+---
+title: "110724_annotationWork"
+author: "Martin Gordon"
+date: "2024-11-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Collection of scripts and functions to perform guide anntoation for CRISPR 
+
+given vector of guides,
+i) align to ref genome to guide start position (on + reference strand)
+ii) find edits on the guide and their index, map these to the gene + strand
+iii) 
+```{r}
+library(data.table)
+library(parallel)
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(viridis)
+library(dendextend) # for dendogram modifications
+library(DESeq2)
+library(patchwork)
+library(ggrepel)
+library(tidymodels)
+library(readxl)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+load relevant anno data and the guide info
+**Todo** think we need a data structure for our genomes
+
+```{r}
+genes.dt <- data.table(transcriptID=c('ENST00000371953', 'ENST00000361445', 'ENST00000649815', 'ENST00000263967'),
+                       gene=c('PTEN', 'MTOR', 'AKT1', 'PIK3CA'))
+
+
+anno.dt <- fetchGeneFeatures(gene_symbol = genes.dt$gene, tID=genes.dt$transcriptID)
+anno.dt[, gene_length := end_position - start_position]
+# need to fix the get sequence, get the gene, cds sequence and align the guides to the cds sequence
+anno.dt[, pep_seq := fetchPeptideSequencefromEnsemblTranscriptID(tID=ensembl_transcript_id,species='HUMAN'), by=.I]
+
+clinvar.dt <- getClinvarDT(path='/Users/martingordon/Documents/projects/071724_BRabu_CRISPRbe_LibraryDesign/data/GRCh38.snp_clinvar.txt',ref='GRCh38',  genesOI = c("PTEN" ,"MTOR","AKT1","PIK3CA"), variantOI = "single nucleotide variant")
+
+
+# Ronalds guides; use these for validation
+sgrna.dt <- read_xlsx('/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/docs/PIK3CA pathway base editing.xlsx', sheet=1) %>% 
+  as.data.table()
+
+# tidy names 
+sgrna.dt[Gene %like% 'sgINTERGENIC', Gene := 'intergenic']
+sgrna.dt[, Gene := toupper(Gene)]
+sgrna.dt <- sgrna.dt[ Gene %in% c("PIK3CA","AKT1","PTEN","MTOR"), ]
+
+
+# 7246 unique guides targeting our genes of interest
+sgrna.dt$Guide %>%  unique() %>%  length()
+sgrna.dt[,Guide := toupper(Guide)]
+sgrna.dt[, `Edited 5'->3' Sequence` := toupper(`Edited 5'->3' Sequence`)]
+```
+Fetch interprotein domains
+
+```{r}
+domains.dt <- fetchInterProtDomains(gene_symbol=anno.dt$external_gene_name, tID=anno.dt$ensembl_transcript_id, keep='largest')
+domains.dt <- merge(anno.dt, domains.dt, by=c('ensembl_transcript_id', 'external_gene_name'))
+
+# again, need the peptide sequence for this function
+#domains.dt[, domainSequence := substr(peptideSequence, interpro_start, interpro_end)]
+```
+To map mutations we need i) gene boundaries, ii) transcript boundaries and iii) cds boundaries
+Will need to use index mapping to map these sites later; look at the gene level anno info, find where sites start
+I think we also need exon boundaries to get the indexes of the different sites
+
+exons also contain 5' and 3' UTRs in addition to CDS
+```{r}
+# keep this for seeing whats available
+mart <-  mart <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+mart.dt <- as.data.table(listAttributes(mart))
+mart.dt[grepl('exon', name)]
+mart.dt[grepl('cdna', name)]
+mart.dt[grepl('cds', name)]
+
+extra.anno.dt <- fetchExtraGeneFeatures(gene_symbol = anno.dt$external_gene_name, tID = anno.dt$ensembl_transcript_id)
+
+# lets practise with generating  the indexes
+extra.anno.dt[, exon.idx := paste0(seq(exon_chrom_start, exon_chrom_end, 1),collapse=',') ,by=.I]
+extra.anno.dt[, genome.idx := paste0(exon.idx), by=external_gene_name]
+
+extra.anno.dt[, exon_length :=exon_chrom_end - exon_chrom_start + 1]
+
+extra.anno.dt[external_gene_name == 'MTOR', .(external_gene_name, ensembl_transcript_id, strand, transcript_start, transcript_end, ensembl_exon_id, exon_chrom_start, exon_chrom_end, exon_length, cds_start, cds_end)]
+extra.anno.dt[external_gene_name == 'PTEN', .(external_gene_name, ensembl_transcript_id, strand, transcript_start, transcript_end, ensembl_exon_id, exon_chrom_start, exon_chrom_end, exon_length, cds_start, cds_end, cdna_coding_start, cdna_coding_end)]
+
+extra.anno.dt[,  length(seq(exon_chrom_start, exon_chrom_end, 1)), by=.I]
+extra.anno.dt[!is.na(cds_start), length(seq(cds_start, cds_end, 1)), by=.I]
+
+extra.anno.dt[external_gene_name == 'PTEN',  length(seq(exon_chrom_start, exon_chrom_end, 1)), by=.I]
+extra.anno.dt[external_gene_name == 'PTEN' & !is.na(cds_start), length(seq(cds_start, cds_end, 1)), by=.I]
+
+extra.anno.dt[external_gene_name == 'PTEN'][order(cds_start)]
+
+
+# add the sequences to the DB
+extra.anno.dt <- merge(extra.anno.dt, anno.dt[,.(external_gene_name,nuc,coding)], by='external_gene_name')
+
+# only parts that dont match are the 5' utr and 3' utr
+# but if we take x bases upstream and downstream, these should match
+```
+
+testing genome pos extraction for genes on + and - strand.. looks good
+```{r}
+# testing... lets compare output to the gene sequence
+# need to also do this with the neg strand genes, but this is good for now
+ref <- BSgenome.Hsapiens.NCBI.GRCh38
+
+pten.idx <- getEnsemblTranscriptGenomeIndices(extra.anno.dt, gene='PTEN')
+
+pten.test <- ref[[10]][pten.idx]
+pten.ref <-  DNAString(paste(seq.list[['PTEN']]$coding_seq, collapse=''))
+# ok the + strand genes look good!
+pairwiseAlignment(pten.test, pten.ref) %>% 
+  writePairwiseAlignments()
+
+#also test PIK3CA
+pik3ca.idx <- getEnsemblTranscriptGenomeIndices(extra.anno.dt, gene='PIK3CA')
+pik3ca.test <- ref[[3]][pik3ca.idx]
+pik3ca.ref <- DNAString(paste(seq.list[['PIK3CA']]$coding_seq, collapse=''))
+
+# perfect match
+pairwiseAlignment(pik3ca.test, pik3ca.ref) %>% 
+  writePairwiseAlignments()
+
+# working.. just needed to modify how I appraoch strandedness
+akt1.idx <- getEnsemblTranscriptGenomeIndices(extra.anno.dt, gene='AKT1')
+
+akt1.test <- ref[[14]][akt1.idx]
+akt1.ref <- DNAString(paste(seq.list[['AKT1']]$coding_seq, collapse=''))
+
+pairwiseAlignment(reverseComplement(akt1.test), akt1.ref, type='global') %>% 
+  writePairwiseAlignments()
+
+
+mtor.idx <- getEnsemblTranscriptGenomeIndices(extra.anno.dt, gene='MTOR')
+
+mtor.test <- ref[[1]][mtor.idx]
+mtor.ref <- DNAString(paste(seq.list[['MTOR']]$coding_seq, collapse=''))
+
+pairwiseAlignment(reverseComplement(mtor.test), mtor.ref, type='global') %>% 
+  writePairwiseAlignments()
+
+# some inspectionto see why not matching...
+#extracting exons 1 by 1 and aligning 
+```
+
+Individual assessment
+```{r}
+# so individually they all align against the ref and the exon boundaries look good... what am I missing here?
+lapply(akt1.idx[1:4], function(x){
+  akt1.test <- ref[[14]][x]
+  print(length(x))
+  pairwiseAlignment(reverseComplement(akt1.test), akt1.ref) %>% writePairwiseAlignments()
+})
+ # issue was adding order of codons. Needed to be done in 5-3 direction of gene (so rev order on - strands)
+akt1.test <- ref[[14]][unlist(c(akt1.idx[3],akt1.idx[2], akt1.idx[1]))] 
+```
+
+
+```{r}
+sequence.dt <- data.table(gene = anno.dt$external_gene_name, 
+                          ensembl_transcript_id = anno.dt$ensembl_transcript_id)
+
+# maybe just align to anno.dt
+anno.dt[, peptide := fetchPeptideSequencefromEnsemblTranscriptID(ensembl_transcript_id), by=.I]
+anno.dt[, nuc := fetchNucleotideSequencefromEnsemblTranscriptID(ensembl_transcript_id), by=.I] # this is the transcript sequence (exon and intron)
+anno.dt[, coding := fetchCodingSequencefromEnsemblTranscriptID(ensembl_transcript_id), by=.I]
+
+#Need to consider if this is the best data.structure a list of dts. may be better with idx, base/peptide..
+anno.dt[, .(external_gene_name, nchar(nuc), nchar(coding), nchar(peptide))]
+anno.dt[, .(external_gene_name, nchar(nuc)/3, nchar(coding)/3, nchar(peptide))]
+
+#split the dt on each gene
+# can add this line into the other functions 
+seq.list <- split(anno.dt, anno.dt$external_gene_name)
+
+seq.list <- lapply(seq.list, function(x){
+  
+    peptide <-  strsplit(x$peptide, '')[[1]]
+    pep.idx <-  seq(1, length(peptide), 1)
+    
+    transcript <- strsplit(x$nuc, '')[[1]]
+    transcript.idx <- seq(1, length(transcript), 1)
+
+    coding  <-  strsplit(x$coding, '')[[1]]
+    #coding.idx <- rep(pep.idx, each=3)
+    coding.idx <- seq(1, length(coding), 1)
+    
+    #where does the coding sequence align to the transcript
+    first_match <- gregexpr(paste(coding[1:20], collapse=''), paste(transcript, collapse=''))[[1]][1]
+    last_match  <- gregexpr(paste(coding[(length(coding) - 20):length(coding)], collapse=''), paste(transcript, collapse=''))[[1]][1] + 20 # need to add 20 as first site returned as index
+    
+    # creating transcript anno
+    transcript.anno <- rep('exon', length(transcript))
+    transcript.anno[1:first_match-1] <- '5_UTR'
+    transcript.anno[length(transcript)] <- '3_UTR'
+    transcript.anno[(last_match+1):length(transcript)] <- '3_UTR'
+    
+    # coding annotation; just annotate the relative positions to transcript in the dt
+    mapping.idx <- seq(first_match, last_match,1)
+    
+    # prepare the genome mapping
+    if(x$strand == '-1'){
+       genome.idx <- rev(seq(x$transcript_start, x$transcript_end, 1))
+    } else {
+      genome.idx <- seq(x$transcript_start, x$transcript_end, 1)
+    }
+    
+    return(list(transcript_seq = transcript,
+                transcript_idx = transcript.idx,
+               # genome_idx = genome.idx, fix this use exon boundaries to annotate
+                transcript_anno = transcript.anno,
+                coding_seq = coding, 
+                coding_idx = coding.idx,
+                transcript_mapping = mapping.idx,
+             #   boundaries = c(first_match, last_match),
+                peptide_seq = peptide,
+                peptide_idx = pep.idx,
+                translate_idx = rep(pep.idx, each=3)
+                ))
+})
+```
+
+This is our reference db to map edits, substitutions etc to bases
+Map the genome idx to the transcripts; will be used to map the edited position in clinvar
+```{r}
+seq.list[['MTOR']]$genome_idx <- getEnsemblTranscriptGenomeIndices(extra.anno.dt, gene='MTOR')
+seq.list[['PIK3CA']]$genome_idx <- getEnsemblTranscriptGenomeIndices(extra.anno.dt, gene='PIK3CA')
+seq.list[['PTEN']]$genome_idx <- getEnsemblTranscriptGenomeIndices(extra.anno.dt, gene='PTEN')
+seq.list[['AKT1']]$genome_idx <- getEnsemblTranscriptGenomeIndices(extra.anno.dt, gene='AKT1')
+
+
+seq.db <- seq.list
+```
+**CRISPR functions**
+Need to add to 
+Currently other annotation functions for find gene/prot level info but take this for now
+
+```{r}
+getSeqReverseComplement <- function(sequence){
+  require(Biostrings)
+  if (grepl('U', sequence)){
+    
+    seq.obj <- RNAStringSet(sequence)
+    return(as.character(reverseComplement(seq.obj)))
+    
+  } else {
+    
+    seq.obj <- DNAStringSet(sequence)
+    return(as.character(reverseComplement(seq.obj)))
+  }
+}
+
+# run this as part of the function
+getGuideStrand <- function(geneStrand, guideStrand){
+  
+  geneStrand <- as.character(geneStrand); guideStrand <- as.character(guideStrand)
+  # easier option would be to convert both symbols to be the same and could do a simple logical ==/!= but fine for now
+  return(ifelse(geneStrand == '1' & guideStrand == '+', 'sense',
+                        ifelse(geneStrand == '-1' & guideStrand == '-', 'sense', 'antisense')))
+}
+
+#' Function to produce the edited seq
+#' Right now I introduce edits within the window boundaries (inclusive) on both sense/antisense stran
+#' If the edits are on the antisense strand, we take the reverse complement of the edit sequence (so edits 4-8 become 13-17 on revcomp sequence)
+getCodingSequenceEdit <- function(Seq, window_start, window_end, guideStrand=NULL, editor=NULL){
+
+  if (as.character(guideStrand) %in% c('-1','1')){
+    guideStrand <- ifelse(guideStrand == '-1', 'antisense', 'sense')
+  }
+  
+  if(!toupper(editor) %in% c('BEMAX','ABE8E'))
+    stop('Must specify editor (either ABE8E or BEMAX)')
+  
+  if(!is.numeric(window_start) | !is.numeric(window_end))
+     stop('window start and window end must be numeric')
+  
+  if(nchar(Seq) < (window_end - window_start) | nchar(Seq) < window_start | nchar(Seq) < window_end)
+    stop('check edit window range')
+  
+  editSeq <- Seq
+  editSeq <- ifelse(toupper(editor) == 'BEMAX', paste0(substr(editSeq, 1, window_start-1), gsub('C', 'T', substr(editSeq, window_start, window_end), fixed=T), substr(editSeq, window_end+1,nchar(editSeq))),
+                                                  paste0(substr(editSeq, 1, window_start-1), gsub('A', 'G', substr(editSeq, window_start, window_end), fixed=T), substr(editSeq, window_end+1,nchar(editSeq))))
+    
+  if (as.character(guideStrand)== 'antisense'){
+    editSeq <- as.character(Biostrings::reverseComplement(Biostrings::DNAStringSet(editSeq)))
+  }
+  return(editSeq)
+}
+
+
+#' From the edited  sequence, return the i) edited bases, their index and the editor that produced them
+#' Goal here is to produce a named list of length edits
+#' Currently, we search all along the guides for the edits, but may need to adjust
+#' Maybe we want the oriStrand edits too. Atm just considering their position on the antisense 
+findEditIndex <- function(Seq, editSeq, guideStrand=NULL, editScores=NULL){
+  
+  if(nchar(Seq) != nchar(editSeq))
+    stop('reference and edit sequences length mismatch. Aborting..')
+  
+  if (as.character(guideStrand) %in% c('-1','1')){
+    guideStrand <- ifelse(guideStrand == '-1', 'antisense', 'sense')
+  }
+  
+  if (as.character(guideStrand)== 'antisense'){
+    Seq <- as.character(Biostrings::reverseComplement(Biostrings::DNAStringSet(Seq)))
+  }
+
+  refSet <- strsplit(Seq,'')[[1]]; editSet <- strsplit(editSeq,'')[[1]]
+  # get mismatch indices
+  edit.idx <- which(refSet != editSet)
+  editbase <- unique(editSet[edit.idx])
+  
+  # sanity check compare to the number of edit socres we detect, if off abort
+  if (!is.null(editScores)){
+    
+    if (length(edit.idx) != length(strsplit(editScores, ', ')[[1]]) )
+      stop('Found different number of edits vs reported in the sgrna input file\n Offending guide: ', Seq)
+  }
+  
+  if (as.character(guideStrand) == 'sense'){
+    
+    return(list(coding_index=paste(edit.idx,collapse=';'),
+             #   guide_index=paste(nchar(Seq) - edit.idx, collapse=';'),
+                editor=paste(ifelse(editbase %in% c('T'), 'bemax', 'abe8e'), collapse=';'),
+                ref=paste(refSet[edit.idx], collapse=';'),
+                alt=paste(editSet[edit.idx], collapse=';')))
+    
+  } else if  (as.character(guideStrand) == 'antisense'){
+    
+    return(list(coding_index=paste(edit.idx,collapse=';'),
+            #    guide_index=paste(nchar(Seq) - edit.idx, collapse=';'),
+                editor=paste(ifelse(editbase %in% c('A'), 'bemax', 'abe8e'), collapse=';'),
+                ref=paste(refSet[edit.idx], collapse=';'),
+                alt=paste(editSet[edit.idx], collapse=';')))
+  }
+}
+
+
+#' simplife rfunction than above just to compare two sequecnes
+compareSequences <- function(Seq, editSeq){
+  
+  if(nchar(Seq) != nchar(editSeq))
+    stop('reference and edit sequences length mismatch. Aborting..')
+  
+  refSet <- strsplit(Seq,'')[[1]]; editSet <- strsplit(editSeq,'')[[1]]
+  # get mismatch indices
+  edit.idx <- which(refSet != editSet)
+  editbase <- unique(editSet[edit.idx])
+  
+    
+  return(list(index=paste(edit.idx,collapse=';'),
+              #editor=paste(ifelse(editbase %in% c('C','G'), 'bemax', 'abe8e'), collapse=';'),
+              editor=paste(ifelse(editbase %in% c('C'), 'bemax', 'abe8e'), collapse=';'),
+              ref=paste(refSet[edit.idx], collapse=';'),
+              alt=paste(editSet[edit.idx], collapse=';')))
+}
+
+
+#' Function to align vector of nucleotide seqs against host genome (currenlty only GRCh38 supported)
+#' Strand & chrToSearch can be specified to limit search space
+#' Currently only NCBI GRCh38 reference genome is supported
+#' Alignments reported relative to the positve strand on the refrence (convention)
+#' Limitation is sacrifice of flexibilty for speed. currently using a dictionary DS forcing seq lengths to be equal and allowing no mismatches in search, but suited to guide mapping as want high-fidelity (I think.)
+#' max ncores = detectCores() - 1
+#' If not specified, runs single stranded 
+alignToReference <- function(seqIn, ref='GRCH38', chrToSearch, strand, nCores=NULL){
+   require(BSgenome.Hsapiens.NCBI.GRCh38)
+   require(parallel)
+  
+  # requires the NCBI reference for the alignment (hopefully aligns with clinvar...)
+  # other option is to go to clinvar, pull out flanking regions of edits and do PW alignments to that but prob slower   
+  if (toupper(ref) != 'GRCH38')
+    stop('Currently only NCBI GRCh38 reference genome is supported')
+
+  ref <- BSgenome.Hsapiens.NCBI.GRCh38
+  
+  if (toupper(chrToSearch) == 'ALL')
+    chrToSearch <- names(ref)[1:24]
+  
+  message("Targeting ", metadata(ref)$genome, " chromosomes ", paste(chrToSearch, collapse=", ")) 
+  
+  #  preprocess as dictionary for faster searching (no mismatches to DB allowed and seqIn must be equal ength)
+  pdict <- PDict(seqIn)
+
+  if (is.null(nCores)) {
+    nCores <-  1
+    message('Number of cores not specified. Running single-threaded')
+  
+  } else if (!is.double(nCores)) {
+    stop('nCores must be an integer if set')
+    
+  } else if (nCores >= detectCores()) {
+    nCores <- detectCores() - 2
+    message('Number of cores exceeds system specs. Setting nCores at ', nCores) 
+  }
+  
+  if (is.null(strand) | !toupper(strand) %in% c('+','-','BOTH')){
+    
+  stop('Reference strand for alignment must be set. Please select either "+","-", or "both"')
+  } else if (strand == '+'){
+    
+   pos.aligns <- mclapply(chrToSearch, function(seqname){
+   
+   subject <- ref[[seqname]]
+   message("Finding all hits in ", strand, " strand of chromosome ", seqname)
+   mindex <- matchPDict(pdict, subject) # fast match but not allowing mismatches
+   matches <- as.data.table(extractAllMatches(subject, mindex))
+    
+   matches[, `:=`(chromosome_name = seqname,
+                   align_strand = strand)]
+  }, mc.cores=nCores) %>% rbindlist()
+  
+  message('Aligned ', (length(unique(pos.aligns$seq))/length(unique(seqIn)))*100,'% of sequences')
+  #message('Failed to align', paste0(setdiff(toupper(seqIn), pos.aligns$seq), collapse=','))
+  return(pos.aligns[, .(Guide=seq, align_strand, pos_align_start=start, pos_align_end=end, chromosome_name)])
+  } else if (strand == '-'){
+   
+   neg.aligns <- mclapply(chrToSearch, function(seqname){
+   
+   subject <- reverseComplement(ref[[seqname]])
+   chr_length <- length(subject)
+   
+   message("Finding all hits in ", strand, " strand of chromosome ", seqname)
+   mindex <- matchPDict(pdict, subject) # fast match but not allowing mismatches
+   matches <- as.data.table(extractAllMatches(subject, mindex))
+    
+   matches[, `:=`(chromosome_name = seqname,
+                  align_strand = strand,
+                  pos_align_start=chr_length - end + 1,
+                  pos_align_end=chr_length - start + 1
+                  )]
+  }, mc.cores=nCores) %>% rbindlist() 
+  
+  message('Aligned ', (length(unique(neg.aligns$seq))/length(unique(seqIn)))*100,'% of sequences')
+  #message('Failed to align', paste0(setdiff(toupper(seqIn), neg.aligns$seq), collapse=','))
+  message('Converting - strand mapping coordinates to + strand..')
+  return(neg.aligns[, .(Guide=seq, align_strand, pos_align_start, pos_align_end, chromosome_name)])  
+  } else {
+    
+   pos.aligns <- mclapply(chrToSearch, function(seqname){
+   
+   subject <- ref[[seqname]]
+   message("Finding all hits in ", strand, " strand of chromosome ", seqname)
+   mindex <- matchPDict(pdict, subject) # fast match but not allowing mismatches
+   matches <- as.data.table(extractAllMatches(subject, mindex))
+    
+   matches[, `:=`(chromosome_name = seqname,
+                   align_strand = "+")]
+  }, mc.cores=nCores) %>% rbindlist()    
+ 
+   neg.aligns <- mclapply(chrToSearch, function(seqname){
+    
+   subject <- reverseComplement(ref[[seqname]])
+   chr_length <- length(subject)
+   
+   message("Finding all hits in - strand of chromosome ", seqname)
+   mindex <- matchPDict(pdict, subject) # fast match but not allowing mismatches
+   matches <- as.data.table(extractAllMatches(subject, mindex))
+    
+   matches[, `:=`(chromosome_name = seqname,
+                  align_strand = '-',
+                  pos_align_start=chr_length - end + 1,
+                  pos_align_end=chr_length - start + 1
+                  )]
+  }, mc.cores=nCores) %>% rbindlist()
+  
+   message('Converting - strand mapping coordinates to + strand..')
+  all.aligns <- rbind(pos.aligns[, .(Guide=seq, align_strand, pos_align_start=start, pos_align_end=end, chromosome_name)],
+                      neg.aligns[, .(Guide=seq, align_strand,  pos_align_start, pos_align_end, chromosome_name)])
+  
+  message('Aligned ', (length(unique(all.aligns$Guide))/length(unique(seqIn)))*100,'% of sequences')
+  #message('Failed to align', paste0(setdiff(toupper(seqIn), all.aligns$Guide), collapse=','))
+  return(all.aligns)
+  }
+}
+
+
+#' use to get the indexs for the start match for each guide
+#' 
+alignGuideToTranscript <- function(guideSeq, transcriptSeq, strand){
+  require(BSgenome.Hsapiens.NCBI.GRCh38)
+  require(parallel)
+  require(Biostrings)
+  
+  transcriptSeq <- DNAString(transcriptSeq)
+  
+  if (is.null(strand) | !toupper(strand) %in% c('SENSE','ANTISENSE')){
+    
+    stop('guide strands must be supplied')
+  } else if (strand == 'antisense'){ 
+    guideSeq <-  PDict(getSeqReverseComplement(guideSeq))
+  } else {
+    
+     guideSeq <-  PDict(guideSeq)
+  }
+  
+  mindex <- matchPDict(guideSeq, transcriptSeq) # fast match but not allowing mismatches
+  matches <- as.data.table(extractAllMatches(transcriptSeq, mindex))
+  
+  
+   
+  return(matches[,.(start,end)])
+}
+
+#' See below
+#' 
+alignCodingToTranscript <- function(codingSeq, transcriptSeq){
+  require(BSgenome.Hsapiens.NCBI.GRCh38)
+  require(parallel)
+  
+  codingSeq <- DNAString(codingSeq)
+  transcriptSeq <- DNAString(transcriptSeq)
+  
+  # align whole string in pattern/query to substring to db; good for searching mature mRNA, but may need to adjust for intron-exon seqs...
+  align.out <-  pairwiseAlignment(codingSeq, transcriptSeq, type='global-local') 
+  
+  return(align.out)
+  
+}
+
+
+#' input is output from the fetchExtraGeneFeatures and fetchGeneFeatures
+#' Todo: create one version of this function with everything we need...
+#' this function takes output of fetch* and identifies the genome positions for th mature transcript (exons + utr)
+#' 
+getEnsemblTranscriptGenomeIndices <- function(dt, gene){
+
+  if (!'strand' %in% colnames(dt))
+    stop('strand column not found in input datatable. must be specified for extracting exon boundaries')
+  
+  message('extracting ', gene, ' info from input datatable')
+  subdt <- dt[external_gene_name == gene & !is.na(cds_start) & !is.na(cds_end)] %>% 
+    .[order(exon_chrom_start)]
+  
+  # for the start of thecoding seq, just take the indices from the end of 5' utr to the exon boundary; for 3' take exon start to 3'utr start
+  message('extracting indicies from coding regions form exon boundaries')
+  
+  if (as.character(unique(subdt$strand)) == '1') {
+    
+    message(gene, 'Extracting indices for + strand gene..')
+    coding_start <- subdt[!is.na(`5_utr_end`) & !is.na(cds_start), seq((`5_utr_end`+1), exon_chrom_end, 1)]
+    coding_end <- subdt[!is.na(`3_utr_start`)  & !is.na(cds_end), seq(exon_chrom_start, (`3_utr_start`-1), 1)]
+    
+    # order by cds start subset to the exons that match the cds boundaries; these are the internal exons (no 5' 3' utr)
+    subdt <- subdt[((cds_end - cds_start) == (exon_chrom_end - exon_chrom_start)),] %>% 
+      .[order(cds_start)]
+    
+    # get indicies of internal exon bases
+    exon.indx <- lapply(1:nrow(subdt), function(x){
+      (subdt[x, seq(exon_chrom_start, exon_chrom_end, 1)])
+    }) %>% 
+    unlist()
+    
+    #combine with 5' start and 3'stop
+    exon.indx <-c(coding_start, exon.indx, coding_end)
+    return(exon.indx)
+
+  } else if (as.character(unique(subdt$strand)) == '-1') {
+   
+    message(gene, 'Extracting indices for - strand gene..')
+
+    # as rev stranded, take exon region before utr    
+    coding_start <- subdt[!is.na(`5_utr_start`) & !is.na(cds_start), seq(exon_chrom_start,`5_utr_start`-1, 1)]
+    coding_end <- subdt[!is.na(`3_utr_start`) & !is.na(cds_end),  seq(`3_utr_end`+1, exon_chrom_end, 1)]
+    
+    # order by cds start subset to the exons that match the cds boundaries; these are the internal exons (no 5' 3' utr)
+    subdt <- subdt[((cds_end - cds_start) == (exon_chrom_end - exon_chrom_start)),] %>% 
+      .[order(cds_start)]
+    
+    # get indicies of internal exon bases
+    # need to reverse order for - strand gene
+    exon.indx <- lapply(1:nrow(subdt), function(x){
+      (subdt[x, seq(exon_chrom_start, exon_chrom_end, 1)])
+    }) %>% 
+      rev() %>% 
+      unlist()
+    
+    #combine with 5' start and 3'stop
+    exon.indx <-c(coding_end, exon.indx, coding_start)
+    return(exon.indx)
+
+  } else { 
+    
+    stop('strand must be specified as "1" or "-1"') 
+  }
+}
+```
+
+Align the guides from the sgrna.dt and align to the reference genome 
+
+```{r}
+align.dt <- alignToReference(seqIn = sgrna.dt$Guide, ref='GRCH38', chrToSearch = 'all', strand='both', nCores = 2)
+
+# N offtarget hits (perfect per guide)
+nHits.dt <- align.dt[,.(nHits = .N), by=Guide]
+
+#fwrite(nHits.dt, ScriptAndDatedFileName('siteHitsperGuide.txt'))
+
+message('Distribution of perfect matches per guide in GRCh38 genome')
+plot(table(nHits.dt$nHits))
+```
+
+```{r}
+message('merging gene level annotation and alignment output')
+
+setkey(anno.dt, start_position, end_position)
+all(key(anno.dt) == c("start_position","end_position"))
+
+# map to gene annotation if guide and gene intervals overlap (guides must be within gene boundaries)
+# drop rows with no overlap (just filter to genes)
+# we want to drop guides that dont match and also
+# mayeb run on align.out.dt to avoid creating a new copy....
+guides.dt <- foverlaps(x=align.dt, y=anno.dt, by.x=c('pos_align_start', 'pos_align_end'), nomatch=0, type='within') %>% 
+  .[chromosome_name == i.chromosome_name, .(guide=Guide, chr=as.character(chromosome_name), gene=external_gene_name, strand, ensembl_tID=ensembl_transcript_id, 
+                                            guide_strand=getGuideStrand(geneStrand = strand, guideStrand = align_strand), pos_align_start, pos_align_end, gene_start=start_position, gene_end=end_position, transcript_start, transcript_end)]
+
+# sanity check to find duplicated guides
+if (length(duplicated(guides.dt$Guide)) != 0)
+  print('Following guides perfectly aligned to more than one gene\n', paste0(guides.dt$Guide[duplicated(guides.dt$Guide)], collapse=','))
+  print('Consider removing from further analyisis')
+  
+```
+
+Now that we have our alignments, we want to identify edits in our guide sequences and convert these to our coding sequences
+
+Bemax = T-C
+Abe8e = A-G
+
+```{r}
+# get the edits
+guides.dt[, abe8e :=  getCodingSequenceEdit(guide, guideStrand = guide_strand, editor='abe8e', window_start = 4, window_end=8), by=.I]
+guides.dt[, bemax :=  getCodingSequenceEdit(guide, guideStrand = guide_strand, editor='bemax', window_start = 4, window_end=8), by=.I]
+
+# melt the datatable to long format so we have two records per guide
+guides.dt <- melt(guides.dt, measure.vars = c("abe8e","bemax"))
+setnames(guides.dt, old=c('variable', 'value'), new=c('editor', 'edited_coding_sequence'))
+```
+
+**Note**
+Edit indexes are reported on the coding strand (think it makes more sense to highlight position on the coding gene, but subject to change)
+```{r}
+#guides.ori <- copy(guides.dt)
+guides.dt <- guides.ori
+
+guides.dt[, c('coding_edit_index', 'editor', 'ref', 'alt') := findEditIndex(Seq=guide, editSeq=edited_coding_sequence, guideStrand = guide_strand), by=.I]
+
+# inspect the output; all the guide_strand == sense looks good (gene + or -)
+guides.dt[strand == -1 & guide_strand == 'sense',.(guide, edited_coding_sequence, editor, coding_edit_index, ref, alt)][editor == 'bemax',.(ref, alt)]
+
+# for antisense the edits look correct (the complement of strand edits)
+# looks good! look for the edits in guide, then the revComp of edit base will match the index
+guides.dt[strand == -1 & guide_strand == 'antisense',.(guide, guide_strand, edited_coding_sequence, editor, coding_edit_index, ref, alt)][editor == 'abe8e',.(ref, alt)] %>%  unique()
+```
+output validation:
+If editor is abe8e, there should be an A in base4-8 rgardless of strand
+Same for bemax; T in base 4-8
+```{r}
+guides.dt[editor == 'abe8e' & guide_strand == 'sense',] #2725
+guides.dt[editor == 'abe8e' & guide_strand == 'sense',] %>% 
+            .[grepl('A', substr(guide,4,8))]
+
+guides.dt[editor == 'abe8e' & guide_strand == 'antisense',] #2632
+guides.dt[editor == 'abe8e' & guide_strand == 'antisense',]  %>% 
+            .[grepl('A', substr(guide,4,8)),]
+
+# bemax is correct too its a C to a T edit
+guides.dt[editor == 'bemax' & guide_strand == 'sense',] #3064
+guides.dt[editor == 'bemax' & guide_strand == 'sense',] %>% 
+            .[grepl('C', substr(guide,4,8))]
+
+guides.dt[editor == 'bemax' & guide_strand == 'antisense',] #3064
+guides.dt[editor == 'bemax' & guide_strand == 'antisense',]  %>% 
+            .[grepl('C', substr(guide,4,8)),]
+```
+
+**Note**
+Seems the issue with the guides is genuine. Many of these guides do not a have recognition site for both editors.. we need to remove these guides from the pool as just adding noise and multiple testing burden to the data..
+Could relabel non-targeting/abe8e only/bemax only  and see FC of this group?
+```{r}
+#fwrite(guides.dt[guide %in% guides.dt[editor == '',guide] & editor != '', .(guide, edited_coding_sequence, detected_editor = editor, missing_editor = ifelse(editor == 'bemax', 'abe8e', 'bemax'), chr, gene, strand, guide_strand, coding_edit_index, ref, alt)], ScriptAndDatedFileName('nohit.guides.csv'))
+
+# all bemax editors on pos strand
+# see if we can grep A in window 
+
+guides.dt[guide %in% guides.dt[editor == '',guide] & editor != '' & editor != 'abe8e' & guide_strand == 'sense', ] # 838 guides for bemax
+guides.dt[guide %in% guides.dt[editor == '',guide] & editor != '' & editor != 'abe8e' & guide_strand == 'sense', ] %>%   # none of these guides  hava a recognition site for abe8e
+  .[grepl('A', substr(guide, 4, 8))]
+```
+
+**Examples of HGVS nomemclature**
+c.76A>C denotes that at nucleotide 76 an A is changed to a C
+c.-14G>C denotes a G to C substitution 14 nucleotides 5' of the ATG translation initiation codon
+c.88+1G>T denotes the G to T substitution at nucleotide +1 of an intron (in the coding DNA positioned between nucleotides 88 and 89) splice donor: first positon of intron
+c.89-2A>C denotes the A to C substitution at nucleotide -2 of an intron (in the coding DNA positioned between nucleotides 88 and 89) - splice acceptor at 2 nuc upstream of intron-exon boundary
+c.*46T>A denotes a T to A substitution 46 nucleotides 3' of the translation termination codon
+the description c.76_77delinsTT is preferred over c.[76A>T; 77G>T]
+
+Now want to merge this datatable with our clinvar database
+In general the format is used for variants changing the +1, +2, -2 and -1 position of an intron, i.e. affecting the GT splice donor and AG splice acceptor site
+
+
+Tidy the clinvar database and fix the nomenclature 
+
+**Todo** 
+For the anno.dt and clinvar function, use biomart to pull in the ncbi anno for ensmebl mapping and filter clinvar resuls by this set
+```{r}
+# first, we need to split out the edit position 
+message('Tidying with clinvar database..')
+
+# these look like non-coding mutations
+# only looking at substitutions as specifying '>'
+# something like: 	NC_000010.11:g.87863548G>
+clinvar.edit.dt <- clinvar.dt[Assembly == 'GRCh38', .(chr=as.character(Chromosome), 
+                                  gene=GeneSymbol,
+                                  hgvs=Name,
+                                  position=Start,
+                                  reference=str_extract(clinvar.dt$Name, '[A-Z0-9//.//_]+(?=[(:])'),  #using this as may want to filter clinvar downstream
+                                  nuc_site=str_extract(clinvar.dt$Name, '(?<=:[gc].)[0-9]+'),      #str_extract(clinvar.dt$Name, '(?<=:[gc].)[0-9+-//*]+[ACGT]>[ACGT]'), origin=Origin,
+                                  ref=ReferenceAlleleVCF,
+                                  alt=AlternateAlleleVCF,
+                                  prot_edit=str_extract(clinvar.dt$Name, '(?<=p\\.)[A-Za-z0-9]+'),
+                                  clinicalSignificance=ClinicalSignificance)]
+
+clinvar.edit.dt[, c('ref_prot', 'alt_prot') := tstrsplit(prot_edit, '[0-9]+')]
+clinvar.edit.dt[, prot_site := gsub('[A-Za-z]+','',prot_edit)]
+# handle silent mutations
+clinvar.edit.dt[grepl('[=]', hgvs), alt_prot := ref_prot]
+
+# classifiy mutation types
+clinvar.edit.dt[, mutant_type := ifelse(ref_prot == alt_prot, 'silent',
+                                                      ifelse(prot_site == 1 & alt_prot != 'Met', 'nonsense',
+                                                             ifelse(ref_prot != alt_prot, 'missense', 'utr')))]
+
+# for splice acceptor/donor considering 1/2  bases upstream/downstream of splicesite
+clinvar.edit.dt[is.na(mutant_type), mutant_type := ifelse(grepl(':[gc].[0-9]+[+][12]{1}[ACTG]', hgvs), 'splice_donor', 
+                                                          ifelse(grepl(':[gc].[0-9]+[-][12]{1}[ACTG]', hgvs), 'splice_acceptor', 'utr'))]
+                                                                                 
+                                          
+
+
+message('Filtering clinvar for edits identified in ensembl transcripts...')
+
+# the transcripts oi are NM_000314.8 PTEN NM_006218.4 PIK3CA NM_004958.4 MTOR and NM_001382430.1 AKT1
+clinvar.edit.dt <- clinvar.edit.dt[reference %in% c('NM_000314.8', 'NM_006218.4', 'NM_001382430.1', 'NM_004958.4'),] 
+```
+Comparing clinvar edits to seqDB mappings for sanity check
+
+For `coding_seq`
+- On + strand genes the edits match
+- On - strand genes the edits are complement of clinvar (edits reported on + strand)
+```{r}
+# for + strand genes perfect match
+seq.db[['PTEN']]$coding_seq[which(seq.db[['PTEN']]$coding_idx == 510)]
+
+# cfor -ve gene; this will be the complement base 
+seq.db[['MTOR']]$coding_seq[which(seq.db[['MTOR']]$coding_idx == 4791)]
+```
+For `transcript_seq`
+- Extract coding seq by matching genome ref (was this necessary? Could I just have used the entire transcript)
+- On + strands the edits match
+- On - strand genes, the base matches the + strand base (the complement of the reference)
+
+Remember this only returns coding edits, but can build it smarter to consider exon/intron boundary proximity to specify as splice acceptor/donor (donor GU bases follows exon, acceptor AG bases before exon)
+```{r}
+#' Function to take as input a genomic position and return the reference nucleotide at this location
+#' By default returns the + strand nucleotide; but returnComplement flexibility for -ve strand genes and antisense guides
+#' WARNING this only returns coding edits at the moment; needs to be adjusted; returns UTR if not in coding seq
+#' Maybe revisit and fix mapping; we want edits relative to the gene rather than the reference
+getReferenceNucleotide <- function(editPosition, seqDB=NULL, gene=NULL, strand=NULL, returnComplement=FALSE){
+  
+  seqDB <- seqDB[[gene]]
+  
+  # if the edit position overlaps non-coding region, return 'utr'
+  ref.base <- ifelse(as.character(strand) == '1', seqDB$coding_seq[which(seqDB$genome_idx == editPosition)],
+                     strsplit(getSeqReverseComplement(paste(seqDB$coding_seq, collapse='')), '')[[1]][which(seqDB$genome_idx == editPosition)]
+                     )
+
+  if (is.na(ref.base)){
+    return('utr')
+  } else if (returnComplement==TRUE){
+    return(as.character(complement(DNAString(ref.base))))
+  }
+    return(ref.base)
+}
+```
+
+Function to capture reference codon,
+*Notes* Works well but need to make sure edits are captured on the coding strand to allow comparability
+*Notes* Adjust so splice acceptor/donors are deteced `use` diff command on the genome idx
+  Detect the splice set per gene; basically pull out genomic loci 2bp+ and 2bp- than the 
+
+reference peptide; alt codon and alt peptide
+So far have the references; now need to consider how to map the edits to this;
+Once the edit is mapped correctly it should be easy to translate using BioString functions
+```{r}
+#' Function to capture reference codon
+#' Give a nucleotide site (genome positon), first, check if this site overlaps coding, if not return 'utr', 
+#' Issue here with negative gene is I bet the index is in reverse...
+getReferenceCodons <- function(editPosition, seqDB, gene, strand){
+  
+  seqDB <- seqDB[[gene]]
+  
+  # if the edit position overlaps non-coding region, return 'utr'
+  ref.base <- ifelse(as.character(strand) == '1', seqDB$coding_seq[which(seqDB$genome_idx == editPosition)],
+                     strsplit(getSeqReverseComplement(paste(seqDB$coding_seq, collapse='')), '')[[1]][which(seqDB$genome_idx == editPosition)]
+                     )
+  
+  if (is.na(ref.base)){
+  #  message('position not found in cds')
+  #  message('finding location of edit')
+    
+    if (editPosition %between% c(min(seqDB$genome_idx), max(seqDB$genome_idx))){
+      return(list(peptide='',
+                  codon='intron'))
+      
+    } else {
+            return(list(peptide='', 
+                        codon='utr'))
+    }
+    
+  } else if (as.character(strand) == '-1'){
+    ref.base <- as.character(complement(DNAString(ref.base)))
+  }
+ 
+  #message('Finding codon and reference peptide...')
+  # relative position of edit in coding seq
+  idx <- which(seqDB$genome_idx == editPosition)
+  
+  # get mapping index between codon & peptide seqs; consider strandedness for -ve sense genes
+  mapping.idx <- ifelse(as.character(strand) == '1', seqDB$translate_idx[idx],
+                        seqDB$translate_idx[(length(seqDB$translate_idx) - idx) + 1])
+                      #  seqDB$translate_idx[length(seqDB$translate_idx) - idx])
+                      
+    return(list(peptide=seqDB$peptide_seq[mapping.idx], 
+              codon=paste(seqDB$coding_seq[seqDB$translate_idx == mapping.idx], collapse='')))
+}
+
+
+#' modify the coding strand directly; use the edit base to 'insert' the edit at that site, then use the bioStrings function to pull it out
+#' Other option is to pull out the codon and map the 
+getMutatedCodons <- function(editPosition, seqDB, gene, strand, ref, alt){
+  
+  seqDB <- seqDB[[gene]]
+  
+   # get relative position of edit in coding seq
+  idx <- which(seqDB$genome_idx == editPosition)
+  
+  # if the edit position overlaps non-coding region, return 'utr'
+  ref.base <- ifelse(as.character(strand) == '1', seqDB$coding_seq[idx],
+                     strsplit(getSeqReverseComplement(paste(seqDB$coding_seq, collapse='')), '')[[1]][idx]
+                     )
+  
+  if (is.na(ref.base)){
+ #   message('position not found in cds')
+#    message('finding location of edit')
+    
+    if (editPosition %between% c(min(seqDB$genome_idx), max(seqDB$genome_idx))){
+      return(list(peptide='',
+                  codon='intron'))
+      
+    } else {
+            return(list(peptide='',
+                        codon='utr'))
+    }
+    
+  } else if (as.character(strand) == '-1'){
+    ref.base <- as.character(complement(DNAString(ref.base)))
+  }
+  
+  #message('Finding codon and reference peptide...')
+  
+  # first check the bases match
+  if (ref.base != ref)
+    stop('mismatch between reference (', ref, ') and base detected by genomic alignment (', ref.base, ')')
+
+  edited.seq <- seqDB$coding_seq
+  
+  if (as.character(strand) == '1'){
+    edited.seq[idx] <- alt
+  } else {
+    # handle strandedness
+    #edited.seq[length(seqDB$translate_idx) - idx] <- alt
+    edited.seq[(length(seqDB$translate_idx) - idx) + 1] <- alt
+  }
+  
+     
+  # get mapping index between codon & peptide seqs; consider strandedness for -ve sense genes
+  mapping.idx <- ifelse(as.character(strand) == '1', seqDB$translate_idx[idx],
+                        seqDB$translate_idx[(length(seqDB$translate_idx) - idx) + 1])
+                       # seqDB$translate_idx[length(seqDB$translate_idx) - idx]) because index is 
+
+  # get results
+  codon <- paste(edited.seq[seqDB$translate_idx == mapping.idx], collapse='')
+  #ref.codon <- paste(seqDB$coding_seq[seqDB$translate_idx == mapping.idx], collapse='')
+  #ref.prot <-  as.character(translate(DNAString(paste(ref.codon, collapse=''))))
+  #print(ref.prot); print(ref.codon)
+
+  peptide <- as.character(translate(DNAString(paste(codon, collapse=''))))
+  
+  return(list(peptide=peptide,
+              codon=codon
+              ))
+}
+```
+
+Ok for guides, lets check the ref and alt bases and ensure these edits are reported on the coding strand. If not, we will need to modify this 
+Donors have a G[UT] at exon-intron interface; look for this
+Acceptors have a [AG] at intron-exon interface'
+For splice donor in clinvar look for 
+```{r}
+# donor +1G or +2T
+clinvar.edit.dt[grep('[+][12]{1}[ACGT]', hgvs)]
+clinvar.edit.dt[grep('[+]1[G]', hgvs)]
+
+# acceptor -1G r -2A
+clinvar.edit.dt[grep('[-][12]{1}[ACGT]', hgvs)]
+clinvar.edit.dt[grep('[-][12]{1}[AG]', hgvs),.N, mutant_type]
+
+```
+
+Clinvar annotated guides
+All our edits are on the coding strand, clinvar uses edits on the + ref strand, so need to adjust for merging;
+After we merge, we can collapse to guides again
+
+
+```{r}
+#guides.expanded[, `:=`(GRCh38_ref = '', GRCh38_alt = '')]
+guides.expanded[, `:=`(GRCh38_ref = ifelse(strand == 1 & editor != '', ref,
+                                           ifelse(strand == -1 & editor != '', as.character(complement(DNAString(ref))), '')),
+                       GRCh38_alt = ifelse(strand == 1 & editor != '', alt,
+                                           ifelse(strand == -1 & editor != '', as.character(complement(DNAString(alt))), '')) ), by=.I]
+
+#fwrite(guides.expanded, ScriptAndDatedFileName('guides.GRCh38.anno.txt'))
+guides.expanded <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/110724_annotateCRISPRguides_Functions_data/2024_11_14_guides.GRCh38.anno.txt')
+guides.expanded[, chr := as.character(chr)]
+```
+Merge with clinvar, and then collapse rows to guide/editor
+Using chr,gene,pos, ref and alt
+```{r}
+message('Merging guide info with clinvar data')
+#guides.expanded[,.(guide, guide_strand, chr, gene, ensembl_tID, strand, transcript_start, transcript_end, edited_coding_sequence, coding_edit_index, GRCh38_position=genome_index, coding_ref=ref, coding_alt=alt, ref=GRCh38_ref, alt=GRCh38_alt)]
+
+# this is just the edges that overlap
+merge.dt <- merge(x=guides.expanded[,.(guide, guide_strand, chr, gene, ensembl_tID, strand, transcript_start, transcript_end, editor, edited_coding_sequence, coding_edit_index, position=genome_index, coding_ref=ref, coding_alt=alt, ref=GRCh38_ref, alt=GRCh38_alt)], y=clinvar.edit.dt, by=c('chr', 'gene', 'position', 'ref', 'alt'))
+
+#fwrite(merge.dt, ScriptAndDatedFileName('guides.clinvar.anno.long.txt'))
+message('Collapsing edits to each guide/editor combo')
+
+merge.collapsed.dt <- merge.dt[, lapply(.SD, function(x) paste(x, collapse=';')), .SDcols=c('position', 'ref', 'alt', 'coding_edit_index', 'coding_ref', 'coding_alt', 'hgvs', 'nuc_site', 'prot_edit', 'clinicalSignificance', 'ref_prot', 'alt_prot', 'prot_site', 'mutant_type'), by=.(chr, gene, ensembl_tID,  strand, guide, guide_strand, editor)] %>%  
+  unique()
+
+#fwrite(merge.collapsed.dt, ScriptAndDatedFileName('guides.clinvar.anno.collapsed.txt'))
+```
+
+Larger overlap set; just over  chr,gene,pos, ref 
+Idea here is if record in clinvar, perhaps the site itself is essential rather than the exact edit
+
+```{r}
+#guides.expanded[,.(guide, guide_strand, chr, gene, ensembl_tID, strand, transcript_start, transcript_end, edited_coding_sequence, coding_edit_index, GRCh38_position=genome_index, coding_ref=ref, coding_alt=alt, ref=GRCh38_ref, alt=GRCh38_alt)]
+
+# this is just the edges that overlap
+merge.dt <- merge(x=guides.expanded[,.(guide, guide_strand, chr, gene, ensembl_tID, strand, transcript_start, transcript_end, editor, edited_coding_sequence, coding_edit_index, position=genome_index, coding_ref=ref, coding_alt=alt, ref=GRCh38_ref, alt=GRCh38_alt)], y=clinvar.edit.dt, by=c('chr', 'gene', 'position', 'ref'))
+
+#fwrite(merge.dt, ScriptAndDatedFileName('guides.clinvar.anno.matchRefPositionOnly.long.txt'))
+
+message('Collapsing edits to each guide/editor combo')
+
+merge.collapsed.dt <- merge.dt[, lapply(.SD, function(x) paste(x, collapse=';')), .SDcols=c('position', 'ref', 'coding_edit_index', 'coding_ref', 'coding_alt', 'hgvs', 'nuc_site', 'prot_edit', 'clinicalSignificance', 'ref_prot', 'alt_prot', 'prot_site', 'mutant_type'), by=.(chr, gene, ensembl_tID,  strand, guide, guide_strand, editor)] %>%  
+  unique()
+
+#fwrite(merge.collapsed.dt, ScriptAndDatedFileName('guides.clinvar.anno.matchRefPositionOnly.collapsed.txt'))
+```
+
+Now we want to call edits in our guides and annotate the edits based on the mutation
+```{r}
+message('Annotating reference codons and proteins in our data')
+
+guides.expanded[, c('ref_peptide', 'ref_codon', 'alt_peptide', 'alt_codon') := '']
+guides.expanded[editor != '', c('ref_peptide', 'ref_codon') := getReferenceCodons(genome_index, seqDB = seq.db, gene=gene, strand=strand), by=.I]
+guides.expanded[editor != '', c('alt_peptide', 'alt_codon') := getMutatedCodons(genome_index, seqDB = seq.db, gene=gene, strand=strand, ref = ref, alt = alt), by=.I]
+```
+Get the positions of the nucelotide and peptide bases within the genes
+```{r}
+message('Annotating positions')
+guides.expanded[editor != '', c('nucelotide_position', 'peptide_position') := getNucleotideandPeptidePosition(GRCh38_position = genome_index, seqDB = seq.db, gene=gene, strand=strand), by=.I]
+```
+
+
+Validate modifications using clinvar dataset; take one from each gene
+```{r}
+# random sampel of one per gene of the overlap groups
+clinvar.edit.dt[position %in% unique(guides.expanded$genome_index)][, .SD[sample(.N,1)], by=gene]
+```
+
+validate the set
+```{r}
+# all look good; ref bases match and so do available bases for clinvar
+# validate this set
+guides.expanded[genome_index %in% c(87933030, 179219634,104773972, 11117097)]
+```
+
+
+Collapse the records to one per guide/row
+Drop the guides with no edits in the window 
+
+```{r}
+#fwrite(guides.expanded, ScriptAndDatedFileName('guides.mutant.anno.long.txt'))
+guides.expanded <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/110724_annotateCRISPRguides_Functions_data/2024_11_14_guides.mutant.anno.long.txt')
+
+# just drop the non-edited guides from the different cas9 sets
+guides.expanded <- guides.expanded[editor != '',]
+message('Detecting edits at exon-intron boundaries...')
+
+guides.expanded[, splice.site := annotateSpliceSites(editPosition = genome_index, seqDB = seq.db, gene=gene, strand=strand), by=.I]
+
+# sanity check to see if the same sites in clinvar are annotated the same...
+clinvar.edit.dt[mutant_type %like% 'splice_donor' & position %in% unique(guides.expanded$genome_index)][, .SD[sample(.N,1)], by=gene][,.(gene,hgvs,position,mutant_type)]
+clinvar.edit.dt[mutant_type %like% 'splice_acceptor' & position %in% unique(guides.expanded$genome_index)][, .SD[sample(.N,1)], by=gene][,.(gene,hgvs,position,mutant_type)]
+
+# looks good
+guides.expanded[genome_index %in% c(87933253, 104772364, 11139532,179201542)]
+guides.expanded[genome_index %in% c(87952116,11210907,104773981)]
+```
+Annotate the mutant type 
+*Todo* consider utr and intron seperately
+Is it concerning most of our edits are missense? or is that ok?
+```{r}
+guides.expanded[, mutant_type := splice.site]
+guides.expanded[mutant_type == '' & ref_peptide != '',  mutant_type := ifelse(alt_peptide == '*', 'nonsense',
+                                         ifelse(ref_peptide != alt_peptide, 'missense',
+                                                ifelse(ref_peptide == alt_peptide, 'silent', mutant_type)))] #dont count 
+                                                                
+guides.expanded[mutant_type == '', mutant_type := ref_codon]
+```
+Collapse guides and save output
+```{r}
+message('collapsing guides and edits')
+
+guides.collapsed <- guides.expanded %>% 
+  .[, lapply(.SD, function(x) paste(x, collapse=';')), .SDcols=c('genome_index', 'coding_edit_index', 'ref', 'alt', 'ref_codon','alt_codon', 'ref_peptide', 'alt_peptide','GRCh38_ref', 'GRCh38_alt', 'splice.site', 'mutant_type'), by=.(chr, gene, strand, gene_start, gene_end, transcript_start, transcript_end, ensembl_tID, guide, guide_strand, editor)] %>%  
+  unique()
+```
+Make a column with the most severe edit (or most common?)
+
+```{r}
+mut.rank.dt <- data.table(Consequence =c('splice-acceptor',
+                        'splice-donor',
+                        'nonsense',
+                        'missense',
+                        'utr',
+                        'intron',
+                        'silent'))
+
+
+guides.collapsed[, most_severe_mutant := getMostSevereVariant(mutant_type, mut.rank.dt, verbose = F), by=.I]
+guides.collapsed[, most_common_mutant := getMostCommonVariant(mutant_type, mut.rank.dt, verbose = F), by=.I]
+```
+
+Write out the collapsed data and invesitgate DE and plots on Mondat
+
+```{r}
+#fwrite(guides.collapsed, ScriptAndDatedFileName('guides.mutant.anno.collapsed.txt'))
+```
+
+
+```{r}
+
+#' Identify splice sites based on genomic annotation
+#' For now will return 'acceptor', 'donor' or ''
+#' Assumption here is all all positions supplied are edited (no checks yet but could include later..)
+#' Detects if edited bases are located are located within 2bp of intron-exon boundary at 'AG and GT motif at 3' intron end and 5' intron start
+#' TODO currently relying on bioMArt exon boundary annotations but maybe pull out the intron bases from the GRCh38 to ensure match to AG GT motif; 
+
+annotateSpliceSites <-  function(editPosition, seqDB, gene, strand){
+  
+  seqDB <- seqDB[[gene]]
+
+  # find indices of 5' and 3' intron boundaries
+  # naming convention for +-strand genes relative to reference
+  intron_3prime.idx <- which(diff(seqDB$genome_idx) > 1) + 1 # splice acceptor set
+  intron_5prime.idx <- which(diff(seqDB$genome_idx) > 1) # splice donor set
+  
+  intron_3prime.sites <- seqDB$genome_idx[intron_3prime.idx]
+  intron_5prime.sites <- seqDB$genome_idx[intron_5prime.idx]
+  
+  # get intron flanking sites 
+  intron_3prime_flanking <- lapply(intron_3prime.sites, function(x) seq(x-1, x-2)) %>% 
+    unlist()
+  intron_5prime_flanking <- lapply(intron_5prime.sites, function(x) seq(x+1, x+2)) %>% 
+    unlist()
+  
+  # if our edit position is in this set
+  if (!editPosition %in% c(intron_3prime_flanking, intron_5prime_flanking)){
+    
+    #message('edit not at exon-intron boundary')
+    return('')    
+  }
+  # consider strandness on returning results
+  ifelse(editPosition %in% intron_3prime_flanking & as.character(strand) == '1',  return('splice-acceptor'), 
+         ifelse(editPosition %in% intron_5prime_flanking & as.character(strand) == '-1', return('splice-acceptor'),
+                 ifelse(editPosition %in% intron_5prime_flanking & as.character(strand) == '1', return('splice-donor'), 'splice-donor')))
+
+}
+
+# testing function... seems decent so far; for +sense it hits botht the AG and GT motifs only
+annotateSpliceSites(87931091, seqDB=seq.db, gene='PTEN', strand='1')
+annotateSpliceSites(87952117, seqDB=seq.db, gene='PTEN', strand='1')
+
+annotateSpliceSites(11256194, seqDB=seq.db, gene='MTOR', strand='-1')
+annotateSpliceSites(11199540, seqDB=seq.db, gene='MTOR', strand='-1')
+
+# motifs look good and only these two modified for both +sense and -sense
+
+ref[[10]][87931090:87931091]
+ref[[10]][87952116:87952117]
+reverseComplement(ref[[1]][11256193:11256194])
+reverseComplement(ref[[1]][11199539:11199540])
+
+# it also doesnt count missense as splice edits
+annotateSpliceSites(11106535, seqDB=seq.db, gene='MTOR', strand='-1')
+```
+
+splice site annotation testing
+
+```{r}
+clinvar.edit.dt[grep('[-]', hgvs) & mutant_type %like% 'splice' & gene == 'MTOR', .(gene,position, mutant_type)]
+clinvar.edit.dt
+```
+
+
+*Not used*
+
+Function testing 
++ strand genes look good
+*Todo* For splice sites, thinking to take the diff of the genome_idx, when we have index, find if the pos is within 2bp of splice donor/acceptor, if yes annotate as this
+
+```{r}
+# first fucntion works well for + and - genes
+getReferenceNucleotide(87933145, seqDB = seq.db, gene='PTEN', strand='1')
+getReferenceNucleotide(11144729, seqDB = seq.db, gene='MTOR', strand='-1', returnComplement = T) # -ve strand genes
+
+
+# reference codons and peptide.. looks good
+# atm not annotating splice... leave as is for now
+# use the diff function to annotate the splice site junctions, test if its on the left or rigth hand side
+getReferenceCodons(87933145, seqDB = seq.db, gene='PTEN', strand='1')
+getReferenceCodons(11144735, seqDB = seq.db, gene='MTOR', strand='-1')
+
+
+# look at splicing adjustments both flagged as intronic or utr, ok for now but needs refinement...
+getReferenceCodons(87933253, seqDB = seq.db, gene='PTEN', strand='1')
+getReferenceCodons(11212411, seqDB = seq.db, gene='MTOR', strand='-1') #looks good
+getReferenceCodons(1, seqDB = seq.db, gene='PTEN', strand='1')
+getReferenceCodons(1, seqDB = seq.db, gene='MTOR', strand='-1')
+
+# test the mutation functions
+# use missense, silent and nonsense as test for genes on both strands
+getMutatedCodons(87957915, seqDB = seq.db, gene='PTEN', strand='1', ref='C', alt='T') #termination
+getMutatedCodons(87952135, seqDB = seq.db, gene='PTEN', strand='1', ref='T', alt='A') #missnese
+getMutatedCodons(87931070, seqDB = seq.db, gene='PTEN', strand='1', ref='C', alt='T') #silent
+#looks good
+getMutatedCodons(11117074, seqDB = seq.db, gene='MTOR', strand='-1', ref='C', alt='T') #termination
+getMutatedCodons(11157174, seqDB = seq.db, gene='MTOR', strand='-1', ref='T', alt='C') #missense
+getMutatedCodons(11112853, seqDB = seq.db, gene='MTOR', strand='-1', ref='C', alt='T') #silent
+```
+```{r}
+clinvar.edit.dt[gene == 'PTEN',] # looks good for ref and mut functions of all types. Now lets try below...
+clinvar.edit.dt[gene == 'MTOR',]
+```
+
+
+
+
+
+
+
+Now implement the substitutions 
+Find the ref base and the altered position (want to focus on gene edit here)
+Firs tget working with simplified set-up
+```{r}
+getMutatedCodons(11144735, seqDB = seq.db, gene='MTOR', strand='-1', ref='G', alt='T')
+
+# works great, but we need to make sure our edits are on the coding strand...
+getReferenceCodons(11144735, seqDB = seq.db, gene='MTOR', strand='-1')
+# how would you get this working for one base?
+seq.db[['MTOR']]
+```
+
+
+
+**Todo**
+Modify the 
+
+#inspecting the refSeq sequences
+seq.db[['PTEN']]$transcript_seq[which(seq.db[['PTEN']]$genome_idx == 87933145)]
+
+
+seq.db[['PTEN']]$transcript_seq[which(seq.db[['PTEN']]$genome_idx %in% seq(87933145, 87933150,1))]
+seq.db[['PTEN']]$coding_seq[which(seq.db[['PTEN']]$coding_idx %in% seq(1, 3, 1))] # this is ATG
+
+
+
+
+seq.db[['PTEN']] 
+seq.db[['PTEN']]
+
+clinvar.dt
+```
+We need to add the coding_edit_idx to our transcript start and end sites, and see if these overlap with any hits in clivar DT
+We can match these using the clinvar `position` column, just need to map the coding_edit_index to the sites correctly
+
+```{r}
+message('mapping edit sites to reference')
+message('warning: treating edits as single mutations (not considering combinatorics)')
+
+ #expand to one row per edit; keep all rows with no edits
+guides.expanded <- rbind(guides.dt[, lapply(.SD, function(x) unlist(tstrsplit(x, ";"))), .SDcols = c("coding_edit_index", "ref", "alt"), by = .(guide, chr, gene, strand, ensembl_tID, guide_strand,  gene_start, gene_end, transcript_start, transcript_end, edited_coding_sequence, pos_align_start, pos_align_end, editor)], guides.dt[editor =='', .(guide, chr, gene, strand, ensembl_tID, guide_strand, gene_start, gene_end, transcript_start, transcript_end, edited_coding_sequence, pos_align_start, pos_align_end, editor, coding_edit_index, ref, alt)])
+```
+
+```{r}
+guides.expanded[, genome_index := ifelse(strand == 1 & guide_strand == 'sense', pos_align_start + as.numeric(coding_edit_index) - 1, #sense guide pos gene correct
+                                  ifelse(strand == 1 & guide_strand == 'antisense', pos_align_start + as.numeric(coding_edit_index) - 1, #antisense guide pos gene correct
+                                          ifelse(strand == -1 & guide_strand == 'sense', pos_align_start + (nchar(guide) - as.numeric(coding_edit_index)), # alignments relative to + ref strand ,so consider edit position in rev_comp seq
+                                                 pos_align_start + (nchar(guide) - as.numeric(coding_edit_index)) )))]
+
+
+#fwrite(guides.expanded, ScriptAndDatedFileName('guides_genomeCoords.anno.dt'))
+```
+Definitely tidiest way to do this is to remvoe this alignment step and just use exon sites to map to genomic coordinates, but until I figure out the exon sites cds mapping this is easier at the moment
+
+
+steps
+align guide to refseq
+ask if the edit window sit in the coding region of the gene?
+If not, return na 
+If yes, return the i) ref codon and edit codon
+Determine the type of mutation introduced
+```{r}
+
+translateCodonToPeptide <- function(codonIdx, gene, seqDB){
+  
+  message('Subsetting seqDB to gene ', gene)
+  seqDB <- seqDB[[gene]]
+  
+  codon <- seqDB$coding_seq[seqDB$translate_idx == codonIdx]
+  peptide <- seqDB$peptide_seq[seqDB$peptide_idx == codonIdx]
+  
+  print(codon)
+  print(peptide)
+}
+
+
+
+
+
+
+#' Given a set of guides, their edit base and edit info
+mapPeptideEdits <- function(guide, gene, genome_index, seqDB){
+  
+  # first check if the gene is found in the database
+  if (!gene %in% names(seqDB))
+    stop('Gene "', gene, '" not found in supplied database...Please check gene names')
+  seqDB <- seqDB[[gene]]
+  
+  # align guide to refSeq; look at previous alingments to enusre we are using same stranded info
+  # check if the alignment (or just edit window?) falls in the CDS; if yes, return the referecne codon and the alt codon, if no return nothing
+  # annotate the mutation type; nonsense, missense etc...
+  
+  <- regexpr(guide, paste0(seqDB$transcript_seq, collapse=''))
+  
+  
+}
+
+guides.expanded[1,]
+mapPeptideEdits(guide = 'CTGCAAAAGAAGATATAATC', gene='GD', genome_index = genome_index, seqDB=seq.list)
+```
+```{r}
+seq.list[['MTOR']]
+```
+
+
+Could try GRanges to extract the correct sites
+
+
+# test with seqID that these bases match
+```{r}
+seq.list[['PIK3CA']]$transcript_seq[50446:50449]
+
+seq.list[['PIK3CA']]$transcript_seq
+
+length(seq.list[['PIK3CA']]$transcript_idx)
+```
+
+
+align the guides to each 
+
+```{r}
+anno.dt[external_gene_name == 'MTOR',]$nuc
+
+test <- a(codingSeq = 'CTGCAAAAGAAGATATAATC', transcriptSeq = anno.dt[external_gene_name == 'MTOR',]$nuc)
+test 
+guides.expanded
+
+help("pairwiseAlignment")
+```
+
+
+clinvar table is complete; now we need to match the edits to protein level; identify the reference and substitution
+another reason to consider only single edits is clinvar focuses onn snps, so this is single site mutations; we can collapse multiple sites to one guide afterwards
+```{r}
+# so we have transcript start and transcript end information and position align start and position align end.
+# we want to conver the edit site to genomic coordinates, check the reference base matches expectation, 
+guides.expanded[gene == 'PTEN',]
+
+
+alignGuideToTranscript(guideSeq = guides.expanded[gene == 'MTOR',guide][1], transcriptSeq = anno.dt[external_gene_name == 'PTEN', nuc][1], strand=guides.expanded[gene == 'PTEN',guide_strand][1])
+
+
+
+
+seq.list[['PTEN']]
+seq.list[['PTEN']]$transcript_seq[seq.list[['PTEN']]$transcript]
+guides.expanded[gene == 'PTEN',guide_strand][1]
+
+guides.expanded
+```
+
+
+Before matching the clinvar edits to the guides, the most difficult (and important part of this process will be to identify the start sites for the guides) 
+
+**Todo**
+Match the coding guide sequence against our DB to identify the relevant indices; pull out the edit site in gene the codon, the aa and the relevant indices they correspond to
+**Better option??** 
+Other option: as we know the genome index of the match, could we transform our gene indices into this space and use this to pull out the relevant info?
+Question: if I do this matching do I need to align to the genome? Maybe this is another step
+
+We will use our exon boundaries guide to resolve coding vs transcirpt boundary
+While seq is >= boundary start & <= boundary end, 
+
+```{r}
+#just adding guides id to the data
+guides.dt <- merge(sgrna.dt[, .(guide_id=`Sl No`,guide=Guide)], guides.dt, by='guide')
+
+#we just want to find + gene guides closest to start site...
+guides.dt[, .SD[which.min(pos_align_start)], by=c('gene')]
+
+
+
+# didnt find the guide in the site
+regexpr(paste(seq.list[['PIK3CA']]$coding_seq[324:3530], collapse=''), paste(seq.list[['PIK3CA']]$transcript_seq, collapse=''))
+regexpr('TGTAAAACTTGCAAAGAATC', paste(seq.list[['PIK3CA']]$transcript_seq, collapse=''))
+
+seq.list[['PIK3CA']]$transcript_seq[298:(318-1)]
+
+paste(seq.list[['MTOR']]$transcript_anno[298:(318-1)])
+
+
+# this is a totally different seq, we can either find our index relative to coding and use that, or 
+paste(seq.list[['MTOR']]$coding_seq[298:(318-1)])
+
+paste(seq.list[['MTOR']]$peptide_seq[298:(318-1)])
+
+
+View(seq.list[['MTOR']])
+```
+
+**Testing....**
+
+
+```{r}
+testset.dt <- guides.expanded[guide %in% c('CTGCAAAAGAAGATATAATC', 'CTGATTATATCTTCTTTTGC', #MTOR
+                                      'GCTAACGATCTCTTTGATGA', 'CAGCCACAGGCTCCCAGACA', #PTEN
+                                      'TGTAAAACTTGCAAAGAATC', 'CCCCACAGTTCACCTGATGA', #PIK3CA
+                                      'ACCATGAGCGACGTGGCTAT', 'CACAATAGCCACGTCGCTCA')]
+
+# the alignments are  performed on the + strand
+testset.dt[, genome_idx := ifelse(strand == 1 & guide_strand == 'sense', pos_align_start + as.numeric(coding_edit_index) - 1, #sense guide pos gene correct
+                                  ifelse(strand == 1 & guide_strand == 'antisense', pos_align_start + as.numeric(coding_edit_index) - 1, #antisense guide pos gene correct
+                                          ifelse(strand == -1 & guide_strand == 'sense', pos_align_start + (nchar(guide) - as.numeric(coding_edit_index)), # alignments relative to + ref strand ,so consider edit position in rev_comp seq
+                                                 pos_align_start + (nchar(guide) - as.numeric(coding_edit_index)) )))]
+
+# all pos strand genes look good; sense and antisense
+testset.dt[guide_strand == 'sense' & strand == 1,.(gene, chr, guide, strand, guide_strand, edited_coding_sequence, genome_idx, coding_edit_index, ref, alt, pos_align_start, pos_align_end)] %>% unique()
+
+#  neg gene and sense guide look good
+testset.dt[guide_strand == 'sense' & strand == -1,.(gene, chr, guide, strand, guide_strand, edited_coding_sequence, genome_idx, coding_edit_index,  ref, alt, pos_align_start, pos_align_end)] %>% 
+  unique() %>% 
+  .[1:4,]
+
+#  neg gene and antisense guide
+testset.dt[guide_strand == 'antisense' & strand == -1, .(gene, chr, guide, strand, guide_strand, edited_coding_sequence, genome_idx, coding_edit_index,  ref, alt, pos_align_start, pos_align_end)] %>% 
+  unique() %>% 
+  .[1:4,]
+
+
+#  neg gene and sense guide look good
+testset.dt[guide_strand == 'antisense' & strand == 1,.(gene, chr, guide, strand, guide_strand, edited_coding_sequence, genome_idx, coding_edit_index,  ref, alt, pos_align_start, pos_align_end)] %>% 
+  unique() %>% 
+  .[1:4,]
+
+# testing.. all looks good!
+# testing sense guide on -strand gene; looks good!
+reverseComplement(ref[[1]][11258596:11258615]) # this is our guide for -ve strand; need to take rev comp to get to pos strand
+ref[[1]][11258596:11258615]
+
+reverseComplement(ref[[1]][11258609:11258612]) # this is our guide for -ve strand; need to take rev comp to get to pos strand
+ref[[1]][11258609:11258612]
+
+# testing antisense guide on sense gene..
+reverseComplement(ref[[1]][11258594:11258613]) # this is our guide for -ve strand; need to take rev comp to get to pos strand
+ref[[1]][11258594:11258613]
+
+reverseComplement(ref[[1]][11258598:11258601]) # this is our guide for -ve strand; need to take rev comp to get to pos strand
+ref[[1]][11258598:11258601]
+
+# trest pos strnad antisense
+reverseComplement(ref[[3]][179198841:179198860]) # this is our guide for -ve strand; need to take rev comp to get to pos strand
+ref[[3]][179198841:179198860]
+
+reverseComplement(ref[[3]][179198854:179198856]) # this is our guide for -ve strand; need to take rev comp to get to pos strand
+ref[[3]][179198854:179198859]
+```
+
+```{r}
+message('matching clinvar edits with guides')
+message('dropping guides with no detected edits in edit window')
+
+# works perfeclty to split up the rows, but drops rows with no found; want to keep all rows with no edits found too
+guides.expanded <- guides.dt[, lapply(.SD, function(x) unlist(tstrsplit(x, ";"))), .SDcols = c("edit_index", "ref_base", "alt_base"), by = .(guide, chr, gene, strand, ensembl_tID, guide_strand, pos_align_start, pos_align_end, editor, editCodingSequence)]
+
+#enable earlier in the pipeline
+#guides.expanded[, chr := as.character(chr)]
+
+# matching sites needs work; easy on + strand sense guide, others more 'hacky'; 
+# see if the antisense strand is 
+guides.expanded[, edit_position := ifelse(strand == '1' & guide_strand == 'sense', pos_align_start + as.numeric(edit_index)-1, 
+                                          ifelse(strand == '1' & guide_strand == 'antisense', pos_align_end - (nchar(guide) - as.numeric(edit_index)), 
+                                                 ifelse(strand == '-1' & guide_strand == 'sense',  pos_align_end, pos_align_end
+
+                                          
+                                          )))]         #pos_align_start + nchar(guide) + (-as.numeric(edit_index)-1), pos_align_start)) ]
+
+# matching on ref and alt as this is on the positive strand
+message('merging guides with clinvar annotations...')
+merged.dt <- merge(x=guides.expanded, y=clinvar.edit.dt, by.x=c('chr', 'gene', 'ref_base', 'alt_base','edit_position'), by.y=c('chr', 'gene','ref', 'alt', 'position'), all.x=T)
+
+message('Collapsing guides')
+collapsed.dt <- merged.dt[, lapply(.SD, function(x) paste0(x, collapse=';')), .SDcols = c('edit_index', 'ref_base', 'alt_base', 'edit_position', 'hgvs', 'clinicalSignificance'), by=.(chr, gene, ensembl_tID, strand, guide, guide_strand, editor)]
+
+merged.dt[guide == 'CTGGTAACTGGAGGCCCAGA',]
+# lets just force the ref base to match,not alt and see how our merge looks
+#merged.dt <- merge(x=guides.expanded, y=clinvar.edit.dt, by.x=c('chr', 'gene', 'ref_base','edit_position'), by.y=c('chr', 'gene','ref', 'position'))
+
+merged.dt[gene == 'PIK3CA' & guide_strand == 'antisense',]
+
+
+# all of these should be C->T edits for bemax
+# A -> G edits for abe8e
+merged.dt[gene == 'PIK3CA' & guide_strand == 'sense' & editor == 'bemax',]
+merged.dt[gene == 'PIK3CA' & guide_strand == 'sense' & editor == 'bemax',]
+merged.dt[gene == 'PIK3CA' & guide_strand == 'antisense' & editor == 'bemax',]
+merged.dt[gene == 'PIK3CA' & guide_strand == 'antisense' & editor == 'bemax',]
+
+```
+
+
+**Notes**
+We can't trust any of Ronalds gene annotation data.. Share the below, edit numbers match but the bases are completely different...
+```{r}
+sgrna.ori <- copy(sgrna.dt)
+
+# create a coding sequence and compare with their edit sequence
+# we are matching the correct number of edits in each, but the edits are incorrect
+sgrna.ori[, codingGuide := ifelse(`Guide Strand` == '-1', getSeqReverseComplement(Guide), Guide), by=.I]
+sgrna.ori[, c('index', 'cas9', 'ref', 'alt') := compareSequences(codingGuide, `Edited 5'->3' Sequence`), by=.I]
+
+sgrna.ori[stringr::str_count(`Edit Scores`, ',') != stringr::str_count(alt, ';')]
+
+sgrna.ori[Guide =='TGTAAAACTTGCAAAGAATC',]
+
+
+sgrna.ori
+# now, we know these are all ABe8e edits, lets see how the bemax edits looks
+sgrna.ori[,.(Guide, codingGuide, `Edited 5'->3' Sequence`,`Guide Strand`,  cas9, index, `Edit Scores`, ref,alt)]
+
+sgrna.ori[unique(cas9)]
+sgrna.ori[codingGuide == 'TGCAAAGAATCAGAACAATG',]
+
+
+# generate edit sequences for both and they should match the guides.dt we have 
+sgrna.ori[, abe8e := getCodingSequenceEdit(Guide, guideStrand=`Guide Strand`, editor='abe8e', window_start = 4, window_end=8), by=.I]
+sgrna.ori[, bemax := getCodingSequenceEdit(Guide, guideStrand=`Guide Strand`, editor='bemax', window_start = 4, window_end=8), by=.I]
+
+
+sgrna.ori[`Edited 5'->3' Sequence` == abe8e, .N, by=.(`Guide Strand`, Gene)]
+sgrna.ori[`Edited 5'->3' Sequence` == bemax, .N, by=.(`Guide Strand`, Gene)]
+```
+
+Additional mapping work.. not needed as now have exon-intron boundaries defined
+
+#to do; might need to add a vector of exon-intron boundary positions to annotate correctly
+# checking alingments; looks good
+
+```{r}
+lapply(names(seq.list), function(x){ print(x); print(seq.list[[x]]$boundaries)})
+
+pik3ca.alignment <- alignCodingToTranscript(codingSeq=paste(seq.list[['PIK3CA']]$coding_seq, collapse=''), transcriptSeq =paste(seq.list[['PIK3CA']]$transcript_seq, collapse=''))
+pten.alignment <- alignCodingToTranscript(codingSeq=paste(seq.list[['PTEN']]$coding_seq, collapse=''), transcriptSeq =paste(seq.list[['PTEN']]$transcript_seq, collapse=''))
+mtor.alignment <- alignCodingToTranscript(codingSeq=paste(seq.list[['MTOR']]$coding_seq, collapse=''), transcriptSeq =paste(seq.list[['MTOR']]$transcript_seq, collapse=''))
+akt1.alignment <- alignCodingToTranscript(codingSeq=paste(seq.list[['AKT1']]$coding_seq, collapse=''), transcriptSeq =paste(seq.list[['AKT1']]$transcript_seq, collapse=''))
+
+start(subject(akt1.alignment)); end(subject(akt1.alignment))
+start(subject(mtor.alignment)); end(subject(mtor.alignment))
+start(subject(pik3ca.alignment)); end(subject(pik3ca.alignment))
+start(subject(pten.alignment)); end(subject(pten.alignment))
+```
+**Not needed for now I think**
+
+Need additional annotation information for the matching
+Pause for now... I'm a litte stuck here... have the i) transcript sequence
+```{r}
+gene.boundary.dt <- fetchExtraGeneFeatures(gene_symbol=anno.dt$external_gene_name, tID=anno.dt$ensembl_transcript_id)
+gene.boundary.dt
+
+gene.boundary.dt[external_gene_name == 'PIK3CA',]
+gene.boundary.dt
+
+mart.dt <- as.data.table(listAttributes(mart))
+
+mart.dt[grepl('cds', name),]
+
+paste(seq.list[['PIK3CA']]$coding_seq[1:20], collapse='')
+
+# interesting for looking at and find pw alignments, but not helpful now for what we nee d
+alignment <- alignCodingToTranscript(codingSeq=paste(seq.list[['PIK3CA']]$coding_seq, collapse=''), transcriptSeq =paste(seq.list[['PIK3CA']]$transcript_seq, collapse=''))
+
+writePairwiseAlignments(alignment)
+
+
+# the second sequence is many times larger.. 
+nchar(paste(seq.list[['PIK3CA']]$coding_seq, collapse=''))
+nchar(paste(seq.list[['PIK3CA']]$transcript_seq, collapse=''))
+```
+```{r}
+# this is the seq for the transcirpt
+mtor.ref <-  DNAString(paste(seq.list[['MTOR']]$coding_seq, collapse=''))
+
+# 5' test
+test <- extra.anno.dt[external_gene_name == 'MTOR' & !is.na(`5_utr_start`) & !is.na(cds_start), seq(exon_chrom_start,`5_utr_start`-1, 1)]
+pairwiseAlignment(reverseComplement(ref[[1]][test]), mtor.ref)
+
+# 3' test
+extra.anno.dt[external_gene_name == 'MTOR' & !is.na(`3_utr_start`) & !is.na(cds_start),]
+
+test <-  extra.anno.dt[external_gene_name == 'MTOR' & !is.na(`3_utr_start`) & !is.na(cds_start), seq(`3_utr_end`+1, exon_chrom_end, 1)]
+
+extra.anno.dt[external_gene_name == 'MTOR' & !is.na(`3_utr_start`) & !is.na(cds_start),]
+pairwiseAlignment(reverseComplement(ref[[1]][test]), mtor.ref)
+
+
+tail(mtor.ref)
+```

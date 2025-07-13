@@ -1,0 +1,510 @@
+---
+title: "WGCNA.moduleGPCRCorrelation"
+author: "Martin Gordon"
+date: "2023-09-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(WGCNA)
+library(magrittr)
+library(preprocessCore) # quantile normalisation
+library(stringr)
+library(matrixStats)
+library(simplifyEnrichment)
+library(fmsb)
+library(readxl)
+library(ggbeeswarm)
+library(ggrepel)
+library(curl)
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+
+# helper scripts for module/network export etc
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+
+```
+
+27/09/23
+-----
+Notes: why is the VsT0 median shift different to the median value per cluster?
+Best approach is probably the eigengene correlation
+have the expression and module eigengene values for each of the modules. 
+Now correlate these scores with GPCR classifications
+
+To do correlate module eigengene values with each receptor
+
+```{r}
+
+pred <- fread("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/predictionScores.txt")
+exp <- fread ("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/experimentalScores.txt")
+iupar <- data.table(read_xlsx("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/IUPHAR_11GPCRs_Gprotein_class_primary.xlsx"))
+
+
+exp.long <- melt(exp, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+pred.long <- melt(pred, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+
+# convert to long format
+iupar.long <- melt(iupar, id.vars = 'GPCR', measure.vars = grep('GPCR', colnames(iupar), invert=T),  variable.name = "GProtein", value.name = "score") %>% 
+  .[, score := as.numeric(score)] 
+
+```
+
+```{r scores.list}
+scores.list <- list(exp = exp.long,
+                    pred = pred.long,
+                    iupar = iupar.long)
+```
+
+Convert the scores to a matrix
+
+```{r}
+scores.mat <- lapply(scores.list, function(x){
+  dcast(x, GProtein~GPCR, value.var = 'score') %>% 
+    as.matrix(rownames = 'GProtein')
+})
+```
+
+change the  colnames to reflect the mss nomenclature
+
+```{r}
+scores.mat <- lapply(scores.mat, function(x){
+  colnames(x) <- c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+  return(x)
+})
+
+```
+
+take the max shift vs T0 per cluster per receptor
+redo: not very good correlations, look at median value, maybe less dominated by outliers
+
+
+First reorder the cols to follow above
+
+```{r}
+# read in mss results
+mss.out <- fread("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/2022_08_31_NiceFitsPower3.csv")
+
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+
+# filter to sig genes and reorder
+sig.genes <- mss.out[pvalue < 0.05 & abs(log2FC) > log2(1.5) & receptor != 'MOR.LG94', unique(gene) ]
+exp.mat <- exp.mat[rownames(exp.mat) %in% sig.genes,]
+
+exp.mat[1:10,1:10]
+
+# renanme MOR DAMGO to MOR
+colnames(exp.mat) <- c('DOR', 'KOR', 'MOR', 'MRX2', 'MRX4', 'NK1R', 'NPFFR1', 'NPY1R','PTGER1', 'PTGER4','QRFPR')
+
+# reorder the cols to match the scoring mat
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+exp.mat <- exp.mat[, col.order]
+```
+
+```{r}
+
+# take the max log2FC value per cluster per receptor and correlate these
+mss.out[, max.log2FC := max(log2FC, na.rm=T), by=.(cluster,receptor)]
+mss.out[, median.log2FC := median(log2FC, na.rm=T), by=.(cluster,receptor)]
+
+# now want a matrix of cluster/receptor combinations
+# take the median log2FC value per cluster (of the max log2FC voer time)
+
+clust.mat <- mss.out %>% 
+  .[receptor != 'MOR.LG94', .(median.log2FC,cluster,receptor)] %>% 
+  unique() %>% 
+  dcast(receptor~cluster, value.var = 'median.log2FC')  %>% 
+  as.matrix(rownames='receptor') %>% 
+  t()
+
+colnames(clust.mat)
+
+colnames(clust.mat) <- c('DOR', 'KOR', 'MOR', 'MRX2', 'MRX4', 'NK1R', 'NPFFR1', 'NPY1R','PTGER1', 'PTGER4','QRFPR')
+# reorder to match above
+clust.mat <- clust.mat[, col.order]
+
+
+clust.mat %>%  t() %>%  head()
+lapply(scores.mat, function(x) t(x) %>%  head())
+```
+
+with the maximum log2FC val per receptor/cluster, correlations were quite poor (max 0.6) but improved when taking median log2FC values per cluster
+cluster 6 showed v strong correlation with GqG11 protein profile
+save these results
+```{r}
+
+# correlate t with each
+cor.list <- lapply(scores.mat, function(x){
+  cor(t(clust.mat), t(x), use= "pairwise.complete.obs") # cluster by row, so keep rownames as receptor
+})
+
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "cluster")
+  return(x)
+})
+```
+
+generate a heatmap of the 3 results
+convert to wide format and a matrix
+
+```{r}
+lapply(cor.long, names)
+```
+
+plot the enrichment results for the 'interesting' modules
+
+```{r}
+mods <- c('1','2','3','4','6','7','8','9','11')
+
+
+cor.long %>%  names()
+names(cor.long) <- c("Experimental","Predicted","IUPAR")
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+
+  # convert to wide
+  x.mat <- dcast(x[[i]], str_extract(cluster,'[0-9].*$')~GProtein, value.var = 'R') %>% as.matrix(rownames='cluster')
+  x.mat <- x.mat[rownames(x.mat) %in% mods,] #filter out noisy clusters
+  
+  # annotation cols  for all mods
+  col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD")  #"#999933" '#DDCC77' "grey"
+  
+  # add wgcna module annotation
+  row_ha <- rowAnnotation(modules=rownames(x.mat), 
+                        #set any annotaiton settings for CH 
+                        annotation_legend_param = list(modules = list(
+                       	ncol = 2, 
+                       	title = "wgcna modules")),
+                        #setting annotation cols
+                        col=list(modules = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3],
+                                                       '4'=col.pal[4], '6'=col.pal[6], 
+                                                       '7'=col.pal[7], '8'=col.pal[8],'9'=col.pal[9], 
+                                                       '11'=col.pal[11])) )
+
+ 
+  hm <- Heatmap(x.mat,
+          name='Pearson r',
+          right_annotation = row_ha,
+          cell_fun = function(j, i, x, y, width, height, fill) {
+          grid.text(sprintf("%.2f", x.mat[i, j]), x, y, gp = gpar(fontsize = 7)) }
+          
+          )
+  
+  BackupAsPDF(draw(hm, column_title=paste0('Module GPCR ', n[[i]], ' Score Correlations')), paste0(n[[i]],'.module.cor.heatmaps.pdf'))
+
+},x=cor.long, n=names(cor.long))
+
+```
+
+write out results first then try regenerate with maximum change from t0
+
+```{r}
+# cor table of IUPAR gene scores
+cor.tab <- cor.long$IUPAR
+cor.table <- dcast(cor.tab, cluster~GProtein, value.var = c("R"))
+fwrite(cor.table, './output/cluster.cor.med.log2FC.iupar.csv') 
+
+
+cor.tab <- cor.long$Predicted
+cor.table <- dcast(cor.tab, cluster~GProtein, value.var = c("R"))
+fwrite(cor.table, './data/cluster.cor.med.log2FC.predicted.csv') 
+
+cor.tab <- cor.long$Experimental
+cor.table <- dcast(cor.tab, cluster~GProtein, value.var = c("R"))
+fwrite(cor.table, './data/cluster.cor.med.log2FC.experimental.csv') 
+```
+
+
+Regenerate the correlations using vT0 values (what we used for the clustering) and check for GProtein correlation
+
+```{r}
+protQuant <- fread('data/2022_08_17_ProteinLevelData.lib.csv.gz')
+
+group.noi <- protQuant[!GROUP %like% c("DOR|KOR|MOR|MRX2|MRX4|NK1R|NPFFR1|NPY1R|PTGER1|PTGER4|QRFPR|DOR"),unique(GROUP)]
+
+protQuant <- protQuant[!GROUP %in% group.noi, ]
+protQuant <- protQuant[!GROUP %like% "MOR_LG94",]
+
+protQuant[, `:=`(timeStr = str_extract(GROUP,'[0-9]{2}$'),
+                 receptor = gsub("_[0-9]{2}$", '', protQuant$GROUP)
+               )]
+
+setorder(protQuant, receptor, Protein, timeStr)
+
+protQuant[, batchControlled := LogIntensities - median(LogIntensities, na.rm = TRUE), by = .(Protein, receptor, SUBJECT)]
+protQuant[, vsTimeZero := batchControlled - mean(batchControlled[timeStr == timeStr[!is.na(batchControlled)][1] ]), by = .(Protein, receptor)]
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+```
+
+subset the expression matrix to genes in the clusters and get matrix of max shift vs T0 per cluster,receptor 
+max shift an issue due to noise in the clusters... what about max shift per gene in each cluster, then take the median vlaue of that?
+maybe ask Ben
+
+```{r}
+protQuant[wgcna.clusters, cluster := i.Cluster, on=c(gene = 'GeneID')]
+
+# this takes the max shift; too strongly influenced by outliers; take median instead
+prot.mat <- protQuant[!is.na(cluster),] %>% 
+  .[, .SD[, vsTimeZero[which.max(abs(vsTimeZero))]], by=.(cluster,receptor)] %>% # extract the max absolute shift vs T0 
+  setnames( old=c('cluster', 'receptor', 'V1'), new = c('cluster', 'receptor', 'max.shift')) %>% 
+  dcast(receptor~cluster, value.var = 'max.shift') %>% 
+  as.matrix(rownames="receptor") %>% 
+  t()
+  
+prot.mat <- protQuant[!is.na(cluster),] %>% 
+  .[, .SD[, median(vsTimeZero)], by=.(cluster,receptor)] %>% 
+  setnames( old=c('cluster', 'receptor', 'V1'), new = c('cluster', 'receptor', 'median.shift')) %>% 
+  dcast(receptor~cluster, value.var = 'median.shift') %>% 
+  as.matrix(rownames="receptor") %>% 
+  t()
+  
+```
+
+rename the receptors and reorder to match the scoring matrices
+
+```{r}
+colnames(prot.mat) <- c('DOR', 'KOR', 'MOR', 'MRX2', 'MRX4', 'NK1R', 'NPFFR1', 'NPY1R','PTGER1', 'PTGER4','QRFPR')
+prot.mat <- prot.mat[, col.order]
+```
+
+rerun the correlations with median shift per cluster/receptor
+cluster 6 and 9 associated with Gq/G11
+
+```{r}
+# correlate t with each
+cor.list <- lapply(scores.mat, function(x){
+  cor(t(prot.mat), t(x), use= "pairwise.complete.obs")
+})
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "cluster")
+  return(x)
+})
+```
+
+plot the enrichment results for the 'interesting' modules
+
+```{r}
+mods <- c('1','2','3','4','6','7','8','9','11')
+
+
+cor.long %>%  names()
+names(cor.long) <- c("Experimental","Predicted","IUPAR")
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+
+  # convert to wide
+  x.mat <- dcast(x[[i]], str_extract(cluster,'[0-9].*$')~GProtein, value.var = 'R') %>% as.matrix(rownames='cluster')
+  x.mat <- x.mat[rownames(x.mat) %in% mods,] #filter out noisy clusters
+  
+  # annotation cols  for all mods
+  col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD")  #"#999933" '#DDCC77' "grey"
+  
+  # add wgcna module annotation
+  row_ha <- rowAnnotation(modules=rownames(x.mat), 
+                        #set any annotaiton settings for CH 
+                        annotation_legend_param = list(modules = list(
+                       	ncol = 2, 
+                       	title = "wgcna modules")),
+                        #setting annotation cols
+                        col=list(modules = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3],
+                                                       '4'=col.pal[4], '6'=col.pal[6], 
+                                                       '7'=col.pal[7], '8'=col.pal[8],'9'=col.pal[9], 
+                                                       '11'=col.pal[11])) )
+
+ 
+  hm <- Heatmap(x.mat,
+          name='Pearson r',
+          right_annotation = row_ha,
+          cell_fun = function(j, i, x, y, width, height, fill) {
+          grid.text(sprintf("%.2f", x.mat[i, j]), x, y, gp = gpar(fontsize = 7)) }
+          
+          )
+  
+  draw(hm, column_title=paste0('Module GPCR ', n[[i]], ' Score Correlations'))
+  BackupAsPDF(draw(hm, column_title=paste0('Module GPCR ', n[[i]], ' Score Correlations')), paste0(n[[i]],'.module.cor.vsT0.heatmaps.pdf'))
+
+},x=cor.long, n=names(cor.long))
+
+```
+
+Write out median shift per cluster, need to correct for other scoring, think it might actually improve the scores
+
+```{r}
+# cor table of IUPAR gene scores
+cor.tab <- cor.long$IUPAR
+cor.table <- dcast(cor.tab, cluster~GProtein, value.var = c("R"))
+fwrite(cor.table, './output/cluster.cor.med.shiftvsT0.iupar.csv') 
+
+
+cor.tab <- cor.long$Predicted
+cor.table <- dcast(cor.tab, cluster~GProtein, value.var = c("R"))
+fwrite(cor.table, './data/cluster.cor.med.shiftvsT0.predicted.csv') 
+
+cor.tab <- cor.long$Experimental
+cor.table <- dcast(cor.tab, cluster~GProtein, value.var = c("R"))
+fwrite(cor.table, './data/cluster.cor.med.shiftvsT0.experimental.csv') 
+```
+
+Correlate eigengene meaasurements with the GPCR classification schemes
+The moduleEignegene function returns an eigengene matrix; col eigengenes and rows samples
+
+
+```{r}
+mod.EG <- fread('./output/11.receptors.moduleEigengenes.wrownames.csv')
+mod.EG %>%  str()
+
+#extract the receptor names and timeStr and calculate avg per receptor
+mod.EG[, receptor := gsub('_.*', '', V1)]
+mod.EG[receptor == 'MOR.DAMGO', receptor := 'MOR']
+
+```
+
+skewed module eigengene distibution.. use median as summary statistic per receptor
+
+```{r}
+as.data.table(mod.EG) %>% 
+  melt(., id.vars=c('V1','receptor'), measure.vars=grep('ME', colnames(mod.EG), value = T)) %>% 
+  ggplot(., aes(x=value, fill=receptor)) +
+  geom_density() +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(title = "Density Plots of Module Eigengenes per Receptor") #%>% 
+  #BackupAsPDF(., 'density.plots.MEperReceptor')
+```
+Take median ME value per receptor,ME and correlate with GPCR classification 
+
+```{r}
+EG.mat <- mod.EG %>% 
+  melt(., id.vars=c('V1','receptor'), grep('ME', colnames(mod.EG)) ) %>% 
+  setnames(., new=c('sample', 'receptor', 'ME', 'value')) %>% 
+  .[, .SD[, median(value)], by=.(receptor, ME)] %>% 
+  dcast(., receptor~ME, value.var = 'V1') %>%  as.matrix(rownames='receptor') %>% 
+  t()
+    
+#reorder rows of the matrix  to match
+EG.mat <- EG.mat[,col.order]
+
+```
+Correlate modEG values with the GPCR classifications
+
+```{r}
+
+# correlate t with each
+cor.list <- lapply(scores.mat, function(x){
+  cor(t(EG.mat), t(x), use= "pairwise.complete.obs")
+})
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "cluster")
+  return(x)
+})
+```
+
+
+plot the enrichment results for the 'interesting' modules
+
+```{r}
+mods <- c('1','2','3','4','6','7','8','9','11')
+
+
+cor.long %>%  names()
+names(cor.long) <- c("Experimental","Predicted","IUPAR")
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+
+  # convert to wide
+  x.mat <- dcast(x[[i]], str_extract(cluster,'[0-9].*$')~GProtein, value.var = 'R') %>% as.matrix(rownames='cluster')
+  x.mat <- x.mat[rownames(x.mat) %in% mods,] #filter out noisy clusters
+  
+  # annotation cols  for all mods
+  col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD")  #"#999933" '#DDCC77' "grey"
+  
+  # add wgcna module annotation
+  row_ha <- rowAnnotation(modules=rownames(x.mat), 
+                        #set any annotaiton settings for CH 
+                        annotation_legend_param = list(modules = list(
+                       	ncol = 2, 
+                       	title = "wgcna modules")),
+                        #setting annotation cols
+                        col=list(modules = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3],
+                                                       '4'=col.pal[4], '6'=col.pal[6], 
+                                                       '7'=col.pal[7], '8'=col.pal[8],'9'=col.pal[9], 
+                                                       '11'=col.pal[11])) )
+
+ 
+  hm <- Heatmap(x.mat,
+          name='Pearson r',
+          right_annotation = row_ha,
+          cell_fun = function(j, i, x, y, width, height, fill) {
+          grid.text(sprintf("%.2f", x.mat[i, j]), x, y, gp = gpar(fontsize = 7)) }
+          
+          )
+  
+  draw(hm, column_title=paste0('Module GPCR ', n[[i]], ' Score Correlations'))
+  BackupAsPDF(draw(hm, column_title=paste0('Module GPCR ', n[[i]], ' Score Correlations')), paste0(n[[i]],'.module.cor.moduleEigenGene.heatmaps.pdf'))
+
+},x=cor.long, n=names(cor.long))
+
+```
+
+cor.long
+
+```{r}
+cor.long$IUPAR[cluster == 'ME6']
+
+EG.mat['ME6',]
+
+scores.mat$iupar
+```
+
+
+
+
+Thoughts
+--- 
+Need to rerun the wgcna and filter for missing values. Want only proteins present in 90% of data? maybe impute mean values for other members of group then
+metric to use? max shift in expression vs t0 per receptor per clust (also try median)
+
+
+
+```{r}
+
+
+
+# min and max value across all timepoints per gene per receptor
+p.quant.clust[, gene.min := min(vsTimeZero), by=.(gene, receptor)]
+p.quant.clust[, gene.max := max(vsTimeZero), by=.(gene, receptor)]
+
+# calculate median expression of min and max values ( i think this will be useful for lollipop chart)
+p.quant.clust[, cluster.min.median := median(gene.min), by=.(cluster, receptor)]
+p.quant.clust[, cluster.max.median := median(gene.max), by=.(cluster, receptor)]
+
+#calculate median value per tp per cluster
+p.quant.clust[, cluster.median.vsT0 := median(vsTimeZero), by=.(cluster, receptor, timeStr)]
+
+
+p.quant.clust[, cluster.med.min := median(vsTimeZero), by=.(cluster, receptor)]
+p.quant.clust[, cluster.receptor := paste0(cluster, '.', receptor)]
+
+```

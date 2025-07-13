@@ -1,0 +1,261 @@
+---
+title: "TF.enrichment"
+author: "Martin Gordon"
+date: "2023-09-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Takehome 
+only three TF Target geensets significantly enirched in our DEG's RNAseq
+CREB is induced by a variety of growth factors and inflammatory signals and subsequently mediates the transcription of genes containing a cAMP-responsive element
+DLX6: This family has at least six members that encode proteins with roles in forebrain and craniofacial development
+
+Both significantly depleted; means that targets for this TF are down-regulated in WT_IFNg-vs-ND_IFNg comparison (where WT is denominator), meaning expression for these target genes are increased in WT relative to ND mutant
+
+In the other condition raw p-value is significant to 1e3 (1 in 1000) but not after correction
+MTC burden here? can we filter out the number of genesets we are testing enrichment for? Find a better geneset maybe
+
+No sig results for the protein abundance data
+
+RNAseq
+---
+WT_IFNg-vs-ND_IFNg	significantly depleted for DLX6 and CREB3L4 targets
+
+
+## Transcription Factor enrichment of AB MS and RNAseq data
+A549 cell lines
+
+```{r}
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(circlize)
+library(ggrepel)
+library(clusterProfiler)
+library(msigdbr) #MSigDB in tidy format
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# enrichment functions and FGSEA 
+source("../../utils/bp_utils/Localization_CellMap.R")
+
+```
+
+In RNA res the denominator goes first, opposite in Prot AB
+
+Read in the DEG results for RNAseq and AB MS
+Again changing the sign of AB to mimic RNAseq so denominator is the same for both
+
+```{r}
+ab.de.res <- fread('/Users/martingordon/Documents/projects/051623_DSwaney/CellLines_Abundance/tables/2023_05_25_msstats_groupcomparisons.csv.gz')
+ab.de.res[Label %in% c('WTpos vs N10t20pos', 'WTpos vs EVpos') & gene == 'ASS1',]
+
+ab.de.res <- ab.de.res[Label %in% c('WTpos vs EVpos', 'WTpos vs N10t20pos'),]
+ab.de.res[Label == "WTpos vs EVpos", Label := "EV_IFNg-vs-WT_IFNg"]
+ab.de.res[Label == "WTpos vs N10t20pos", log2FC := -1 * log2FC]
+ab.de.res[Label == "WTpos vs N10t20pos", Label := "WT_IFNg-vs-ND_IFNg"]
+
+#prot.ab[Label == "WTpos vs EVpos", log2FC := -1 * log2FC]
+prot.ab[Label == "WTpos vs EVpos", Label := "EV_IFNg-vs-WT_IFNg"]
+prot.ab[Label == "WTpos vs N10t20pos", log2FC := -1 * log2FC]
+prot.ab[Label == "WTpos vs N10t20pos", Label := "WT_IFNg-vs-ND_IFNg"]
+
+# clean RNAseq
+box.loc <- '~/Library/CloudStorage/Box-Box/Mac1_omics_data/'
+rna.ab.core <- fread(paste0(box.loc, 'CellLines_RNAseq/core_table_gene.xls.gz'), fill=T)
+
+EV.WT.cols.OI <- c(2,3, grep('EV_IFNg-vs-WT_IFNg', colnames(rna.ab.core)))
+WT.ND.cols.OI <- c(2,3, grep('WT_IFNg-vs-ND_IFNg', colnames(rna.ab.core)))
+#easiest way to reformat is to perform the split seperately and then 
+
+cols.OI <- c(EV.WT.cols.OI, WT.ND.cols.OI)
+
+  
+EV.WT.rna.res <- rna.ab.core[, ..EV.WT.cols.OI] %>% 
+    .[,Label := 'EV_IFNg-vs-WT_IFNg'] %>% 
+    melt(., id.vars = c('Label','gene_id','gene_symbol'), 
+            measure.vars = list(c('diffexp_log2fc_EV_IFNg-vs-WT_IFNg'), 
+                                                       c('diffexp_deseq2_pvalue_EV_IFNg-vs-WT_IFNg'),
+                                                       c('diffexp_deseq2_qvalue_EV_IFNg-vs-WT_IFNg')),
+                                     value.name = c('log2FC', 'pvalue', 'qvalue'))
+  
+  
+
+
+WT.ND.rna.res <- rna.ab.core[, ..WT.ND.cols.OI] %>% 
+  .[,Label := 'WT_IFNg-vs-ND_IFNg'] %>% 
+  melt(., id.vars = c('Label', 'gene_id','gene_symbol'), 
+          measure.vars = list(c('diffexp_log2fc_WT_IFNg-vs-ND_IFNg'), 
+                                                       c('diffexp_deseq2_pvalue_WT_IFNg-vs-ND_IFNg'),
+                                                       c('diffexp_deseq2_qvalue_WT_IFNg-vs-ND_IFNg')),
+                                   value.name = c('log2FC', 'pvalue', 'qvalue'))
+
+
+rna.res <- rbind(EV.WT.rna.res, WT.ND.rna.res) %>% 
+  .[,variable := NULL]
+
+#sanity check - we want denominato-numerator naming convention
+ab.de.res[gene == 'ASS1',]
+rna.res[gene_symbol == 'ASS1',]
+
+```
+write out 
+
+```{r}
+#write(rna.res, './output/rna.clean.dea.results.csv')
+#fwrite(ab.de.res,  './output/prot.ab.clean.dea.results.csv')
+```
+
+read in results 
+
+```{r}
+prot.ab <- fread('./output/prot.ab.clean.dea.results.csv')
+rna <-fread('./output/rna.clean.dea.results.csv')
+```
+
+load in the MSigDB dataset for TF targets in humans for GSEA enrichment  
+(not sure about curation here; ask )
+
+```{r}
+tft_gene_sets = msigdbr(species = "human", category = "C3", subcategory = "TFT:GTRD") %>% 
+  as.data.table()
+
+tft_gene_sets %>%  str()
+tft_gene_sets[gs_name == 'MYF6_TARGET_GENES', .N, ]
+
+# list of vectors - not needed
+#tf.sets <- tft_gene_sets %>%  
+#  .[, .(gs_name, gene_symbol)] #%>% 
+ # .[, lapply(.SD, paste0, collapse=" "), by=gs_name]
+
+tf.sets <- split(tft_gene_sets$gene_symbol, tft_gene_sets$gs_name)
+```
+
+calculate ranked metric for the log2FC, for this we will use signed pvalue
+remove infinite values too 
+
+```{r}
+rna <- rna[, rank.metric :=  -log10(pvalue)*sign(log2FC), by=Label] %>% 
+  .[is.finite(rank.metric)]
+
+prot.ab <- prot.ab[, rank.metric :=  -log10(pvalue)*sign(log2FC), by=Label] %>% 
+    .[is.finite(rank.metric)]
+```
+
+convert both datasets to a matrix 
+```{r}
+
+rna.mat <- dcast(rna, gene_symbol ~ Label, value.var = 'rank.metric') %>%  
+  as.matrix(rownames='gene_symbol')
+
+prot.mat <- dcast(prot.ab, gene ~ Label, value.var = 'rank.metric') %>% 
+  as.matrix(rownames='gene')
+
+
+mat.list <- list('rna'=rna.mat,
+            'ab.ms'=prot.mat)
+```
+
+looked for significant enrichment of results 
+In the RNAseq dataset only targets for 3 TFs significantly enriched (actually depleted!)
+
+```{r}
+FGSEA.enrich <- lapply(mat.list, function(x){
+  matrixFGSEA(x, sets = tf.sets)
+})
+
+
+```
+not enough sig results to plot, so jsut provide the enrichment results tables
+
+```{r}
+fwrite(FGSEA.enrich[['rna']], './output/TFT.enrichment.rna.csv')
+fwrite(FGSEA.enrich[['ab.ms']], './output/TFT.enrichment.ab.ms.csv')
+```
+
+```{r}
+hist(FGSEA.enrich[['rna']]$pval)
+```
+Look for enrichment for the IPA pathways
+Issues with both files.. speak to Adrian tomorrow
+
+```{r}
+TFacts <- fread('./docs/TFactS_sensitive.gmt', sep='\t', header = F, fill=T)
+#collapse third column on into genes list
+
+# Define the columns to concatenate
+columns_to_concat <- names(TFacts)[3:ncol(TFacts)]
+TFacts[, gene.list := do.call(paste, c(.SD, sep = ",")), .SDcols = columns_to_concat]
+TFacts[, gene.list := sub(',+$', '', gene.list)]
+#TFacts[, gene.list := gsub(' ', '\t', gene.list)]
+TFacts <- TFacts[, .(V1,gene.list)]
+
+TFacts
+# create a gene list of the two for the enrichment
+tfacts.set <- split(TFacts$gene.list, TFacts$V1)
+tfacts.set <- lapply(tfacts.set, function(x) unlist(strsplit(x, ',')))
+```
+run fgsea enrichment on these results
+```{r}
+FGSEA.enrich <- lapply(mat.list, function(x){
+  matrixFGSEA(x, sets = tfacts.set)
+})
+
+```
+check the results
+no significant terms after correction, but many are very enriched 
+
+```{r}
+lapply(FGSEA.enrich, function(x) setnames(x, old = 'pathway', new='TF_direction'))
+
+lapply(seq_along(FGSEA.enrich), function(x,n,i){
+  
+  x[[i]][order(padj)] %>% 
+    .[, dataset := n[[i]] ]
+  
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.TFact.enrichment.table.csv'))
+  
+},x=FGSEA.enrich, n=names(FGSEA.enrich))
+
+names(FGSEA.enrich)
+
+fread('./output/ab.ms.TFact.enrichment.table.csv')
+```
+
+171023
+---
+Read in the TF feature tables and 
+
+```{r}
+input <- dir(path='./output/TFtarget.enrichment', pattern = '.csv$', full.names = T) %>% 
+  as.data.table() %>% 
+  setnames('.', 'path') %>% 
+  .[, table := str_extract(path, 'ab.ms.TFact|rna.TFact|TFT.enrichment.ab.ms|TFT.enrichment.rna')]
+
+
+enrich.dt <- lapply(input$path, function(x){
+  
+  e.dt <- fread(x)
+  e.dt[pval < 0.05,]
+})
+
+
+
+names(enrich.dt) <- c('TFTargetS.ABMS', 'TFTargetS.RNA', 'MSigDB.TFT.ABMS', 'MSigDB.TFT.RNA')
+
+lapply(seq_along(enrich.dt), function(x,n,i){
+  
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.enrichment.csv'))
+},x=enrich.dt, n=names(enrich.dt))
+```
+

@@ -1,0 +1,623 @@
+---
+title: "T-SNE_exp"
+author: "Martin Gordon"
+date: "2023-07-08"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## T-SNE experimental data
+
+In addition to integrating the output from ntwork propagation, we also wish to look at the expression for the WT, ND and EV conditions
+
+To do this we will integrate all the experimentally-relevant data associated with the three conditions
+Firstly, lets see if clustering occurs by source or condition:
+
+We will use the normalised data matricies produced for the samples:EV, WT and ND
+
+
+Packages
+```{r}
+library(RColorBrewer) 
+library(mixOmics)
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(eulerr) #venn diagrams
+library(DESeq2) #normalise RNAseq data
+
+library(umap)
+library(cluster) #k-mediod clustering
+library(factoextra) #estimate optimal k
+
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+
+```
+
+
+Read in the data 
+
+Protein RNA & PH data
+```{r}
+p.ab.quant <- fread('~/Documents/projects/051623_DSwaney/2023_05_16_DSwaney_AA08_AB_data/2023_05_25_ProteinLevelData.csv.gz') 
+p.ph.quant <- fread('~/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_protein-lvl-data.csv.gz')
+rna.quant <- fread('~/Library/CloudStorage/Box-Box/Mac1_omics_data/CellLines_RNAseq/Expression/gene_expression.xls')
+
+box.loc <- '~/Library/CloudStorage/Box-Box/Mac1_omics_data/'
+rna.ab.core <- fread(paste0(box.loc, 'CellLines_RNAseq/core_table_gene.xls.gz'), fill=T)
+
+cols.OI <- grep("^read_count|gene_symbol",colnames(rna.ab.core), value=T)
+
+rna.mat <- rna.ab.core[, colnames(rna.ab.core) %in% cols.OI, with=F] %>% 
+  .[,-25, with=F] %>% #rm dup gene_symbol
+  as.matrix(rownames='gene_symbol')
+
+```
+Convert to matrix and adjust colnames
+```{r}
+p.ph.mat <- dcast(p.ph.quant, Protein~paste0(GROUP,"_",SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+p.ab.mat <- dcast(p.ab.quant, Protein~paste0(GROUP, "_", SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+colnames(rna.mat) <- gsub('read_count_','',colnames(rna.mat))
+
+# set up colnames to match rna-seq dataset
+colnames(p.ph.mat) <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "Par_IFNg_A", "Par_IFNg_B",  "Par_IFNg_C", "Par_IFNg_D", "Par_ctrl_A",  "Par_ctrl_B",  "Par_ctrl_C",  "Par_ctrl_D", "WT_IFNg_A",   "WT_IFNg_B",   "WT_IFNg_C", "WT_IFNg_D") 
+
+colnames(p.ab.mat) <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "Par_ctrl_A", "Par_ctrl_B",  "Par_ctrl_C", "Par_ctrl_D", "Par_IFNg_A",  "Par_IFNg_B",  "Par_IFNg_C",  "Par_IFNg_D", "WT_IFNg_A",   "WT_IFNg_B",   "WT_IFNg_C", "WT_IFNg_D") 
+
+#keep only conditions of interest
+p.cond.OI <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "WT_IFNg_A",   "WT_IFNg_B",  "WT_IFNg_C", "WT_IFNg_D")
+rna.cond.OI <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "WT_IFNg_A", "WT_IFNg_B",  "WT_IFNg_C")
+
+rna.mat <- rna.mat[, rna.cond.OI]
+p.ab.mat <- p.ab.mat[, p.cond.OI]
+p.ph.mat <- p.ph.mat[, p.cond.OI]
+
+
+#prefilter low count genes
+rna.mat <- rna.mat[rowSums(rna.mat) >= 10,]
+#rna.mat <- log2(rna.mat + 1)
+
+```
+
+Normalise the RNA input
+
+```{r}
+
+design.mat <- data.frame(replicate=as.factor(c(rep(c('A','B','C'),3))),
+                         condition=as.factor(str_extract(colnames(rna.mat), 'IFNg|ctrl')), 
+                         celltype=as.factor(str_extract(colnames(rna.mat),'EV|ND|WT')))
+
+
+design.mat$contrast <- as.factor(paste0(design.mat$celltype,"_", design.mat$condition))
+#assign rownames from the colnames of count matrix
+rownames(design.mat) <- colnames(rna.mat)
+```
+
+Run DEseq2 to normalize library & extract variance stabilised counts
+```{r}
+# only accepts integers
+rna.mat <- round(rna.mat)
+
+dds <- DESeqDataSetFromMatrix(countData = rna.mat,
+                              colData = design.mat,
+                              design = ~ contrast)
+
+
+#maybe use log2 as more gaussian? Let look again after feature selection
+# vst handles the transformation of the data better than log2 + pseudocount, so proceed with this
+vsd <- rlog(dds)
+rna.mat <- assay(vsd)
+
+#using log2 transformed counts instead as more Gaussian
+#rna.mat <- log2(assay(dds) + 1)
+
+
+```
+
+Create dataframes of the 3 modes and generate boxplots to assess normalization
+
+```{r}
+
+rna.df <- melt(rna.mat, id.vars = c("gene_symbol"),
+     measure.vars = colnames(rna.mat)[colnames(rna.mat) != 'gene_symbol'])
+
+colnames(rna.df) <- c('feature', 'variable', 'value')
+
+prot.ab.df <- melt(p.ab.mat, id.vars = c("Protein"),
+     measure.vars = colnames(p.ab.mat)[colnames(p.ab.mat) != 'Protein'])
+
+colnames(prot.ab.df) <- c('feature', 'variable', 'value')
+
+
+prot.ph.df <-  melt(p.ph.mat,
+                  id.vars = c("Protein"),
+     measure.vars = colnames(p.ph.mat)[colnames(p.ph.mat) != 'Protein'])
+
+colnames(prot.ph.df) <- c('feature', 'variable', 'value')
+
+
+# comb
+df.list <- list(rna  = rna.df,
+                p.ab = prot.ab.df,
+                p.ph = prot.ph.df)
+
+
+mat.list <- list(rna  = rna.mat,
+                p.ab = p.ab.mat,
+                p.ph = p.ph.mat)
+
+
+lapply(df.list, function(x){
+  
+  ggplot(x, aes(x=variable, y=value)) +
+    geom_boxplot() +
+    theme(axis.text.x = element_text(angle=90))
+})
+
+
+```
+
+
+
+
+Normalization looks good but we need to scale the modes before integrating
+Created a scaled version of the data
+
+Take the z-scores for the data
+May need to renormalise RNAseq (median subtraction??); proceed as is for now
+
+```{r}
+
+scaled.mat <- lapply(mat.list, function(x){
+
+  str(x)
+  scale(x, center = T, scale=T)
+  # could also do
+  #sweep(x, 2, apply(x, 2, mean))/ apply(x, 2, sd)
+})
+
+
+# convert to df and plot again
+lapply(scaled.mat, function(x){
+  data.table(x, keep.rownames = T) %>% 
+    melt(id.vars = c("rn"),
+     measure.vars = colnames(x)[colnames(x) != 'rn']) %>% 
+    
+    ggplot(aes(x=variable, y=value)) +
+    geom_boxplot() +
+    theme(axis.text.x = element_text(angle=90))
+    
+})
+
+
+```
+
+## Feature selection
+------------
+
+Select Informative features from the 3 omics sets (those with strongest variance between groups)
+Follow the tutorial; select features where the inter-group variance exceeds inter-group "a change between conditions is “strong” if it exceeds most of the values for the variation between replicates within conditions"
+Basically take the logFC between conditions
+
+```{r}
+# create a group column for each omics set
+
+df.list <- lapply(df.list, function(x){
+  x$group <- sub('_[ABCD]', '', x$variable)
+  return(x)
+})
+
+
+
+# convert to data.table for easier manipulation
+df.list <- lapply(df.list, function(x){
+  x <- as.data.table(x)
+  
+  # calculate mean and sd for each
+  x[, grp_mean := mean(value) ,by=.(group, feature)] #mean expression within group
+  x[, max_within_FC := (max(value) - min(value)), by=.(group, feature)]
+  x[, max_between_FC := (max(grp_mean) - min(grp_mean)), by=.(feature)]#
+  
+  # extract desired cols & remove duplicate rows
+  x[, .(feature, group, grp_mean, max_between_FC, max_within_FC)] %>% 
+   unique()
+  
+})
+
+```
+
+Seems we have a lot more features recovered from RNAseq; intra-group variability a lot lower (tech replicates less variable, so more things found)
+
+```{r}
+
+# count features to see what has 
+
+lapply(df.list, function(x){
+  print(x[max_between_FC > max_within_FC, .N, by=.(group)])
+#  print(x[max_between_FC < max_within_FC, .N, by=.(group)])
+})
+
+
+```
+
+Plot the max FC changes between groups for each mode
+
+```{r}
+lapply(df.list, function(x){
+  ggplot(x, aes(x=max_between_FC)) +
+    geom_histogram(binwidth=0.1)
+})
+
+```
+For selecting informative features, take the rows where the maximum FC between conditions is greater than the :
+80th percentile of change within conditions (protine & phospho)
+99th percentile (rna) #smaller SE
+Take top ~300 features per condition
+
+```{r}
+df.list[['rna']] <- df.list[['rna']][max_between_FC > quantile(max_within_FC, .9, na.rm=T),] %>% 
+  .[order(-max_between_FC)] %>% 
+  .[1:1000,]
+df.list[['p.ab']] <- df.list[['p.ab']][max_between_FC > quantile(max_within_FC, .8, na.rm=T),]
+df.list[['p.ph']] <- df.list[['p.ph']][max_between_FC > quantile(max_within_FC, .9, na.rm=T),] %>% 
+  .[order(-max_between_FC)] %>% 
+  .[1:1000,]
+
+
+# applying different thresholds for themodes
+
+#t.2 <- lapply(test, function(x){
+#  FC.threshold <- quantile(x$max_within_FC, .8, na.rm=T) # get the 95th quantile value
+  # filter the dataset by values which exceed the 95th quantile
+#  x[ max_between_FC > FC.threshold, ]
+#})
+
+
+```
+Merge the data.tables and generate a umap plot 
+- mapping from uniprot to gene (or vice versa)
+- then colbind the results on gene
+
+
+Convert the prot.ph & prot.anb to gene names
+Clean up the 
+```{r}
+comb.data <- rbindlist(df.list, idcol = 'omics')
+
+```
+
+cast data and create list of complete & different omics sets
+```{r}
+comb.df <- dcast(comb.data, omics+feature~group, value.var = 'grp_mean')
+
+# extract the matrix for each set of data
+input.mat.list <- list(all = comb.df[, -1] %>%  as.matrix(rownames='feature'),
+                       rna = comb.df[omics== 'rna', -1] %>%  as.matrix(rownames='feature'),
+                       p.ab = comb.df[omics== 'p.ab', -1] %>%  as.matrix(rownames='feature'),
+                       p.ph = comb.df[omics== 'p.ph', -1] %>%  as.matrix(rownames='feature'))
+
+#testing
+input.mat.list <- lapply(input.mat.list, function(x){
+  x <- x[complete.cases(x),]
+  
+})
+
+
+#mat.mets <- comb.df[,c(1,2)]
+#t <- as.matrix(dist(input.mat.list[[2]]))
+
+```
+
+create subsets of the data and run for each, then combine
+```{r}
+# modify the default umap config 
+custom.config <- umap.defaults
+custom.config$n_neighbors <- 30 #close to sqrt(N)
+
+umap.out.list <- lapply(input.mat.list, function(x){
+  
+  umap::umap(x)})
+})
+```
+
+Lets plot the results
+
+```{r}
+umap.dts <- lapply(umap.out.list, function(x){
+  as.data.table(x$layout, keep.rownames = T)
+})
+
+
+lapply(umap.dts, function(x){
+  ggplot(x, aes(x=V1, y=V2)) +
+    geom_point()
+})
+
+
+umap.dts
+
+t.dist <- as.matrix(dist(umap.dts[[2]]))
+
+dt <- umap(d=t.dist, cofig=custom.config, input="dist")
+
+ggplot(as.data.table(dt$layout, rownames=T), aes(x=V1, y=V2)) +
+  geom_point()
+```
+I wonder if this is due to values being strongly correlated?
+
+
+Generate heatmaps of distance matrix for the plots
+Lots of values with very similar distances
+
+```{r}
+input.mat.list[[2]]
+
+lapply(input.mat.list, function(x){
+  dist.mat <- as.matrix(dist(x, method = 'manhattan'))
+  
+  submat <- dist.mat[1:200, 1:200]
+  #hc <- hclust(as.dist(max(submat)-submat))
+  
+  ComplexHeatmap::Heatmap(submat,
+                          cluster_columns = T,
+                          cluster_rows = T,
+                          show_row_names = F,
+                          show_column_names = F)
+  
+})
+
+
+
+t <- input.mat.list[[1]]
+
+dist.t <- as.matrix(dist(t))
+
+str(dist.t)
+
+scaled.intensity.mat[sample.int(nrow(scaled.intensity.mat), 2000),]
+
+dist.t[sample.int(nrow(dist.t), 2000),]
+
+```
+Generate PCA plot
+
+```{r}
+lapply(input.mat.list, function(x){
+  x.pca <- prcomp(x) 
+  pcaPercentVar <- round(100 * (x.pca$sdev^2)/sum(x.pca$sdev^2), 1)
+  x.dt <- as.data.table(x.pca$x, keep.rownames = T)
+  
+  
+  
+  ggplot(x.dt, aes(x=PC1, y=PC2)) + 
+    geom_point() +
+    xlab(pcaPercentVar[1]) +
+    ylab(pcaPercentVar[2])
+})
+```
+
+
+Seems a lot of the values selected in the dist.mat are highly correlated
+
+
+Take the z-scores for the data
+May need to renormalise RNAseq (median subtraction??); proceed as is for now
+
+```{r}
+
+scaled.df <- lapply(mat.list, function(x){
+  print(x)
+  str(x)
+  scale(x, center = T, scale=T)
+  # could also do
+  #sweep(x, 2, apply(x, 2, mean))/ apply(x, 2, sd)
+})
+
+
+# convert to df and plot again
+lapply(scaled.df, function(x){
+  data.table(x, keep.rownames = T) %>% 
+    melt(id.vars = c("rn"),
+     measure.vars = colnames(x)[colnames(x) != 'rn']) %>% 
+    
+    ggplot(aes(x=variable, y=value)) +
+    geom_boxplot() +
+    theme(axis.text.x = element_text(angle=90))
+    
+})
+
+```
+## Selecting features with strongest variance
+------------
+
+Select Informative features from the 3 omics sets
+
+Follow th tutorial; select features where the inter-group variance exceeds inter-group "a change between conditions is “strong” if it exceeds most of the values for the variation between replicates within conditions"
+
+Could also
+i) select genes with +/- 1.96 Z score
+ii) select the differentially expressed genes across each condition (too restrictive for finding interesting features)
+
+using the list of datatables for this calculation
+
+```{r}
+# calculate LogFC within replicates, then 
+test <- df.list[[1]]
+str(test)
+
+test[, group := sub('_[ABC]', '',variable)]
+
+grp_means <- apply(test, 1, )
+```
+
+
+To do later.. keep simple for now without complicating
+Upload the SAINT dataset 
+```{r}
+saint <- readxl::read_xlsx('./data/SAINT_Results.xlsx')
+```
+
+
+Seelcting genes with strongest variance
+
+The vst handles the heteroskedacity of the rnaseq data much better. proceed with this
+
+Select Informative features for the 3 omics and upload the SAINT dataset
+
+We could:
+i) select genes with +/- 1.96 Z score
+ii) select the differentially expressed genes across each condition
+
+
+
+## Attempt with log2FC values from each of the datasets
+
+maybe first instead try take the log2FC values from each dataset
+Fold changes are scaled measurements, so we should be able to integrate these
+
+```{r}
+
+# read in the clean omics files
+rna.ab.clean <- fread('./output/rna_ab.clean.csv.gz')
+rna.ab.clean[, omics :='rna']
+rna.ab.clean[, adj.pvalue := p.adjust(pvalue, method = 'BH')]
+
+prot.ab.clean <- fread('./output/prot_ab.clean.csv.gz')
+prot.ab.clean[, omics := 'p.ab']
+prot.ph.clean <- fread('./output/prot_ph.clean.csv.gz')
+prot.ph.clean[, omics := 'p.ph']
+
+omics.clean <- list(rna_ab = rna.ab.clean,
+                    prot_ab = prot.ab.clean,
+                    prot_ph = prot.ph.clean)
+```
+
+
+```{r}
+
+lapply(omics.clean, function(x){
+  ggplot(x, aes(x=Label, y=log2FC)) +
+    geom_boxplot()
+})
+
+```
+ 
+Feature selection: extract significant results from either modality; extract h
+```{r}
+sig.genes <- lapply(omics.clean, function(x){
+  x[adj.pvalue < 0.05, unique(gene)]
+})
+```
+
+Transform to matrix
+```{r}
+# filter the matrix to include sig genes only
+clean.mat.list <- lapply(seq_along(omics.clean), function(x,y,i){
+  mat <- dcast(x[[i]], gene~Label, value.var = 'log2FC') %>% 
+    as.matrix(rownames='gene')
+  
+  # filter only for sig gene rows
+  mat <- mat[rownames(mat) %in% y[[i]],]
+  
+  # remo
+  mat <- mat[complete.cases(mat),]
+  
+}, x=omics.clean, y=sig.genes)
+```
+
+# need to remove rows with NA values so umap can handle 
+
+```{r}
+
+```
+
+
+plot the 3 using umap separately
+
+```{r}
+lapply(mat.list, function(x){
+  x <- x[complete.cases(x),]
+  
+  x.umap <- umap(x, input='data')
+  x.dt <- as.data.table(x.umap$layout, keep.rownames = T)
+  
+  ggplot(x.dt, aes(x=V1, y=V2)) +
+    geom_point()
+  
+  #return(x.dt)
+  
+})
+
+colnames(scaled.mat[[1]])
+```
+
+
+plot the 3 using pca
+
+```{r}
+lapply(mat.list, function(x){
+  x <- x[complete.cases(x),]
+  
+  x.pca <- prcomp(x)
+  x.pca$var <- round(100 * (x.pca$sdev^2)/sum(x.pca$sdev^2), 1)
+  x.dt <- as.data.table(x.pca$x, keep.rownames = T)
+  print(x.dt)
+  ggplot(x.dt, aes(x=PC1, y=PC2)) +
+    geom_point() +
+    xlab(x.pca$var[1]) +
+    ylab(x.pca$var[2])
+  
+  #return(x.dt)
+  
+})
+```
+
+FOr PCA you can actually just supply the dataframe
+```{r}
+prcomp_cereals_num <- prcomp(cereals_num[, 1:12])
+pca_cereals_num <- data.frame(
+  PC1 = prcomp_cereals_num$x[, 1],
+  PC2 = prcomp_cereals_num$x[, 2],
+  label = cereals_num$label,
+  classification = cereals_num$classification
+)
+
+ggplot(pca_cereals_num, aes(x = PC1, y = PC2, label = label, col = classification)) +
+  geom_point() +
+  ggrepel::geom_text_repel(cex = 2.5)
+
+```
+
+
+Color according to 
+
+Combine the data frames and plot
+```{r}
+comb.df <- rbindlist(omics.clean, idcol = T, fill=T ) %>% 
+  .[, .(.id,gene, Label, log2FC)]
+
+all.sig <- unlist(sig.genes) %>%  unique()
+
+comb.df <- comb.df[gene %in% all.sig, ]
+
+comb.mat <- dcast(comb.df, gene~Label, value.var = 'log2FC') %>% 
+  as.matrix(rownames='gene')
+
+```
+

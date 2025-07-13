@@ -1,0 +1,409 @@
+---
+title: "061625_D3_MSstatsSmmarization"
+author: "Martin Gordon"
+date: "2025-06-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+Prepare the SEC-MS data for input into BP pipeline and CCprofiler
+Stil grappling with the different data formats produced by the Spectronaut searches. Now we will try comparing the MSstats format file between CCprofiler and Bens pipeline
+Review the code from the previous MSS summarization and implement this for the protein level summarization. Tidy and use the peptide level info for CCprofiler
+
+```{r packages}
+library(MSstats)
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+library(parallel)
+library(pbapply)
+
+
+
+# useful utility scripts
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+Using parallel package to deal the lappy functions 
+
+```{r}
+cores <- parallel::detectCores() - 2
+```
+
+
+Focus on the msstats reports; read these into file, summarize for input to SEC-MS pipeline 
+```{r}
+allFiles <- dir('./data/HIV_Infection_CD4T_cells/Spectronaut_Reports_061625', full.names = T, include.dirs = T, recursive = T, pattern="*MSStats_Report.tsv")
+allFiles <-  grep('Cell_Lysis', allFiles, invert=T, value=T)
+
+# 
+pep.ls <-  pbapply::pblapply(allFiles, fread, cl=9)
+names(pep.ls) <-  sapply(allFiles, function(x) unlist(strsplit(x, '[/]'))[7])
+names(pep.ls) <- gsub('MSStats_Report.tsv', '', names(pep.ls))
+```
+
+naming convention not standardised... you know what? Lets just name manually for simplification
+```{r}
+names(pep.ls) <- c('Infected_1', 'Challenged_1', 'Uninfected_1', 'Infected_2', 'Challenged_2', 'Uninfected_2', 'Infected_3', 'Challenged_3', 'Uninfected_3')
+```
+
+No imputation from the looks of things
+```{r}
+lapply(pep.ls, function(x) summary(x))
+
+lapply(pep.ls, function(x) {hist(log2(x$Intensity))})
+
+pep.dt <- rbindlist(pep.ls, idcol='sample')
+```
+
+
+Want to run the MSstats summarization for each sample seperately. RN we are using tmp to summarize, but need to avoid more complicated outlier detection, imputation etc.
+Do a simplified MS summarization
+```{r}
+test <- pep.ls[[1]]
+
+#' Given an MSstats long format file, we want to summairze to protein level information
+#' Check for essential 
+MSSproteinSummarization <- function(mss.in, summary.method='TMP', imputeVals=FALSE, ...){
+  
+  dt <- copy(mss.in)
+
+  cols.oi <- c("Condition", "Run","BioReplicate","ProteinName","PeptideSequence","FragmentIon","PrecursorCharge","Intensity","ProductCharge")
+  
+  # summarizing protein level information
+  stopifnot(all(cols.oi %in% colnames(dt)))
+  stopifnot(length(unique(dt$BioReplicate)) == 1)
+  stopifnot(is.logical(imputeVals))
+  stopifnot(toupper(summary.method) %in% c('TMP', 'linear'))
+  
+  message('Adding PeptideModifiedSequence IsotopeLabelType columns...')
+  dt[, c('PeptideModifiedSequence', 'IsotopeLabelType') := .(NA, 'L')]
+  
+  message('Warning: Considering each Run/Condition combo as a seperate fraction...\nPlease ensure Run column matches the fraction before running')
+  dt[, Condition := paste0(Condition, '.fraction', Run)]
+  
+  message('Running MSstats summarization...')
+  if (imputeVals)
+    message('Imputation enabled. This will significantly increase dataProcess times')
+  
+  dp.out <- MSstats::dataProcess(dt, 
+                                MBimpute =  imputeVals, 
+                                normalization = FALSE, # turn off for SECMS
+                                summaryMethod = summary.method,
+                                ...)
+  
+  return(dp.out)
+}
+
+```
+
+Check out runtimes of various runs; plot
+
+```{r}
+# simpleiest version
+t1 <- system.time(MSSproteinSummarization(test, summary.method = 'TMP', imputeVals = FALSE))
+# subset to only include features >= n features
+t2 <- system.time(MSSproteinSummarization(test, summary.method = 'TMP', imputeVals = FALSE, featureSubset='top3'))
+
+# high quality features only 
+t3 <- system.time(MSSproteinSummarization(test, summary.method = 'TMP', imputeVals = FALSE, min_feature_count=3, featureSubset='highQuality'))
+
+# imputation enabled
+t4 <- system.time(MSSproteinSummarization(test, summary.method = 'TMP', imputeVals = TRUE))
+
+# imputation and high qual feature. Considered most robust, but runtime maybe an issue...
+t5 <- system.time(MSSproteinSummarization(test, summary.method = 'TMP', imputeVals = TRUE, min_feature_count=3, featureSubset='highQuality'))
+```
+
+```{r runtimes, fig.width=4, fig.height=5}
+exec.dt <- data.table(Reduce(rbind, list(t1,t2,t3,t4,t5)))
+exec.dt[, rn := c('TMP', 'TMP (top 3 features)', 'TMP (highQual features)', 'TMP + Impute', 'TMP (highQual features) + Impute')]
+
+g <- ggplot(exec.dt, aes(x=reorder(rn, elapsed/60),y=elapsed/60)) +
+  geom_bar(stat='Identity') +
+  theme(axis.text.x=element_text(angle=90))
+
+BackupAsPDF(g, 'ms.summarization.runtimes.barplot')
+```
+
+Lets summarize the samples, we will use the most simple summarization method (use tmp on all features)
+
+```{r prot-summarization}
+cores <- parallel::detectCores() - 2
+
+ms.ls <- pbmcapply::pbmclapply(pep.ls[1:9],  function(pep.dt){ 
+  tryCatch({
+    MSSproteinSummarization(pep.dt,
+                            summary.method = 'TMP', 
+                            imputeVals = FALSE)
+  }, error = function(e){
+     message("ERROR on one of the data.tables: ", e$message)
+  })
+},mc.cores = cores)
+```
+
+Save the RDS objects to file, read in the peptide level data, summarize to 
+
+```{r}
+ms.ls <- parallel::mclapply(seq_along(pep.ls), function(i) {
+  tryCatch({
+    message("Processing index: ", i)
+    MSSproteinSummarization(pep.ls[[i]], summary.method = 'TMP', imputeVals = FALSE)
+  }, error = function(e) {
+    message("ERROR at index ", i, ": ", e$message)
+    NULL
+  })
+}, mc.cores = cores)
+
+names(ms.ls) <- names(pep.ls)
+
+```
+
+An issue with the pbmclapply function; just use mclapply or oblapply with `cl` might be the equivalent
+# save the protein and feature level data in DT format and use to run the analysis
+```{r}
+feat.dt <- unlist(ms.ls, recursive=FALSE)[grepl('FeatureLevelData', names(unlist(ms.ls, recursive=FALSE)))] %>% 
+  rbindlist(idcol='sample')
+
+prot.dt <- unlist(ms.ls, recursive=FALSE)[grepl('ProteinLevelData', names(unlist(ms.ls, recursive=FALSE)))] %>% 
+  rbindlist(idcol='sample') %>% 
+  setDT()
+
+prot.dt <- prot.dt[, .(sample = gsub('.ProteinLevelData', '', sample), protein=Protein, intensity=2^LogIntensities, LogIntensities, fraction=originalRUN, NumMeasuredFeature)]
+fwrite(prot.dt, ScriptAndDatedFileName('hiv.d123.mss.summarized.csv.gz'))
+```
+For the feature level data, summarize to protein level and write out
+
+```{r}
+feat.dt[, c('peptideSeq', 'precursorCharge') := tstrsplit(PEPTIDE, '__', keep=c(1,2))]
+feat.dt <- feat.dt[, .(sample = gsub('.FeatureLevelData', '', sample), fraction=originalRUN, protein=PROTEIN, sequence=gsub('_', '', peptideSeq), precursorCharge, intensity=INTENSITY)]
+pep.dt <- feat.dt[, .(intensity=sum(intensity,na.rm=T)), by=.(sample, fraction, protein, sequence)]
+
+feat.dt[,.N, by=.(protein, sequence, sample, fraction)][N>1]
+```
+```{r}
+pep.dt[protein == 'A0AVT1' & sequence == 'DKFESSFSHKPSLFNK' & sample == 'Infected_1' & fraction == 1,]
+
+
+feat.dt[protein == 'A0AVT1' & sequence == 'GHTEVIVPHLTESYNSHRDPPEEEIPFC[Carbamidomethyl (C)]TLK' & sample == 'Infected_1' & fraction == 1,]
+pep.ls[['Infected_1']][ProteinName == 'A0AVT1' & Run == 1,]
+
+# what is interesting is that this lists the peptides/features found across all runs per sample, but will attach an NA values for where that run/fraction is undetected
+feat.dt[protein == 'A0AVT1' & sample == 'Infected_1' & fraction == 1,]
+
+fwrite(feat.dt[intensity != 0],  ScriptAndDatedFileName('hiv.d123.mss.feature.csv.gz'))
+fwrite(pep.dt[intensity != 0],  ScriptAndDatedFileName('hiv.d123.mss.peptide.csv.gz'))
+```
+
+sanity check; looks good!
+```{r}
+feat.dt[intensity != 0][,.N, by=.(sample,protein, sequence, fraction)][N>1]
+feat.dt[sample== 'Infected_1' & protein == 'O00487' & sequence == 'QTTSNLGHLNKPSIQALIHGLNR' & fraction == 1, sum(intensity)]
+pep.dt[sample== 'Infected_1' & protein == 'O00487' & sequence == 'QTTSNLGHLNKPSIQALIHGLNR' & fraction == 1]
+
+```
+
+Question here is what do we consider a sample. I think a sample should be the fraction/condition combo
+
+```{r}
+
+spec.list[['sonic']][!is.na(Intensity)]
+
+lapply(spec.list, str)
+lapply(spec.list, head)
+
+dp.out <- lapply(names(spec.list), function(x){
+
+  message('Running MSStats dataProcess on ', x)
+  
+  dp.out <- MSstats::dataProcess(spec.list[[x]], 
+                                MBimpute =  FALSE, 
+                                normalization = FALSE, # turn off for SECMS
+                                summaryMethod = "TMP",
+                                featureSubset = 'highQuality',
+                                remove_uninformative_feature_outlier=T)
+
+  saveRDS(dp.out, paste0('./output/', x, '.mss.dp.rds'))
+  return(dp.out)
+})
+```
+
+
+
+**not used**
+
+```{r}
+allFiles <- dir('./data/HIV_Infection_CD4T_cells/Donor-3-061125/D3_Stringent_Spectronaut_Parameters_061225/', full.names = T, include.dirs = T, recursive = T)
+pep.ls <- lapply(grep('Peptide', allFiles, value=T), fread)
+names(pep.ls) <- sapply(grep('Peptide', allFiles, value=T), function(x) unlist(strsplit(x, '[/]'))[7])
+names(pep.ls)
+```
+
+# convert to DT and tidy
+
+```{r}
+pep.dt <- rbindlist(pep.ls, idcol='sample')
+pep.dt[, sample := gsub('_061225', '', sample)]
+```
+
+nasty format... lets tidy, remove unnessary colnames and combine in long format and save the files
+```{r}
+ints.cols <- grep('TargetQuantity', colnames(pep.dt), value=T)
+qval.cols <- grep('Qvalue', colnames(pep.dt), value=T)
+id.cols <- colnames(pep.dt)[1:9]
+
+ints.long <- pep.dt[, !..qval.cols] %>% 
+  melt(., idvars=id.cols, measure.vars = ints.cols)
+setnames(ints.long, old=c('variable', 'value'), new=c('run', 'intensity'))
+
+qval.long <- pep.dt[, !..ints.cols] %>% 
+  melt(., id.vars = id.cols, measure.vars = qval.cols)
+setnames(qval.long, old=c('variable', 'value'), new=c('run', 'qvalue'))
+colnames(qval.long)
+
+# tidy the run column; extract the val in square brackets and the follwoing first numberic set
+ints.long[, c('fraction', 'fraction2') := tstrsplit(run, '[^0-9]+', keep=c(2,3))]
+qval.long[, c('fraction', 'fraction2') := tstrsplit(run, '[^0-9]+', keep=c(2,3))]
+# check fraction == fraction2, if so drop fract two and then create a replicate column. we will save these as peptide level measurements for importing into 
+
+ints.long[fraction == fraction2]
+
+#drop ununsed cols
+cols.noi <- c('PG.ProteinDescriptions', 'run', 'fraction2')
+ints.long[, c(cols.noi) := NULL]
+qval.long[, c(cols.noi) := NULL]
+
+# drop fraction and ints
+key.cols <- colnames(ints.long)[-9]
+
+# merge the values
+pep.dt <- merge(ints.long, qval.long, by=key.cols)
+
+colnames(pep.dt)
+pep.dt[, replicate := 3]
+
+```
+
+tr
+
+
+
+tidy and save the peptide info 
+
+```{r}
+fwrite(pep.dt[, .(sample, replicate, fraction, protein=PG.ProteinAccessions, gene=PG.Genes, precursor=EG.PrecursorId, pg_specific=PEP.IsProteinGroupSpecific,
+           decoy=EG.IsDecoy, mw=PG.MolecularWeight, org=PG.Organisms, intensity, qvalue)], ScriptAndDatedFileName('hiv.d3.peptide.ints.long.csv.gz'))
+```
+read in the data and summarize to the protein level 
+```{r}
+msin.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_D3_MSstatsSmmarization_data/2025_06_16_hiv.d3.peptide.ints.long.csv.gz')
+
+```
+
+# so it looks like the decoys are detected at the protein level; we definitely dont want to include this in our other protein quant estimates;
+for safety prefix 'decoy' to each protei/gene name
+```{r}
+# all of these decoy have an NA qvalue
+msin.dt[decoy == TRUE, .(protein, gene,precursor, qvalue)]
+msin.dt[gene == 'CIZ1', .N, by=.(decoy,sample)]
+
+
+# tidy the decoy names for gene and protein
+paste0('decoy_',strsplit("Q12959;Q12959-3;Q12959-5;Q12959-6" , ";")[[1]], collapse=';')
+msin.dt[decoy == TRUE, unique(protein)]
+
+
+sdcols <- c('protein', 'gene')
+msin.dt[decoy == TRUE, (sdcols) :=  lapply(.SD, function(x){ paste0('decoy_',strsplit(x, ";")[[1]], collapse=';')}), .SDcols = sdcols, by=.I]
+```
+
+```{r}
+fwrite(msin.dt, ScriptAndDatedFileName('hiv.d3.peptide.ints.long.csv.gz'))
+msin.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_D3_MSstatsSmmarization_data/2025_06_16_hiv.d3.peptide.ints.long.csv.gz')
+```
+
+# prepare the files for MSS input
+
+first prepare an annotation data.table 
+```{r}
+anno.dt <- msin.dt[, .(protein, gene, mw)] %>% 
+  unique()
+#fwrite(anno.dt, ScriptAndDatedFileName('prot.id.mapper.csv.gz'))
+```
+
+Tidy the input to see which proteins will be input into the analysis
+```{r}
+# create cols
+msin.dt[, PrecursorCharge :=  as.numeric(str_extract(precursor, '[0-9]{1,2}$'))]
+msin.dt[, IsotopeLabelType := 'L']
+msin.dt[, Condition := ifelse(sample == 'D3-Challenged_Infected', 'Infected',
+                              ifelse(sample == "D3-'Challenged_Uninfected", 'Challenged', 'Uninfected'))]
+msin.dt[, BioReplicate := replicate]
+msin.dt[, PeptideSequence := gsub('[.][0-9]+$', '', precursor)]
+msin.dt[, Run := paste0(Condition, '_', fraction, '.raw')]
+msin.dt %>% colnames()
+setnames(msin.dt, old=c('protein'), new=c('ProteinName'))
+
+fwrite(msin.dt[, .(Run, Condition, BioReplicate, ProteinName, PeptideSequence, PrecursorCharge, IsotopeLabelType, Intensity=intensity)], ScriptAndDatedFileName('d3.hiv.mss.input.csv.gz'))
+```
+Do a protein summarization; lets see if the pquant groups are maintained
+```{r}
+msin.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_D3_MSstatsSmmarization_data/2025_06_16_d3.hiv.mss.input.csv.gz')
+msin.dt[, c('PeptideModifiedSequence', 'FragmentIon', 'ProductCharge') := NA]  #need these cols in the data 
+msin.dt[, treatment := Condition]
+msin.dt[, Condition :=  Run]
+msin.dt[, Run := paste0(Condition,'.', BioReplicate, '.raw')]
+```
+Run in parallel
+```{r}
+library(parallel)
+nCores <- detectCores() - 2
+
+dp.ls <- mclapply(split(msin.dt, msin.dt$treatment), function(x){
+
+  sname <- unique(x$treatment)
+  message('Running MSStats dataProcess on ', sname)
+  
+  print(x)
+  dp.out <- MSstats::dataProcess(x, 
+                                MBimpute =  FALSE, 
+                                normalization = FALSE, # turn off for SECMS
+                                summaryMethod = "TMP",
+                                featureSubset = 'highQuality',
+                                remove_uninformative_feature_outlier=T)
+
+  saveRDS(dp.out, ScriptAndDatedFileName(sname,'.mss.data.proc.rds'))
+  return(dp.out)
+
+}, mc.cores = nCores)
+```
+
+```{r}
+print('hello')
+```
+

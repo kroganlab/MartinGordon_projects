@@ -1,0 +1,405 @@
+---
+title: "083024_viralComparisons"
+author: "Martin Gordon"
+date: "2024-08-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Goal here is to perform a comparison of the viral proteins across conditions
+Two goals; we need to normalize to genomic DNA and then normalize to a reference strain (WA)
+
+```{r}
+library(DESeq2)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(circlize)
+library(ComplexHeatmap)
+library(ggrepel)
+library(readxl)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj; eg facet_grid allow x/y axis to vary
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+library(viridis)
+library(readxl)
+library(viridis)
+
+library(biomaRt)
+
+# RNAseq DE functions
+library(tximport)
+library(DESeq2)
+library(IHW)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+source("../../utils/mg_utils/r_utils/differentialTesting.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+```
+
+Read in the mapping file and the keys file with sample name
+These are reads that had a map q > 30, so considered high quality
+```{r}
+# read in the read counts mapped to the different genomic locations
+loc.dt <- fread('./output/Subgenomic_Starts_Labeled.csv')
+loc.dt[, read := str_extract(file, 'R1|R2')]
+loc.dt[, file := gsub('-','_', gsub('\\_.+','', file))]
+
+# read in sample mapping files 
+keys <- fread('./output/comb.samplesheet.csv', header=F)
+
+keys <- keys[, .(sample=V1, filename=str_extract(V2, 'RF.+$|MRC.+$'))]
+keys[, file := gsub('-','_', gsub('\\_.+','', filename))]
+
+
+loc.dt <- merge(x=loc.dt, y=keys, by.x='file', by.y='file', all.x=T)
+```
+
+
+```{r}
+# just take reads mapped to the relevenant splice site
+loc.dt <- loc.dt[splice.name != '',]
+
+loc.dt[, `:=`(host=ifelse(grepl('MRC5', sample), 'human', 'bat'),
+              timepoint=ifelse(grepl('Mock', sample), '', str_extract(sample, '[0-9]{1,2}h')),
+              virus=ifelse(grepl('Mock', sample), 'Mock', gsub('MRC5_|RFe_|_[0-9]{1,2}h.+', '', sample))
+                 )]
+```
+
+summarise counts across both reads per sample
+```{r}
+counts.dt <- loc.dt[, .(count = sum(N, na.rm=T)), by=.(splice.name, sample, host, virus,timepoint)]
+counts.dt[, rep := str_extract(sample,'[123]$')]
+```
+Calculate normalized counts;
+```{r}
+# double normalization; first normalize to genomic
+# some NA as dont have measurement dfor the genomic seq
+counts.dt[, genomicNormCount := count/count[splice.name == 'genomic'], by=.(sample)]
+
+# here each subdt is the subgenomic seq, the host the tp and individual rep (is this correct? why do we assume the reps are matched)
+counts.dt[, WANormCount := genomicNormCount/genomicNormCount[virus == 'WA'], by=.(splice.name, host,timepoint, rep)]
+
+#counts.dt[, FC := log2(WANormCount)]
+#counts.dt[, meanFC := mean(FC, na.rm=T),by=.(splice.name, host,timepoint, virus)]
+
+counts.dt[splice.name == 'nonc_9b', splice.name := 'orf9b']
+
+# reorder factors
+counts.dt[, splice.name := factor(splice.name, levels=c('genomic', 'S', 'orf3', 'E', 'M', 'orf6', 'orf7', 'orf8', 'N', 'orf9b', 'Nstar'))]
+counts.dt[, virus := factor(virus, levels=c("WA","N_P80T","9b_T72I_N_P80T"))]
+
+fwrite(counts.dt, ScriptAndDatedFileName('viral.subgenomicRNA.counts.csv'))
+```
+
+```{r}
+
+g <- ggplot(data=counts.dt[host =='human' & !splice.name %in% c('Nstar'), .(meanFC = mean(WANormCount, na.rm=T), stDev = sd(WANormCount, na.rm=T)), by=.(splice.name, host,timepoint, virus)], 
+            aes(x=log2(meanFC), y=virus, fill=virus)) +
+  geom_bar(stat='Identity') +
+  geom_point(data=counts.dt[host =='human' & !splice.name %in% c('Nstar') & splice.name != 'genomic' & virus != 'WA',], aes(x=log2(WANormCount), y=virus, fill=virus), shape=21) +
+  #geom_errorbar(dataaes(xmin=log2(meanFC)-log2(stDev), xmax=log2(meanFC)+log2(stDev)), width=.2, position=position_dodge(.9)) + 
+  geom_vline(xintercept=0) +
+  ggtitle('Human SARS2 subgenomic regions FC vs WA') +
+  xlab('log2 (Variant/Genomic)/WA ') +
+  ylab('Virus') +
+  scale_fill_brewer(type='seq') +
+  facet_grid2(timepoint~splice.name, scales = 'free_x') +
+  #xlim(c(-2,2)) +
+  theme_bw()
+g
+BackupAsPDF(g,'humanSARS2.subgenomicRegions.barplots', dimensions=c(18,8))
+
+#viral plots dont work
+
+g <- ggplot(data=counts.dt[host =='bat' & !splice.name %in% c('Nstar'), .(meanFC = mean(WANormCount, na.rm=T), stDev = sd(WANormCount, na.rm=T)), by=.(splice.name, host,timepoint, virus)], 
+            aes(x=log2(meanFC), y=virus, fill=virus)) +
+  geom_bar(stat='Identity') +
+  geom_point(data=counts.dt[host =='bat' & !splice.name %in% c('Nstar') & splice.name != 'genomic' & virus != 'WA',], aes(x=(WANormCount), y=virus, fill=virus), shape=21) +
+  #geom_errorbar(dataaes(xmin=log2(meanFC)-log2(stDev), xmax=log2(meanFC)+log2(stDev)), width=.2, position=position_dodge(.9)) + 
+  geom_vline(xintercept=0) +
+  ggtitle('Bat SARS2 subgenomic regions FC vs WA') +
+  xlab('log2 (Variant/Genomic)/WA ') +
+  ylab('Virus') +
+  scale_fill_brewer(type='seq') +
+  facet_grid2(timepoint~splice.name, scales = 'free_x') +
+  #xlim(c(-2,2)) +
+  theme_bw()
+g
+BackupAsPDF(g,'batSARS2.subgenomicRegions.barplots', dimensions=c(18,8))
+```
+bat plot doesnt work as not detecting it consistently in bat, so not a good baseline
+Just plot a heatmap of both?
+
+Just use the genomic normalized reads
+Quantifications are normalized to genomic (leader + orf1a) counts to control for differences in viral replication between the strains
+Then look for differences to WA
+
+```{r}
+bat.counts <-  dcast(counts.dt[host == 'bat' & !splice.name %in% c('Nstar'),], splice.name~sample, value.var = 'genomicNormCount') %>% 
+  as.matrix(rownames='splice.name')
+
+human.counts <-  dcast(counts.dt[host == 'human' &!splice.name %in% c('Nstar'),], splice.name~sample, value.var = 'genomicNormCount') %>% 
+  as.matrix(rownames='splice.name')
+
+# and then median sweep the values
+submat <- sweep(human.counts, 1, apply(human.counts, 1, median, na.rm=T), '/')
+#submat <- log2(submat)
+
+hm <- Heatmap(log2(submat),
+        border=T,
+        cluster_column_slices = F,
+        name='log2 (counts/genomic)/median',
+        column_split=list(str_extract(colnames(submat),'12h|24h|48h'),
+                          gsub('MRC5_|_[0-9]{2}h.+', '', colnames(submat))),
+        column_names_gp = gpar(fontsize=6),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows=F)
+
+
+BackupAsPDF(draw(hm, column_title='human viral transcripts'), 'human.viral.genomicNorm.heatmap', dimensions=c(12,8))
+```
+
+plot the same for the virus
+Missing the WA 48h samples, for now just share the viral human results and the count matrices for the viral bat
+
+```{r}
+submat <- sweep(bat.counts, 1, apply(bat.counts, 1, median, na.rm=T), '/')
+
+hm <- Heatmap(log2(submat),
+        border=T,
+        cluster_columns = F,
+        cluster_column_slices = F,
+        name='log2 (counts/genomic)/median',
+        column_split=list(str_extract(colnames(submat),'6h|12h|24h|48h'),
+                          gsub('RFe_|_[0-9]{1,2}h.+', '', colnames(submat))),
+        column_names_gp = gpar(fontsize=6),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows=F)
+
+hm
+BackupAsPDF(draw(hm, column_title='bat viral transcripts'), 'bat.viral.genomicNorm.heatmap', dimensions=c(14,8))
+```
+
+Differential testing of the human samples
+Take the genomic norm count and do a two sample t-test with unequal variance for each row
+Just use the lm function 
+```{r}
+
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~ virus + timepoint){  
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  return (as.data.table(contrast1))
+}
+
+  
+lm.out <- linearModelsAllProteins(counts.dt[host =='human',], 
+                                  formulaList = list(BasicModel =  genomicNormCount ~ virus + timepoint,
+                                                     Interaction =  genomicNormCount ~ virus + timepoint + virus:timepoint),
+                                  splitColumn = "splice.name", 
+                                  postProcessFunction = emmeans.contrastOfContrasts, cl = 6) |> suppressWarnings()
+
+
+# lets filter out the differences between the groups
+hu.contrasts <- list('12h_countrast' = lm.out$postProcess[model == 'BasicModel' & contrast %like% '12h.+12h',],
+     '24h_countrast' = lm.out$postProcess[model == 'BasicModel' & contrast %like% '24h.+24h',],
+     '48h_contrast'  = lm.out$postProcess[model == 'BasicModel' & contrast %like% '48h.+48h',]) %>%  
+  rbindlist(idcol=T)
+```
+
+```{r}
+N_P80T.vsWA <- counts.dt[host =='human' & splice.name != 'genomic' & !is.na(WANormCount), t.test(x=log2(WANormCount[condition == 'MRC5_N_P80T']), y=log2(WANormCount[condition == 'MRC5_WA']), alternative='two.sided', var.equal=F), by=.(splice.name, timepoint)] %>%
+  .[, .(splice.name, contrast='MRC5_N_P80T vs MRC5_WA',timepoint, statistic, df=parameter, p.value, stderr, method, alternative)] %>%  unique()
+
+dblMut.vsWA <- counts.dt[host =='human' & splice.name != 'genomic' & !is.na(WANormCount), t.test(x=log2(WANormCount[condition == 'MRC5_9b_T72I_N_P80T']), y=log2(WANormCount[condition == 'MRC5_WA']), alternative='two.sided', var.equal=F), by=.(splice.name, timepoint)] %>%
+  .[, .(splice.name, contrast='MRC5_9b_T72I_N_P80T vs MRC5_WA',timepoint, statistic, df=parameter, p.value, stderr, method, alternative)] %>%  unique()
+
+dblMut.vsN_P08T <- counts.dt[host =='human' & splice.name != 'genomic' & !is.na(WANormCount), t.test(x=log2(WANormCount[condition == 'MRC5_9b_T72I_N_P80T']), y=log2(WANormCount[condition == 'MRC5_N_P80T']), alternative='two.sided', var.equal=F), by=.(splice.name, timepoint)] %>%
+  .[, .(splice.name, contrast='MRC5_9b_T72I_N_P80T vs MRC5_N_P80T',timepoint, statistic, df=parameter, p.value, stderr, method, alternative)] %>%  unique()
+
+
+stats.dt <- rbind(N_P80T.vsWA, dblMut.vsWA, dblMut.vsN_P08T)
+fwrite(stats.dt, ScriptAndDatedFileName('human.viral.sgRNA.t.tests.csv'))
+```
+
+```{r}
+hu.feat.counts <- fread('./output/featureCounts/hsSARS.featureCounts.txt') 
+cols.oi <- c('Geneid', grep('[.]markdup[.]sorted.bam', colnames(hu.counts), value=T))
+
+hu.counts <- hu.counts[, ..cols.oi]
+colnames(hu.counts) <- gsub('/wynton/group/krogan/mgordon/projects/072524_JBatra_SARS2RNAseqHuBat/output/huSARS2/star_salmon/|.markdup.sorted.bam', '', colnames(hu.counts))
+hu.counts <- as.matrix(hu.counts, rownames='Geneid')
+
+cols.oi <- c('Geneid', grep('[.]markdup[.]sorted.bam', colnames(hu.counts), value=T))
+
+Heatmap(sweep(human.counts, 1, apply(human.counts, 1, median, na.rm=T)))
+
+
+Heatmap(human.counts)
+Heatmap(bat.counts)
+
+
+boxplot(log2(human.counts))
+```
+
+
+Think the bat counts are so low for WA we cant use this to normalize..
+
+First plot RNAseq total counts 
+Calculate TPM (need vecotor of viral gene lengths)
+```{r}
+bat.counts <-  dcast(counts.dt[host == 'bat' & !splice.name %in% c('Nstar', 'nonc_9b'),], splice.name~sample, value.var = 'count') %>% 
+  as.matrix(rownames='splice.name')
+
+human.counts <-  dcast(counts.dt[host == 'human' &!splice.name %in% c('Nstar', 'nonc_9b'),], splice.name~sample, value.var = 'count') %>% 
+  as.matrix(rownames='splice.name')
+
+# get gene counts
+sars2.gtf <- fread(cmd = "grep -v '#' ./output/annoFiles/SARS2_WA.gtf") %>% 
+  .[V3 == 'gene', .(ref=V1,start=V4, stop=V5, info=V9)]
+
+sars2.gtf[, c('gene_id', 'gene') := tstrsplit(gsub('\\"|gene_id\\s|gene\\s', '', info), ';', keep=c(1,5))]
+sars2.gtf[, gene.length := stop - start]
+
+gene.lengths <- sars2.gtf$gene.length
+names(gene.lengths) <- gsub(' ', '', sars2.gtf$gene)
+
+```
+
+```{r}
+gene.lengths <- c(gene.lengths, 'genomic' = 29882)
+# tidy 
+names(gene.lengths)[3] <- 'orf3'
+names(gene.lengths)[7] <- 'orf7'
+
+# keep same subset and maotch order in heatmap
+gene.lengths <- gene.lengths[names(gene.lengths) %in% rownames(human.counts)]
+gene.lengths <- gene.lengths[match(rownames(human.counts), names(gene.lengths))]
+```
+
+
+this doenst work as I also need a vector of other gene lengths in sample... just leave off for now
+```{r}
+hu.tpm.mat <- rawCountsToTPM(human.counts, gene.length = gene.lengths)
+bat.tpm.mat <- rawCountsToTPM(bat.counts, gene.length = gene.lengths)
+
+```
+
+091324
+Regeenrate the plot for hte bat counts; instead of WT compare the single vs the double mutatn
+
+Think we may need to reprocess the bat counts
+
+```{r}
+# read in the read counts mapped to the different genomic locations
+loc.dt <- fread('./output/Subgenomic_Starts_Labeled.csv')
+loc.dt[, read := str_extract(file, 'R1|R2')]
+loc.dt[, file := gsub('-','_', gsub('\\_.+','', file))]
+
+# read in sample mapping files 
+keys <- fread('./output/comb.samplesheet.csv', header=F)
+
+keys <- keys[, .(sample=V1, filename=str_extract(V2, 'RF.+$|MRC.+$'))]
+keys[, file := gsub('-','_', gsub('\\_.+','', filename))]
+
+
+loc.dt <- merge(x=loc.dt, y=keys, by.x='file', by.y='file', all.x=T)
+```
+
+```{r}
+# just take reads mapped to the relevenant splice site
+loc.dt <- loc.dt[splice.name != '',]
+
+loc.dt[, `:=`(host=ifelse(grepl('MRC5', sample), 'human', 'bat'),
+              timepoint=ifelse(grepl('Mock', sample), '', str_extract(sample, '[0-9]{1,2}h')),
+              virus=ifelse(grepl('Mock', sample), 'Mock', gsub('MRC5_|RFe_|_[0-9]{1,2}h.+', '', sample))
+                 )]
+
+
+```
+
+summarise counts across both reads per sample
+```{r}
+counts.dt <- loc.dt[, .(count = sum(N, na.rm=T)), by=.(splice.name, sample, host, virus,timepoint)]
+counts.dt[, rep := str_extract(sample,'[123]$')]
+
+counts.dt[, genomicNormCount := count/count[splice.name == 'genomic'], by=.(sample)]
+
+counts.dt[, N_P80TNormCount := genomicNormCount/genomicNormCount[virus == 'N_P80T'], by=.(splice.name, host,timepoint, rep)]
+
+counts.dt[splice.name == 'nonc_9b', splice.name := 'orf9b']
+
+# reorder factors
+counts.dt[, splice.name := factor(splice.name, levels=c('genomic', 'S', 'orf3', 'E', 'M', 'orf6', 'orf7', 'orf8', 'N', 'orf9b', 'Nstar'))]
+counts.dt[, virus := factor(virus, levels=c("WA","N_P80T","9b_T72I_N_P80T"))]
+counts.dt[, timepoint := factor(timepoint, levels=c("6h","12h","24h","48h"))]
+
+
+
+g <- ggplot(data=counts.dt[host == 'bat' & virus != 'WA' & !splice.name %in% c('Nstar'), .(meanFC = mean(log2(N_P80TNormCount), na.rm=T),stDev = sd(N_P80TNormCount, na.rm=T)), by=.(splice.name, host,timepoint, virus)], 
+            aes(x=meanFC, y=virus, fill=virus)) + 
+  geom_bar(stat='Identity') +
+  geom_point(data=counts.dt[host == 'bat' & !virus %in% c('WA', 'N_P80T') & !splice.name %in% c('Nstar', 'genomic'),], aes(x=log2(N_P80TNormCount), y=virus, fill=virus), shape=21) +
+  geom_vline(xintercept=0) +
+  geom_vline(xintercept=0) +
+  ggtitle('Bat SARS2 subgenomic regions FC vs N_P80T') +
+  xlab('log2 (Variant/Genomic)/N_P80T') +
+  ylab('Virus') +
+  scale_fill_brewer(type='seq') +
+  facet_grid2(timepoint~splice.name, scales = 'free_x') +
+  #xlim(c(-2,2)) +
+  theme_bw()
+g
+
+BackupAsPDF(g,'batSARS2.subgenomicRegions.vsN_P80T.barplots', dimensions=c(18,8))
+```
+Calculate normalized counts;
+```{r}
+counts.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/083024_viralComparisons_data/2024_08_31_viral.subgenomicRNA.counts.csv')
+
+# normalize to the single mutant
+counts.dt[, N_P80TNormCount := genomicNormCount/genomicNormCount[virus == 'N_P80T'], by=.(splice.name, host,timepoint, rep)]
+
+g <- ggplot(data=counts.dt[host =='bat' & virus != 'WA' & !splice.name %in% c('Nstar'), .(meanFC = mean(N_P80TNormCount, na.rm=T), stDev = sd(N_P80TNormCount, na.rm=T)), by=.(splice.name, host,timepoint, virus)], 
+            aes(x=log2(meanFC), y=virus, fill=virus)) +
+  geom_bar(stat='Identity') +
+  geom_point(data=counts.dt[host =='bat' & !splice.name %in% c('Nstar') & splice.name != 'genomic' & virus != 'WA',], aes(x=(N_P80TNormCount), y=virus, fill=virus), shape=21) +
+  #geom_errorbar(dataaes(xmin=log2(meanFC)-log2(stDev), xmax=log2(meanFC)+log2(stDev)), width=.2, position=position_dodge(.9)) + 
+  geom_vline(xintercept=0) +
+  ggtitle('Bat SARS2 subgenomic regions FC vs WA') +
+  xlab('log2 (Variant/Genomic)/WA ') +
+  ylab('Virus') +
+  scale_fill_brewer(type='seq') +
+  facet_grid2(timepoint~splice.name, scales = 'free_x') +
+  #xlim(c(-2,2)) +
+  theme_bw()
+g
+BackupAsPDF(g,'batSARS2.subgenomicRegions.barplots', dimensions=c(18,8))
+```
+

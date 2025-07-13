@@ -1,0 +1,1175 @@
+---
+title: "220424_newPlots"
+author: "Martin Gordon"
+date: "2024-04-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Review of analysis & plot generation
+
+First to do; Want to recreate the input matrix for mageck and run the DE testing with the log transformed counts
+Also; review the original input data; why are many of the DE genes mostly moving up direction?
+What about using the non-targeting controls for estimating p-values? Try the log values and then reruns
+
+
+Todo
+---
+Redo DE testing with other type of normalization - tried, less hits found (better)
+Generate new plots
+Check for lost variants in the VEP output - many sgRNA only present in one of the cas9 in the canonical VEP list. Investigate input/output
+Complete enrichment of the results 
+  
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(ggrepel)
+library(ggridges) # ridgeline plots
+library(eulerr) # for venn diagram plots
+library(ggvenn)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+
+
+```{r}
+counts.dt <- fread('./032824_MAGECK_DE_firstPass_data/2024_03_28_sampleCounts.csv')
+
+counts.dt %>%  colnames()
+
+norm.count.mat <- dcast(counts.dt, sgRNA+Gene~sample, value.var = "CPM.normCounts")
+#fwrite(norm.count.mat, ScriptAndDatedFileName('lognormalizedCounts.matrix.csv'))
+```
+
+Read in the normalized count matrix
+```{r}
+norm.mat.dt <- fread('~/Documents/projects/032124_RBabu_CRISPRMutantScreen/220424_newPlots_data/2024_04_22_lognormalizedCounts.matrix.csv')
+```
+
+
+```{r}
+# first thing we need to do is write to each file a subset of the mat of interest
+selectCols <- function(dt, colPatterns=c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL2','Abe8eSerum')){
+  cols.oi <- grep(paste(colPatterns, collapse = '|'), colnames(dt), value = T)
+  
+  print(cols.oi)
+  dt[, ..cols.oi]
+}
+```
+
+```{r}
+# first grp is fitness analysis after base editing
+cols.oi <- list(c('sgRNA', 'Gene', 'Bemax_Lib', 'BemaxDMSO_CTRL2'),
+                c('sgRNA', 'Gene', 'Bemax_Lib', 'BemaxDMSO_CTRL2'),
+                c('sgRNA', 'Gene', 'Abe8e_Lib', 'Abe8eDMSO_CTRL2'),
+                c('sgRNA', 'Gene', 'Abe8e_Lib', 'Abe8eDMSO_CTRL2'),
+                # drug sensitivity analysis
+                #bemax set
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL2', 'Bemax_TORIN'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL2', 'Bemax_BAFA1'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL2', 'BemaxSerum_STARVE'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL2', 'Bemax_GPN'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL3', 'Bemax_DOXO'),
+                #abe8e set
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL2', 'Abe8e_TORIN'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL2', 'Abe8e_BAFA1'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL2', 'Abe8eSerum_STARVE'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL2', 'Abe8e_GPN'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL3', 'Abe8e_DOXO'))
+#
+
+comparisons.list <- lapply(cols.oi, function(x){
+  
+   selectCols(norm.mat.dt, colPatterns = x)
+})
+names(comparisons.list) <- lapply(cols.oi, function(x){ paste(x[c(3:4)], collapse='-')  })
+
+names(comparisons.list)
+
+
+lapply(comparisons.list, function(x){
+  
+  x[Gene =='non-targeting']
+})
+
+# wrrite the datatables to file
+lapply(seq_along(comparisons.list), function(x,n,i){
+  
+  fwrite(x[[i]], paste0('./output/logNorm_matrices/', n[[i]], '220424.logNorm.count.tsv'), sep='\t')
+  
+}, x=comparisons.list, n=names(comparisons.list))
+
+```
+
+Get the negative control guide list 
+I have looked at this results and 
+
+```{r}
+#fwrite(counts.dt[Gene == 'non-targeting', .(unique(sgRNA))], ScriptAndDatedFileName('non-targeting-controls.txt'))
+```
+
+Generate the requested plots
+----------
+Variant Annotation
+Annotat the sgRNA by mutational consequence
+Read in the VEP annotated data
+
+```{r}
+abe8e.canonical <- fread('./160424_annotateVariants_data/2024_04_17_abe8ecanonicalVEPAnnotations.txt')
+bemax.canonical <- fread('./160424_annotateVariants_data/2024_04_17_bemaxcanonicalVEPAnnotations.txt')
+
+# severe set 
+abe8e.severe <- fread('./160424_annotateVariants_data/2024_04_17_abe8ehighestImpactVEPAnnotations.txt')
+bemax.severe <- fread('./160424_annotateVariants_data/2024_04_17_bemaxhighestImpactVEPAnnotations.txt')
+
+
+vep.anno.list <- list('abe8e.canonical' = abe8e.canonical,
+                      'bemax.canonical' = bemax.canonical,
+                      'abe8e.severe' = abe8e.severe,
+                      'bemax.severe' = bemax.severe)
+
+lapply(vep.anno.list, function(x){
+  x[, c('sgRNA_sequence', 'windowEdits') := tstrsplit(Name,'__', keep=c(1,2))]
+})
+
+
+# seems we have lost many sgRNA..
+# need to go back to the VEP data and double check this... why did we lose so many sgRNA?
+lapply(vep.anno.list, function(x){
+  x[,unique(sgRNA_sequence)] %>%  length()
+})
+```
+Read in the DE sgRNA testing results
+Edit: have rerun the analysis with the sgRNA controls; lets see how it looks
+These are the logNrmalised results; not as many sig hits as the other group
+```{r}
+de.sgRNA.meta <- dir(path='./output/mageck_test_logNorm', pattern='*.sgrna_summary.txt', full.names = T, recursive = F) %>% 
+  as.data.table()
+de.gene.meta <- dir(path='./output/mageck_test_logNorm', pattern='*.gene_summary.txt', full.names = T, recursive =F) %>% 
+  as.data.table()
+
+de.sgRNA.meta[, contrast := sub('.sgrna_summary.txt', '', sub('./output/mageck_test_logNorm/', '', .)) ]
+de.sgRNA.meta[, c('numerator', 'denominator') :=  tstrsplit(contrast, '-', keep=c(1,2))]
+
+de.gene.meta[, contrast := sub('.sgrna_summary.txt', '', sub('./output/mageck_test_logNorm/', '', .)) ]
+de.gene.meta[, c('numerator', 'denominator') :=  tstrsplit(contrast, '-', keep=c(1,2))]
+```
+read in the output results and bind the DTs together
+
+```{r}
+de.sgRNA.list <- lapply(de.sgRNA.meta$., fread)
+names(de.sgRNA.list) <- de.sgRNA.meta$contrast
+
+# ok the results look good, bind and lets visualise hits
+sgRNA.dt <- rbindlist(de.sgRNA.list, idcol = 'contrast')
+
+sgRNA.dt[, c('Treatment', 'Control') := tstrsplit(contrast, '-', keep=c(1,2))]
+
+
+sgRNA.dt <- sgRNA.dt[, c("contrast","sgrna","Gene","Control", "Treatment", "control_count","treatment_count","control_mean","treat_mean","LFC","control_var",
+             "adj_var","score","p.low","p.high","p.twosided","FDR","high_in_treatment")]
+
+#fwrite(sgRNA.dt, ScriptAndDatedFileName('sgRNA.mageck.test.redoWDMSOCtrl2.csv'))
+
+sgRNA.wide <- dcast(sgRNA.dt, sgrna+Gene~contrast, value.var = c('LFC', 'p.low', 'p.high', 'p.twosided', 'FDR', 'control_count', 'treatment_count'))
+#fwrite(sgRNA.wide, ScriptAndDatedFileName('sgRNA.mageck.test.redoWDMSOCtrl2.wideformat.csv'))
+```
+First: how do the DE results from the logNorm input look?
+
+Plots of the analysis
+We set a stronger LFC threshold here (halfing/doubling) than previous
+
+```{r}
+# add a sig title
+sgRNA.dt[,sig := 'not']
+# this might be the other approach
+sgRNA.dt[abs(LFC) >= 1 & (p.low < 0.01 | p.high < 0.01), sig := ifelse(LFC > 0, 'up', 'down')]
+
+#just fdr < 0.1
+#sgRNA.dt[abs(LFC) >= 1 & FDR < 0.1, sig := ifelse(LFC > 0, 'up', 'down')]
+
+
+sgRNA.dt[, cas9 := ifelse(grepl('Abe8e', contrast), 'Abe8e', 'Bemax')]
+sgRNA.dt[, grp_comparison := paste0(sub('Abe8e[_]{0,1}|Bemax[_]{0,1}', '', Treatment), '-vs-', sub('Abe8e[_]{0,1}|Bemax[_]{0,1}', '', Control))]
+```
+
+Plot number of sig Hits with the new pval threshold
+Trends broadly similar, but we are finding far less DE hits..
+Lets retry with the sgRNA to estimate the null distribution
+
+It didnt really impact our recovery of DE genes... try rerunning with our other normalized reads
+```{r}
+# breakdown by contrast
+g <- ggplot(sgRNA.dt[,.N, by=.(sig,grp_comparison, cas9)][sig != 'not',], aes(x=cas9, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~grp_comparison) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & p.adjust < 0.1)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+
+BackupAsPDF(g, 'sgRNA.sigHits.breakdownbyContrast', dimensions=c(10,12))
+```
+Reread in our TMM normalised results and lets analyse
+
+Read in the DE sgRNA testing results
+Edit: have rerun the analysis with the sgRNA controls; lets see how it looks
+```{r}
+de.sgRNA.meta <- dir(path='./output/mageck_test', pattern='*.sgrna_summary.txt', full.names = T, recursive = F) %>% 
+  as.data.table()
+de.gene.meta <- dir(path='./output/mageck_test', pattern='*.gene_summary.txt', full.names = T, recursive =F) %>% 
+  as.data.table()
+
+de.sgRNA.meta[, contrast := sub('.sgrna_summary.txt', '', sub('./output/mageck_test/', '', .)) ]
+de.sgRNA.meta[, c('numerator', 'denominator') :=  tstrsplit(contrast, '-', keep=c(1,2))]
+
+de.gene.meta[, contrast := sub('.sgrna_summary.txt', '', sub('./output/mageck_test/', '', .)) ]
+de.gene.meta[, c('numerator', 'denominator') :=  tstrsplit(contrast, '-', keep=c(1,2))]
+```
+read in the output results and bind the DTs together
+
+```{r}
+de.sgRNA.list <- lapply(de.sgRNA.meta$., fread)
+names(de.sgRNA.list) <- de.sgRNA.meta$contrast
+
+# ok the results look good, bind and lets visualise hits
+sgRNA.dt <- rbindlist(de.sgRNA.list, idcol = 'contrast')
+
+sgRNA.dt[, c('Treatment', 'Control') := tstrsplit(contrast, '-', keep=c(1,2))]
+
+
+sgRNA.dt <- sgRNA.dt[, c("contrast","sgrna","Gene","Control", "Treatment", "control_count","treatment_count","control_mean","treat_mean","LFC","control_var",
+             "adj_var","score","p.low","p.high","p.twosided","FDR","high_in_treatment")]
+
+#fwrite(sgRNA.dt, ScriptAndDatedFileName('sgRNA.mageck.test.redoWDMSOCtrl2.csv'))
+
+sgRNA.wide <- dcast(sgRNA.dt, sgrna+Gene~contrast, value.var = c('LFC', 'p.low', 'p.high', 'p.twosided', 'FDR', 'control_count', 'treatment_count'))
+#fwrite(sgRNA.wide, ScriptAndDatedFileName('sgRNA.mageck.test.redoWDMSOCtrl2.wideformat.csv'))
+```
+
+
+```{r}
+# add a sig title
+sgRNA.dt[,sig := 'not']
+# this might be the other approach
+sgRNA.dt[abs(LFC) >= 1 & (p.low < 0.01 | p.high < 0.01), sig := ifelse(LFC > 0, 'up', 'down')]
+
+#just fdr < 0.1
+#sgRNA.dt[abs(LFC) >= 1 & FDR < 0.05, sig := ifelse(LFC > 0, 'up', 'down')]
+
+sgRNA.dt[, cas9 := ifelse(grepl('Abe8e', contrast), 'Abe8e', 'Bemax')]
+sgRNA.dt[, grp_comparison := paste0(sub('Abe8e[_]{0,1}|Bemax[_]{0,1}', '', Treatment), '-vs-', sub('Abe8e[_]{0,1}|Bemax[_]{0,1}', '', Control))]
+```
+
+Plot number of sig Hits with the new pval threshold
+Trends broadly similar, but we are finding far less DE hits..
+Lets retry with the sgRNA to estimate the null distribution
+
+It didnt really impact our recovery of DE genes... try rerunning with our other normalized reads
+```{r}
+# breakdown by contrast
+g <- ggplot(sgRNA.dt[,.N, by=.(sig,grp_comparison, cas9)][sig != 'not',], aes(x=cas9, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~grp_comparison) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & pvalue < 0.01)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+
+BackupAsPDF(g, 'sgRNA.sigHits.breakdownbyContrast', dimensions=c(10,12))
+```
+```{r}
+# breakdown by contrast and gene
+g <- ggplot(sgRNA.dt[,.N, by=.(sig,grp_comparison,Gene, cas9)][sig != 'not',], aes(x=cas9, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_grid(Gene~grp_comparison) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & & pvalue < 0.01)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        strip.text.x = element_text(size=6))
+g
+
+BackupAsPDF(g, 'sgRNA.sigHits.breakdownbyGeneandContrast', dimensions=c(11,14))
+```
+
+Breakdown by gene
+
+```{r}
+# breakdown by  and gene
+g <- ggplot(sgRNA.dt[,.N, by=.(sig,Gene, cas9)][sig != 'not',], aes(x=cas9, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~Gene) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & & pvalue < 0.01)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'sgRNA.sigHits.breakdownbyGene', dimensions=c(11,14))
+```
+Ranking the FC of the different sgRNA per contrast
+```{r}
+lapply(unique(sgRNA.dt$contrast), function(x){
+
+  subdt <- sgRNA.dt[contrast == x,]
+    
+  g <- ggplot(data=subdt, aes(x=reorder(sgrna,LFC), y=LFC, label=sgrna, col=sig)) +
+    geom_point(size=1, aes(col=ifelse(LFC > 1, 'up', 
+                                      ifelse(LFC< -1,'down', 'not')))) +
+    #geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+    geom_label_repel(data=subdt[sig != 'not',], aes(label=sgrna),  segment.linetype=3, max.overlaps = 20,size=1.5) +
+    ggtitle(paste0(x, ' rank plot')) +
+    theme_classic() +
+    xlab('Rank') +
+    # here we add numeric vals to expand the scales
+    scale_x_discrete(expand = expansion(add=500)) +
+    scale_y_discrete(expand = expansion(add=1)) +
+    scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          legend.position = 'none'
+        )
+  
+ BackupAsPDF(g, paste0('rankplots/', x, '.LFC.rankplot'), dimensions = c(6.5,10))
+})
+```
+
+Heatmap of sig sgRNA
+# about 1/6 of the datset is DE.. should this be a consideration for our normalization approach?
+```{r}
+sigHits <-  sgRNA.dt[(p.low < 0.01 | p.high < 0.01) & abs(LFC) >= 1, unique(sgrna)]
+counts.dt[, Replicate := seq_len(.N), by=.(group, sgRNA, Gene)]
+```
+
+plot the heatmap
+
+Plot heatmap
+I think this heatmap is kind of interesting; looks like the control vs Library comparison and DOXO are just complete outliers in both groups but relative treatment similarity is quite similiar within groups.
+
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(k=length(unique(counts.dt$group)))
+
+sg.mat <- dcast(sgRNA.dt[sgrna %in% sigHits,], sgrna~contrast, value.var = 'LFC') %>% 
+  as.matrix(rownames='sgrna')
+
+# create annotation
+ann <- data.table(treatment=str_extract(colnames(sg.mat), 'BAFA1|Lib|DOXO|STARVE|TORIN|GPN'),
+                  cas9=ifelse(grepl('Abe8e|Bemax', colnames(sg.mat)), str_extract(colnames(sg.mat), 'Abe8e|Bemax'), 'Ctrl'))
+
+colours <- list('cas9' = c('Abe8e' = '#4477AA', 'Bemax'="#228833", 'Ctrl'="#CCBB44"),
+                'treatment' =c('BAFA1' = col.pal[1], 'Lib'=col.pal[2], 'DOXO'=col.pal[3], 'CTRL1'=col.pal[4], 'CTRL2'=col.pal[5], 'CTRL3'=col.pal[6],
+                           'STARVE' = col.pal[7], 'TORIN'=col.pal[8], 'GPN'=col.pal[9], 'plasmid_BE'=col.pal[10], 'gRNA_noBE'=col.pal[11]))
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+hm <- Heatmap(sg.mat, 
+        cluster_rows = clusterWNA(sg.mat, method='pearson'),
+        top_annotation = colAnn,
+        row_title = paste0(nrow(sg.mat), ' sgRNA (Log2FC >= 1 & p.adj < 0.05)'),
+        name='Log2(FC)',
+        col=colorRamp2(breaks=c(-2,0,2), colors=c('blue', 'white', 'red')),
+        column_names_gp = gpar(fontsize=6),
+        show_row_names = F)
+hm
+#BackupAsPDF(draw(hm, column_title='Significant sgRNA'), 'sigsgRNA.LFC.pearsonDist.Heatmap', dimensions=c(10,10))
+```
+Replot dropping DMS_ vs ctrl_lib
+Replot but drop the DMSO Ctrl vs Lib group
+Need to check quality of the DOXO and serum starve samples
+```{r}
+sg.mat <- dcast(sgRNA.dt[sgrna %in% sigHits,], sgrna~contrast, value.var = 'LFC') %>% 
+  as.matrix(rownames='sgrna')
+
+submat <-  sg.mat[, grep('CTRL2[-].+', colnames(sg.mat), invert=T)]
+# create annotation
+ann <- data.table(treatment=str_extract(colnames(submat), 'BAFA1|DOXO|STARVE|TORIN|GPN'),
+                  cas9=ifelse(grepl('Abe8e|Bemax', colnames(submat)), str_extract(colnames(submat), 'Abe8e|Bemax'), 'Ctrl'))
+
+colours <- list('cas9' = c('Abe8e' = '#4477AA', 'Bemax'="#228833", 'Ctrl'="#CCBB44"),
+                'treatment' =c('BAFA1' = col.pal[1], 'Lib'=col.pal[2], 'DOXO'=col.pal[3],
+                           'STARVE' = col.pal[7], 'TORIN'=col.pal[8], 'GPN'=col.pal[9]))
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat, method='pearson'),
+        top_annotation = colAnn,
+        row_title = paste0('sgRNA (Log2FC >= 1 & p.val < 0.01)'),
+        name='Log2(FC)',
+        col=colorRamp2(breaks=c(-2,0,2), colors=c('blue', 'white', 'red')),
+        column_names_gp = gpar(fontsize=6),
+        show_row_names = F)
+hm
+
+BackupAsPDF(draw(hm, column_title='Significant sgRNA'), 'sigsgRNA.LFC.pearsonDist.noCtrlvsLib.Heatmap', dimensions=c(10,10))
+```
+scatterplots
+```{r}
+library(ggpubr) # could also use geom_annotate..
+
+# do a all by all scatterplot comparison
+contrast.pairs <-  UniqueFactorCombos(sgRNA.dt$contrast, allow.dups = F, sep=',')
+contrast.pairs
+
+contrast.pairs[Var1 %like% 'GPN' & Var2 %like% 'BAFA1',]
+
+apply(contrast.pairs,1,  function(x){
+  
+  print(sgRNA.dt[contrast %in% x, unique(contrast)])
+  
+  dt <- dcast(sgRNA.dt[contrast %in% x,], sgrna+Gene~contrast, value.var = c('LFC','sig'))
+  # print
+  setnames(dt, new=c('sgRNA', 'gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+
+  
+  # could try nested if else but not working v well....
+  dt[, label := 'not']
+  dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'both']
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=sgRNA)) +
+    geom_point() +
+    geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-1,1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('y-axis sig'='#990033', 'x-axis sig'="#2A788EFF", 'not'='grey', 'both'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not',],size = 2, max.overlaps = 20, show.legend = F) +
+    xlab(paste(x[1], 'log2 fold change',sep=' ')) +
+    ylab(paste(x[2], 'log2 fold change',sep=' ')) +
+    ggtitle(paste('Fold Change Comparisons')) + 
+    theme_bw()
+  
+  #add cor score
+  g <- g + stat_cor(data=dt, aes(x=log2FC.x, y=log2FC.y, label=..r.label..), method='pearson', inherit.aes = F)
+  
+  BackupAsPDF(g, paste0('scatterplots/',x[1], 'vs', x[2],'.log2FC.scatterplots.'))
+})
+```
+
+Venn Diagrams to explore overlaps in the sighits
+```{r}
+# get abe8e and bemax sig groups seperately
+sigSgs <- sgRNA.dt[sig != 'not', .(sgrna, Gene, contrast)] %>% 
+  split(.$contrast)
+
+sigSgs <- lapply(sigSgs, function(x){
+  return(paste(x$sgrna, x$Gene, sep='-'))
+})
+
+abe8e.sig <- sigSgs[grep('Abe8e', names(sigSgs))]
+bemax.sig <- sigSgs[grep('Abe8e', names(sigSgs), invert = T)]
+
+```
+
+```{r}
+names(bemax.sig) <- gsub('Bemax_|BemaxSerum_|Bemax', '', names(bemax.sig))
+names(abe8e.sig) <- gsub('Abe8e_|Abe8eSerum_|Abe8e', '', names(abe8e.sig))
+
+p <- plot(euler(bemax.sig),
+          adjust_labels = TRUE,
+          legend=F,
+          labels=list(cex=.6, fontface=2),
+          main = list(label='Bemax Cas9 Group Comparison Overlaps (Log2FC >1 & pvalue < 0.01)', cex=1, fontface=1),
+          quantities = TRUE
+     )
+p
+BackupAsPDF(p, 'vennDiagrams/bemax.allSigComparisons.vennDiagram', dimensions = c(8,8))
+
+p <- plot(euler(abe8e.sig),
+          adjust_labels = TRUE,
+          legend=F,
+          labels=list(cex=.6, fontface=2),
+          main = list(label='Abe8e Cas9 Group Comparison Overlaps (Log2FC >1 & pvalue < 0.01)', cex=1, fontface=1),
+          quantities = TRUE
+     )
+p
+BackupAsPDF(p, 'vennDiagrams/abe8e.allSigComparisons.vennDiagram', dimensions = c(8,8))
+```
+
+Look at up-reg and down-reg separately
+
+Get the sets
+Seperate the names correctly
+```{r}
+# get abe8e and bemax sig groups seperately
+sigSgs <- sgRNA.dt[sig != 'not', .(sgrna, Gene, contrast, sig)] %>% 
+  split(.$contrast)
+
+
+
+upSgs <- lapply(sigSgs, function(x){
+    up.set <- x[sig == 'up', .(paste(sgrna, Gene, sep='-'))]$V1
+    return(up.set)
+})
+
+downSgs <- lapply(sigSgs, function(x){
+    down.set <- x[sig == 'down', .(paste(sgrna, Gene, sep='-'))]$V1
+    return(down.set)
+})
+
+# upreg
+abe8e.up <- upSgs[grep('Abe8e', names(upSgs))]
+bemax.up <- upSgs[grep('Abe8e', names(upSgs), invert = T)]
+
+#downreg
+abe8e.down <- downSgs[grep('Abe8e', names(downSgs))]
+bemax.down <- downSgs[grep('Abe8e', names(downSgs), invert = T)]
+
+
+# fix names 
+names(bemax.up) <- gsub('Bemax_|BemaxSerum_|Bemax', '', names(bemax.up))
+names(abe8e.up) <- gsub('Abe8e_|Abe8eSerum_|Abe8e', '', names(abe8e.up))
+names(bemax.down) <- gsub('Bemax_|BemaxSerum_|Bemax', '', names(bemax.down))
+names(abe8e.down) <- gsub('Abe8e_|Abe8eSerum_|Abe8e', '', names(abe8e.down))
+
+# add to list
+sigSets <-  list('Abe8e UpReg' = abe8e.up,
+                 'BeMax UpReg' = bemax.up,
+                 'Abe8e DownReg' = abe8e.down, 
+                 'BeMax DownReg' = bemax.down
+)
+```
+
+Volcanoplots 
+---
+Volcanoplots of the sig hits
+
+```{r}
+lapply(unique(sgRNA.dt$contrast), function(x){
+  
+  subdt <- sgRNA.dt[contrast == x,]
+  # create a new pval col
+  subdt[, p.value := ifelse(p.low < p.high, p.low, p.high)]
+  
+  g <- ggplot(subdt, aes(x=LFC, y=-log10(p.value), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.01), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not'], show.legend = F, size=2, max.overlaps = 20) +
+  facet_wrap(~Gene, ncol=3, scales='free_y') +
+  ggtitle(x) +
+  ylab('-log10 p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  g
+  BackupAsPDF(g, paste0('volcanoplots_individual/gene_breakdown/',x ,'.volcanoplots'), dimensions=c(12,14))
+})
+
+
+lapply(unique(sgRNA.dt$contrast), function(x){
+  
+  subdt <- sgRNA.dt[contrast == x,]
+  subdt[, p.value := ifelse(p.low < p.high, p.low, p.high)]
+  subdt[ p.value > 20, p.value := 20 ]
+  
+  g <- ggplot(subdt, aes(x=LFC, y=-log10(p.twosided), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not'], show.legend = F, size=2, max.overlaps = 20) +
+  facet_wrap(~Gene, ncol=3) +
+  ggtitle(x) +
+  ylab('-log10 p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+  BackupAsPDF(g, paste0('volcanoplots_individual/gene_breakdown_thresholded/',x ,'.volcanoplots'), dimensions=c(12,14))
+})
+```
+
+Read in CRISPR lib info 
+```{r}
+crispr.lib <- fread('./docs/crispr.lib.txt', header = F)
+setnames(crispr.lib, new=c('sgRNA', 'sgRNA_sequence', 'Gene'))
+
+```
+
+Subset the VEP data tables to the interesting cols
+Merging our crispr lib with the variant annotation now
+
+```{r}
+vep.cols.oi <- c("Name","Feature","Consequence","Location","REF_ALLELE","Allele","IMPACT","SYMBOL","Gene",
+                 "cDNA_position","CDS_position","Protein_position","Amino_acids","Codons",'sgRNA_sequence', 'windowEdits',
+                 "EXON","INTRON","HGVSc","HGVSp","SWISSPROT","MANE_SELECT", "Existing_variation")
+                 
+                 
+# subset to the cols we want
+vep.anno.list <- lapply(vep.anno.list, function(dt){
+  dt[, ..vep.cols.oi]
+})
+
+
+# merge the annotation list with the crispr IDs 
+vep.anno.list <- lapply(vep.anno.list, function(dt){
+  merge(x=dt, y=crispr.lib[,-c('Gene')], by='sgRNA_sequence', all.x=T)
+})
+
+```
+
+```{r}
+canonical.vep <- vep.anno.list[grepl('canonical', names(vep.anno.list))] %>% 
+  rbindlist(idcol=T)
+
+# modify the id col to just contain the cas9 used
+canonical.vep[, .id := gsub('[.]canonical', '', .id)]
+# convert to upper
+canonical.vep[, .id := ifelse(.id == 'abe8e', 'Abe8e', 'Bemax')]
+canonical.vep[, IMPACT := factor(IMPACT, levels=c('MODIFIER','LOW','MODERATE','HIGH'))]
+
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(canonical.vep$Consequence)))
+```
+
+
+Merge the VEP annotation with output from MAGECK DE testing
+
+```{r}
+# before merging, we need to adjust the gene names for MCOLN1 and AKT1
+sgRNA.dt[Gene == 'Akt1', Gene := 'AKT1']
+sgRNA.dt[Gene == 'COLN1', Gene := 'MCOLN1']
+
+# now merge the dts using the columns
+canonical.dt <- merge(x=sgRNA.dt, y=canonical.vep,  by.x=c("sgrna","Gene", 'cas9'), by.y=c('sgRNA', "SYMBOL", '.id'), all.x=T)
+
+###
+### Not used
+###
+
+# combined this way as 1:1 mapping when joing res and cas9 variant tables seperately
+#merged.LFC.list <- lapply(vep.anno.list, function(dt){
+# LFC.dt <- merge(x=sgRNA.dt, y=dt, by.x=c("sgrna","Gene", 'cas9'), by.y=c('sgRNA', "SYMBOL", '.id'), all.x=T)
+# return(LFC.dt)
+#})
+
+#canonical.dt <- merged.LFC.list[grepl('canonical', names(merged.LFC.list))] %>% 
+#  rbindlist(idcol=T)
+```
+
+One issue here is some of the sgRNAs are only annotated in one cas9.. why we lose a lot of info.. need to investigate
+```{r}
+canonical.vep[,.N, by=.(sgRNA)] %>%  table()
+```
+
+Write out the output so we can reuse
+```{r}
+#fwrite(canonical.dt, ScriptAndDatedFileName('mageckDE.VEP.anno.txt'))
+canonical.dt <-  fread('~/Documents/projects/032124_RBabu_CRISPRMutantScreen/220424_newPlots_data/2024_04_23_mageckDE.VEP.anno.txt')
+```
+
+inspect the canonical dt; looks good
+
+```{r}
+canonical.dt[Gene == 'TFEB' & sgrna == 'BE_182' & grp_comparison == 'GPN-vs-DMSO_CTRL2',]
+canonical.dt$IMPACT %>%  unique()
+```
+
+
+Look at the LFC distibutions per gene split by mutant severity
+```{r}
+# per contrast get the z-scoress of the log2FC distributions per contrast
+canonical.dt[, LFC.zscore := scale(LFC, center=T, scale=T), by=.(contrast)]
+
+contrasts.oi <- unique(canonical.dt$grp_comparison)
+
+# for the intergenic/non-targeting, add these as an IMPACT type to view their distributions
+canonical.dt[, IMPACT := ifelse(Gene %in% c('Intergenic', 'non-targeting'), Gene, IMPACT)]
+
+genes.oi <- unique(canonical.dt$Gene)
+genes.oi
+genes.oi <- genes.oi[-c(5,6)] # drop the controls from this comparison
+genes.oi
+```
+
+```{r}
+lapply(contrasts.oi, function(x){
+  
+  lapply(genes.oi, function(y){
+    # need to make a new 'plot' dt with the intergenic group
+    dt <- canonical.dt[IMPACT != '' & grp_comparison == x & Gene == y,]
+    ctrl.dt <- canonical.dt[Gene %in% c('Intergenic', 'non-targeting'),]
+    new.dt <- rbind(dt, ctrl.dt)
+    new.dt[, IMPACT := factor(IMPACT, levels=c('non-targeting', 'Intergenic', 'MODIFIER', 'LOW','MODERATE','HIGH'))]
+  
+    g <- ggplot(new.dt, aes(x=LFC, y=IMPACT, fill=IMPACT, height = after_stat(density))) +
+      geom_density_ridges(scale = 1.3, stat='density') +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      ggtitle(paste0(x, ' ', y)) +
+     #scale_fill_manual(values=col.pal) +
+      scale_fill_brewer(palette = 4) +
+      facet_grid(~cas9) +
+      theme_ridges() 
+  g
+  BackupAsPDF(g, paste0('ridgePlots/perGeneandContrast/', y, '_', x,'.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions=c(10,8))
+  })
+})
+```
+Ronald request: ridgeplot of the 6 genes togther for each contrast
+
+```{r}
+g <- ggplot(canonical.dt[IMPACT != '',], aes(x=LFC, y=IMPACT, fill=IMPACT, height = after_stat(density))) +
+      geom_density_ridges(scale = 1.3, stat='density') +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      ggtitle(paste0('LFC distributions')) +
+     #scale_fill_manual(values=col.pal) +
+      scale_fill_brewer(palette = 4, direction=-1) +
+      facet_grid(grp_comparison~cas9) +
+      theme_ridges() 
+g
+BackupAsPDF(g, 'ridgePlots/collapsed/LFCdistributions.ridgeplots', dimensions=c(9,16))
+
+g <- ggplot(canonical.dt[IMPACT != '',], aes(x=LFC, y=IMPACT, fill=IMPACT, height = after_stat(density))) +
+      geom_density_ridges(scale = 1.3, stat='density') +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      ggtitle(paste0('LFC distributions')) +
+     #scale_fill_manual(values=col.pal) +
+      scale_fill_brewer(palette = 4, direction=-1) +
+      facet_grid(cas9~grp_comparison) +
+      theme_ridges() +
+      theme(strip.text.x = element_text(size=9))
+g
+BackupAsPDF(g, 'ridgePlots/collapsed/LFCdistributions.mutFaceted.ridgeplots', dimensions=c(16,9))
+```
+
+
+Lets plot the LFC results and see how these break out
+
+```{r}
+g <- ggplot(canonical.dt[sig != 'not' & IMPACT != '',], aes(x=LFC, y=IMPACT, fill=IMPACT, height = after_stat(density))) +
+      geom_density_ridges(scale = 1.3, stat='density') +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      ggtitle(paste0('sig LFC distributions')) +
+     #scale_fill_manual(values=col.pal) +
+      scale_fill_brewer(palette = 4, direction=-1) +
+      facet_grid(cas9~grp_comparison) +
+      theme_ridges() +
+      theme(strip.text.x = element_text(size=9))
+g
+BackupAsPDF(g, 'ridgePlots/collapsed/sigLFCdistributions.mutFaceted.ridgeplots', dimensions=c(16,9))
+```
+Now generate the dotplot, just showcasing things that are significantly moving..
+```{r}
+hgsv.dt <- canonical.dt[HGVSp != '-' & !is.na(HGVSp) & HGVSp != '',]
+hgsv.dt[,mutation := tstrsplit(HGVSp, ':', keep=2) ]
+hgsv.dt[, aa.startSite := as.numeric(str_extract(mutation, '[0-9]+'))]
+hgsv.dt <- hgsv.dt[order(aa.startSite)]
+```
+
+faceted plots
+```{r}
+
+genes.oi <-  'MTOR'
+#genes.oi <- unique(canonical.dt$Gene)
+#genes.oi <- genes.oi[-c(9,10)] # drop the controls from this comparison
+#genes.oi
+
+lapply(contrasts.oi, function(x){
+  
+  lapply(genes.oi, function(y){
+    
+    # need to make a new 'plot' dt with the intergenic group
+    dt <- hgsv.dt[!is.na(IMPACT) & grp_comparison == x & Gene %in% y,]
+    dt[, IMPACT := factor(IMPACT, levels=c('MODIFIER', 'LOW','MODERATE','HIGH'))]
+    
+    # x axis limit
+    xlimit <- max(dt$aa.startSite)
+    
+    g <- ggplot(dt, aes(x=aa.startSite, y=LFC, shape=cas9, fill=IMPACT, label=sgrna)) +
+      geom_point() +
+      geom_text_repel(data=dt[sig != 'not',], size=2, max.overlaps = 20) +
+      geom_hline(yintercept = c(-1,1), alpha=0.4, linetype=2) +
+      xlab('Amino acid') +
+      ylab('Log2 FC') +
+      ggtitle(paste0(y, ' ', x)) +
+      facet_wrap(~cas9, ncol=1) +
+      scale_x_continuous(breaks = seq(0, xlimit, by = 500)) +
+      scale_shape_manual(values = c(21,24)) +
+      scale_fill_manual(values=c('MODIFIER'='grey', 'LOW'='lightyellow', 'MODERATE'='orange', 'HIGH'='darkred')) +
+      theme_classic() +
+      theme(
+            axis.text.x=element_text(size=8),
+            axis.ticks.x = element_blank()) +
+      guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+ 
+  BackupAsPDF(g, paste0('dotplots_labelled/amino_acids/faceted/',y, '_', x,'.LFC.mutantConsequence.windowStartSite.dotplot'), dimensions=c(10,6))
+  })
+})
+```
+combined plots
+
+```{r}
+
+genes.oi <-  'MTOR'
+
+#genes.oi <- unique(canonical.dt$Gene)
+#genes.oi <- genes.oi[-c(9,10)] # drop the controls from this comparison
+#genes.oi
+
+lapply(contrasts.oi, function(x){
+  
+  lapply(genes.oi, function(y){
+    
+    # need to make a new 'plot' dt with the intergenic group
+    dt <- hgsv.dt[!is.na(IMPACT) & grp_comparison == x & Gene %in% y,]
+    dt[, IMPACT := factor(IMPACT, levels=c('MODIFIER', 'LOW','MODERATE','HIGH'))]
+    
+    # x axis limit
+    xlimit <- max(dt$aa.startSite)
+    
+    g <- ggplot(dt, aes(x=aa.startSite, y=LFC, shape=cas9, fill=IMPACT, label=sgrna)) +
+      geom_point() +
+      geom_text_repel(data=dt[sig != 'not',], size=2, max.overlaps = 20) +
+      geom_hline(yintercept = c(-1,1), alpha=0.4, linetype=2) +
+      xlab('Amino acid') +
+      ylab('Log2 FC') +
+     # facet_wrap(~cas9, ncol=1) +
+      scale_x_continuous(breaks = seq(0, xlimit, by = 500)) +
+      scale_shape_manual(values = c(21,24)) +
+      scale_fill_manual(values=c('MODIFIER'='grey', 'LOW'='lightyellow', 'MODERATE'='orange', 'HIGH'='darkred')) +
+      theme_classic() +
+      theme(
+            axis.text.x=element_text(size=8),
+            axis.ticks.x = element_blank()) +
+      guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+ 
+  BackupAsPDF(g, paste0('dotplots_labelled/amino_acids/collapsed/',y, '_', x,'.LFC.mutantConsequence.windowStartSite.dotplot'), dimensions=c(10,6))
+  })
+})
+```
+
+Redo the dotplots, but lets plot only the significant genes
+
+```{r}
+
+genes.oi <-  'MTOR'
+#genes.oi <- unique(canonical.dt$Gene)
+#genes.oi
+#genes.oi <- genes.oi[-c(5,6)] # drop the controls from this comparison
+#genes.oi
+
+lapply(contrasts.oi, function(x){
+  
+  lapply(genes.oi, function(y){
+    
+    # need to make a new 'plot' dt with the intergenic group
+    dt <- hgsv.dt[!is.na(IMPACT) & grp_comparison == x & Gene %in% y,]
+    dt[, IMPACT := factor(IMPACT, levels=c('MODIFIER', 'LOW','MODERATE','HIGH'))]
+    
+    # x axis limit
+    xlimit <- max(dt$aa.startSite)
+    
+    g <- ggplot(dt[sig != 'not',], aes(x=aa.startSite, y=LFC, shape=cas9, fill=IMPACT, label=sgrna)) +
+      geom_point() +
+      geom_text_repel(data=dt[sig != 'not',], size=2, max.overlaps = 20) +
+      geom_hline(yintercept = c(-1,1), alpha=0.4, linetype=2) +
+      xlab('Amino acid') +
+      ylab('Log2 FC') +
+      ggtitle(paste0(y, ' ', x)) +
+      #facet_wrap(~cas9, ncol=1) +
+      scale_x_continuous(breaks = seq(0, xlimit, by = 500)) +
+      scale_shape_manual(values = c(21,24)) +
+      scale_fill_manual(values=c('MODIFIER'='grey', 'LOW'='lightyellow', 'MODERATE'='orange', 'HIGH'='darkred')) +
+      theme_classic() +
+      theme(
+            axis.text.x=element_text(size=8),
+            axis.ticks.x = element_blank()) +
+      guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+ 
+  g
+  BackupAsPDF(g, paste0('dotplots_labelled/amino_acids/pval_threshold/',y, '_', x,'.LFC.mutantConsequence.windowStartSite.dotplot'), dimensions=c(10,6))
+  })
+})
+
+```
+
+Regeenrate same plot, but with barplot instead
+
+```{r}
+
+genes.oi <- unique(canonical.dt$Gene)
+genes.oi
+genes.oi <- genes.oi[-c(9,10)] # drop the controls from this comparison
+genes.oi
+
+genes.oi <-  'MTOR'
+
+lapply(contrasts.oi, function(x){
+  
+  lapply(genes.oi, function(y){
+    
+    # need to make a new 'plot' dt with the intergenic group
+    dt <- hgsv.dt[!is.na(IMPACT) & grp_comparison == x & Gene %in% y,]
+    dt[, IMPACT := factor(IMPACT, levels=c('MODIFIER', 'LOW','MODERATE','HIGH'))]
+    
+    # x axis limit
+    xlimit <- max(dt$aa.startSite)
+    
+    g <- ggplot(dt, aes(x=aa.startSite, y=LFC, shape=cas9, fill=sig)) +
+      geom_bar(stat='Identity', linewidth=8) +
+      #geom_text_repel(data=dt[sig != 'not',], size=2, max.overlaps = 20) +
+      geom_hline(yintercept = c(-1,1), alpha=0.4, linetype=2) +
+      xlab('Amino acid') +
+      ylab('Log2 FC') +
+      ggtitle(paste0(y, ' ', x)) +
+      facet_wrap(~cas9, ncol=1, scales='free_y') +
+      scale_x_continuous(breaks = seq(0, xlimit, by = 500), expand = c(0,0)) +
+      scale_shape_manual(values = c(21,24)) +
+      scale_fill_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+      theme_bw() +
+      theme(
+            axis.text.x=element_text(size=8),
+            axis.ticks.x = element_blank()) +
+      guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+ 
+  g
+  BackupAsPDF(g, paste0('barplots/amino_acid/cas9_facet/',y, '_', x,'.LFC.mutantConsequence.windowStartSite.barplot'), dimensions=c(10,6))
+  })
+})
+```
+Table of the different sgRNAs
+----
+We just want to count the number of sig Hits in each cas9 group
+Idea is to find sgRNA significant in more than one contrast
+
+```{r}
+sig.sgRNA.dt <- sgRNA.dt[sig!= 'not',.N, by=.(sgrna,cas9)][order(-N)]
+setnames(sig.sgRNA.dt, new=c('sgrna', 'cas9', 'NsigContrasts'))
+
+#sig.sgRNA.dt <-  merge(x=sig.sgRNA.dt, y=sgRNA.dt[,.(sgrna,cas9,Gene)], by.x=c('sgrna', 'cas9'), by.y=c('sgrna', 'cas9'), all.x = T)
+#fwrite(sig.sgRNA.dt[order(-NsigContrasts)], ScriptAndDatedFileName('sgRNA.numberSigContrasts.txt'))
+
+#sig.sgRNA.dt <- fread('./220424_newPlots_data/2024_04_24_sgRNA.numberSigContrasts.txt')
+```
+
+Now we want to merge the number of sgRNA significantly different 
+
+```{r}
+sig.sgRNA.dt$NsigContrasts %>%  unique()
+
+
+nrow(sig.sgRNA.dt)
+nrow(hgsv.dt)
+
+# so including the gene in the merge cuased the issue... why?
+hgsv.dt <- merge(x=hgsv.dt, y=sig.sgRNA.dt, by.x=c('sgrna', 'cas9'), by.y=c('sgrna','cas9'), all.x=T)
+
+# convert the values
+hgsv.dt[, NsigContrasts := ifelse(is.na(NsigContrasts), 0, NsigContrasts)]
+```
+
+Now lets regenerate the same plot per gene; split by cas9 and color by N significant contrasts
+
+```{r}
+
+#genes.oi <-  'MTOR'
+genes.oi <- unique(canonical.dt$Gene)
+genes.oi
+genes.oi <- genes.oi[-c(2,9,10)] # drop the controls from this comparison
+genes.oi
+
+lapply(genes.oi, function(y){
+    
+    # need to make a new 'plot' dt with the intergenic group
+    dt <- hgsv.dt[Gene %in% y, .(aa.startSite, NsigContrasts, cas9, sgrna)]
+    dt <- unique(dt) # we just want the unique set
+    #dt[, IMPACT := factor(IMPACT, levels=c('MODIFIER', 'LOW','MODERATE','HIGH'))]
+    
+    # x axis limit
+    xlimit <- max(dt$aa.startSite)
+    
+    g <- ggplot(dt, aes(x=aa.startSite, y=NsigContrasts, shape=cas9, fill=NsigContrasts, label=sgrna)) +
+      geom_point() +
+      geom_text_repel(data=dt[NsigContrasts > 1,], size=2, max.overlaps = 20) +
+      xlab('Amino acid position') +
+      ylab('Significant in N contrasts') +
+      ggtitle(paste0(y, ' ')) +
+      facet_wrap(~cas9, ncol=1) +
+      scale_x_continuous(breaks = seq(0, xlimit, by = 50)) +
+      scale_shape_manual(values = c(21,24)) +
+      scale_fill_viridis_c() +
+      theme_classic() +
+      theme(
+            axis.text.x=element_text(size=8),
+            axis.ticks.x = element_blank()) +
+      guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+ 
+  g
+  BackupAsPDF(g, paste0('dotplots_labelled/NsigContrasts/',y,'.NsigContrasts.dotplot'), dimensions=c(10,6))
+})
+
+```
+Last request was the replicate scatterplots
+Plot sample correlations with R score included
+
+```{r}
+counts.dt <-  fread('~/Documents/projects/032124_RBabu_CRISPRMutantScreen/032824_MAGECK_DE_firstPass_data/2024_03_28_sampleCounts.csv')
+counts.dt
+
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# read in the counts.dt 
+
+pairs.dt <- UniqueFactorCombos(counts.dt$sample, sep=',', allow.dups = F)
+#  subset the dt to replicate pairs
+pairs.dt <- pairs.dt[sub('[_][0-9]{1,2}$', '', Var1) == sub('[_][0-9]{1,2}$', '', Var2),]
+
+
+pairs.dt
+
+# what samples are we missing?
+setdiff(unique(counts.dt$sample), unique(c(pairs.dt$Var1,pairs.dt$Var2)))
+
+# add these back into the dt
+pairs.dt <- rbind(pairs.dt, data.table(Var1= "Abe8e_Lib1_35", Var2="Abe8e_Lib2_36"))
+pairs.dt <- rbind(pairs.dt, data.table(Var1= "Bemax_Lib1_33", Var2="Bemax_Lib2_34"))
+pairs.dt <- rbind(pairs.dt, data.table(Var1= "gRNA_noBE_37", Var2="plasmid_BE_38"))
+```
+
+plot both the normalised and raw data; include the correlation score
+```{r}
+library(ggpubr)
+# normalised counts
+apply(pairs.dt, 1,  function(x){
+  
+  dt <- dcast(counts.dt[sample %in% x,], sgRNA+Gene~sample, value.var = c('tmo.normCounts'))
+  # print
+  setnames(dt, new=c('sgRNA', 'Gene', 'Counts.x', 'Counts.y'))
+
+  g <- ggplot(dt, aes(x=log2(Counts.x), y=log2(Counts.y))) +
+    geom_point() +
+    geom_density2d() +
+    geom_abline(aes(intercept=0, slope=1), color='darkred') +
+    xlab(paste(x[1], 'Normalized Counts', sep=' ')) +
+    ylab(paste(x[2], 'Normalized Counts', sep=' ')) +
+    ggtitle(paste(x[1], x[2], 'Comparisons', sep=' ')) + 
+    theme_bw()
+  
+   g <- g + stat_cor(data=dt, aes(x=log2(Counts.x), y=log2(Counts.y), label=..r.label..), method='pearson', inherit.aes = F)
+   g
+  #BackupAsPDF(g, paste0('replicateScatterplots/normalized/',x[1], 'vs', x[2],'.normCounts.scatterplots.'))
+})
+
+# raw counts for the samples
+apply(pairs.dt, 1,  function(x){
+  
+  dt <- dcast(counts.dt[sample %in% x,], sgRNA+Gene~sample, value.var = c('rawCounts'))
+  # print
+  setnames(dt, new=c('sgRNA', 'Gene', 'Counts.x', 'Counts.y'))
+  
+  head(dt)
+
+  g <- ggplot(dt, aes(x=log2(Counts.x+1), y=log2(Counts.y+1))) +
+    geom_point() +
+    geom_density2d() +
+    geom_abline(aes(intercept=0, slope=1), color='darkred') +
+    xlab(paste(x[1], ' (Log2 + 1)', sep=' ')) +
+    ylab(paste(x[2], ' (Log2 + 1)', sep=' ')) +
+    ggtitle(paste(x[1], x[2], 'Comparisons', sep=' ')) + 
+    theme_bw()
+  
+  g <- g + stat_cor(data=dt, aes(x=log2(Counts.x+1), y=log2(Counts.y+1), label=..r.label..), method='pearson', inherit.aes = F)
+  g
+  BackupAsPDF(g, paste0('replicateScatterplots/raw/',x[1], 'vs', x[2],'.rawCounts.scatterplots.'))
+})
+
+
+log2(5)
+```
+
+
+
+
+
+Not used...
+------
+```{r}
+18824 %>% sqrt()
+184 %>% sqrt()
+
+
+
+5/13
+5/186
+
+1/10 + 1/20 %>%  sqrt()
+
+0.5/0.003
+
+canonical.dt[Protein_position == '-' ,] %>%  View()
+
+
+canonical.dt$Protein_position
+
+sub("[?][-]", "", unique(canonical.dt$Protein_position))
+
+
+canonical.dt[, aa.startSite := '']
+canonical.dt[Protein_position != '-' & Protein_position != '' & !is.na(Protein_position), aa.startSite := ifelse(grep('[?][-]', Protein_position), tstrsplit(Protein_position, '[-]', keep=2), 
+                                                                                                                 ifelse(grep('[-][?]', Protein_position), tstrsplit(Protein_position, '[-]', keep=1), 
+                                                                                                                        tstrsplit(Protein_position, '[-]', keep=1) ))]
+                                                                                                                 
+                                                                                                                                                                                                                     
+
+canonical.dt[, startSite := (tstrsplit(Location, ':|-', keep=2))]
+canonical.dt[, startSite := as.numeric(startSite)]
+
+lapply(contrasts.oi, function(x){
+  
+  lapply(genes.oi, function(y){
+    
+    # need to make a new 'plot' dt with the intergenic group
+    dt <- canonical.dt[IMPACT != '' & comparison == x & Gene %in% y,]
+    dt[, IMPACT := factor(IMPACT, levels=c('MODIFIER', 'LOW','MODERATE','HIGH'))]
+    dt[, cas9 := gsub('[.]canonical', '', .id)]
+    
+    g <- ggplot(dt, aes(x=reorder(startSite, startSite, decreasing=F), y=LFC, shape=cas9, fill=IMPACT, label=sgrna)) +
+      geom_point() +
+      geom_text_repel(data=dt[sig != 'not',], size=2, max.overlaps = 20) +
+      xlab('Edit Window Start Site') +
+      ylab('Log2 FC') +
+      ggtitle(paste0(y, ' Contrast', x)) +
+      scale_shape_manual(values = c(21,24)) +
+      scale_fill_manual(values=c('MODIFIER'='grey', 'LOW'='lightyellow', 'MODERATE'='orange', 'HIGH'='darkred')) +
+      theme_classic() +
+      theme(axis.text.x=element_blank(),
+            axis.ticks.x = element_blank()) +
+      guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+ 
+  g
+  #BackupAsPDF(g, paste0('dotplots_labelled/',y, '_', x,'.LFC.mutantConsequence.windowStartSite.dotplot'), dimensions=c(10,6))
+  })
+})
+```
+

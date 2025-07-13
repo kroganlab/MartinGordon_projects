@@ -1,0 +1,368 @@
+---
+title: "112024_HIVHs_Interactor_Integrations"
+author: "Martin Gordon"
+date: "2024-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## README
+
+*Hotspots*
+Looking for hotspots in the sites; easiest way is to permute.
+Here we will do it at the level of the residue (find some summary stat, and then we want to swap the labels (residues and values) and find how significant these hotspots are)
+
+Goal here is to intergate the AF interacot list with other information.
+
+Looking to integrate the data with these 3 sets
+https://www.nature.com/articles/s41467-022-29346-w
+https://pmc.ncbi.nlm.nih.gov/articles/PMC3310911/
+https://pmc.ncbi.nlm.nih.gov/articles/PMC11387401/
+
+```{r}
+library(magrittr)
+library(ggplot2)
+library(data.table)
+library(readxl)
+
+# source afew useful commands 
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+```
+pull in the mist count data (from what study?)
+THe DB use the IntAct database of human interactions and filter to HIV
+
+```{r}
+af.dt <- fread('./data/AF2M_HsHIV_interactors.csv')
+af.dt2 <- fread('./data/VPU_interactors.csv')
+
+af.dt <- rbind(af.dt, af.dt2)
+
+
+# dont think we want to use a hard threshold
+af.filtered.dt <- af.dt[ipTM_mean>= 0.75]
+
+# very few pass a sig threshold
+nrow(af.filtered.dt)/nrow(af.dt)
+
+# ok some of these include mutants
+af.dt$Protein_2 %>%  unique()
+```
+
+Read in the MIST counts from the initial data; add the bait counts and the control counts so can assess if they are different
+
+Get the 
+i) mist results
+ii) mist input counts
+iii) the db interactions
+
+
+Supplementary tables are from the original MIST paper that was created fro HIV
+https://pmc.ncbi.nlm.nih.gov/articles/PMC3310911/#SD2
+
+```{r}
+ints.long.list <- list(HEK = as.data.table(read_xls('./docs/NIHMS358189-supplement-Supplementary_Data_1.xls', sheet=1)),
+                  Jurkat = as.data.table(read_xls('./docs/NIHMS358189-supplement-Supplementary_Data_1.xls', sheet=3)))
+
+ints.mat.list <- list(HEK = as.data.table(read_xls('./docs/NIHMS358189-supplement-Supplementary_Data_1.xls', sheet=2)),
+                      Jurkat = as.data.table(read_xls('./docs/NIHMS358189-supplement-Supplementary_Data_1.xls', sheet=4)))
+
+
+mist.scores.list <- list(HEK = as.data.table(read_xls('./docs/NIHMS358189-supplement-Supplementary_Data_2.xls', sheet=1)),
+                         Jurkat = as.data.table(read_xls('./docs/NIHMS358189-supplement-Supplementary_Data_2.xls', sheet=2)))
+
+
+
+
+lapply(names(mist.scores.list), function(x){
+  
+
+  new_repo <- paste0(x, '_MiST_Reproducibility')
+  new_abu <- paste0(x, '_MiST_Abundance')
+  new_spe <- paste0(x, '_MiST_Specificity')
+  new_mist <- paste0(x, '_MiST_score')
+  
+  setnames(mist.scores.list[[x]], old=c('Reproducibility', 'Abundance', 'Specificity','MiST score'), new=c(new_repo, new_abu, new_spe, new_mist))
+})
+
+# combine mist scores for the two cell lines
+# mist scores doesnt distinguish the groups...
+mist.scores.dt <- merge(x=mist.scores.list[[1]][,.(Bait, Prey,HEK_MiST_Reproducibility,HEK_MiST_Abundance,  HEK_MiST_Specificity
+,HEK_MiST_score)], mist.scores.list[[2]][,.(Bait,Prey,Jurkat_MiST_Reproducibility,Jurkat_MiST_Abundance, Jurkat_MiST_Specificity, Jurkat_MiST_score)], by=c('Bait', 'Prey'), all.x=T, all.y=T)
+
+```
+
+
+# merge the MiST scores with the AF scores
+```{r}
+af.dt[, Bait := gsub('[-]SF', '',Protein_2)]
+af.dt[, .(Bait, Protein_2)] %>% unique()
+
+unique(mist.scores.dt$Bait)
+setdiff(af.dt$Bait, mist.scores.dt$Bait)
+
+
+
+af.dt[, Bait := toupper(gsub('[-]SF|SP[-]', '', Bait))]
+af.dt[Bait %in% c('NVIF', 'HVPR'), Bait := sub('^[NH]', '', Bait)]
+
+af.dt$Bait %>%  unique() %>% sort()
+unique(mist.scores.dt$Bait) %>%  sort()
+
+af.dt[, .(Bait, Protein_2)] %>% unique()
+
+af.dt[Bait == "PR(D25N)", Bait := 'PR']
+af.dt[Bait == "POL(D25N)", Bait := 'POL']
+af.dt[Bait == "VPU_HV1H2", Bait := 'VPU']
+
+af.dt[Bait %in% c('NVIF', 'HVPR'), Bait := sub('^[NH]', '', Bait)]
+
+# no differences, use this for merging
+setdiff(unique(af.dt$Bait), unique(mist.scores.dt$Bait))
+setdiff(unique(mist.scores.dt$Bait), unique(af.dt$Bait))
+```
+*Todo*
+Try get aliases for these genes and see if we can combine
+```{r}
+missing.uniprots <- setdiff(mist.scores.dt$Prey,af.dt$Protein_1)
+length(missing.uniprots)
+
+mist.scores.dt[, PreyGene := multiUniprots2multiGenes(Prey, species = 'HUMAN')]
+af.dt[, PreyGene := multiUniprots2multiGenes(Protein_1, species='HUMAN')]
+```
+```{r}
+merge.af.dt <- merge(af.dt[, -c('PreyGene')], mist.scores.dt[, -c('PreyGene')], by.x=c('Protein_1','Bait'), by.y=c('Prey', 'Bait'), all.x=T)
+```
+Ok, now simply lets combine the counts from the MiST input
+
+```{r}
+lapply(names(ints.long.list), function(x){
+  
+  cols.oi <- c('Intensity', 'IP', 'Isolation', 'Tag')
+  new.cols <- paste0(x,'_', cols.oi)
+  setnames(ints.long.list[[x]], old = cols.oi, new=new.cols)
+})
+
+```
+Just seperate according to library prep and retunr the log2 transformed counts for all groups
+```{r}
+# change bait names
+ints.long.list[['HEK']][Bait == 'Pol', Bait := 'POL']
+ints.long.list[['HEK']][Bait == 'p6', Bait := 'P6']
+ints.long.list[['Jurkat']][Bait == 'NCC', Bait := 'NC']
+
+hek.ints <- dcast(ints.long.list[['HEK']], Bait+Prey~interaction(HEK_Isolation, HEK_Tag),  
+      fun.aggregate=function(x) paste(as.character(log2(x)), collapse='|'), value.var = 'HEK_Intensity')
+
+junkat.ints <- dcast(ints.long.list[['Jurkat']], Bait+Prey~interaction(Jurkat_Isolation, Jurkat_Tag),  
+      fun.aggregate=function(x) paste(as.character(log2(x)), collapse='|'), value.var = 'Jurkat_Intensity')
+
+cols.oi <- colnames(hek.ints)[3:length(colnames(hek.ints))]
+setnames(hek.ints, old = cols.oi, new=paste0('HEK_',cols.oi))
+
+cols.oi <- colnames(junkat.ints)[3:length(colnames(junkat.ints))]
+setnames(junkat.ints, old = cols.oi, new=paste0('Jurkat_',cols.oi))
+
+# so it looks like the input matrix they combine the POL ans pol counts.. have done the same above
+ints.long.list[[1]][Bait %in% c('POL', 'Pol') & Prey == '25121906', HEK_Intensity] %>% unique() %>% sort()
+ints.mat.list[[1]][`#...1` == '25121906', ..col.oi] %>% as.numeric() %>% sort()
+
+# now baits are all the same
+setdiff(junkat.ints$Bait, hek.ints$Bait)
+
+merge.ints.dt <- merge(hek.ints, junkat.ints, by=c('Bait', 'Prey'), all.x=T, all.y=T)
+
+fwrite(merge.af.dt, ScriptAndDatedFileName('af_interactors_mistScores.csv'))
+fwrite(merge.ints.dt, ScriptAndDatedFileName('MiST_log2Intensities.csv'))
+```
+
+Look at the pol intensity values for the matrix and the long format; what overlaps? Use that set for the merge
+
+
+```{r}
+ints.list[['HEK']][Bait == 'VIF' & Prey == 'Q15369',]
+
+g <- ggplot(ints.list[['HEK']][Bait == 'VIF' & Prey == 'Q15369',], aes(x=interaction(Isolation,Tag), y=log2(Intensity), color=interaction(Isolation,Tag))) +
+  geom_point() +
+  ggtitle('Vif pulldown of Elongin C')
+
+BackupAsPDF(g, 'vif-ElonginC.expgroup.dotplot')
+```
+Add in the intensity columns
+```{r}
+mist.ints.dt <- fread('~/Documents/projects/112024_RKakke_AF2_HIV_hitsInvestigation/201124_AFInteractiorsIntegration_data/2024_11_21_MiST_log2Intensities.csv')
+af.interactors.dt  <- fread('~/Documents/projects/112024_RKakke_AF2_HIV_hitsInvestigation/201124_AFInteractiorsIntegration_data/2024_11_20_af_interactors_mistScores.csv')
+
+all.merge.dt <- merge(af.interactors.dt, mist.ints.dt, by.x=c('Protein_1', 'Bait'), by.y=c('Prey', 'Bait'), all.x=T)
+```
+
+Add the IntAct or IMEx; to the group
+```{r}
+imex.db <- fread('./docs/IMEx_ALL_PPI.MITAB_v2.7.Compact.GeneName.table')
+
+hiv.subset <- imex.db[(grepl('Human_immunodeficiency_virus_type_1', Species_A) & grepl('Homo_sapiens', Species_B)) | (grepl('Human_immunodeficiency_virus_type_1', Species_B) & grepl('Homo_sapiens', Species_A))][, .(Species_A, Species_B,GeneName_A, GeneName_B, ID_A, ID_B, Detection_method, Role_A, Role_B, Confidence_value, Ref)]
+
+# for our subset, put virus in bait col and human in prey
+hiv.subset[, Bait := ifelse(Role_A == 'bait', ID_A,
+                           ifelse(Role_B == 'bait', ID_B, ''))]
+
+hiv.subset[, BaitGene := ifelse(Role_A == 'bait', GeneName_A,
+                           ifelse(Role_B == 'bait', GeneName_B, ''))]
+
+# for our subset, put virus in bait col and human in prey
+hiv.subset[, Prey := ifelse(Role_A == 'prey', ID_A,
+                           ifelse(Role_B == 'prey', ID_B, ''))]
+
+hiv.subset[, PreyGene := ifelse(Role_A == 'prey', GeneName_A,
+                           ifelse(Role_B == 'prey', GeneName_B, ''))]
+
+
+viral.prots <- grep('[a-z]', hiv.subset$GeneName_A, value=T)
+
+
+hiv.subset[, viral_GeneName := ifelse(GeneName_A %in% viral.prots, GeneName_A, GeneName_B)]
+hiv.subset[, hs_GeneName := ifelse(!GeneName_A %in% viral.prots, GeneName_A, GeneName_B)]
+hiv.subset[, viral_Prot := ifelse(GeneName_A %in% viral.prots, ID_A, ID_B)]
+hiv.subset[, hs_Prot := ifelse(!GeneName_A %in% viral.prots, ID_A, ID_B)]
+
+
+hiv.subset[, viral_GeneName := toupper(viral_GeneName)]
+# leave out GAG-pol as not necessary relevant for our seperate set
+
+
+interact.dt <- hiv.subset[viral_GeneName != 'GAG-POL', .(viral_GeneName, hs_GeneName, viral_Prot, hs_Prot, Confidence_value, Ref)]
+
+
+#subset to the max scores from this datatbale
+interact.dt <- interact.dt[, .SD[which.max(Confidence_value)], by=.(viral_GeneName, hs_GeneName)]
+```
+Save the interactrion data and merge with AF
+```{r}
+
+interact.dt[viral_GeneName == 'GAG' & hs_Prot == 'P19525'] 
+
+all.merge.wAnno.dt <- merge(all.merge.dt, interact.dt[,.(viral_GeneName, hs_Prot, iMEX_ConfidenceScore=Confidence_value, iMEX_Ref=Ref)], by.x=c('Bait', 'Protein_1'), by.y=c('viral_GeneName', 'hs_Prot'), all.x=T)
+
+#228 out of 300
+fwrite(all.merge.wAnno.dt, ScriptAndDatedFileName('af.hiv.interactors.MiSTscores.iMEX.anno.csv'))
+
+fread('~/Documents/projects/112024_RKakke_AF2_HIV_hitsInvestigation/201124_AFInteractiorsIntegration_data/2024_11_21_af.hiv.interactors.MiSTscores.iMEX.anno.csv')
+```
+
+
+Ok now merge with the intensity data
+```{r}
+# no difference in the bait names
+setdiff(merge.ints.dt$Bait, merge.af.dt$Bait)
+
+merge.all.dt <- merge(merge.af.dt, merge.ints.dt, by.x=c('Bait', 'Protein_1'), by.y=c('Bait', 'Prey'), all.x=T, all.y=F)
+
+merge.ints.dt
+mist.scores.dt
+
+mist.merge.dt <- merge(mist.scores.dt[, -c('PreyGene')], merge.ints.dt, by=c('Bait', 'Prey'), all.x=T, all.y=F)
+mist.merge.dt
+
+mist.scores.dt[Bait == 'CA' & Prey == 'P17066']
+merge.ints.dt[Bait == 'CA' & Prey == 'P17066']
+
+hek.ints[Bait == 'CA' & Prey == 'P17066']
+
+```
+
+```{r}
+mist.merge.dt[Bait == 'CA' & Prey == 'P17066']
+
+
+ints.long.list[[1]][Bait %in% c('P6', 'p6') & Prey =='19172951'][order(HEK_Intensity)]
+unique(ints.long.list[[1]])
+ints.long.list[[1]]$Bait %>% unique()
+ints.long.list[[2]]$Bait %>% unique()
+```
+
+```{r}
+ints.long.list[[1]][Bait == 'CA'& Prey == '19172948', .N, by=.(HEK_IP, Replicate, HEK_Isolation, HEK_Tag)][order(HEK_Isolation, HEK_Tag)]
+
+ints.long.list[[1]][Bait == 'CA'& Prey == '19172948', ]
+
+ints.long.list[[1]]$Bait %>% unique()
+
+col.oi <- grep("CA", colnames(ints.mat.list[[1]]))
+
+ints.mat.list[[1]][c(1:2) |`#...1` == '19172948', ..col.oi]
+
+ints.mat.list[[1]]
+```
+```{r}
+#fwrite(af.dt, ScriptAndDatedFileName('AF2M_HIV_interactions.wMISTscores.csv'))
+fread('~/Documents/projects/112024_RKakke_AF2_HIV_hitsInvestigation/201124_AFInteractiorsIntegration_data/2024_11_20_AF2M_HIV_interactions.wMISTscores.csv')
+```
+
+```{r}
+mist.scores.dt$Bait %>%  unique()
+```
+
+
+```{r}
+ints.list[[2]][`#...1` == 'P04264',] %>% 
+  colnames()
+
+
+col.oi <-  grepl('VPR', colnames(ints.list[[2]]))
+
+ints.list[[2]][`#...1` == 'P04264', ..col.oi ]
+```
+Something weird with thw data... the MIST input has grouped togther multiple batches of APMS..
+```{r}
+prey.oi <- c('Q15369',
+'Q13951',
+'Q15370',
+'Q9UBF6',
+'Q9C0C7',
+'Q93034',
+'Q13617',
+'Q99615',
+'Q13501',
+'Q7Z6Z7',
+'Q8IWV8',
+'Q9UNE7',
+'P61289',
+'O75376',
+'O15379',
+'Q9Y5V3',
+'Q9BZK7',
+'Q8TEB1',
+'Q9ULX6',
+'P46379',
+'Q13227',
+'P25686',
+'Q16659',
+'P11441')
+
+
+# overlap with 0 cols added in the matrix...
+ints.list[[1]][Bait == 'VIF' & Prey == 'Q15369', unique(Intensity)]
+ints.list[[2]][`#...1` == 'Q15369', ..col.oi]
+
+ints.list[[2]][`#...1` == 'Q15369', ..col.oi][, unique(Intensity)] %in% ints.list[[1]][Bait == 'VIF' & Prey == 'Q15369', unique(Intensity)]
+ints.list[[1]][Bait == 'VIF' & Prey == 'Q15369', unique(Intensity)] %in% ints.list[[2]][`#...1` == 'Q15369', ..col.oi]
+
+ggplot(ints.list[['HEK']][Bait == 'VIF' & Prey == 'Q15369',], aes(x=interaction(Isolation,Tag), y=log2(Intensity), color=interaction(Isolation,Tag))) +
+  geom_point()
+```
+For now proceed with long format as eaiser to process
+Take the full datatbale, merge with the MIST data (first the counts)
+```{r}
+# collapse replicates by sample prep
+af.dt
+```
+
+```{r}
+
+```
+
+

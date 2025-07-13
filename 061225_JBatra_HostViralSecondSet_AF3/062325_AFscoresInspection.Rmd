@@ -1,0 +1,89 @@
+---
+title: "062325_AFscoresInspection"
+author: "Martin Gordon"
+date: "2025-06-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Inspect the output from the AF3 runs for Jyoti to see the scores and return the tables 
+Write out a file with scores that pass both average and best thresholds
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R")
+```
+
+```{r read-res}
+allScores  <- fread('./output/AllSummaryScores.csv')
+allScores[, ppi := tstrsplit(model, '[.]', keep=1)]
+allScores[, ppi := toupper(ppi)]
+allScores[, c('protein1', 'protein2') := tstrsplit(ppi, '__', keep=c(1,2))]
+
+allScores[, gene2 := multiUniprots2multiGenes(protein2)] # prey hits
+#allScores[, c('gene1', 'gene2') := lapply(.SD, function(x) multiUniprots2multiGenes(x)), .SDcols=c('protein1', 'protein2')]
+```
+
+For the bait IDs,we need to load inthe id mapper as cant map using standard functions 
+
+```{r id-mapper}
+keys.dt <- data.table(fa.header=c('up|I0B7A3|Hemagglutinin_IBV', 'up|Q596H2|Hemagglutinin_IBV', 'up|C0LT34|Neuraminidase_IBV', 'up|Q596G9|Neuraminidase_IBV','up|I0B7B2|PB1_IBV','up|Q596H4|PB1_IBV',
+                                  'up|I0B7B1|PA_IBV', 'up|Q596H3|PA_IBV', 'up|I0B7A8|Nucleoprotein_IBV', 'up|Q596H1|Nucleoprotein_IBV','up|I0B7A4|Matrix_protein','up|Q596G8|Matrix_protein',
+                                  'up|I0B7B0|Nuclear_export_protein_IBV', 'up|Q596G6|Nuclear_export_protein_IBV','up|I0B7A9|NS1_IBV','up|Q596G5|NS1_IBV','up|C0LT33|Glycoprotein_NB_IBV','up|Q596H0|Glycoprotein_NB_IBV',
+                                  'up|I0B7A5|BM2_IBV', 'up|Q596G7|BM2_IBV', "up|I0B7B0|Nuclear_export_protein_IBV"),
+                      bait.name =c('Brisbane_HA', 'Victoria_HA', 'Brisbane_NA', 'Victoria_NA','Brisbane_PB1', 'Victoria_PB1',
+                                   'Brisbane_PA', 'Victoria_PA','Brisbane_NP', 'Victoria_NP', 'Brisbane_M1', 'Victoria_M1',
+                                   'Bribane_NEP', 'Victoria_NS2','Brisbane_NS1','Victoria_NS1','Brisbane_NB', 'Victoria_NB',
+                                   'Brisbane_BM2', 'Victoria_BM2', 'Brisbane_NS2'
+                                   ))
+keys.dt[, protein1 := tstrsplit(fa.header, '[|]', keep=c(2))]
+
+keys.dt <- keys.dt[, .(protein1, gene1=bait.name)]
+
+
+allScores[keys.dt, gene1 := i.gene1, on=.(protein1)]
+# n models per ppi
+allScores[, N := length(unique(model)), by=ppi]
+```
+
+```{r}
+allScores <- allScores[, .(ppi, N, model, protein1, gene1, protein2, gene2, ptm, iptm)]
+allScores[, ppi_gene := paste0(gene1, '__', gene2)]
+fwrite(allScores, ScriptAndDatedFileName('allAF3Scores.tidy.csv'))
+```
+```{r}
+summary.dt <- fread('~/Documents/projects/061225_JBatra_HostViralSecondSet_AF3/062325_AFscoresInspection_data/2025_06_23_allAF3Scores.tidy.csv') %>% 
+  .[, .(ppi, protein1, protein2,  gene1, gene2, mean_iptm=mean(iptm, na.rm=T), max_iptm=max(iptm, na.rm=T),  mean_ptm=mean(ptm, na.rm=T), max_ptm=max(ptm, na.rm=T)), by=ppi_gene] %>% 
+  unique()
+
+fwrite(summary.dt, ScriptAndDatedFileName('summaryAF3Scores.tidy.csv'))
+
+
+fread('~/Documents/projects/061225_JBatra_HostViralSecondSet_AF3/062325_AFscoresInspection_data/2025_06_23_summaryAF3Scores.tidy.csv')
+```
+
+```{r}
+summary.dt[, c('virus', 'gene1simplified') := tstrsplit(gene1, '_', keep=c(1,2))]
+
+g <- ggplot(summary.dt, aes(x=mean_iptm, y=max_iptm, color=gene1simplified, shape=virus, label=ppi_gene)) +
+  geom_point() +
+  geom_vline(xintercept=0.5, linetype=2) +
+  geom_hline(yintercept=0.5, linetype=2) +
+  ggrepel::geom_text_repel(data=summary.dt[mean_iptm >= 0.5 & max_iptm >= 0.5]) +
+  theme_bw()
+
+BackupAsPDF(g, 'hiv.baitprey.scatterplot')
+
+summary.dt[mean_iptm >= 0.5 & max_iptm >= 0.5, tolower(ppi)]
+fwrite(summary.dt[mean_iptm >= 0.5 & max_iptm >= 0.5, tolower(ppi)], ScriptAndDatedFileName('promisinghits.recoverModels.csv'))
+```
+

@@ -1,0 +1,479 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This template file located at:
+/Applications/RStudio.app/Contents/Resources/resources/templates/notebook_osx.Rmd
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("../../../utils/bp_utils/ManageScriptData.R")
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+move data
+
+from : https://www.biorxiv.org/content/10.1101/2020.07.02.185173v1.supplementary-material
+
+```{r}
+dt <- setDT(openxlsx::read.xlsx("/Users/ben/Downloads/media-2 (1).xlsx", startRow = 3, colNames = TRUE))[, X4 := NULL][]
+
+dt[, hc := ifelse(zscore > 2.502, TRUE, FALSE)] # using boundary they used in xlsx. Not sure why the 2.501 case was labeled low confidence :shrug:
+
+fwrite (dt, file.path(ScriptNamedDir(), "kaushikPPI.csv"))
+```
+
+
+```{r}
+kppi <- fread (file.path(ScriptNamedDir(), "kaushikPPI.csv"))[hc == TRUE]
+kppi[, baitsPerPrey := .N, by = Prey]
+```
+
+```{r}
+pcmi.ppi <- fread ("/Users/ben/UCSF/kroganlab/BenPolacco/random2022/2023_03_09_PCMI_MehdisDSD_data/D_Final_v3.txt")
+pcmi.ppi <- pcmi.ppi[, .(Bait, Prey = PreyGene, Clusters)]
+pcmi.ppi[, baitsPerPrey := .N, by = Prey]
+```
+
+
+```{r}
+hist ( kppi[, .(baitsPerPrey), by= Prey]$baitsPerPrey, breaks = 0:20 + 0.5)
+hist ( pcmi.ppi[, .(baitsPerPrey), by= Prey]$baitsPerPrey, breaks = 0:20 + 0.5, add = TRUE)
+```
+
+```{r, fig.width = 3, fig.height = 2.5}
+hists <- rbindlist( list (kaushik = kppi[, .(baitsPerPrey = unique(baitsPerPrey)), by= Prey][, .N, by= baitsPerPrey], 
+                          pcmi = pcmi.ppi[, .(baitsPerPrey = unique(baitsPerPrey)), by= Prey][, .N, by= baitsPerPrey]), idcol = "study")
+
+hists[study == "kaushik", fractionPrey := N/length(unique(kppi$Prey))]
+hists[study == "pcmi", fractionPrey := N/length(unique(pcmi.ppi$Prey))]
+
+ggplot (hists, aes(x = baitsPerPrey, y = N, fill = study)) + geom_col( position = "dodge2") + theme_classic()
+
+p <- ggplot (hists, aes(x = baitsPerPrey, y = fractionPrey, fill = study, color = study)) +
+  #geom_hline(yintercept = c(1,2), lwd = 0.25, color = "grey") +
+  geom_point() +
+  scale_y_log10() +
+  #scale_x_log10() +
+  geom_smooth(se = FALSE, lty = "dashed", lwd = 0.5, span = 2, data = hists[baitsPerPrey < 15]) +
+  xlab ("Prey Degree") +
+  ylab ("Fraction of Prey") +
+  scale_color_manual(values = c(kaushik = "orange", pcmi = "cornflowerblue")) +
+  theme_bw() + 
+  theme(legend.position="top")
+p
+
+BackupAsPDF(p)
+
+```
+
+# pairwise overlaps
+
+baitPrey matrix
+```{r, fig.width =8, fig.height = 5}
+pcmi.mat <- dcast (pcmi.ppi, Prey~Bait, value.var = "Bait", fun.aggregate = length) |> as.matrix(rownames= "Prey")
+pcmi.mat[pcmi.mat > 1] <- 1
+Heatmap(pcmi.mat, col = c("white", "firebrick"), column_names_gp = gpar(fontsize =5))
+```
+
+baitPrey matrix
+```{r, fig.width =8, fig.height = 5}
+kaushik.mat <- dcast (kppi, Prey~Bait, value.var = "Bait", fun.aggregate = length) |> as.matrix(rownames= "Prey")
+Heatmap(kaushik.mat, col = c("white", "firebrick"), column_names_gp = gpar(fontsize =5))
+```
+
+```{r, fig.width = 5, fig.height  = 4}
+pcmi.jaccard <- dist (t(pcmi.mat), method = "binary") |> as.matrix()
+Heatmap (1-pcmi.jaccard, col = circlize::colorRamp2(breaks = c(0, 0.4), colors =  c("white", "firebrick")))
+```
+
+
+
+```{r, fig.width = 5, fig.height  = 4}
+kaushik.jaccard <- dist (t(kaushik.mat), method = "binary") |> as.matrix()
+Heatmap (1-kaushik.jaccard, col = circlize::colorRamp2(breaks = c(0, 0.4), colors =  c("white", "firebrick")))
+```
+
+```{r, fig.width = 5, fig.height= 4}
+
+#  File from Belinda, all HEK detectable proteins + PCMI prey
+#scan("/Users/ben/Downloads/hek293tProteome_BekkerJenwen2017_ASDppiPrey.csv", what = character()) |> unique() |> length()
+# 11169, use this number below as the background
+
+
+pairwiseFisher <- function (bait1, bait2, matrix){
+  both <- sum(rowSums(matrix[, c(bait1, bait2)]) == 2)
+  firstOnly  <- sum(matrix[, c(bait1)]) - both
+  secondOnly <- sum(matrix[, c(bait2)]) - both
+  neither <- 11169 - both - firstOnly  -secondOnly
+  #neither <- nrow(matrix) - both- firstOnly- secondOnly
+  
+  fisher.test (matrix(c(both, firstOnly, secondOnly, neither), nrow = 2), alternative = "greater")$p.value
+}
+
+allByAll <- data.table(bait1 = colnames(pcmi.mat))[, .(bait2 = colnames(pcmi.mat)), by = bait1][bait1 < bait2]
+
+allByAll[ , fisherP := pairwiseFisher(bait1, bait2, pcmi.mat), by = .(bait1, bait2)]
+
+allByAll[, pP := -log10(fisherP)]
+pcmi.fisher.dt <- allByAll
+
+pcmi.fisher.mat <- dcast (rbind (allByAll, allByAll[, .(bait1 = bait2, bait2 = bait1, fisherP, pP)]),
+       bait1~bait2, value.var = "pP") |> as.matrix (rownames = "bait1")
+
+
+baitClusters <- unique(pcmi.ppi[, .(Bait, Clusters)])
+
+
+
+hm <- Heatmap (pcmi.fisher.mat,
+         name = "-log10(P)\nfisher.test",
+         row_split = as.factor(baitClusters[rownames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+         column_split = as.factor(baitClusters[colnames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+         col = circlize::colorRamp2(breaks = c(0, 4), color = c("white", "firebrick")),
+         left_annotation = rowAnnotation(cluster = as.factor(baitClusters[rownames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+                                         col = list (cluster = setNames(c("#FF3333","#FF9900","#F6D80C","#0CB212","#4A56FD","#AA4AFD","#1CDDEB","black"), 1:8))),
+         top_annotation = columnAnnotation(cluster = as.factor(baitClusters[rownames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+                                         col = list (cluster = setNames(c("#FF3333","#FF9900","#F6D80C","#0CB212","#4A56FD","#AA4AFD","#1CDDEB","black"), 1:8))),
+         border  = TRUE,
+         row_names_gp = gpar(fontsize = 2),
+         column_names_gp = gpar(fontsize = 2),
+         gap = unit(0.3, "mm"),
+         column_gap = unit(0.3, "mm"))
+
+BackupAsPDF(hm)
+
+
+
+
+
+
+```
+
+```{r, fig.width = 5, fig.height= 4}
+allByAll <- data.table(bait1 = colnames(kaushik.mat))[, .(bait2 = colnames(kaushik.mat)), by = bait1][bait1 < bait2]
+
+allByAll[ , fisherP := pairwiseFisher(bait1, bait2, kaushik.mat), by = .(bait1, bait2)]
+
+allByAll[, pP := -log10(fisherP)]
+
+kaushik.fisher.dt <- allByAll
+
+kaushik.fisher.mat <- dcast (rbind (allByAll, allByAll[, .(bait1 = bait2, bait2 = bait1, fisherP, pP)]),
+       bait1~bait2, value.var = "pP") |> as.matrix (rownames = "bait1")
+
+
+hm <- Heatmap (kaushik.fisher.mat, 
+         name = "-log10(P)\nfisher.test",
+         col = circlize::colorRamp2(breaks = c(0, 4), color = c("white", "firebrick")))
+
+BackupAsPDF(hm)
+```
+
+```{r}
+hist (pcmi.fisher.mat[pcmi.fisher.mat > 0], breaks = 100)
+hist(kaushik.fisher.mat[kaushik.fisher.mat > 0], breaks = 100, add = TRUE)
+```
+
+
+```{r}
+fisher.dt <- rbindlist(list (pcmi= pcmi.fisher.dt, kaushik = kaushik.fisher.dt), idcol = "study")
+ggplot(fisher.dt, aes (x = pP, color = study)) + geom_density(alpha  = 0.5) +theme_bw() 
+ggplot(fisher.dt, aes (x = pP, color = study)) + geom_density(alpha  = 0.5) +theme_bw() + coord_cartesian(ylim = c(0, 0.1)) 
+ggplot(fisher.dt, aes (x = pP, color = study)) + geom_density(alpha  = 0.5) +theme_bw() + coord_cartesian(xlim = c(0, 5), ylim = c(0, 0.1)) 
+```
+
+
+```{r, fig.width = 2, fig.height = 2.5}
+p <- ggplot (fisher.dt[, 100 *sum(fisherP < 0.05)/.N, by = study], aes(x = study, y= V1, fill = study)) +
+  geom_col(show.legend = FALSE, width = 0.5) +
+  geom_hline(yintercept = 5, color = "grey") +
+  ylab( "% of bait pairs with significant (p < 0.05)\n prey convergence") +
+  scale_fill_manual(values = c(kaushik = "orange", pcmi = "cornflowerblue")) +
+  theme_classic() +
+  coord_cartesian(ylim = c(5,15))
+  
+  
+BackupAsPDF(p)
+```
+
+
+```{r}
+fisher.dt[baitClusters, cluster1 := i.Clusters, on = c(bait1 = "Bait")]
+fisher.dt[baitClusters, cluster2 := i.Clusters, on = c(bait2 = "Bait")]
+fisher.dt[!is.na(cluster2) & study == "kaushik"]
+```
+```{r, fig.width = 2, fig.height = 2.5}
+p <- ggplot (fisher.dt[study== "kaushik" | (cluster1 !=   cluster2),
+                       100 *sum(fisherP < 0.05)/.N, by = study],
+             aes(x = study, y= V1, fill = study)) +
+  geom_hline(yintercept = 5, color = "grey") +
+  geom_col(show.legend = FALSE, width = 0.5) +
+  ylab( "% of bait pairs with significant (p < 0.05)\n prey convergence") +
+  scale_fill_manual(values = c(kaushik = "orange", pcmi = "cornflowerblue")) +
+  theme_classic() 
+  
+  
+BackupAsPDF(p)
+```
+```{r}
+ggplot (fisher.dt[study== "kaushik" | (cluster1 !=   cluster2), sum(fisherP < 0.05)/.N, by = study], aes(x = study, y= V1)) + geom_col() + ylab( "% of bait pairs with signfiicant (p < 0.05) white balls") +
+  ggtitle("Ball-and-Urn tests between all pairs of baits")
+
+
+fisher.dt
+
+```
+
+
+
+
+```{r}
+hist (kppi[, .(baitDegree = length(unique(Prey))), by = Bait]$baitDegree, breaks = 0:120)
+hist (pcmi.ppi[, .(baitDegree = length(unique(Prey))), by = Bait]$baitDegree, breaks = 0:120, add = TRUE, col = "red")
+
+baitDegrees <- rbindlist (list (kaushik = kppi[, .(baitDegree = length(unique(Prey))), by = Bait],
+                                pcmi = pcmi.ppi[, .(baitDegree = length(unique(Prey))), by = Bait]),
+                          idcol = "study")
+
+p <- ggplot (baitDegrees, aes(x = baitDegree, fill = study, color = study))  + 
+  geom_dotplot(method = "histodot", binwidth = 1.5) +
+  #geom_density(color = "black") +
+  facet_wrap(~study, ncol = 1) +
+  coord_cartesian(ylim = c(0,0.1)) +
+  theme_classic() +
+  geom_vline(xintercept = 33.5)
+BackupAsPDF(p)
+```
+# revisiting, exclude top N baitDegree batis
+
+What happens when you exclude the top N baitDegree baits, to have a more consistent overlap
+
+```{r}
+kppi <- fread (file.path(ScriptNamedDir(), "kaushikPPI.csv"))[hc == TRUE]
+kppi[, baitsPerPrey := .N, by = Prey]
+```
+
+```{r}
+pcmi.ppi <- fread ("/Users/ben/UCSF/kroganlab/BenPolacco/random2022/2023_03_09_PCMI_MehdisDSD_data/D_Final_v3.txt")
+pcmi.ppi <- pcmi.ppi[, .(Bait, Prey = PreyGene, Clusters)]
+pcmi.ppi[, baitsPerPrey := .N, by = Prey]
+```
+
+```{r}
+baitDegrees <- rbindlist (list (kaushik = kppi[, .(baitDegree = length(unique(Prey))), by = Bait],
+                                pcmi = pcmi.ppi[, .(baitDegree = length(unique(Prey))), by = Bait]),
+                          idcol = "study")
+
+threshold = 33
+
+excludeBaits <- baitDegrees[baitDegree > threshold, Bait]
+
+
+p <- ggplot (baitDegrees[!Bait %in% excludeBaits], aes(x = baitDegree, fill = study, color = study))  + 
+  geom_dotplot(method = "histodot", binwidth = 0.75) +
+  #geom_density(color = "black") +
+  facet_wrap(~study, ncol = 1) +
+  coord_cartesian(ylim = c(0,0.1)) +
+  theme_classic() +
+  ggtitle(sprintf ("Only baits with <= %d prey", threshold))
+
+BackupAsPDF(p)
+
+```
+
+```{r}
+pcmi.ppi[!Bait %in% excludeBaits, .(length(unique(Bait)), length(unique(Prey)), .N)]
+```
+
+82 baits, 659 prey, 933 interactions
+
+
+
+```{r}
+kppi[!Bait %in% excludeBaits, .(length(unique(Bait)), length(unique(Prey)), .N)]
+```
+
+```{r}
+pcmi.ppi[ , .(length(unique(Bait)), length(unique(Prey)), .N)]
+kppi[ , .(length(unique(Bait)), length(unique(Prey)), .N)]
+
+```
+
+
+
+```{r, fig.width = 3, fig.height = 2.5}
+
+pcmi.ppi[!Bait %in% excludeBaits, baitsPerPrey := .N, by = Prey]
+
+
+hists <- rbindlist( list (kaushik = kppi[!Bait %in% excludeBaits, .(baitsPerPrey = unique(baitsPerPrey)), by= Prey][, .N, by= baitsPerPrey], 
+                          pcmi = pcmi.ppi[!Bait %in% excludeBaits, .(baitsPerPrey = unique(baitsPerPrey)), by= Prey][, .N, by= baitsPerPrey]), idcol = "study")
+
+hists[study == "kaushik", fractionPrey := N/length(unique(kppi$Prey))]
+hists[study == "pcmi", fractionPrey := N/length(unique(pcmi.ppi$Prey))]
+
+ggplot (hists, aes(x = baitsPerPrey, y = N, fill = study)) + geom_col( position = "dodge2") + theme_classic()
+
+p <- ggplot (hists, aes(x = baitsPerPrey, y = fractionPrey, fill = study, color = study)) +
+  #geom_hline(yintercept = c(1,2), lwd = 0.25, color = "grey") +
+  geom_point() +
+  scale_y_log10() +
+  #scale_x_log10() +
+  geom_smooth(se = FALSE, lty = "dashed", lwd = 0.5, span = 2, data = hists[baitsPerPrey < 13]) +
+  xlab ("Prey Degree") +
+  ylab ("Fraction of Prey") +
+  scale_color_manual(values = c(kaushik = "orange", pcmi = "cornflowerblue")) +
+  theme_bw() + 
+  theme(legend.position="top")
+p
+
+BackupAsPDF(p)
+
+```
+
+
+
+```{r, fig.width = 5, fig.height= 4}
+
+#  File from Belinda, all HEK detectable proteins + PCMI prey
+#scan("/Users/ben/Downloads/hek293tProteome_BekkerJenwen2017_ASDppiPrey.csv", what = character()) |> unique() |> length()
+# 11169
+
+
+pairwiseFisher <- function (bait1, bait2, matrix){
+  both <- sum(rowSums(matrix[, c(bait1, bait2)]) == 2)
+  firstOnly  <- sum(matrix[, c(bait1)]) - both
+  secondOnly <- sum(matrix[, c(bait2)]) - both
+  neither <- 11169 - both - firstOnly  -secondOnly
+  #neither <- nrow(matrix) - both- firstOnly- secondOnly
+  
+  
+  
+  fisher.test (matrix(c(both, firstOnly, secondOnly, neither), nrow = 2), alternative = "greater")$p.value
+}
+
+
+pcmi.mat <- dcast (pcmi.ppi, Prey~Bait, value.var = "Bait", fun.aggregate = length) |> as.matrix(rownames= "Prey")
+pcmi.mat[pcmi.mat > 1] <- 1
+
+
+allByAll <- data.table(bait1 = colnames(pcmi.mat))[, .(bait2 = colnames(pcmi.mat)), by = bait1][bait1 < bait2]
+
+allByAll <- allByAll[ (!bait1 %in% excludeBaits) & (!bait2 %in% excludeBaits)]
+
+
+allByAll[ , fisherP := pairwiseFisher(bait1, bait2, pcmi.mat), by = .(bait1, bait2)]
+
+allByAll[, pP := -log10(fisherP)]
+pcmi.fisher.dt <- allByAll
+
+pcmi.fisher.mat <- dcast (rbind (allByAll, allByAll[, .(bait1 = bait2, bait2 = bait1, fisherP, pP)]),
+       bait1~bait2, value.var = "pP") |> as.matrix (rownames = "bait1")
+
+
+baitClusters <- unique(pcmi.ppi[, .(Bait, Clusters)])
+
+
+
+hm <- Heatmap (pcmi.fisher.mat,
+         name = "-log10(P)\nfisher.test",
+         row_split = as.factor(baitClusters[rownames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+         column_split = as.factor(baitClusters[colnames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+         col = circlize::colorRamp2(breaks = c(0, 4), color = c("white", "firebrick")),
+         left_annotation = rowAnnotation(cluster = as.factor(baitClusters[rownames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+                                         col = list (cluster = setNames(c("#FF3333","#FF9900","#F6D80C","#0CB212","#4A56FD","#AA4AFD","#1CDDEB","black"), 1:8))),
+         top_annotation = columnAnnotation(cluster = as.factor(baitClusters[rownames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+                                         col = list (cluster = setNames(c("#FF3333","#FF9900","#F6D80C","#0CB212","#4A56FD","#AA4AFD","#1CDDEB","black"), 1:8))),
+         border  = TRUE,
+         row_names_gp = gpar(fontsize = 2),
+         column_names_gp = gpar(fontsize = 2),
+         gap = unit(0.3, "mm"),
+         column_gap = unit(0.3, "mm"))
+
+BackupAsPDF(hm)
+
+
+
+
+
+
+```
+
+```{r, fig.width = 5, fig.height= 4}
+kaushik.mat <- dcast (kppi, Prey~Bait, value.var = "Bait", fun.aggregate = length) |> as.matrix(rownames= "Prey")
+
+allByAll <- data.table(bait1 = colnames(kaushik.mat))[, .(bait2 = colnames(kaushik.mat)), by = bait1][bait1 < bait2]
+
+allByAll <- allByAll[ (!bait1 %in% excludeBaits) & (!bait2 %in% excludeBaits)]
+
+allByAll[ , fisherP := pairwiseFisher(bait1, bait2, kaushik.mat), by = .(bait1, bait2)]
+
+allByAll[, pP := -log10(fisherP)]
+
+kaushik.fisher.dt <- allByAll
+
+kaushik.fisher.mat <- dcast (rbind (allByAll, allByAll[, .(bait1 = bait2, bait2 = bait1, fisherP, pP)]),
+       bait1~bait2, value.var = "pP") |> as.matrix (rownames = "bait1")
+
+
+hm <- Heatmap (kaushik.fisher.mat, 
+         name = "-log10(P)\nfisher.test",
+         col = circlize::colorRamp2(breaks = c(0, 4), color = c("white", "firebrick")))
+
+BackupAsPDF(hm)
+```
+
+```{r}
+hist (pcmi.fisher.mat[pcmi.fisher.mat > 0], breaks = 100)
+hist(kaushik.fisher.mat[kaushik.fisher.mat > 0], breaks = 100, add = TRUE, col = "red")
+```
+
+
+```{r}
+fisher.dt <- rbindlist(list (pcmi= pcmi.fisher.dt, kaushik = kaushik.fisher.dt), idcol = "study")
+ggplot(fisher.dt, aes (x = pP, color = study)) + geom_density(alpha  = 0.5) +theme_bw() 
+ggplot(fisher.dt, aes (x = pP, color = study)) + geom_density(alpha  = 0.5) +theme_bw() + coord_cartesian(ylim = c(0, 0.1)) 
+ggplot(fisher.dt, aes (x = pP, color = study)) + geom_density(alpha  = 0.5) +theme_bw() + coord_cartesian(xlim = c(0, 5), ylim = c(0, 0.1)) 
+```
+
+
+```{r, fig.width = 2, fig.height = 2.5}
+p <- ggplot (fisher.dt[, 100 *sum(fisherP < 0.05)/.N, by = study], aes(x = study, y= V1, fill = study)) +
+  geom_hline(yintercept = 5, color = "grey") +
+  geom_col(show.legend = FALSE, width = 0.5) +
+  ylab( "% of bait pairs with significant (p < 0.05)\n prey convergence") +
+  scale_fill_manual(values = c(kaushik = "orange", pcmi = "cornflowerblue")) +
+  theme_classic() +
+  coord_cartesian(ylim = c(4,11))
+  
+  
+BackupAsPDF(p)
+```
+
+
+```{r}
+fisher.dt[baitClusters, cluster1 := i.Clusters, on = c(bait1 = "Bait")]
+fisher.dt[baitClusters, cluster2 := i.Clusters, on = c(bait2 = "Bait")]
+fisher.dt[!is.na(cluster2) & study == "kaushik"]
+```
+```{r, fig.width = 2, fig.height = 2.5}
+p <- ggplot (fisher.dt[study== "kaushik" | (cluster1 !=   cluster2),
+                       100 *sum(fisherP < 0.05)/.N, by = study],
+             aes(x = study, y= V1, fill = study)) +
+  geom_hline(yintercept = 5, color = "grey") +
+  geom_col(show.legend = FALSE, width = 0.5) +
+  ylab( "% of bait pairs with significant (p < 0.05)\n prey convergence") +
+  scale_fill_manual(values = c(kaushik = "orange", pcmi = "cornflowerblue")) +
+  theme_classic() 
+  
+  
+BackupAsPDF(p)
+```
+

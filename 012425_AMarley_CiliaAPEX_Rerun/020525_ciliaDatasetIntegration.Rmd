@@ -1,0 +1,266 @@
+---
+title: "020525_ciliaDatasetIntegration"
+author: "Martin Gordon"
+date: "2025-02-05"
+output: html_document
+---
+
+*notes*
+Integration of the runs form the 2024/2025 datasets
+Todo; after speaking to justin, want to i)
+Plot the sum of intensities per sample ordered by runID (similar trend to Npeptides would indicate carryover between runs; should be relatively constant)
+plot the boxplots with median feature data point in each sample drawn on top with geom point; and draw lines grouping across samples; hopefully it will be relatively consistent across runs
+
+What could the difference in Npeptides be?
+1) Could be biological (more peptides as more protein-dense region in one oft he GPCRs)
+2) Carry over from previous samples
+
+Something else to bear in mind; look at the runorder IDs perhaps use this to 'batchify' the samples: is there any obvious groupings in the runs? eg (run1-3, then run 4-9 etc) Look at gaps between the groups
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(showtext)
+library(readxl)
+library(tidymodels)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/NMF_Helpers.R")
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_ipsum_rc() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+```
+Before considering integrating the two datasets, are we getting consistent signal between the two?
+Plot a correlation matrix of the LFC values between the two
+
+```{r}
+new.de.dt <- fread('020325_msstatsDEanalysis_data/2025_02_04_mss.pwcomparisons.firstPass.wIntensities.csv.gz')
+old.agonist.dt <- fread('../061324_XFang_Cilia_GPCR/062724_AgonistPWComparisons_data/2024_06_28_mss.pwComparisons.agonistComparisons.csv')
+old.de.dt <- fread('../061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_27_mss.pwComparisons.ciliaComparisons.csv')
+```
+cilia markers 
+```{r}
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+cilia.AM <- c('INPP5E', 'LCA5', 'PRKAR1A', 'ARL13B', 'SMO', 'EVC2', 'EVC', 'PKD2', 'TTC21B', 'PKHD1', 'IFT88', 'NPHP4', 'EFCAB7', 'CYS1')
+
+cilia.Consensus <- c('Pdap1','Cep131','Cep41','Ift122','Ift172','Ift52','Ift57','Ift74','Ift81','Ift88','Cfap97','Lca5','Cemip2','Wdr35',
+                     'Arl13b','Arl3','Inpp5e','Nme7','Kif3a','Kif3b','Kifap3','Ywhaz','Cys1','Evc2','Ttc21b','Ift56')
+
+cilia.Consensus[!cilia.Consensus %in% unique(mh_mappings$Symbol.mouse)]
+
+# all found
+cilia.AM.prots <- mh_mappings[Symbol.human %in% cilia.AM, SWISS_PROT_IDs.mouse]
+cilia.Consensus.prots <- mh_mappings[Symbol.mouse %in% cilia.Consensus, SWISS_PROT_IDs.mouse]
+cilia.AM.prots
+```
+
+
+```{r}
+
+old.de.dt <- old.de.dt[Label %in% c("+cilia_GPR135 vs -cilia_GPR135", "+cilia_SMO vs -cilia_SMO", "+cilia_Pth2r vs -cilia_Pth2r"),]
+old.agonist.dt <- old.agonist.dt[Label %in% c("+cilia_SMO_ag vs +cilia_SMO", "+cilia_Pth2r_ag vs +cilia_Pth2r"),]
+
+dim(old.de.dt)
+dim(old.agonist.dt)
+
+old.de.dt <- rbind(old.de.dt, old.agonist.dt)
+old.de.dt[grepl('Pth2r', Label), Label := gsub('_Pth2r', '_PTH2R', Label)]
+old.de.dt[, padj := p.adjust(pvalue, method='BH'), by=.(Label)]
+
+# sanity check 
+all(unique(old.de.dt$Label) %in% unique(new.de.dt$Label))
+
+old.de.dt[, exp := '2024_dataset']
+new.de.dt[, exp := '2025_dataset']
+```
+
+combine the two datasets 
+```{r}
+cols.oi <- c("exp","Protein","gene","Label", "log2FC", "SE","pvalue","padj")
+comb.dt <- rbind(new.de.dt[, ..cols.oi], old.de.dt[, ..cols.oi])
+
+comb.dt[, sig := 'not']
+comb.dt[abs(log2FC) > 0.58 & padj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+#fwrite(comb.dt, ScriptAndDatedFileName('pwcontrasts.combined.datasesets.csv'))
+# now combine this with hu protein annotation
+
+comb.dt <- fread('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/020525_ciliaDatasetIntegration_data/2025_02_05_pwcontrasts.combined.datasesets.csv')
+```
+
+look at the correlation of the LFC values
+```{r}
+# have to remove infinite values from the correlation; become NA, which do not impact correlation
+comb.dt[, newLabel := paste0(exp,'__',Label)]
+
+contrast.pairs <-  UniqueFactorCombos(comb.dt$newLabel, allow.dups = F, sep=',')
+contrast.pairs <- contrast.pairs[gsub('202[45]_dataset__', '', Var1) == gsub('202[45]_dataset__', '', Var2),]
+
+
+apply(contrast.pairs, 1,  function(x){
+
+  dt <- dcast(comb.dt[!is.infinite(log2FC) & newLabel %in% x,], Protein+gene~newLabel, value.var = c('log2FC', 'sig'))
+  setnames(dt, new=c('Protein', 'gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+  # 
+  # # could try nested if else but not working v well....
+  dt[, label := 'not']
+  dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'),  label :=  'both']
+  
+  cor.score <- paste0('r=',round(cor(dt$log2FC.x, dt$log2FC.y, use = "pairwise.complete.obs"),2))
+  
+
+  ggt <- gsub('2024_dataset__', '', x[1])
+
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=gene)) +
+    geom_point(size=1.5, alpha=0.75) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    annotate(geom='text', x=-3, y=3, label=cor.score) +
+    scale_color_manual(values=c("not" ='grey',"x-axis sig"="#FDE725FF", "y-axis sig"="#35B779FF", "both"="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not',],size = 2, max.overlaps = 20) +
+    ggtitle(ggt) +
+    xlab(paste0(x[1],' LFC')) +
+    ylab(paste0(x[2],' LFC')) +
+    customTheme +
+    coord_obs_pred()
+
+  tidyname <- gsub(' ', '.', gsub('[+-]','', ggt))
+  BackupAsPDF(g, paste0('scatterplots/',tidyname,'.log2FC.scatterplots.'), dimensions = c(8,8))
+})
+
+
+cor.mat <- cor(comb.wide,method='pearson', use = "pairwise.complete.obs")
+
+
+#set ordering for diagonal mat
+od =  hclust(dist(cor.mat))$order
+# reorder matrix on both dimensions to match clusterin
+cm = cor.mat[od, od]
+
+hm <- Heatmap(cm, 
+        name='LFC pearson cor.',
+        rect_gp = gpar(type = "none"), 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=6),
+        col=colorRamp2(breaks = seq(from = -1, to = 1, length.out = 11),
+                                    colors = rev(RColorBrewer::brewer.pal(11, "RdBu"))),
+	cell_fun = function(j, i, x, y, w, h, fill) {
+		if(i >= j) {
+		  # only populate if i > j
+			grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='black'))
+		}
+	})
+BackupAsPDF(draw(hm, column_title=expression(log[2]~'FC correlations across 2024/2025 datasets')), 'sample.LFC.heatmaps')
+```
+
+```{r}
+lapply(seq_along(colnames(comb.dt)), function(x){
+  
+  print(x)
+  print(colnames(comb.dt)[x])
+  
+  
+  
+  comb.dt[grepl(vec1$col[x], ), colnme := gsub(vec1$col1[x], vec1)]
+  
+})
+  
+  
+oriSet <- colnames(p.mat)
+newSet <- gsub()
+
+
+
+
+vec.ori <- c('PTH2R', 'SMO')
+vec.test <- c('pth2r', 'smoothen')
+
+colnames(test.mat) <- colnames(p.mat)
+
+newcolNames <- colnames(test.mat)
+
+alcolNames <- lapply(seq_along(vec.ori), function(x){
+
+  
+  ifelse()
+  newcolNames <- gsub(vec.ori[x], vec.test[x], newcolNames)
+  print(newcolNames)
+  return(newcolNames)
+})
+
+
+for (x in seq_along(vec.ori)){
+  
+  colnames(test.mat) <- ifelse(grepl(vec.ori[x], colnames(test.mat)), gsub(vec.ori[x], vec.test[x], colnames(test.mat)), colnames(test.mat))
+}
+
+
+colnames(test.mat)
+ifelse()
+
+alcolNames
+
+newcolNames
+
+
+lapply(colnames(df), function(x){
+  
+  
+  
+  
+  
+})
+```
+
+

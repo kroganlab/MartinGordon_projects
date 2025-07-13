@@ -1,0 +1,328 @@
+---
+title: "AFscores_plots"
+author: "Martin Gordon"
+date: "2024-04-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+packages
+```{r}
+library(data.table)
+library(ggplot2)
+library(stringr)
+library(magrittr)
+library(ComplexHeatmap)
+
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("../../utils/bp_utils/manageScriptData.R")
+```
+
+
+
+read in the data
+
+```{r}
+scores.dt <- fread('./data/allScores.csv')
+setnames(scores.dt, new=c('file', 'ptm', 'iptm'))
+
+scores.dt[, pair := tstrsplit(file, '[/]', keep=1)]
+scores.dt[, model :=  sub("model_","", str_extract(file, 'model_[1-5]'))]
+scores.dt[, c('GPCR', 'GProtein') :=  tstrsplit(pair, '__', keep=c(1,2))]
+```
+All runs produced 5 models
+```{r}
+scores.dt[, .N, by=pair][N < 5]
+```
+get gene names for gprotein and gpcrs
+
+```{r}
+scores.dt[, GPCR_gene := multiUniprots2multiGenes(GPCR, species='HUMAN')]
+scores.dt[, GProtein_gene := multiUniprots2multiGenes(GProtein, species='HUMAN')]
+scores.dt[, gene_pair := paste0(GPCR_gene, "__", GProtein_gene)]
+
+scores.dt[, mean.iptm := mean(iptm), by=pair]
+scores.dt[, above.threshold := ifelse(iptm > .5, 'yes', 'no')]
+```
+boxplots of the scores
+
+```{r}
+g <- ggplot(scores.dt, aes(x=gene_pair, y=iptm, color=above.threshold)) +
+  #geom_boxplot(alpha=0.4, color='darkgrey') +
+  geom_point(alpha=0.8) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer GPCR-GProtein pair scores') +
+  ylim(c(0,1)) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.boxplot', dimensions=c(14,10))
+```
+Order by mean IPTM
+```{r}
+g <- ggplot(scores.dt, aes(x=reorder(gene_pair, -mean.iptm), y=iptm, color=above.threshold)) +
+  #geom_boxplot(alpha=0.4, color='darkgrey') +
+  geom_point(alpha=0.8) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer GPCR-GProtein pair scores') +
+  ylim(c(0,1)) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.boxplot', dimensions=c(14,10))
+```
+All the scores seem pretty high...
+facet by GPCR and GProtein
+
+```{r}
+g <- ggplot(scores.dt, aes(x=reorder(gene_pair, -mean.iptm), y=iptm, color=above.threshold)) +
+  #geom_boxplot(alpha=0.4, color='darkgrey') +
+  geom_point(alpha=0.8) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer GPCR-GProtein pair scores') +
+  ylim(c(0,1)) +
+  facet_wrap(~GProtein_gene,scales = 'free_x') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.GProteinfacet', dimensions=c(14,14))
+
+
+g <- ggplot(scores.dt, aes(x=gene_pair, y=iptm, color=above.threshold)) +
+  #geom_boxplot(alpha=0.4, color='darkgrey') +
+  geom_point(alpha=0.8) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer GPCR-GProtein pair scores') +
+  ylim(c(0,1)) +
+  facet_wrap(~GPCR_gene,scales = 'free_x') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.GPCRfacet', dimensions=c(14,14))
+```
+Barplot of mean IPTM scores
+
+```{r}
+dt <- scores.dt[,.(above.threshold = ifelse(mean.iptm > 0.5, 'yes', 'no'), gene_pair, mean.iptm,GProtein_gene, GPCR_gene)] %>% 
+  unique()
+
+
+g <- ggplot(dt, aes(x=reorder(gene_pair,-mean.iptm), y=mean.iptm, fill=above.threshold)) +
+  geom_bar(alpha=0.8, stat='Identity') +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_fill_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer GPCR-GProtein pair scores') +
+  ylim(c(0,1)) +
+  facet_wrap(~GPCR_gene,scales = 'free_x') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.GPCRfacet.barplot', dimensions=c(14,14))
+```
+What models contribute to the high scores
+
+```{r}
+g <- ggplot(scores.dt, aes(x=gene_pair, y=iptm, shape=model, color=above.threshold)) +
+  geom_point(alpha=0.8) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  labs(title='AF-multimer Sacsin pair scores') +
+  ylim(c(0,1)) +
+  scale_color_manual(values=c('no'='black', 'yes'='red')) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+g
+BackupAsPDF(g, 'AFscores.boxplot', dimensions=c(14,10))
+```
+
+Looks like there might be a GPCR-GProtein bias
+First lets visualise these scores as a heatmap
+Input all the results, and cluster; then take the averages of the models
+
+```{r}
+# just get the mean iptm from each of the groups
+scores.mat <- dcast(scores.dt, GProtein_gene~GPCR_gene, value.var = 'iptm', fun.aggregate=mean) %>%  
+  as.matrix(rownames='GProtein_gene')
+
+colnames(scores.mat)
+
+# create annotation
+ann <- data.table('Gi/Go' = c('Yes','No', 'Yes', 'Yes', 'Yes','Yes', 'Yes', 'No', 'No', 'Yes', 'No'),
+                  'Gq/G11' = c('Yes', 'Yes', 'No', 'No', 'No', 'No', 'No', 'Yes', 'No', 'Yes', 'Yes'),
+                  'Gs' = c('No', 'No', 'No', 'No', 'No', 'No', 'No', 'No', 'Yes', 'No', 'Yes'))
+
+colours <- list('Gi/Go'= c('Yes' = '#4477AA', 'No'="grey"),
+                'Gq/G11'= c('Yes' = '#CCBB44','No'="grey"),
+                'Gs'= c('Yes' = 'darkred', 'No'="grey")
+                )
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+# draw heatmap
+hm <- Heatmap(scores.mat, 
+              cluster_rows=T,
+              show_row_names = T,
+              cluster_columns = T, 
+              top_annotation = colAnn, 
+              name='Mean iPTM')
+
+
+BackupAsPDF(hm, 'mean.iPTM.heatmap')
+```
+Make a heatmap of 'all the models' maybe interesting to see if models with templates tend to have better scores
+
+```{r}
+# just get the mean iptm from each of the groups
+scores.mat <- dcast(unique(scores.dt), GProtein_gene~paste0(GPCR_gene,'.model', model), value.var = 'iptm') %>%  
+  as.matrix(rownames='GProtein_gene')
+
+# create annotation
+ann.new <- data.table('model' = gsub('*[.]model', '', colnames(scores.mat)),
+                  'receptor'= gsub('[.]model[1-5]$', '', colnames(scores.mat)))
+
+ann.new[, `Gi/Go` := ifelse(receptor %in% c('QRFPR','OPRM1', 'ORPD1', 'OPRK1', 'NPFFR1','NPY1R', 'MRGPRX2'), 'Yes', "No")]
+ann.new[, `Gq/G11` := ifelse(receptor %in% c('TACR1','QRFPR', 'PTGER1','MRGPRX2', 'MRGPRX4'), 'Yes', "No")]
+ann.new[, `Gs` := ifelse(receptor %in% c('PTGER4','TACR1'), 'Yes', "No")]
+
+ann.new$receptor %>%  unique()
+# draw heatmap
+hm <- Heatmap(scores.mat, 
+              cluster_rows=T,
+              show_row_names = T,
+              cluster_columns = T, 
+              column_names_gp = gpar(fontsize=6),
+              row_names_gp = gpar(fontsize=6),
+              name='iPTM')
+
+BackupAsPDF(hm, 'ipTM.heatmap')
+```
+```{r}
+scores.dt$GProtein_gene %>%  unique()
+scores.dt$GPCR_gene %>%  unique()
+```
+
+
+Take the inital scores, matrix and do a TMP and look at the residuals
+Color by predicted to interact score
+```{r}
+scores.dt[, knownInteraction := ifelse( GProtein_gene %in%  c('GNAQ', 'GNA11') & GPCR_gene %in% c('TACR1', 'QRFPR', 'PTGER1', 'MRGPRX2', 'MRGPRX4'), 'Gq.G11',
+                                        ifelse(GProtein_gene %in%  c("GNAI1", "GNAI2", "GNAI3","GNAO1") & GPCR_gene %in% c('QRFPR', "OPRM1","OPRD1","OPRK1", 'NPY1R', 'MRGPRX2','NPFFR1'), 'Gi.Go',
+                                               ifelse(GProtein_gene %in%  c("GNAS") & GPCR_gene %in% c('PTGER4', 'TACR1'), 'Gs','unknown')) )]
+
+
+g <- ggplot(scores.dt, aes(x=reorder(gene_pair, -mean.iptm), y=iptm, color=knownInteraction)) +
+  #geom_boxplot(alpha=0.4, color='darkgrey') +
+  geom_point(alpha=0.8) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('Gq.G11'='red', 'Gi.Go'='blue', 'Gs'='green', 'unknown'='grey')) +
+  labs(title='AF-multimer GPCR-GProtein pair scores') +
+  ylim(c(0,1)) +
+  facet_wrap(~GProtein_gene,scales = 'free_x') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+
+BackupAsPDF(g,'AFscores.GProteinfacet.colInteractions', dimensions=c(14,14))
+```
+
+Need to attempt TMP on this dataset; subtract column and row effects get residuals and see how the interactions look
+
+```{r}
+scores.mat <- dcast(scores.dt, GProtein_gene~GPCR_gene, value.var = 'iptm', fun.aggregate=mean) %>%  
+  as.matrix(rownames='GProtein_gene')
+
+tmp.out <- medpolish(scores.mat)
+
+tmp.out$residuals %>% str()
+
+        # create annotation
+ann <- data.table('Gi/Go' = c('Yes','No', 'Yes', 'Yes', 'Yes','Yes', 'Yes', 'No', 'No', 'Yes', 'No'),
+                  'Gq/G11' = c('Yes', 'Yes', 'No', 'No', 'No', 'No', 'No', 'Yes', 'No', 'Yes', 'Yes'),
+                  'Gs' = c('No', 'No', 'No', 'No', 'No', 'No', 'No', 'No', 'Yes', 'No', 'Yes'))
+
+colours <- list('Gi/Go'= c('Yes' = '#4477AA', 'No'="grey"),
+                'Gq/G11'= c('Yes' = '#CCBB44','No'="grey"),
+                'Gs'= c('Yes' = 'darkred', 'No'="grey")
+                )
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+# draw heatmap
+hm <- Heatmap(tmp.out$residuals, 
+              cluster_rows=T,
+              show_row_names = T,
+              cluster_columns = T, 
+              top_annotation = colAnn, 
+              name='Mean iPTM')
+hm
+```
+plot the avg iPTM from the GPRotein and GPCR respectively
+
+```{r}
+g <- ggplot(scores.dt, aes(x=GPCR_gene, y=iptm, fill=GPCR_gene)) +
+  geom_boxplot() +
+  ggtitle('Distributions of iPTM scores') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'GPCRDistributions.boxplots.')
+
+g <- ggplot(scores.dt, aes(x=GProtein_gene, y=iptm, fill=GProtein_gene)) +
+  geom_boxplot() +
+  ggtitle('Distributions of iPTM scores') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+  
+BackupAsPDF(g, 'GProteinDistributions.boxplots.')
+```
+
+Can we just subtract the row effect?
+```{r}
+# remove row effects
+submat <- sweep(scores.mat, 1, FUN='-', tmp.out$row)
+# remove col effects
+#submat <- sweep(submat, 2, FUN='-', tmp.out$col)
+
+# draw heatmap
+hm <- Heatmap(submat, 
+              cluster_rows=T,
+            ##  clustering_distance_rows = "pearson",
+          ##    clustering_distance_columns = 'pearson',
+              show_row_names = T,
+              cluster_columns = T, 
+              top_annotation = colAnn, 
+              name='Mean iPTM')
+hm
+BackupAsPDF(hm, 'GProtein.tmp.rmRowEffects.heatmap')
+```
+
+
+
+
+
+Problem with tmp method for this is we are assuming the effect is additive. Not the case here as these values are constrained to 1.
+What we want to do is convert each cell to rank
+We want weigthing by both rows and columns (think of if one row doesnt contribute much but column does, then that row will be driven by the column effect)
+
+```{r}
+
+```
+
+
+```{r}
+help("medpolish")
+```
+

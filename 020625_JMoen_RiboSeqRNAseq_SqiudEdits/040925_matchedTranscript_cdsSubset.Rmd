@@ -1,0 +1,117 @@
+---
+title: "040925_matchedTranscriptSitesComparison_cdsSubset"
+author: "Martin Gordon"
+date: "2025-04-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview 
+
+Rerun of the matched transcript site work; but w just want to find the subset of these transcripts that overlap with the protein-coding transcripts
+
+
+```{r}
+library(data.table)
+library(Rsamtools)
+library(magrittr)
+library(ggplot2)
+library(devtools)
+library(riboWaltz)
+library(hrbrthemes)
+library(ComplexHeatmap)
+library(viridis)
+library(scales)
+library(ggsankey) #sankey/alluvlai plots in ggplot syntax
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/bamProcessing.R")
+
+# de testing of codons
+source("../../utils/bp_utils/LinearModels.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+```
+
+Read in the all edits set, subset to edits overlapping thjre CDS, and compare with our HQ edits set
+
+```{r}
+all.edits<- dir('./output/reditools/032825_transcriptomeMap', full.names=T,pattern='outTable', recursive = T)
+edits.list <- lapply(all.edits, fread)
+names(edits.list) 
+
+edits.dt <- rbindlist(lapply(all.edits, fread), idcol='sample')
+```
+
+
+Read in the previously filtered subset
+```{r}
+hq.edits <- fread('040225_EditsVsNoEdits_highConfSubset_data/2025_04_02_OL.edits.highQuality.csv.gz')
+```
+First thing to do. Look at Jacks set of protein coding sequenes, see if these identifiers overlap our cds gtf file
+Here we can see the geneID overlaps
+```{r}
+cds.gtf <- fread('./data/wynton_downloads/Dpea_1_genomic_cleanheaders_final.pipelineFiltered.cdsOnly.gtf')
+
+cds.gtf[, c('tid', 'gid') := tstrsplit(V9, ';', keep=c(1,2))]
+
+cols.oi <- c('tid', 'gid')
+# extract everything in quites
+cds.gtf[, (cols.oi) :=  lapply(.SD, function(x){
+  stringr::str_extract(x, '(?<=\\s\\")[A-Za-z0-9:.]+')
+}), .SDcols = cols.oi]
+
+```
+load Jacks fasta
+```{r}
+fa.in <- seqinr::read.fasta('./docs/Dpealeiiv2_Protein_CDS.fasta',as.string = T, forceDNAtolower = F, whole.header = T)
+
+fa.dt <- data.table(header=names(unlist(fa.in)),
+                    seq=unlist(fa.in))
+```
+When we filter to just Jacks genes, we lose a lot of records
+About 25k records
+
+```{r}
+# remove the .g suffix
+cds.gtf[, gid := gsub('[.]g$', '', gid)]
+proteinCoding <- cds.gtf[gid %in% fa.dt$header, unique(gid)]
+proteinCoding.gtf <-  cds.gtf[gid %in% fa.dt$header,]
+
+#fwrite(proteinCoding.gtf, ScriptAndDatedFileName('proteinCodingCDS.gtf'))
+proteinCoding.gtf <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040925_matchedTranscript_cdsSubset_data/2025_04_09_proteinCodingCDS.gtf')
+```
+
+read in our ori edit calls and see if these overlap
+
+```{r}
+ori.edits.dt <- fread('./output/reditools/032825_transcriptomeMap/RIBO_OPTIC_5/DnaRna_327412032/outTable_327412032')
+sub.dt <- ori.edits.dt[`Coverage-q30` >= 10 & Frequency > 0.1, ] # filter to high quality
+sub.dt[Region %in% proteinCoding.gtf$tid,] #losing 3% of edits
+
+```
+
+```{r}
+ori.edits.dt
+```
+

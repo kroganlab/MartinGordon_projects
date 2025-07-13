@@ -1,0 +1,1266 @@
+---
+title: "NetProp Data Integration"
+author: "Martin Gordon"
+date: "2023-06-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Packages
+
+```{r}
+library("RColorBrewer") 
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(RcppCNPy) #R/W support to import numpy objects into R
+library(VennDiagram)
+library(pbapply) #apply functions with progress bar
+library(eulerr)
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+source ("../../utils/bp_utils/NetworkPropagation.R")
+```
+## TODO 
+perform net prop on each seperately
+remove duplicate names in protein list
+get A549 proteome & gene detected by RNASEQ to use as bg set: look at the Sanger pan-cancer proteomic map: https://www.sciencedirect.com/science/article/pii/S1535610822002744
+
+## Network Propagation Data Integration
+
+Want to combine the RNAseq, Protein AB and Protein PH datasets to identify both common pathways and novel pathways/mechanisms only visible using all three
+
+
+First load in the 3 datasets. We will look at the 
+
+```{r}
+#load in the 3 datasets
+box.loc <- '~/Library/CloudStorage/Box-Box/Mac1_omics_data/'
+
+rna.ab.core <- fread(paste0(box.loc, 'CellLines_RNAseq/core_table_gene.xls.gz'), fill=T)
+
+#using data below with same comparisons as RNAseq
+prot.ab <- fread(paste0(box.loc, 'CellLines_Abundance/CellLines_Abundance/tables/2023_05_25_msstats_groupcomparisons.csv.gz'))
+prot.ph <- fread(paste0(box.loc, 'CellLines_Phospho/CellLines_Phospho/tables/2023_06_01_msstats_groupcomparisons.csv.gz'))
+
+
+#using new data with updated comparisons
+##compared the reverse comparisons.. exact same findings.. use ori as what was supplied
+
+#prot.ab <- fread('/Users/martingordon/Documents/projects/051623_DSwaney/2023_06_15_MSstats_newcontrasts_data/2023_06_15_ab-mssstats_groupcomparisons_newcontr#asts.csv.gz')
+#prot.ph <- fread('/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/2023-06-15_MSstats_newcontrasts_data/2023_06_15_ph-mssstats_groupcomparisons_newcontrasts.csv.gz')
+```
+Convert the RNAseq data from wide to long format
+Want Log2FC,pval and qvalue as seperate columns.First convert to longformat, create id col for the values (log2fc,pvalue,qvalue) and convert to wideforat
+
+```{r}
+rna.ab.core <- rna.ab.core[, c(2,3,97:144)]
+
+#combine all value cols to split sensibly
+rna.ab.core <- melt(rna.ab.core, id.vars= c("gene_id","gene_symbol"), measure.vars = c(seq(3,50,by=1)))
+#use this id col for converting to wide format
+rna.ab.core[, id := str_extract(variable, "log2fc|qvalue|pvalue")]
+rna.ab.core[, Label := sub("diffexp_log2fc_|diffexp_deseq2_qvalue_|diffexp_deseq2_pvalue_", "", variable)]
+#convert to wide format
+rna.ab <- dcast(rna.ab.core, gene_id+gene_symbol+Label~id, value.var = "value")
+rna.ab[, fdr := p.adjust(pvalue, method='BH')]
+#renmae cols to match prot data
+rna.ab[, `:=`(gene=gene_symbol, log2FC=log2fc)]
+#drop these cols
+rna.ab[, c("qvalue","gene_id","gene_symbol","log2fc") := NULL]
+rm(rna.ab.core)
+```
+
+
+The WT-EV contrast for (phospho)proteomics datasets uses WT as denominator. 
+Change Log2FC sign and rename for Proteomics datasets
+
+```{r}
+# change the sign of the ab and ph log2FC values
+prot.ab[Label == "WTpos vs EVpos", log2FC := -1 * log2FC]
+prot.ab[Label == "WTpos vs EVpos", Label := "EV_IFNg-vs-WT_IFNg"]
+prot.ab[Label == "WTpos vs N10t20pos", Label := "WT_IFNg-vs-ND_IFNg"]
+
+prot.ph[Label == "WT+ vs EV+", log2FC := -1 * log2FC]
+prot.ph[Label == "WT+ vs EV+", Label := "EV_IFNg-vs-WT_IFNg"]
+prot.ph[Label == "WT+ vs N10t20+", Label := "WT_IFNg-vs-ND_IFNg"]
+```
+
+Wrtie out the three cleaned datasets to file
+
+```{r}
+#dir.create('./output')
+fwrite(rna.ab, './output/rna_ab.csv')
+fwrite(prot.ab, './output/prot_ab.csv')
+fwrite(prot.ph, './output/prot_ph.csv')
+
+```
+
+
+Combine the 3 datsets into a list to make iteration easier
+
+```{r}
+omics_list <- list(rna_ab = rna.ab,
+                   prot_ab = prot.ab,
+                   prot_ph = prot.ph)
+
+```
+
+For now prioritise EV_IFNg vs WT_IFNg and WT_IFNg vs N1062D_IFNg comparisons
+```{r}
+
+omics_list <- lapply(omics_list, function(x){
+  x[ Label %in% c("EV_IFNg-vs-WT_IFNg","WT_IFNg-vs-ND_IFNg"),]
+})
+
+```
+
+Remove noisy LFC estimates (& infinities) from the data
+(RNAseq data has already been filtered)
+
+```{r}
+omics_list <- lapply(omics_list, function(x){
+                     x <- x[abs(log2FC) < 10,]
+                     })
+
+```
+
+
+## Defining function to generate network heat input (pval log2fc geommetric mean)
+https://github.com/kroganlab/bp_utils/blob/master/notebooks/Network_Propagation_Example.Rmd
+```{r}
+
+magSigScore <- function(log2FC, pvalue, magnitudeScale = 2){
+  magnitude <- magnitudeScale * abs(log2FC)
+  significance <- -log10(pvalue)
+  significance <- ifelse (significance > magnitude, magnitude, significance)
+  sqrt(magnitude * significance)
+}
+
+```
+
+Calculate the magSigscore for each dataset
+
+```{r}
+lapply(omics_list, function(x){
+  x[, magSig := magSigScore(log2FC=log2FC,pvalue=pvalue)]
+  })
+
+
+```
+
+Need to deal with mulitple values per protein in the phosphodata. For nextwork propagation, we only need one 1 per protein
+Code taken from https://github.com/kroganlab/bp_utils/blob/master/notebooks/Network_Propagation_Example.Rmd
+
+This hack removes the site info per protein, discards sites with multiplenames, and then takes the max score per protein
+
+```{r}
+omics_list[['prot_ph']][, uniprot := gsub("_[STY][0-9]+", "", Protein) %>% #strip phosphosite info
+          strsplit (";") %>%  #split multiprots; creates a list of vectors of each element
+          lapply (unique) %>% #removes any duplicate elements in list
+          lapply (paste, collapse = ";") %>% #colapses back to unique prot names
+          unlist]
+
+omics_list[['prot_ph']] <- omics_list[['prot_ph']][,uniprot := sub("\\;.*","", uniprot)] #keep only the first protein name instead of dropping these rows
+#omics_list[['prot_ph']] <- omics_list[['prot_ph']][!grepl(";", uniprot),] #only select rows w/o multiuniprots
+
+
+
+#only taking record with max magSig score
+omics_list[['prot_ph']] <- omics_list[['prot_ph']][!is.na(magSig), .(magSig = max(magSig, na.rm = TRUE)), by = .(Label, uniprot)]
+
+# using gene symbols as identifiers
+omics_list[['prot_ph']][, gene := translateUniprot2GeneName(uniprot, species = "HUMAN")] # or "MOUSE" or "RAT"
+
+```
+Also clean the protein data to only keep the first protein identified
+
+```{r}
+omics_list[['prot_ab']] <- omics_list[['prot_ab']][,uniprot := sub("\\;.*","",Protein)] #take only first name with multi uniprots
+#omics_list[['prot_ab']] <- omics_list[['prot_ab']][,!grepl(";", Protein),] #only select rows w/o multiuniprots
+
+
+#only taking record with max magSig score (incase of multiple measurements) - no change
+omics_list[['prot_ab']] <- omics_list[['prot_ab']][!is.na(magSig), .(magSig = max(magSig, na.rm = TRUE)), by = .(Label, uniprot)]
+
+# using gene symbols as identifiers
+omics_list[['prot_ab']][, gene := translateUniprot2GeneName(uniprot, species = "HUMAN")] # or "MOUSE" or "RAT"
+
+```
+Write out the cleaned omics files
+
+```{r}
+lapply(seq_along(omics_list), function(x,n,i){
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.clean.csv.gz'))
+}, x=omics_list, n=names(omics_list))
+```
+
+
+Drop unnecessary columns in the RNAseq data 
+
+```{r}
+omics_list[['rna_ab']][, c('fdr', 'pvalue', 'log2FC') := NULL] # or "MOUSE" or "RAT"
+```
+Remove genes with NA
+
+```{r}
+omics_list <- lapply(omics_list, function(x){
+  x[!is.na(gene),]
+})
+```
+Some genes have mulitple scores (same gene, different uniprot)
+We should only keep the highest scoring genes as only want one input score per gene
+
+```{r}
+#only take max magSig value
+omics_list <- lapply(omics_list, function(x){
+  x[!is.na(magSig), .(heat = max(magSig, na.rm = TRUE)), by = .(Label, gene)]
+})
+
+#sanity check 
+any(omics_list[['prot_ab']][, .N, by=.(Label,gene)]$N > 1)
+any(omics_list[['prot_ph']][, .N, by=.(Label,gene)]$N > 1)
+
+```
+
+### Defining a background set
+---------
+
+For the background set, we will use all mRNA and all Proteins detected in the A549 cell lines
+Cell model passports link: https://cellmodelpassports.sanger.ac.uk/passports/SIDM00903
+
+RNAseq dataset ~37k mRNA detected; should we use this as background? Seems v large..
+The proteomics background set ~6k genes
+
+For now the background will be union set of theses and the proteins/mRNA quantified in the experiment
+```{r}
+rna.bg <- fread('./data/SIDM00903_rnaseq.csv')
+prot.bg <- fread('./data/SIDM00903_proteomics.csv')
+
+rna.bg <- unique(rna.bg$symbol)
+prot.bg <- unique(prot.bg$symbol)
+
+rna.bg <- union(omics_list[['rna_ab']]$gene, rna.bg)
+prot.bg <- union(omics_list[['prot_ab']]$gene, prot.bg)
+```
+
+### Defining input gene list & heat
+---------
+
+As this is genome/proteome-wide profiling, just take the magSig score of each gene detected in the three experiments
+
+```{r}
+
+#map string IDs to each gene in our dataset
+lapply(omics_list, function(x){
+  x[, string := GetStringIDMapping.inOrder(gene, stringAliasFile='./data/9606.protein.aliases.v11.5.txt.gz')]
+})
+```
+
+
+### Choice of Network
+----
+Larger more inclusive gene interaction networks work best for disease gene discovery, so we will use STRING for first-pass (PCNet is another option)
+
+ These will be our background set
+
+### Compute S matrix on background network
+--------
+
+The S matrix (terminology from Ideker et al reference: https://www.nature.com/articles/nrg.2017.38 ), is a square matrix with dimensions num_genes X num_genes.  It describes how gene i (row index) receives heat from gene j (column index) in the full propagation. There is no need to iterate this matrix. 
+
+You only need to calculate S matrix once per network 
+This calculates a different S matrix fo different values of `pr` (the restart probability).  See the for loop at line 145 to change these
+possible values of pr.
+
+Two different ways to calculate heat propagation/S matrix:
+
+Random walk with restart (lower restart probability = greater diffusion)
+Heat diffusion ( higher time parameter = greater diffusion)
+
+We are using RWR with pr=.3 for first run
+
+```{r}
+
+# this is precomputed by a python script NetworkPropagation_Build_S_matrix.py (I modified the input to use latest version of string network)
+#python3 ../../../utils/bp_utils/NetworkPropagation_Build_S_matrix_mg.py
+
+#S_matrix.20 <- LoadNumPyS_matrix(matrixPath = "./data/S_matrix.human.string.pr0.20.npy", 
+ #                             nodesTablePath = "./data/S_matrix.human.string.pr0.20.nodeNames.csv" )
+
+#using 30 for now
+S_matrix.30 <- LoadNumPyS_matrix(matrixPath = "./data/S_matrix.human.string.pr0.30.npy", 
+                              nodesTablePath = "./data/S_matrix.human.string.pr0.30.nodeNames.csv" )
+
+```
+
+# make sure most of our genes are in the S matrix
+Most features are, so proceed
+```{r}
+
+lapply(omics_list, function(x){
+       x[, inNetwork := string %in% rownames(S_matrix.30)][, length(unique(string)), by = .(inNetwork)]})
+
+```
+Using permutations of input heat to assess significance of output heat 
+We will perform network propagation for each dataset & contrast:
+
+```{r}
+#get each unique contrast
+contrast.groups <- unique(omics_list$rna_ab$Label)
+names(contrast.groups) <- contrast.groups
+contrast.groups
+
+
+rna.ab.allNP <- pbapply::pblapply(contrast.groups, function(g){
+  
+   NetworkPropagateS_matrix(S_matrix.30,
+                            geneHeats = omics_list[['rna_ab']][Label == g, .(gene = string, heat)], # requires gene and heat column (using string as gene)
+                            networkHeatOnly = TRUE,
+                            permuteOnlyInObserved=TRUE,
+                            numPermutations = 20000)
+  
+})
+
+prot.ab.allNP <- pbapply::pblapply(contrast.groups, function(g){
+  
+   NetworkPropagateS_matrix(S_matrix.30,
+                            geneHeats = omics_list[['prot_ab']][Label == g, .(gene = string, heat)], # requires gene and heat column (using string as gene)
+                            networkHeatOnly = TRUE,
+                            permuteOnlyInObserved=TRUE,
+                            numPermutations = 20000)
+  
+})
+
+prot.ph.allNP <- pbapply::pblapply(contrast.groups, function(g){
+  
+   NetworkPropagateS_matrix(S_matrix.30,
+                            geneHeats = omics_list[['prot_ph']][Label == g, .(gene = string, heat)], # requires gene and heat column (using string as gene)
+                            networkHeatOnly = TRUE,
+                            permuteOnlyInObserved=TRUE,
+                            numPermutations = 20000)
+  
+})
+
+rna.ab.allNPdt <- rbindlist(rna.ab.allNP, idcol = "Label")
+fwrite (rna.ab.allNPdt,  "./output/AllNetworkPropagation_RNA_STRING_Interactions.rs0.3.csv")
+
+prot.ab.allNPdt <- rbindlist(prot.ab.allNP, idcol = "Label")
+fwrite (prot.ab.allNPdt,  "./output/AllNetworkPropagation_PROT_AB_STRING_Interactions.rs0.3.csv")
+
+prot.ph.allNPdt <- rbindlist(prot.ph.allNP, idcol = "Label")
+fwrite (prot.ph.allNPdt,  "./output/AllNetworkPropagation_PROT_PH_STRING_Interactions.rs0.3.csv")
+```
+Read in the netprop results
+
+```{r}
+rna.ab.allNPdt <- fread("./output/AllNetworkPropagation_RNA_STRING_Interactions.rs0.3.csv")
+prot.ab.allNPdt <- fread("./output/AllNetworkPropagation_PROT_AB_STRING_Interactions.rs0.3.csv")
+prot.ph.allNPdt <-fread("./output/AllNetworkPropagation_PROT_PH_STRING_Interactions.rs0.3.csv")
+```
+
+
+
+```{r}
+
+np.out.list <- list('rna_ab' = rna.ab.allNPdt,
+                      'prot_ab' = prot.ab.allNPdt,
+                      'prot_ph' = prot.ph.allNPdt)
+
+
+combinations <- expand.grid(X = np.out.list, Y = contrast.groups)
+```
+
+inspect p-values.. V strange histograms, why is there a large number of values with with a p-vlaue of 1?
+
+```{r hist-pval}
+
+lapply(seq_along(combinations[,1]), function(i){
+  X <- combinations$X[[i]]
+  Y <- combinations$Y[i]
+  
+  g <- ggplot(X[Label == Y,], aes(x = pvalue)) +
+       geom_histogram(boundary = 0.0, binwidth = 0.005) +
+       ggtitle(paste("Combination:", names(combinations$X)[i], "Contrast Group:", Y))
+  
+  fname <- paste0("./output/netprop.pvalues_", names(combinations$X)[i], "_", Y, ".png")
+  
+  ggsave(fname,g)
+  })#
+
+```
+
+generate histograms of the raw data to inspect
+
+```{r}
+raw.list <- list(rna.ab = rna.ab, 
+                 prot.ab = prot.ab,
+                 prot.ph = prot.ph)
+            
+
+raw.combo <- expand.grid(X=raw.list, Y=contrast.groups)
+
+lapply(seq_along(raw.combo[,1]), function(i){
+  X <- raw.combo$X[[i]]
+  Y <- raw.combo$Y[i]
+  
+  g <- ggplot(X[Label == Y,], aes(x = pvalue)) +
+       geom_histogram(boundary = 0.0, binwidth = 0.005) +
+       ggtitle(paste("Combination:", names(combinations$X)[i], "Contrast Group:", Y))
+  
+  fname <- paste0("./output/raw.pvalues_", names(combinations$X)[i], "_", Y, ".png")
+  
+#  ggsave(fname,g)
+  g
+  })#
+
+```
+
+
+
+
+Assess p-values & Z score relationship
+
+```{r}
+# Generate plots for each combination using lapply
+lapply(seq_len(nrow(combinations)), function(i) {
+  X <- combinations$X[[i]]
+  Y <- combinations$Y[i]
+  
+  g <- ggplot(X[Label == Y & z > 0, ], aes(x = z, y = -log10(pvalue))) +
+       geom_point(alpha = 0.5) +
+       geom_density2d() +
+       ggtitle(paste("Combination:", names(combinations$X)[i], "Contrast Group:", Y))
+  
+  fname <- paste0("./output/z-pval_scatterplot_", names(combinations$X)[i], "_", Y, ".png")
+  g
+  #ggsave(fname,g)
+})
+```
+
+Compute network proximity scores (z * z * z) for the condition comparisons
+This will allow use to detect features with large deviations from the mean
+For now, lets extract: i) all genes with a prox.zscore > 4.5 and any genes with an individual zscore greater than 1.5
+Combine the dfs for each omics set and look at 
+
+```{r}
+np.out.comb  <- do.call(cbind, np.out.list) #colbind
+
+# now split intolist of the contrasts
+np.out.comb.list <- split(np.out.comb, np.out.comb$rna_ab.Label)
+
+```
+
+For first pass, I've taken the 99th percentile genes 
+
+
+Next pass, lets extract: i) all genes with a prox.zscore > 5.88 and any genes with an individual zscore greater than 1.96
+# taken from https://www.ncbi.nlm.nih.gov/pmc/articles/PMC10257754/#SD1
+Combine the dfs for each omics set and look at 
+
+
+When trying to filter, no genes were found to be significant in all modalities
+Take 90th percetnrile and those significant in at least 2 modalities for now
+
+```{r}
+lapply(np.out.comb.list, function(x){
+  x[, prox.all.z.score:= rna_ab.z * prot_ab.z * prot_ph.z]
+  x[, prox.rna.prot.ab.score:= rna_ab.z * prot_ab.z]
+  x[, prox.rna.prot.ph.score:= rna_ab.z * prot_ph.z]
+  x[, prox.prot.ab.prot.ph.score:= prot_ph.z * prot_ab.z]
+  
+})
+
+# can see most values are centered around 0
+lapply(np.out.comb.list, function(x) {
+  ggplot(x, aes(x=prox.all.z.score)) +
+                  geom_histogram(boundary = 0.0, binwidth = 0.1) +
+                  xlim(-15,15) })
+
+
+
+# for starter threshold at 99 percentile, will designate values more extreme as interestinng and significant in at least one fo the modalities
+np.out.sig.list <- lapply(np.out.comb.list, function(X) {
+  upper_threshold <- quantile(X$prox.all.z.score, 0.99)
+  
+  X[ prox.all.z.score > 4.5 & (prot_ab.adj.pvalue < 0.5 & rna_ab.adj.pvalue < 0.05) | (prot_ab.adj.pvalue < 0.5 & prot_ph.adj.pvalue < 0.05) | (rna_ab.adj.pvalue < 0.5 & prot_ph.adj.pvalue < 0.05),]}) #take genes and their z scores
+
+
+#cmopare results of products of 3 z score vs each pairwise combo
+#np.out.sig.list <- lapply(np.out.comb.list, function(X) {
+#  X[prox.rna.prot.ab.score > 1.5 & rna_ab.adj.pvalue < 0. & prox.rna.prot.ab.score > 1.5 & prot_ab.adj.pvalue < 0.05 & prox.prot.ab.prot.ph.score > 1.5 & prot_ph.adj.pvalue,]}) 
+
+#colnames(np.out.sig.list[[1]])
+```
+
+
+Split the `np.out.list` per condition
+
+```{r}
+np.out.list[['rna_ab_EV-vs-WT']] <- np.out.list[['rna_ab']][Label == 'EV_IFNg-vs-WT_IFNg',]
+np.out.list[['rna_ab_WT-vs-ND']] <- np.out.list[['rna_ab']][Label == "WT_IFNg-vs-ND_IFNg",]
+np.out.list[['prot_ab_EV-vs-WT']] <- np.out.list[['prot_ab']][Label == 'EV_IFNg-vs-WT_IFNg',]
+np.out.list[['prot_ab_WT-vs-ND']] <- np.out.list[['prot_ab']][Label == "WT_IFNg-vs-ND_IFNg",]
+np.out.list[['prot_ph_EV-vs-WT']] <- np.out.list[['prot_ph']][Label == 'EV_IFNg-vs-WT_IFNg',]
+np.out.list[['prot_ph_WT-vs-ND']] <- np.out.list[['prot_ph']][Label == "WT_IFNg-vs-ND_IFNg",]
+
+lapply(np.out.list, function(X){
+  X[, gene := translateString2Gene(gene, species= "HUMAN")]
+  })
+
+```
+
+
+## heatmap
+
+```{r, fig.width = 6, fig.height=10}
+
+lapply(np.out.list, function(x){
+  
+  sigAnywhere <- x[adj.pvalue < 0.05, unique(gene)]
+
+  np.mat <- as.matrix(dcast (x[gene %in% sigAnywhere], gene~Label, value.var = "pvalue"), rownames = "gene")
+
+  np.mat <- -log10(np.mat)
+  np.mat[is.infinite(np.mat)] <- 5
+
+  p.hm <- Heatmap(np.mat, show_row_names = FALSE,
+                col = circlize::colorRamp2(breaks = c(1,4), colors = c("white", "firebrick")),
+                cluster_columns = FALSE,
+           #     km = 12,
+                column_split = tstrsplit(colnames(np.mat), split = "_")[c(1,3)],
+                show_column_names = FALSE, column_title_rot = 90)
+
+draw(p.hm)
+  
+})
+```
+
+Run a quick enrichment analysis on this geneset; lets identify if anyhting immediately sticks out
+
+
+First convert stringID to genenames
+
+```{r}
+lapply(np.out.sig.list, function(X){
+  X[, gene := translateString2Gene(rna_ab.gene, species= "HUMAN")]
+  })
+
+```
+
+Run the enrichment test
+ 
+Combine the DFs again and use Label as group
+```{r}
+np.out.sig <- rbindlist(np.out.sig.list, idcol = T)
+
+# get the GO genes mapping
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# our universe will be all genes in all genes in the nextwork
+uni <-  unique(rownames(S_matrix.30)) %>% 
+  translateString2Gene(species = 'HUMAN')
+
+
+enrich.dt <- enricherOnGroups(np.out.sig, geneColumn = 'gene', groupColumns = '.id', term2gene.gmt = gmt.go, universe=uni)
+
+enrich.heat <- enrichHeatmapBestPerGroup(enrich.dt, groupColumn = '.id', topN=30, column_names_gp = gpar(fontsize=10), upperThreshold =8)
+
+pdf('./output/two-modality-4.5netcoloc-enrich.heatmap.pdf', width=10, height=12)
+
+draw(enrich.heat$hmList)
+
+dev.off()
+```
+Decide on what to import to cytoscape; can use 99 percentile and two modalities, or netcoloc 4.5 & sig in two modalities i think as a place to start and we can try community detection on the netcolococ subnetwork using HiDef algorithm in cytoscape
+
+For now, just return the significant overlapping genes in the different omics datasets
+Include info on what is significant following network propagation
+
+```{r}
+# read in the clean omics files
+rna.ab.clean <- fread('./output/rna_ab.clean.csv.gz')
+prot.ab.clean <- fread('./output/prot_ab.clean.csv.gz')
+prot.ph.clean <- fread('./output/prot_ph.clean.csv.gz')
+
+omics.clean <- list(rna_ab = rna.ab.clean,
+                    prot_ab = prot.ab.clean,
+                    prot_ph = prot.ph.clean)
+```
+
+Look at the number of genes in all 3 that are significant
+
+lets also view the overlap in the number of differentially upregulated features between the three datasets
+
+Collapse the 3 lists to one data.table, and split on contrast
+```{r}
+merge.omics <- rbindlist(omics.clean, fill = T,idcol = T)
+
+#Add sig column for venn diagram visualisation of differentially expressed features
+
+merge.omics[, sig := 'not']
+merge.omics[ fdr < 0.05 & abs(log2FC) > log2(1.5), sig := ifelse(log2FC < 0, "down", "up")]
+merge.omics[, sig := factor(sig, levels = c("up", "not", "down"))]
+
+merge.omics.list <- split(merge.omics, merge.omics$Label)
+```
+
+# redundancy in prot_ph
+Break down of sig results among the three datasets; most sig results in phosphoproteomics?
+# ph data: 1111 unique sig in cond 1, 272 unique sig in condition 2
+
+```{r}
+lapply(seq_along(merge.omics.list), function(x,n,i){
+  x[[i]][sig != 'not' & .id == 'prot_ph', .N, by=.(gene)][order(-N)]
+}, x=merge.omics.list, n=names(merge.omics.list))
+```   
+Redundancy in the phospho dataset
+Proceed as is for now, just identify genes that are significant in all 3
+```{r}
+lapply(seq_along(merge.omics.list), function(x,n,i){
+  x[[i]][sig!= 'not', .N, by=.(.id)]
+}, x=merge.omics.list, n=names(merge.omics.list))
+```
+Removed duplicates if over level of significance
+#in total 1645 genes sig in label 1, 496 in label 2
+```{r}
+
+sig.genes.list <- lapply(seq_along(merge.omics.list), function(x,n,i){
+  #cal geom.mean 
+  x[[i]][, gm.lfc.fdr := sqrt(abs(log2FC) * fdr)] %>% 
+    .[.id == 'prot_ph', gene := multiUniprots2multiGenes(uniprot, simplify = F)] %>% #uniprot col is the clean version in prot_ph dataser
+    # only take the row with the max geom.mean value in the ph group
+    .[sig != 'not', .SD[which.max(gm.lfc.fdr)], by = .(.id,gene)]
+}, x=merge.omics.list, n=names(merge.omics.list))
+
+
+
+lapply(seq_along(sig.genes.list), function(x,n,i){
+  x[[i]][ sig!= 'not', .N, by=.(.id)]
+}, x=sig.genes.list, n=names(sig.genes.list))
+```
+After removing duplicate values, identify overlapping sig genes in the 3 omics datasets
+
+```{r}
+names(sig.genes.list) <- c( 'EV_IFNg-vs-WT_IFNg', 'WT_IFNg-vs-ND_IFNg')
+
+lapply(seq_along(sig.genes.list), function(x,n,i){
+  p <- plot(eulerr::euler( lapply(list(AB = x[[i]][.id == 'prot_ab', gene], 
+                           PH  = x[[i]][.id == 'prot_ph', gene],
+                           RNA = x[[i]][.id == 'rna_ab', gene])[c("AB", "PH", "RNA" )], unique)),
+
+     quantities = TRUE, main = paste0(n[[i]], ' sig features'))
+  
+  pdf(ScriptAndDatedFileName(paste0(n[[i]], '-exp-sig.pdf')))
+p
+  
+}, x=sig.genes.list, n=names(sig.genes.list))
+
+```
+Identify the overlapping genes and extract from the raw data 
+Write out this info from the raw data
+
+```{r}
+exp.all.omics.sig <- lapply(sig.genes.list, function(x){
+   Reduce(intersect, list(x[.id == 'rna_ab', gene],
+                       x[.id == 'prot_ab', gene],
+                       x[.id == 'prot_ph', gene]))
+})
+
+exp.rna.ab.sig <- lapply(sig.genes.list, function(x){
+   intersect(x[.id == 'rna_ab', gene],
+              x[.id == 'prot_ab', gene])
+
+})
+
+exp.rna.ph.sig <- lapply(sig.genes.list, function(x){
+   intersect(x[.id == 'rna_ab', gene],
+              x[.id == 'prot_ph', gene])
+
+})
+
+exp.ab.ph.sig <- lapply(sig.genes.list, function(x){
+   intersect(x[.id == 'prot_ph', gene],
+              x[.id == 'prot_ab', gene])
+
+})
+
+# combine all the different comparisons
+exp.list <- list(all = exp.all.omics.sig,
+                 rna.ab =exp.rna.ab.sig,
+                 rna.ph = exp.rna.ph.sig,
+                 ab.ph = exp.ab.ph.sig)
+
+
+# extract relevant sections of the raw data
+all.sig <- lapply(seq_along(sig.genes.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, fdr, log2FC) ]
+}, x=sig.genes.list, y=exp.all.omics.sig, n=names(sig.genes.list))
+
+rna.ab.sig <- lapply(seq_along(sig.genes.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, fdr, log2FC) ]
+}, x=sig.genes.list, y=exp.rna.ab.sig, n=names(sig.genes.list))
+
+rna.ph.sig <- lapply(seq_along(sig.genes.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, fdr, log2FC) ]
+}, x=sig.genes.list, y=exp.rna.ph.sig, n=names(sig.genes.list))
+
+ab.ph.sig <-  lapply(seq_along(sig.genes.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, fdr, log2FC) ]
+}, x=sig.genes.list, y=exp.ab.ph.sig, n=names(sig.genes.list))
+
+
+sig.list <- list(all.sig = all.sig,
+                 rna.ab.sig = rna.ab.sig,
+                 rna.ph.sig = rna.ph.sig,
+                 ab.ph.sig = ab.ph.sig)
+
+exp.sig <- lapply(sig.list, function(x){ rbindlist(x)})
+
+
+exp.sig <- lapply(exp.sig, function(x){
+  dcast(x, gene+Label~.id, value.var=c('log2FC','fdr'))
+})
+
+
+
+#add label where the dataset came from
+lapply(seq_along(exp.sig), function(x,n,i){
+  x[[i]][, omics := n[[i]] ] 
+
+},x=exp.sig, n=names(exp.sig))
+
+
+#collapse the dataset into one 
+fwrite(rbindlist(exp.sig), './output/experimental-omics-sig-genes.csv')
+
+
+
+```
+
+Do the same with the netprop results 
+
+```{r}
+
+```
+
+
+
+Net prop results
+Plot a venn diagram of significant results after the netprop
+Split out the netprop results by condition
+```{r}
+#comb and split by condition
+net.prop.list <- rbindlist(np.out.list, fill = T,idcol = T) %>% 
+  split(.$Label)
+
+# go back to gene ids
+lapply(net.prop.list, function(x){
+  x[, gene := translateString2Gene(gene, fillMissing = T, species='HUMAN' )]
+})
+
+
+lapply(seq_along(net.prop.list), function(x,n,i){
+  
+  pdf(ScriptAndDatedFileName(paste0(n[[i]],'-venndiagram-netprop-sig.pdf')))
+  p <- plot(eulerr::euler( lapply(list(AB = x[[i]][.id == 'prot_ab' & adj.pvalue < 0.05, gene], 
+                           PH  = x[[i]][.id == 'prot_ph' & adj.pvalue < 0.05, gene],
+                           RNA = x[[i]][.id == 'rna_ab' & adj.pvalue < 0.05, gene])[c("AB", "PH", "RNA" )], unique)),
+
+     quantities = TRUE, main=n[[i]])
+  p
+  #pdf(ScriptAndDatedFileName('venndiagram-netprop-sig.pdf'))
+  dev.off()
+  
+}, x=net.prop.list, n=names(net.prop.list))
+
+#plots corruped just run individually ....
+#cond2 
+pdf(ScriptAndDatedFileName(paste0(names(net.prop.list)[1],'-venndiagram-netprop-sig.pdf')))
+
+p <- plot(eulerr::euler( lapply(list(AB = net.prop.list[[1]][.id == 'prot_ab' & adj.pvalue < 0.05, gene], 
+                           PH  = net.prop.list[[1]][.id == 'prot_ph' & adj.pvalue < 0.05, gene],
+                           RNA = net.prop.list[[1]][.id == 'rna_ab' & adj.pvalue < 0.05, gene])[c("AB", "PH", "RNA" )], unique)),
+
+     quantities = TRUE, main=names(net.prop.list)[1])
+p
+dev.off()
+
+#cond 2
+pdf(ScriptAndDatedFileName(paste0(names(net.prop.list)[2],'-venndiagram-netprop-sig.pdf')))
+
+p <- plot(eulerr::euler( lapply(list(AB = net.prop.list[[2]][.id == 'prot_ab' & adj.pvalue < 0.05, gene], 
+                           PH  = net.prop.list[[2]][.id == 'prot_ph' & adj.pvalue < 0.05, gene],
+                           RNA = net.prop.list[[2]][.id == 'rna_ab' & adj.pvalue < 0.05, gene])[c("AB", "PH", "RNA" )], unique)),
+
+     quantities = TRUE, main=names(net.prop.list)[2])
+p
+dev.off()
+  
+
+
+```
+extract the significant genes from both conditions
+
+```{r}
+np.all.omics.sig <- lapply(net.prop.list, function(x){
+   Reduce(intersect, list(x[.id == 'rna_ab' & adj.pvalue < 0.05, gene],
+                       x[.id == 'prot_ab'  & adj.pvalue < 0.05, gene],
+                       x[.id == 'prot_ph'  & adj.pvalue < 0.05, gene]))
+})
+
+np.rna.ab.sig <- lapply(net.prop.list, function(x){
+   intersect(x[.id == 'rna_ab'  & adj.pvalue < 0.05, gene],
+              x[.id == 'prot_ab'  & adj.pvalue < 0.05, gene])
+
+})
+
+np.rna.ph.sig <- lapply(net.prop.list, function(x){
+   intersect(x[.id == 'rna_ab'  & adj.pvalue < 0.05, gene],
+              x[.id == 'prot_ph'  & adj.pvalue < 0.05, gene])
+
+})
+
+np.ab.ph.sig <- lapply(net.prop.list, function(x){
+   intersect(x[.id == 'prot_ph'  & adj.pvalue < 0.05, gene],
+              x[.id == 'prot_ab'  & adj.pvalue < 0.05, gene])
+
+})
+
+```
+
+
+Extract gene list overlapping in the two experimental methods
+
+```{r}
+# extract relevant sections of the raw data
+np.all.sig <- lapply(seq_along(net.prop.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, z, adj.pvalue) ]
+}, x=net.prop.list, y=np.all.omics.sig, n=names(net.prop.list))
+
+np.rna.ab.sig <- lapply(seq_along(net.prop.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, z, adj.pvalue) ]
+}, x=net.prop.list, y=np.rna.ab.sig, n=names(net.prop.list))
+
+np.rna.ph.sig <- lapply(seq_along(net.prop.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, z, adj.pvalue) ]
+}, x=net.prop.list, y=np.rna.ph.sig, n=names(net.prop.list))
+
+np.ab.ph.sig <-  lapply(seq_along(net.prop.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, z, adj.pvalue) ]
+}, x=net.prop.list, y=np.ab.ph.sig, n=names(net.prop.list))
+
+
+np.sig.list <- list(all.sig = np.all.sig,
+                 rna.ab.sig = np.rna.ab.sig,
+                 rna.ph.sig = np.rna.ph.sig,
+                 ab.ph.sig =  np.ab.ph.sig)
+
+np.sig <- lapply(np.sig.list, function(x){ rbindlist(x)})
+
+np.sig <- lapply(np.sig, function(x){
+  dcast(x, gene+Label~.id, value.var=c('z','adj.pvalue'))
+})
+
+
+
+#add label where the dataset came from
+lapply(seq_along(np.sig), function(x,n,i){
+  x[[i]][, omics := n[[i]] ] 
+
+},x=np.sig, n=names(np.sig))
+
+
+#collapse the dataset into one 
+fwrite(rbindlist(np.sig), './output/netprop-omics-sig-genes.csv')
+
+
+```
+Run enrichment analysis on both genesets
+
+```{r}
+nt.gene <- rbindlist(np.sig) %>% .[, unique(gene)]
+ 
+exp.gene <- rbindlist(exp.sig) %>% .[, unique(gene)]
+exp.gene
+
+
+np.gene.list <- rbindlist(np.sig) %>% 
+  .[, unique(gene), by=.(Label)]
+
+exp.gene.list <- rbindlist(exp.sig) %>% 
+  .[, unique(gene), by=.(Label)]
+
+# get the GO genes mapping
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# our universe will be all genes in all genes in the nextwork
+np.uni <-  unique(rownames(S_matrix.30)) %>% 
+  translateString2Gene(species = 'HUMAN')
+
+exp.uni <- unique(merge.omics.clean$gene)
+
+enrich.dt <- enricherOnGroups(exp.gene.list, geneColumn = 'gene', groupColumns = 'Label', term2gene.gmt = gmt.go, universe=exp.uni)
+
+enrich.heat <- enrichHeatmapBestPerGroup(enrich.dt, groupColumn = '.id', topN=30, column_names_gp = gpar(fontsize=10), upperThreshold =8)
+
+pdf('./output/two-modality-4.5netcoloc-enrich.heatmap.pdf', width=10, height=12)
+
+draw(enrich.heat$hmList)
+
+dev.off()
+
+```
+
+
+
+Assess overlap in the two sets (experimental, network propagation)
+No overlap detected in the two datasets...
+
+
+```{r}
+# wont work in loop run individually as below
+lapply(names(sig.genes.list), function(x){
+  pdf(ScriptAndDatedFileName(paste0(x,'-venndiagram-comb-sig.pdf')))
+  
+    p <- plot(eulerr::euler( lapply(list(AB_exp = sig.genes.list[[x]][.id == 'prot_ab', gene], 
+                             PH_exp  = sig.genes.list[[x]][.id == 'prot_ph', gene],
+                             RNA_exp = sig.genes.list[[x]][.id == 'rna_ab', gene],
+                             AB_np = net.prop.list[[x]][.id == 'prot_ab' & adj.pvalue < 0.05, gene], 
+                             PH_np  = net.prop.list[[x]][.id == 'prot_ph' & adj.pvalue < 0.05, gene],
+                             RNA_np = net.prop.list[[x]][.id == 'rna_ab' & adj.pvalue < 0.05, gene])[c("AB_exp", "PH_exp", "RNA_exp","AB_np", "PH_np", "RNA_np")], unique)),
+   quantities = TRUE, main=x)
+  
+    
+    dev.off()
+              })
+
+#cond1
+pdf(ScriptAndDatedFileName(paste0(names(net.prop.list)[1],'-venndiagram-comb-sig.pdf')))
+
+p <- plot(eulerr::euler( lapply(list(AB_exp = sig.genes.list[[1]][.id == 'prot_ab', gene], 
+                             PH_exp  = sig.genes.list[[1]][.id == 'prot_ph', gene],
+                             RNA_exp = sig.genes.list[[1]][.id == 'rna_ab', gene],
+                             AB_np = net.prop.list[[1]][.id == 'prot_ab' & adj.pvalue < 0.05, gene], 
+                             PH_np  = net.prop.list[[1]][.id == 'prot_ph' & adj.pvalue < 0.05, gene],
+                             RNA_np = net.prop.list[[1]][.id == 'rna_ab' & adj.pvalue < 0.05, gene])[c("AB_exp", "PH_exp", "RNA_exp","AB_np","PH_np", "RNA_np")], unique)),
+     quantities = TRUE, main=names(net.prop.list)[1])
+p
+dev.off()
+
+#cond 2
+
+pdf(ScriptAndDatedFileName(paste0(names(net.prop.list)[2],'-venndiagram-comb-sig.pdf')))
+
+p <- plot(eulerr::euler( lapply(list(AB_exp = sig.genes.list[[2]][.id == 'prot_ab', gene], 
+                             PH_exp  = sig.genes.list[[2]][.id == 'prot_ph', gene],
+                             RNA_exp = sig.genes.list[[2]][.id == 'rna_ab', gene],
+                             AB_np = net.prop.list[[2]][.id == 'prot_ab' & adj.pvalue < 0.05, gene], 
+                             PH_np  = net.prop.list[[2]][.id == 'prot_ph' & adj.pvalue < 0.05, gene],
+                             RNA_np = net.prop.list[[2]][.id == 'rna_ab' & adj.pvalue < 0.05, gene])[c("AB_exp", "PH_exp", "RNA_exp", "PH_np","RNA_np", "AB_np")], unique)),
+     quantities = TRUE, main=names(net.prop.list)[2])
+p
+dev.off()
+```
+
+
+
+# not needed 
+
+sig.genes.all.omics <- np.out.comb[ prox.rna.prot.ab.score >= 5.88 & prox.rna.prot.ph.score >= 5.88 & prox.prot.ab.prot.ph.score >= 5.88, .(rna_ab.gene,rna_ab.z,prot_ab.z,prot_ph.z) ] # 354 genes show synergy across all modalities
+
+sig.genes.2.omics <- np.out.comb[ prox.rna.prot.ab.score >= 5.88 | prox.rna.prot.ph.score >= 5.88 | prox.prot.ab.prot.ph.score >= 5.88, .(rna_ab.gene,rna_ab.z,prot_ab.z,prot_ph.z) ] #3.5 k genes show synergy across at least 2 modalities
+
+
+sign(np.out.comb$rna_ab.z)
+
+-4*5
+
+
+
+
+
+#test this
+```{r mapply test}
+rna.ab.allNP <- mapply(function(X,Y, Z){
+  
+   NetworkPropagateS_matrix(S_matrix.30,
+                            geneHeats = X[[Z]]][Label == Y, .(gene = string, heat)], # requires gene and heat column (using string as gene)
+                            networkHeatOnly = TRUE,
+                            permuteOnlyInObserved=TRUE,
+                            numPermutations = 20000)
+  
+}X=omics_list,Y=contrast.groups,Z=names(omics_list),SIMPLIFY=FALSE)
+```
+
+
+### Below Not required 
+This is calculting heat for a ppi experiment; much simplier for our example
+```{r input heats}
+#redoing input heats
+rnaHeats
+
+#maybe create list and just loop through this setup
+rnaHeats <- data.table(symbol=rna.bg, heat=0)
+rnaHeats[omics_list[['rna_ab']]$gene, heat := omics_list[['rna_ab']]$magSig, on="symbol"]
+rnaHeats[, string := GetStringIDMapping.inOrder(symbol, stringAliasFile='./data/9606.protein.aliases.v11.5.txt.gz')]
+rnaHeats <- rnaHeats[!is.na(string),]
+
+prot.abHeats <- data.table(symbol=prot.bg, heat=0)
+prot.abHeats[omics_list[['prot_ab']]$gene, heat := omics_list[['prot_ab']]$magSig, on="symbol"]
+prot.abHeats[, string := GetStringIDMapping.inOrder(symbol, stringAliasFile='./data/9606.protein.aliases.v11.5.txt.gz')]
+prot.abHeats <- prot.abHeats[!is.na(string),]
+
+prot.phHeats <- data.table(symbol=prot.bg, heat=0)
+prot.phHeats[omics_list[['prot_ph']]$gene, heat := omics_list[['prot_ph']]$magSig, on="symbol"]
+prot.phHeats[, string := GetStringIDMapping.inOrder(symbol, stringAliasFile='./data/9606.protein.aliases.v11.5.txt.gz')]
+prot.phHeats <- prot.phHeats[!is.na(string),]
+
+
+heats_list <-    list('rna_ab' = rnaHeats,
+                      'prot_ab' = prot.abHeats,
+                      'prot_ph' = prot.phHeats)
+
+
+```
+
+
+## a view of a "corner" of the S_matrix
+```{r, fig.width = 6, fig.height = 6}
+dim(S_matrix.30)
+subMat <- S_matrix.30[1:1000, 1:1000]
+colnames(subMat) <- rownames(subMat) <- translateString2Gene(rownames(subMat), species = "HUMAN")
+
+hc <- hclust(as.dist(max(subMat)-subMat)) #higher values more dissimliar; identify similiar clusters
+Heatmap (subMat, name = "portion heat", cluster_rows = hc, cluster_columns = hc, col = c("white", "firebrick"),
+         row_names_gp = gpar(fontsize = 5), column_names_gp = gpar(fontsize = 5), column_names_side = "top")
+Heatmap (log10(subMat), name = "log10\nportion heat", cluster_rows = hc, cluster_columns = hc, col = c("white", "firebrick"),
+         row_names_gp = gpar(fontsize = 5), column_names_gp = gpar(fontsize = 5), column_names_side = "top")
+
+```
+
+
+### Defining input gene list & heat
+---------
+
+Initialise all heats in the table to 0, then add heat as those genes detected in our experiment
+
+First pass, add all genes, plot th p-vlaues then threshold for top X
+Second pass our input will be just significant score above padj = 0.05 & log2FC =1 #1.613
+If this doesnt produce optimal results, we will attempt the Netcoloc method
+
+
+As we are using a string network for network propagation, we need stringIDs as genes
+Import using Ben's function
+prots: 5956 mapped
+rna: 19282 mapped
+```{r, eval=FALSE}
+#take max value in heat per stringID, filter rows to retain those with stringIDs in matrix, and get vector of heat values
+rna.inputHeats <- rnaHeats[, .(heat = max(heat)), by = string][colnames(S_matrix.30), heat, on = "string"]
+rna.inputHeats[is.na(rna.inputHeats)] <- 0
+
+prot.ab.inputHeats <- prot.abHeats[, .(heat = max(heat)), by = string][colnames(S_matrix.30), heat, on = "string"] 
+prot.ab.inputHeats[is.na(prot.ab.inputHeats)] <- 0
+
+prot.ph.inputHeats <- prot.phHeats[, .(heat = max(heat)), by = string][colnames(S_matrix.30), heat, on = "string"]
+prot.ph.inputHeats[is.na(prot.ph.inputHeats)] <- 0
+
+
+in.heats_list <- list('rna_ab' = rna.inputHeats,
+                      'prot_ab' = prot.ab.inputHeats,
+                      'prot_ph' = prot.ph.inputHeats)
+```
+# At its simplest, network propagation is simply matrix multiplication:
+
+Basically extract vector of heat values matching genes in your input gene list and s-matrix and perform matrix multiplication
+
+
+```{r}
+#multiplying the S_matrix by the input heats for each dataset
+# %*%  symbol for matrix multiplication
+
+prop.heats.list <- lapply(seq_along(in.heats_list), function(x,n,i){
+  name <- paste0(n[[i]],'_prop.heat')
+  name <- S_matrix.30 %*% x[[i]]
+}, x=in.heats_list, n=names(in.heats_list))
+
+names(prop.heats.list) <- c('rna_ab', 'prot_ab', 'prot_ph')
+
+lapply(prop.heats.list, function(x){
+  hist(x)
+})
+```
+
+As recommended in the Netcoloc protcol https://www.ncbi.nlm.nih.gov/pmc/articles/PMC10257754/ , we need to threshold the number of input genes. Recommended to work best for 5-500 as too large wll impact specificity
+
+```{r}
+#1.61309
+thresh <- magSigScore(1,0.05,magnitudeScale = 2)
+
+lapply(seq_along(omics_list), function(x,n,i){
+  print(n[[i]])
+  x[[i]][magSig > thresh, .N, by=Label]
+}, n=names(omics_list), x=omics_list)
+
+
+
+
+prot.ph[Label %in% c("EV_IFNg-vs-WT_IFNg","WT_IFNg-vs-ND_IFNg") & pvalue < 0.05 & log2FC > 1, .N, by=.(Label)]
+prot.ab[Label %in% c("EV_IFNg-vs-WT_IFNg","WT_IFNg-vs-ND_IFNg") & pvalue < 0.05 & log2FC > 1, .N, by=.(Label)]
+rna.ab[Label %in% c("EV_IFNg-vs-WT_IFNg","WT_IFNg-vs-ND_IFNg") & pvalue < 0.05 & log2FC > 1, .N, by=.(Label)]
+
+```
+
+### Choice of Network
+----
+Larger more inclusive gene interaction networks work best for disease gene discovery, so we will use STRING for first-pass (PCNet is another option)
+
+prots: 5444 mapped
+rna: 15113 mapped
+
+ These will be our background set
+```{R}
+# I will use string network, so we need string IDs as genes
+
+source ("../../utils/bp_utils/STRING_db_utils.R")
+rnaHeats[, string := GetStringIDMapping.inOrder(symbol, stringAliasFile='./data/10090.protein.aliases.v11.5.txt.gz')]
+protHeats[, string := GetStringIDMapping.inOrder(symbol, stringAliasFile='./data/10090.protein.aliases.v11.5.txt.gz')]
+
+#remove any rows w/o string aliases
+rnaHeats <- rnaHeats[!is.na(string),]
+protHeats <- protHeats[!is.na(string),]
+```
+
+
+
+
+
+Generate a Venn Diagram for both comparisons of all detected features
+NAs in dataset; need to tidy
+```{r venn-diagram}
+
+lapply(seq_along(merge.omics.list), function(i,x,n){
+  #print(lab)
+  uni      = x[[i]][,unique(gene)] #all genes detected in exp
+  rna      = x[[i]][.id == 'rna_ab', unique(gene)]
+  print(rna)
+  sig.rna  = x[[i]][.id == 'rna_ab' & sig != 'not', unique(gene)]
+  sig.ab   = x[[i]][.id == 'prot_ab' & sig != 'not', unique(gene)]
+  ab       = x[[i]][.id == 'prot_ab', unique(gene)]
+  print(ab)
+  sig.ph   = x[[i]][.id == 'prot_ph' & sig != 'not', unique(gene)]
+  ph       = x[[i]][.id == 'prot_ph', unique(gene)]
+  print(ph)
+
+    
+  venn.data <- list(shared.prots=uni,
+                    RNA_AB=rna,
+                    PROT_PH=ph,
+                    PROT_AB=ab)
+                    #RNA.up=up.rna,
+                    #RNA.down=down.rna,
+                   # AB.up=up.ab,
+                   # AB.down=down.ab,
+                   # PH.up=up.ph,
+                   # PH.down=down.ph)
+    #draw plots
+  vd <- venn.diagram(x=venn.data,
+                     main=paste0(n[[i]],' total features'),
+                     filename=paste0(n[[i]],'-total-features.png'),
+                     output=TRUE,
+                     
+                  
+                     # Output features
+                     imagetype="png" ,
+                     #height = 480 , 
+                     #idth = 480 , 
+                     #resolution = 300,
+                     #compression = "lzw",
+                     
+                     #circles 
+                     lwd = 2,
+                     lty = 'blank',
+                     fill = c("#868686FF","#0073C2FF", "#EFC000FF", "#CD534CFF"),#,'#21908dff', '#FFA500'),#, '#800080'),
+                      
+                     # Numbers
+                     cex = .5,
+                     fontface = "bold",
+                     fontfamily = "sans",
+        
+                    # Set names
+                    cat.cex = 0.5,
+                    cat.fontface = "bold",
+                    cat.default.pos = "outer",
+                 #   cat.pos = c(-27, 27, 135),
+                  #  cat.dist = c(0.055, 0.055, 0.085),
+                    cat.fontfamily = "sans"
+                #    rotation = 1
+  )             
+  return(vd)       
+
+}, x=merge.omics.list, n=names(merge.omics.list))
+
+```
+
+```
+
+
+
+
+```{r}
+# first lets confirm that they are inverted and its not just a naming convention
+# look for highly significant genes overlapping in both datasets
+shared.features <- prot.ab[gene %in% rna.ab$gene_symbol,gene]
+
+
+
+rna.ab[gene_symbol %in% shared.features][order(pvalue), .(gene_symbol,pvalue,log2fc)]
+prot.ab[gene == 'MUC13'][order(pvalue), .(gene,pvalue,log2FC)]
+
+prot.ab[gene %in% shared.features][order(pvalue), .(gene,pvalue,log2FC)]
+
+
+shared.features <- prot.ab[gene %in% rna.ab$gene_symbol,gene]
+```
+
+Not required
+```{r}
+
+p.val.vec <- grep('pvalue', colnames(rna.ab.core), value=TRUE)
+q.val.vec <- grep('qvalue', colnames(rna.ab.core), value=TRUE)
+log2fc.vec <- grep('log2fc', colnames(rna.ab.core), value=TRUE)
+
+
+colnames(rna.ab.core)
+rna.ab <- rna.ab.core[, .(gene_id, gene_symbol,
+                  log2FC = test[grep("log2fc",variable),value], #SD subset the datatable by cols vector; it selects all rows , but only the columns specified
+                  pvalue = test[grep("pvalue",variable),value],
+                  qvalue = test[grep("qvalue",variable),value],
+                  label  = sub("diffexp_log2fc_|diffexp_deseq2_qvalue_|diffexp_deseq2_pvalue_", "", variable))]
+
+
+# do.call: a function that takes a function & a list of arguments to apply to (colnames; remember they are basically lists)
+# in this case concatenate is the function (c)
+#SD subset the datatable by cols vector; it selects all rows , but only the columns specified
+test <- rna.ab.core[, .(gene_id, gene_symbol,
+                        log2FC =d
+                        o.call(c, .SD[, log2fc.vec]), #SD subset the datatable by cols vector; it selects all rows , but only the columns specified
+                        pvalue = do.call(c, .SD[, p.val.vec]),
+                        qvalue = do.call(c, .SD[, q.val.vec]))][,
+                        label  = tstrsplit(variable, "_", fixed=TRUE)[2:6]]  ])]
+```
+
+
+

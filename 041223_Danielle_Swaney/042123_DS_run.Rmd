@@ -1,0 +1,1046 @@
+---
+title: "042123_Danielle_S"
+author: "Martin Gordon"
+date: "2023-04-21"
+output: 
+  html_document:
+    fig_width: 12
+    fig_height: 8
+    theme: cerulean
+    highlight: tango
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Project Goal: Comparison of 4 MS protocols
+Assess:
+how many peptides and proteins per sample? #count
+reproducibility between replicates of the same prep method? #clustering 
+Overlap in peptide/protein IDs between methods #seems like a venn diagram or umap plot
+When different prep methods identify the same protein, is there any systematic difference in the abundance of proteins? because if so, I want to pick the method that give us higher abundances
+
+scatterplot at protein level
+
+```{bash eval=FALSE }
+
+git clone https://github.com/kroganlab/bp_utils.git ./scripts
+
+```
+```{r load-packages}
+library(artMS) #for initial analysis
+library(org.Hs.eg.db)
+library(viridis)
+
+library(ggpubr)
+library(ggplot2)
+library(MSstats)
+library(circlize)
+library(data.table)
+
+library(dtplyr) #data.table backend for dplyr
+library(data.table)
+library(tidyverse) #should load subsets of pkg..
+
+
+library(clusterProfiler)
+```
+
+```{r mg-util-functions}
+
+#function for converting enrichment results to dec for plotting
+fract_to_dec <- function(x) {
+  x <- as.numeric(x)
+  x <- x[1] / x[2] 
+  return(round(x,3))
+}
+
+# only works on R df
+extract_sig_prots <- function(x, LFC=0.58, pval=0.05) {
+  x %>% 
+    filter(abs(log2FC) >= LFC & adj.pvalue <= pval) %>% 
+    return(select(UNiProt, log2FC, SE, pvalue, adj.pvalue))
+}
+
+
+enrich_bar_fun <- function(x,y){
+  
+  ego_df <- as.data.frame(x) 
+  ego_df$generatio_dec <- map_dbl(strsplit(ego_df$GeneRatio, "/"), ~ fract_to_dec(.) ) #return numeric vector w gene ratio
+  
+  ggplot(ego_df, aes(x = -log(p.adjust, base=10), 
+                          y = fct_reorder(Description, -log(p.adjust, base=10)))) + 
+    geom_col(aes(fill = generatio_dec)) +
+    scale_fill_viridis(name = 'gene_ratio')  +
+    scale_y_discrete(position= 'right') +
+    scale_x_continuous(expand = c(0,0.1)) +
+    xlab('-log10(P)') +
+    ylab(NULL) +
+    ggtitle(paste0("GO BP enrichment ", y )) +
+    theme_bw() +
+     theme(
+     axis.title.x = element_text(size=10),
+     legend.position = "bottom",
+     )
+}
+
+
+
+```
+
+```{r util-functions}
+
+
+today <- function(){
+  format(Sys.time(), "%Y_%m_%d")
+}
+DateFileName <- function(x){
+  name <-   paste0(today(), "_", x)
+  print (name)
+  return (name)
+}
+
+ScriptNamedDir <- function(scriptName = NULL){
+  if(is.null(scriptName))
+    scriptName <- rstudioapi::getActiveDocumentContext()$path
+  if (is.null (scriptName) || scriptName == "")
+    stop("No script name found -- you may need to save this file first")
+  outDir <- gsub(".R(md)?$", "_data", scriptName, ignore.case = TRUE)
+  stopifnot( outDir != scriptName)
+  if (!dir.exists(outDir)){
+    message ("Creating directory associated with ", scriptName,", at ", outDir)
+    dir.create(outDir)
+  }
+  return(outDir)
+}
+
+ScriptAndDatedFileName <- function(x, scriptName = NULL){
+  dir <- ScriptNamedDir(scriptName)
+  fileName <- DateFileName(x)
+  path <- file.path(dir, fileName)
+  print (path)
+  return (path)
+}
+
+GetLatestScriptFile <- function(x, scriptName=NULL){
+  stopifnot (length(x) == 1)
+  dir <- ScriptNamedDir(scriptName)
+  filePattern <- paste0("^\\d{4}_\\d{2}_\\d{2}_", x, "$", collapse = "")
+  filesFound <- list.files(dir, filePattern)
+  stopifnot (length(filesFound) > 0)
+  if (length(filesFound) > 1){
+    message ("Multiple files  with matching names found.  Using the last one")
+    print (filesFound)
+  }
+  return (file.path(dir, tail(filesFound, 1)))
+} 
+
+PDFBackupFileName <- function(prefix = "", subDir = ""){
+  scriptDir <- ScriptNamedDir()
+  imageDir <- file.path(scriptDir, "pdfs", subDir)
+  if (!dir.exists(imageDir)) dir.create(imageDir, recursive = TRUE)
+  now <- format(Sys.time(),  "%Y_%m_%d__%H_%M__%S")
+  counter <- 0
+  path <- file.path (imageDir, sprintf("%s%s.%02d.pdf", prefix, now, counter))
+  while (file.exists(path)){
+    counter <- counter + 1
+    path <- file.path (imageDir, sprintf("%s%s.%02d.pdf", prefix, now, counter))
+  }
+  return (path)
+}
+
+BackupAsPDF <- function(graphics, prefix = "", subDir = "", dimensions = NULL){
+  path <- PDFBackupFileName(prefix, subDir)
+  if (is.null(dimensions))
+  dimensions <- dev.size(units = "in")
+
+  print (sprintf("Writing image to  %s", path))
+  cairo_pdf(path, width = dimensions[1], height = dimensions[2])
+  
+  # handle functions, my enrichment heatmaps that are part of a list
+  if ("function" %in% class(graphics)){
+    graphics()
+    g <- "finished" # something to print to console instead of graphics to device 
+  }else if (! ("ggplot" %in% class(graphics) | "grob" %in% class(graphics) | "Heatmap" %in% class(graphics) | "HeatmapList" %in% class(graphics))){
+    g <- graphics$hmList    
+  }  else{
+    g <- graphics
+  }
+  print (g)
+  
+  dev.off()
+  return (graphics)
+}
+
+
+
+
+
+WriteSessionInfo <- function(path = NULL){
+  if (is.null(path))
+    path <- ScriptAndDatedFileName("SessionInfo.txt")
+  si <- devtools::session_info()
+  fileOut <- file(path, open = "wt")
+  writeLines("─ Session info ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+             con = fileOut)
+  write.table(data.frame( value = unlist(si[[1]])), fileOut)
+  #writeLines(capture.output(data.frame(value = unlist(si[[1]]))), con = fileOut) # for some mysterious reason, this always goes to the notebook output when run in a notebook. type = "message" is no help...[shrug]
+  writeLines(capture.output(data.table(setting = names(si[[1]]), value = unlist(si[[1]]))), con = fileOut) # this too. Maybe an RStudio version issue
+  writeLines("─ Packages ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+             con  = fileOut)
+  #write.table(si[[2]], fileOut)
+  writeLines(capture.output(si[[2]]), con = fileOut)
+  close(fileOut)
+}
+
+WriteInstalledPackages <- function (path = NULL){
+  if (is.null(path))
+    path <- ScriptAndDatedFileName("Installed.Packages.csv")
+  package.mat <- installed.packages()
+  fwrite (as.data.table(package.mat, keep.rownames = TRUE), path)
+}
+
+WriteSessionInfo()
+WriteInstalledPackages()
+
+```
+
+# ArtMS Analysis
+
+Have a .csv file output from Spectronaut software
+Convert to evidence.txt file to use with ArtMS software
+
+Ben has a script to perform this
+```{r}
+source('./scripts/spectronautFile2ArtMS.R')
+```
+
+# Create ArtMS input
+Adjust config file for extended ArtMS QC plots
+```{r artms, eval = FALSE}
+#get our input file
+input <- './data/MSstats.csv'
+ms_counts <- read_delim(input)
+
+
+# define some settings that will over-write defaults in artMS config file:
+cf<- list()
+cf$output_extras$annotate$enabled <- as.integer(0) # turn off any attempt to annotate proteins (only works with HUMAN)
+cf$qc$extended <- as.integer(1)  # extended QC plots
+
+globalInput <- spectronautFile2ArtMS(input,   # a path to a spectronaut "evidence" file
+                                     outFilePrefix = "artMS/spec_to_mss_input",   # the prefix for file names of generated 
+                                     artmsConfig = cf,  # the config object we created above with different-from-default 
+                                     # contrastPatterns (below) is a vector of contrasts and/or regular expressions that 
+                                     contrastPatterns = c("Urea-UreaSon",
+                                                          "Urea-TFA",
+                                                          "Urea-TFASon",
+                                                          "UreaSon-TFA",
+                                                          "UreaSon-TFASon",
+                                                          "TFA-TFASon"
+                                                          ))
+
+```
+
+Ran extended quality control pipeline to assess results
+```{r, eval = FALSE}
+# its also possible to just run QC instead:
+artmsQualityControlEvidenceExtended(globalInput$config_data$files$evidence, globalInput$config_data$files$keys)
+```
+
+
+```{r artms-filterna, eval = FALSE}
+# filter na values prior to ArtMS input
+artms_in<- ms_counts %>% 
+  filter( ! is.na(Intensity)) %>% 
+  write.csv('/Users/martingordon/Documents/projects/041223_Danielle_Swaney/data/MSstats_rmna.csv')
+
+
+input_rmna <- './data/MSstats_rmna.csv'
+
+
+globalInput <- spectronautFile2ArtMS(input_rmna,   # a path to a spectronaut "evidence" file
+                                     outFilePrefix = "artMS/042423_ds_qccheck_rmna",   # the prefix for file names of generated 
+                                     artmsConfig = cf,  # the config object we created above with different-from-default 
+                                     # contrastPatterns (below) is a vector of contrasts and/or regular expressions that 
+                                     contrastPatterns = c("Urea-UreaSon",
+                                                          "Urea-TFA",
+                                                          "Urea-TFASon",
+                                                          "UreaSon-TFA",
+                                                          "UreaSon-TFASon",
+                                                          "TFA-TFASon"
+                                                          ))
+```
+
+
+#Review Spectronaut to ArtMS output.
+
+```{r sanity-check, eval = FALSE}
+evidence.txt_f <- fread('./artMS/042423_ds_qccheck_rmna/evidence.txt')
+# sanity check
+sum(is.na(evidence.txt_f$Intensity))
+```
+
+Standard global abundance assessment using ArtMS with extended QC section.
+
+Rerun Extended QC pipeline to assess data quality
+
+```{r run-extended-narm, eval = FALSE}
+# its also possible to just run QC instead:
+artmsQualityControlEvidenceExtended(globalInput$config_data$files$evidence, globalInput$config_data$files$keys)
+```
+
+Run Differential Expression Analysis using ArtMS
+```{r}
+artmsQuantification(yaml_config_file='./artMS/042423_ds_qccheck_rmna/config.yaml')
+```
+
+
+Standard Enrichment analysis using ArtMS.. not working.. seems to be an error caused when trying to impute values possibly due to lack of observations
+
+```{r}
+#setwd as output for the ArtMS quantification run
+setwd('./artMS/042423_ds_qccheck_rmna/output')
+
+
+
+artmsAnalysisQuantifications(log2fc_file = "results.txt",
+                              modelqc_file = "results_ModelQC.txt",
+                              species = "human",
+                              mnbr = 2,
+                              output_dir = "AnalysisQuantifications")
+
+setwd('/Users/martingordon/Documents/projects/041223_Danielle_Swaney')
+```
+
+
+## ArtMS enrichment Analysis
+
+Pull out `results.txt` file and process 
+
+```{r}
+artms_df <- read_delim('/Users/martingordon/Documents/projects/041223_Danielle_Swaney/artMS/042423_ds_qccheck_rmna/output/results.txt')
+
+artms_results_list <- artms_df %>%
+  mutate(Protein = as.character(Protein)) %>% #ensure Protein name is character
+  mutate(UNiProt = str_split_i(Protein, "\\|",2)) %>% #recover uniprot_ids
+  group_by(Label) %>% 
+  group_split() %>% 
+  setNames(unique(artms_df$Label))
+```
+
+```{r artms-filter}
+#filter rows with 'issues'
+#artms_results_list <- purrr::map(artms_results_list, ~filter(.x, is.na(issue)))
+```
+
+
+
+```{r artms-get-sig-genes}
+# sig_gene_list
+artms_sig_prots_list <- artms_results_list %>% 
+  map( ~ extract_sig_prots(.x, 0.58, 0.05))
+```
+
+```{r}
+
+# first need to drop the empty elements where no sig differential expression
+artms_sig_prots_list[['Urea-UreaSon']] <- NULL
+#artms_sig_prots_list[['UreaSon-TFASon']] <- NULL
+```
+
+
+```{r split-sig-genes}
+artms_up_sig <- artms_sig_prots_list %>% 
+  map( ~{
+    filter(.x, log2FC > 0) 
+  })
+
+artms_down_sig <- artms_sig_prots_list %>% 
+  map( ~{
+    filter(.x, log2FC < 0) 
+  })
+```
+
+Check out up regulated genes involved in go_bp
+
+```{r up-enrichment}
+artms_go_bp_up <- artms_up_sig %>% 
+  imap(~{ 
+    sig_mapping = AnnotationDbi::select(org.Hs.eg.db, .x$UNiProt, "ENTREZID", "UNIPROT") #mapping of significant genes from DPA
+    bg_mapping = AnnotationDbi::select(org.Hs.eg.db, artms_results_list[[.y]]$UNiProt, "ENTREZID", "UNIPROT" )
+    
+    #run the enrichGO using
+    ego <- enrichGO(gene = sig_mapping$ENTREZID,
+                universe = bg_mapping$ENTREZID,
+                keyType = 'ENTREZID',
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.05,
+                pAdjustMethod = 'BH',
+                minGSSize = 10,
+                ont='BP', #biological processes
+                OrgDb = org.Hs.eg.db)
+   return(ego)
+    })
+```
+
+Check out downregulated genes in go_bp
+
+```{r down-enrichment}
+artms_go_bp_down <- artms_down_sig %>% 
+  imap(~{ 
+    sig_mapping = AnnotationDbi::select(org.Hs.eg.db, .x$UNiProt, "ENTREZID", "UNIPROT") #mapping of significant genes from DPA
+    bg_mapping = AnnotationDbi::select(org.Hs.eg.db, artms_results_list[[.y]]$UNiProt, "ENTREZID", "UNIPROT" )
+    
+    #run the enrichGO using
+    ego <- enrichGO(gene = sig_mapping$ENTREZID,
+                universe = bg_mapping$ENTREZID,
+                keyType = 'ENTREZID',
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.05,
+                pAdjustMethod = 'BH',
+                ont='BP', #biological processes
+                OrgDb = org.Hs.eg.db)
+   return(ego)
+    })
+```
+
+Check out downregulated genes in go_cc
+
+
+```{r up-enrichment-gocc}
+artms_go_cc_up <- artms_up_sig %>% 
+  imap(~{ 
+    sig_mapping = AnnotationDbi::select(org.Hs.eg.db, .x$UNiProt, "ENTREZID", "UNIPROT") #mapping of significant genes from DPA
+    bg_mapping = AnnotationDbi::select(org.Hs.eg.db, artms_results_list[[.y]]$UNiProt, "ENTREZID", "UNIPROT" )
+    
+    #run the enrichGO using
+    ego <- enrichGO(gene = sig_mapping$ENTREZID,
+                universe = bg_mapping$ENTREZID,
+                keyType = 'ENTREZID',
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.05,
+                pAdjustMethod = 'BH',
+                ont='CC', #cellular compartment
+                OrgDb = org.Hs.eg.db)
+   return(ego)
+    })
+```
+
+Check out downregulated genes in go_cc
+
+```{r down-enrichment-gocc}
+artms_cc_bp_down <- artms_down_sig %>% 
+  imap(~{ 
+    sig_mapping = AnnotationDbi::select(org.Hs.eg.db, .x$UNiProt, "ENTREZID", "UNIPROT") #mapping of significant genes from DPA
+    bg_mapping = AnnotationDbi::select(org.Hs.eg.db, artms_results_list[[.y]]$UNiProt, "ENTREZID", "UNIPROT" )
+    
+    #run the enrichGO using
+    ego <- enrichGO(gene = sig_mapping$ENTREZID,
+                universe = bg_mapping$ENTREZID,
+                keyType = 'ENTREZID',
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.05,
+                pAdjustMethod = 'BH',
+                ont='CC',#cellular compartment
+                OrgDb = org.Hs.eg.db)
+   return(ego)
+    })
+```
+
+No significant enrichment for GO CC down reg genes
+
+```{r-dotplot-of-processes}
+dotplot(artms_go_bp_up[['UreaSon-TFASon']], showCategory=30, title='GO BP enrichment results UreaSon-TFASon', font.size=8)
+
+
+artms_go_bp_down %>% 
+  imap( ~{
+      dotplot(.x, 
+      showCategory=30,
+      title=paste0('GO BP enrichment results - ', .y),
+      font.size = 8
+        )
+  })
+    
+```
+
+```{r}
+
+```
+
+
+```{r get-enrichment-obj}
+artms_go_df <- artms_sig_prots_list %>% 
+  
+  imap(~{ 
+    sig_mapping = AnnotationDbi::select(org.Hs.eg.db, .x$UNiProt, "ENTREZID", "UNIPROT") #mapping of significant genes from DPA
+    bg_mapping = AnnotationDbi::select(org.Hs.eg.db, artms_results_list[[.y]]$UNiProt, "ENTREZID", "UNIPROT" )
+    
+    #run the enrichGO using
+    ego <- enrichGO(gene = sig_mapping$ENTREZID,
+                universe = bg_mapping$ENTREZID,
+                keyType = 'ENTREZID',
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.05,
+                pAdjustMethod = 'BH',
+                ont='BP', #biological processes
+                OrgDb = org.Hs.eg.db)
+   return(ego)
+    })
+
+#artms_go_df[['Urea-TFA']] <- NULL
+#artms_go_df[['TFA-TFASon']] <- NULL
+
+enrichGO(gene = artms_sig_prots_list[["Urea-TFA"]]$UNiProt, universe = artms_results_list[['Urea-TFA']]$UNiProt, keyType = 'UNIPROT',
+                         pvalueCutoff = 0.05,
+                qvalueCutoff = 0.05,
+                pAdjustMethod = 'BH',
+                ont='CC', #biological processes
+                OrgDb = org.Hs.eg.db)
+         
+```
+
+```{r artms-plot-enrichment}
+
+artms_go_df %>% 
+  purrr::imap(~ { enrich_bar_fun(.x,.y)})
+
+```
+
+```{r artms-}
+
+go_df <- artms_go_df %>% 
+  purrr::imap(~ { as.data.frame(.x)})
+
+```
+
+
+Q. How many peptides and proteins per sample? 
+
+Peptides.pdf/Proteins.pdf: number of unique peptides same for the entire dataset. TFA samples seem to detect both more proteins and peptides 
+Number of unique proteins and peptides the same for each experiment?
+
+IntensityStats.pdf: 
+Total sum of intensities -Intensity sums highest in URea samples, but plot is misleading as y axis is truncated.  Quite similar numbers for all reps
+Peptides counts: TFA samples  recover most
+
+Q. Reproducibility between replicates of the same prep method?
+PCA plot.pdf
+
+Indicates broad prep method (Urea vs TFA) are the main drivers of variance in the dataset
+TFA's show very strong clustering at both protein & peptide level, TFASon2 slightly removed from the others
+
+Looking at Urea samples, not clusered as tightly at protein or peptide levels. UreaSon1 clearly seperated from other samples
+
+ProteinIntensityCV.pdf/PeptideIntensityCV.pdf
+Again TFA Samples seem to have the tightest distribution of CV values at both the protein & peptide level, indicating reduced spread relative to other methods
+
+This is consistent across all protein expression groups (low to high expression)
+
+ProteinDetection.pdf
+TFA method shows highest overlap (92.2%)
+
+
+
+
+Q. Overlap in peptide/protein IDs between methods 
+ID-overlap.pdf
+
+Up
+
+Clean distinction of two clusters at a high level: TFA & UREA.
+TFA/TFASon replicates protein IDs more similiar at both protein & pepetide levels. 
+At protein level >90% similiarity across all four samples
+TFA replicates 92.2% protein similiarity & 76.5% peptide similiarity
+
+Less reproducibility in Urea-based methods, but still >87% at protein and ~70% at peptide level
+
+Strong(er) overlap in TFA peptide & protein identification
+
+
+Q. When different prep methods identify the same protein, is there any systematic difference in the abundance of proteins? because if so, I want to pick the method that give us higher abundances #assess mean and sd protein abundances for each method
+
+Globally, it seems Urea-based methods detect higher intensities on average
+
+# Custom Analysis
+
+## High Level Inspection of Data
+
+```{r read-in}
+
+setwd('/Users/martingordon/Documents/projects/041223_Danielle_Swaney')
+
+ms_counts <- read_delim('./data/MSstats.csv')
+
+spec(ms_counts)
+
+#10 cols & 57K rows
+dim(ms_counts)
+
+#why are all Fragment Ion & Product Cahrge values NA? Indicates DDA data?
+summary(ms_counts)
+
+#data already in long format
+ms_counts[1:10,]
+
+summary(ms_counts)
+
+ms_counts %>% 
+  distinct(Condition)
+```
+
+Histogram of overall intensities (log2)
+Cut-off threshold? Don't seem to be any obvious 'garbage' overall
+
+```{r}
+
+ms_counts %>% 
+  ggplot(mapping=aes(x=log2(Intensity))) +
+  geom_histogram(intervals=100,binwidth = .1)
+```
+
+Histograms of each MS protocol. Distributions seem very similiar at high level
+
+```{r}
+ms_counts %>% 
+  ggplot(mapping=aes(x=log2(Intensity), color=Condition)) + 
+  geom_histogram(intervals=100,binwidth = .1) +
+  facet_grid(rows=vars(Condition))
+```
+
+Looking at summary statistics for each group
+Median values all in the range of 10^7
+TFA Mean & Median values closest and lowest number of NA's
+Also tighter variance around the mean 
+Urea dataset has highest number of NA's of the four groups
+
+
+```{r}
+#split tibble into list of tibble on condition
+ms_counts_cond <- ms_counts %>%
+  split(f = as.factor(.$Condition)) 
+
+map(ms_counts_cond, summary)
+```
+
+## balance of peptide identifications per MS run
+
+Each row in the table should be the intensity from one MS "feature" per run (an elution peak from a single peptide ion). It's possible that there are multiple features per peptide ion and run--if the peptide elutes in two different peaks perhaps.
+
+### are there any multiple-feature peptide ions? No
+
+```{r}
+
+ms_counts %>% 
+  group_by(Run, PeptideSequence, PrecursorCharge) %>% 
+  tally() %>% 
+  dim()
+
+  dim(ms_counts) #check if grouped table rows are same as original tibble.. true
+  
+```
+
+confirmed with DT method
+```{r, eval=FALSE}
+
+ms_counts_dt <- fread('./data/MSstats.csv')
+
+any(ms_counts_dt[, .N, by = .(Run, PeptideSequence, PrecursorCharge)]$N) > 1
+
+```
+
+Bar plot of number of number of peptides detected in each biosample
+
+```{r peptide-intensities}
+ms_counts_narm <- ms_counts %>% 
+  filter( ! is.na(Intensity))
+
+ggplot (data = ms_counts_narm, aes (x = paste0(Condition, "_", BioReplicate), fill = Condition)) + 
+  geom_bar() 
+
+```
+
+Peptide intensities distributions for each  biosample. Intensity values are quite consistent between both conditions and replicates, but overall Urea-based samples seem to have slightly higher peptide intensities on average
+
+```{r boxplot-intensities}
+ggplot (data = ms_counts_narm, 
+        aes (x = paste0(Condition, "_", BioReplicate), y = log2(Intensity), fill = Condition)) + 
+  geom_boxplot() 
+```
+
+
+Count number of NA values in each individual biorep
+TFA has the smallest number of NA values in df, but counts seem to be fairly close
+
+```{r NA values}
+# number of rows with NA values
+ms_counts %>% 
+  group_by(Condition,BioReplicate) %>% 
+  summarise(na_counts = sum(is.na(Intensity))) 
+
+```
+
+Plot of missing values in the individual biosamples. TFA samples seem to have the lowest proportion of missing values, in addition to highest number of detected peptides (above).
+
+```{r plot-NA-values}
+
+
+missing.values <- ms_counts %>%
+  group_by(Condition,BioReplicate) %>% #group by biosample
+  mutate(isna = is.na(Intensity)) %>% #boolean if value missing
+  mutate(total = n()) %>% #count total n records per sample
+  group_by(Condition, BioReplicate, total, isna) %>% 
+  summarise(num.isna = n()) %>% #calc na records per sample
+  mutate(pct = num.isna / total * 100) # % for plotting
+
+
+
+gg <- missing.values %>%
+      ggplot() +
+        geom_bar(aes(x = paste0(Condition, "_", BioReplicate), 
+                     y = pct, fill=isna), 
+                 stat = 'identity', alpha=0.8) +
+     # scale_x_discrete(limits = levels) +
+      scale_fill_manual(name = "", 
+                        values = c('steelblue', 'tomato3'), labels = c("Present", "Missing")) +
+      coord_flip() +
+      labs(title = "% missing values per sample", x =
+             'Variable', y = "% of missing values")
+
+gg
+```
+
+
+# Run MSstats summarize peptide to protein intensities
+
+## Remove NA values for MSstats data processing
+
+MSStats likes explicit missing values, so ensure if protein detected in one of runs, it must be present with a NA value in other runs if not detected. Use BP utiliy function for this.
+
+MSStats normalises by adjusting based on median expression counts
+```{r}
+
+#sanity check to ensure not odd number of rows for peptide groups. 
+#NB to as MSStats likes NA values where no detection rather than missing row
+
+ms_counts_t <- ms_counts %>% 
+  group_by(PeptideSequence, PrecursorCharge) %>% 
+  mutate(num = n())
+unique(ms_counts_t$num)
+
+rm(ms_counts_t)
+
+dp.out <- MSstats::dataProcess(ms_counts,
+                               normalization = 'equalizeMedians',
+                               featureSubset = "highQuality",
+                               summaryMethod = 'TMP',
+                               censoredInt = 'NA', #censor NA values
+                               remove_uninformative_feature_outlier = TRUE,
+                               MBimpute = FALSE )
+          
+```
+
+The MSstats::dataProcess normalized by adjusting so that median peptide intensity is equal across runs.  Inspect the output with another boxplot to look at ProteinIntensity trends.
+
+```{r, fig.width = 10, fig.height = 4}
+gg <- ggplot (dp.out$ProteinLevelData, aes (x = interaction ( SUBJECT, GROUP), y = LogIntensities, fill = GROUP)) + geom_boxplot()
+
+gg
+```
+
+### Generating Data Process plots
+
+EDA to investigate the data after MSS data normalisation & processing.
+Plots are quite slow to generate..
+
+```{r, eval=FALSE}
+# 
+# # Profile plot
+dataProcessPlots(data=dp.out, type="ProfilePlot")
+# 
+# # Quality control plot 
+dataProcessPlots(data=dp.out, type="QCPlot")	
+# 
+# # Quantification plot for conditions
+dataProcessPlots(data=dp.out, type="ConditionPlot")
+
+```
+
+Differential Expression Analysis of the Different Proteins
+
+First generate a contrast matrix for a pairwise comparison of sample groups
+```{r}
+# load helper functions to process the data
+source ("./scripts/MSStats_V4_Functions.R")
+
+# use helper function to make a contrast matrix  for all vs all comparison
+contrasts <- makeContrast.AllByAll(dp.out)
+
+# input contrast matrix for 
+testResultComparisons <- groupComparison(contrast.matrix=contrasts, data=dp.out)
+
+  
+mss_results_list <- testResultComparisons$ComparisonResult %>%
+  mutate(Protein = as.character(Protein)) %>% #ensure Protein name is character
+  mutate(UNiProt = str_split_i(Protein, "\\|",2)) %>% #recover uniprot_ids
+  group_by(Label) %>% 
+  group_split() %>% 
+  setNames(unique(testResultComparisons$ComparisonResult$Label))#can't directly do this in tidyverse I think, so take unique names from ori df used for splitting
+
+
+```
+
+Filter rows where 'issues' were found. Issues relate to missing values and only want to keep 'full-set' comparisons
+
+```{r filter-issues}
+#filter rows with 'issues'
+mss_results_list <- purrr::map(mss_results_list, ~filter(.x, is.na(issue)))
+```
+
+
+Plot volcano plots for each comparison. For starters, just use the in-built volcano plot package
+
+```{r lmm-volcano}
+
+# # Volcano plot 
+purrr::map(mss_results_list, ~groupComparisonPlots(data=.x, type="VolcanoPlot"))
+```
+
+```{r lmm-heatmap, eval=FALSE}
+# Heatmap plot - not running
+#purrr::map(mss_results_list, ~groupComparisonPlots(data=.x, type="Heatmap"))
+```
+
+Plots of protein expression across samples. Disabled as takes a long time to run
+
+```{r lmm-comparison-p, eval=FALSE}
+# # Comparison Plot
+groupComparisonPlots(data=testResultComparisons$ComparisonResult, type="ComparisonPlot")
+
+```
+
+## Enrichment Analysis
+
+Extract the significant genes for each comparison. For current comparisons, let it be proteins expression changes larger than log2FC >= 0.58 and p.adjust <= 0.05
+
+Enrichment tests to identify significantly enriched proteins in GO Biological Processes 
+
+```{r}
+
+# sig_gene_list
+sig_prots_list <- mss_results_list %>% 
+  map( ~ extract_sig_prots(.x, 1, 0.05))
+
+# first need to drop the empty elements where no sig differential expression
+sig_prots_list[['TFA-TFASon']] <- NULL
+sig_prots_list[['Urea-UreaSon']] <- NULL
+```
+
+
+```{r get-enrichment-obj}
+go_bp_df <- sig_prots_list %>% 
+  
+  imap(~{ 
+    sig_mapping = AnnotationDbi::select(org.Hs.eg.db, .x$UNiProt, "ENTREZID", "UNIPROT") #mapping of significant genes from DPA
+    bg_mapping = AnnotationDbi::select(org.Hs.eg.db, mss_results_list[[.y]]$UNiProt, "ENTREZID", "UNIPROT" )
+    
+    #run the enrichGO using
+    ego <- enrichGO(gene = sig_mapping$ENTREZID,
+                universe = bg_mapping$ENTREZID,
+                keyType = 'ENTREZID',
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.05,
+                pAdjustMethod = 'BH',
+                ont='BP', #biological processes
+                OrgDb = org.Hs.eg.db)
+   return(ego)
+    })
+
+```
+
+Plot results from the GO_BP analysis
+
+```{r}
+sig_mapping = AnnotationDbi::select(org.Hs.eg.db, sig_prots_list[['Urea-TFA']]$UNiProt, "ENTREZID", "UNIPROT") #mapping of significant genes from DPA
+    bg_mapping = AnnotationDbi::select(org.Hs.eg.db, mss_results_list[[.y]]$UNiProt, "ENTREZID", "UNIPROT" )
+    
+    #run the enrichGO using
+    ego <- enrichGO(gene = sig_mapping$ENTREZID,
+                universe = bg_mapping$ENTREZID,
+                keyType = 'ENTREZID',
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.05,
+                pAdjustMethod = 'BH',
+                ont='BP', #biological processes
+                OrgDb = org.Hs.eg.db)
+```
+
+```{r}
+
+go_bp_df %>% 
+  purrr::imap(~ { enrich_bar_fun(.x,.y)})
+
+```
+
+
+
+```{r t-test, eval=FALSE}
+
+#extract the protein expression dataset
+mss_df <- dp.out$ProteinLevelData
+dp.out
+
+(dp.out$ProcessedData)
+
+#convert to wide format for t-test
+mss_df_w <- mss_df %>% 
+  as_tibble() %>% 
+  unite('BioRep','GROUP':'SUBJECT', remove = T) %>% 
+  select(-c(originalRUN,RUN,NumImputedFeature, TotalGroupMeasurements, NumMeasuredFeature, MissingPercentage, more50missing)) %>% 
+  spread(BioRep, LogIntensities)
+
+```
+
+
+ #Create the different datasets (write function to do this)
+```{r eval=FALSE}
+TFA_TFAS_df <- mss_df_w %>% 
+  select(c(Protein, TFA_1, TFA_2, TFASon_1, TFASon_2)) %>% 
+  drop_na()
+
+
+str(TFA_TFAS_df$TFASon_1)
+
+t.test(TFA_TFAS_df[2,2:3],TFA_TFAS_df[2,4:5])
+
+TFA_Urea_all = apply(TFA_Urea_df,1, function(x) { t.test(x[2:3], x[4:5]) $p.value } )
+
+TFA_Urea_df <- mss_df_w %>% 
+  select(c(Protein, TFA_1, TFA_2, Urea_1, Urea_2))
+
+TFA_UreaS_df <- mss_df_w %>% 
+  select(c(Protein, TFA_1, TFA_2, UreaSon_1, UreaSon_2))
+
+TFAS_Urea_df <- mss_df_w %>% 
+  select(c(Protein, TFASon_1, TFASon_2, Urea_1, Urea_2))
+
+TFAS_UreaS_df <- mss_df_w %>% 
+  select(c(Protein, TFASon_1, TFASon_2, UreaSon_1, UreaSon_2))
+
+Urea_UreaS_df <- mss_df_w %>% 
+  select(c(Protein, Urea_1, Urea_2, UreaSon_1, UreaSon_2))
+
+```
+
+
+
+
+Map Protein names to Gene IDs
+
+```{r}
+
+source ("./scripts/UniprotIDMapping.R")
+
+mss_prot[, gene := multiUniprots2multiGenes(Protein)]
+
+
+p <- ggplot(protQuant[gene %in% c("ARRB2","PRKCD")], aes (x = interaction ( SUBJECT, GROUP ), y = LogIntensities, color = gene)) + geom_line(aes(group = Protein)) + geom_point(aes(shape = as.factor(SUBJECT))) +  rotate.x.axis.text
+
+```
+
+
+
+Generated scatterplots of each pair of samples at peptide level to assess global expression patterns
+
+Plot of peptide level abundances for each sample and compare pairwise
+
+```{r peptide-scatter, eval=FALSE}
+# use spread to convert to wide format
+ms_counts_w <- ms_counts %>% 
+  unite('BioRep', 'Condition':'BioReplicate',remove=FALSE) %>% 
+  select(-c(Run,Condition, BioReplicate)) %>% 
+  spread(BioRep, Intensity)
+
+
+ms_counts_w %>% 
+  ggplot(aes(log2(Urea_1),log2(Urea_2)), color=BioReplicate) +
+  geom_point() +
+  geom_smooth(method=lm)
+
+ms_counts_w %>% 
+  ggplot(aes(log2(TFA_1),log2(TFA_2))) +
+  geom_point() +
+  geom_smooth(method=lm)
+
+ms_counts_w %>% 
+  ggplot(aes(log2(TFASon_1),log2(TFASon_2))) +
+  geom_point()
+
+ms_counts_w %>% 
+  ggplot(aes(log2(UreaSon_1),log2(UreaSon_2))) +
+  geom_point()
+
+ms_counts_w %>% 
+  ggplot(aes(log2(Urea_1),log2(TFA_2)), color=BioReplicate) +
+  geom_point()
+
+```
+
+Bioreplicate scatterplots
+
+```{r protein-scatter, eval=FALSE}
+# use spread to convert to wide format
+ms_counts_w <- ms_counts %>% 
+  unite('BioRep', 'Condition':'BioReplicate',remove=FALSE) %>% 
+
+
+ms_counts_w %>% 
+  ggplot(aes(log2(Urea_1),log2(Urea_2)), color=BioReplicate) +
+  geom_point() +
+  geom_smooth(method=lm)
+
+ms_counts_w %>% 
+  ggplot(aes(log2(TFA_1),log2(TFA_2))) +
+  geom_point() +
+  geom_smooth(method=lm)
+
+ms_counts_w %>% 
+  ggplot(aes(log2(TFASon_1),log2(TFASon_2))) +
+  geom_point()
+
+ms_counts_w %>% 
+  ggplot(aes(log2(UreaSon_1),log2(UreaSon_2))) +
+  geom_point()
+
+ms_counts_w %>% 
+  ggplot(aes(log2(Urea_1),log2(TFA_2)), color=BioReplicate) +
+  geom_point()
+  select(-c(Run,Condition, BioReplicate)) %>% 
+  spread(BioRep, Intensity)
+
+```
+
+Generating Data Process plots
+
+Perform DEA of the different cell types. This should give a decent indication of library prep protcols with significantly divergent expression patterns
+We will perform a two sample t-test for each prep method. As there is only two replicates,
+
+```{r}
+
+```
+
+
+Perform DEA of the different cell types. This should give a decent indication of library prep protcols with significantly divergent expression patterns
+
+
+
+
+

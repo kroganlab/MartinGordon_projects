@@ -1,0 +1,236 @@
+---
+title: "051225_plotsForReview"
+author: "Martin Gordon"
+date: "2025-05-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Prepare heatmaps/linecharts for Qiongyu for meeting with Robyn and Kirsten tomorrow
+
+```{r packages}
+library(ComplexHeatmap)
+library(circlize)
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+
+source ("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source("/Users/martingordon/Documents/utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+
+col.pal <- getQualitativePalette(n=15)
+```
+read in the msstats dt
+```{r}
+dp.dt <- fread('/Users/martingordon/Documents/projects/071123_QLi_DARPA.GC01.GC02/output/QRFPR.mss.pwcomparisons.proc.csv')
+#MRX2.mss <- fread('/Users/martingordon/Documents/projects/071123_QLi_DARPA.GC01.GC02/output/MRX2.mss.pwcomparisons.proc.csv')
+
+mss.out <-  rbind(MRX2=MRX2.mss,
+                 QRFPR=QRFPR.mss)
+```
+
+proteins OI 
+
+```{r}
+prots.oi <- 'ARPC3
+ABI1
+CTTN
+EFHD2
+DBNL
+ACTR3
+FNBP1L
+TRIP10
+ABI2
+PRKCA
+WASF1
+KCTD12
+PRKD2
+RAPH1
+BRK1
+WASF3
+ARPC2
+GNAQ
+ARPC5
+ARPC1A
+GNA11
+BCORL1
+WASF2
+ING3'
+```
+
+```{r}
+prots.oi <- strsplit(prots.oi, '\n')[[1]]
+
+
+dp.dt$Label %>% unique()
+
+# looking at impactof YM here
+conditions.oi <- c("RF05-RF00", "RF10-RF00",  "RF05_YM-RF00_YM", "RF10_YM-RF00_YM")
+reduced.conditions.oi <- c("RF10-RF00", "RF10_YM-RF00_YM")
+expanded.conditions.oi <- c("RF05-RF00", "RF10-RF00",  "RF05_YM-RF00_YM", "RF10_YM-RF00_YM", # basically looks at time and YM pre-treatment
+                            "RF05_YM-RF05", "RF10_YM-RF10",
+                            "RF05_PTX-RF00_PTX", "RF10_PTX-RF00_PTX") 
+unique(dp.dt$Label)
+
+
+grep('PTX', unique(dp.dt$Label), invert=T,value=T)
+```
+
+this is the output of the pw contrasts... we want the counts
+```{r}
+dp.dt[, gene := multiUniprots2multiGenes(Protein, species='HUMAN')]
+subdt <- dp.dt[gene %in% prots.oi]
+```
+
+read in the LFC values/counts values for this QRFPR analysis
+```{r, lfc-heatmap, fig.height=3.5, fig.width=3.5}
+mat <- dcast(subdt, gene~Label, value.var='log2FC') %>% 
+  as.matrix(rownames='gene')
+
+submat <- mat[,  grepl(paste0(conditions.oi, collapse = '|'), colnames(mat))]
+
+
+hm <- Heatmap(submat,
+        name='log2FC',
+        border=T,
+        show_column_dend = FALSE,
+        col=colorRamp2(breaks=c(-1,0,1), colors = c(col.pal[1], 'white', col.pal[2])),
+        row_names_gp = gpar(fontsize=6),
+        column_title_gp = gpar(fontsize=8),
+        column_names_gp = gpar(fontsize=7),
+        column_split = ifelse(grepl('YM-', colnames(submat)), 'YM pre-treated', 'Not pre-treated')
+        )
+hm
+BackupAsPDF(hm, 'YM.pretreatment.lfc.heatmap')
+
+
+submat <- mat[,  grepl(paste0(reduced.conditions.oi, collapse = '|'), colnames(mat))]
+
+
+hm <- Heatmap(submat,
+        name='log2FC',
+        border=T,
+        show_column_dend = FALSE,
+        col=colorRamp2(breaks=c(-1,0,1), colors = c(col.pal[1], 'white', col.pal[2])),
+        row_names_gp = gpar(fontsize=6),
+        column_title_gp = gpar(fontsize=8),
+        column_names_gp = gpar(fontsize=7),
+        column_split = ifelse(grepl('YM-', colnames(submat)), 'YM pre-treated', 'Not pre-treated')
+        )
+hm
+BackupAsPDF(hm, 'YM.pretreatment.reduced.lfc.heatmap')
+```
+
+get the intensity heatmap and plot these
+
+```{r}
+ints.dt <- fread('output/QRFPR.ProteinlvlData.tmpNormalized.csv.gz')
+ints.dt[, gene := multiUniprots2multiGenes(Protein, species='HUMAN')]
+
+ints.sub <- ints.dt[gene %in% prots.oi,]
+```
+
+Heatmap; get the groups of interest
+
+```{r, ints-heatmap, fig.height=3.5, fig.width=8}
+groups.oi <- ints.sub
+
+ints.mat <- dcast(ints.sub, gene~paste0(GROUP, '.', SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='gene')
+
+
+groups.oi
+groups.oi <- grep('PTX', colnames(ints.mat), invert=T, value=T)
+groups.subset.oi <- grep('RF00_YM', groups.oi, invert=T, value=T)
+
+submat <- ints.mat[,  grepl(paste0(groups.oi, collapse = '|'), colnames(ints.mat))]
+# sweep outt he median intensity
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+# first sweep out the median, then maybe try some baseline (T0 no treat or pretreat)
+hm <- Heatmap(submat,
+        name='ints/median',
+        border=T,
+        cluster_columns=FALSE,
+        show_column_dend = FALSE,
+        show_column_names = FALSE,
+        column_split = list(ifelse(grepl('RF05', colnames(submat)), '05 min',
+                              ifelse(grepl('RF10', colnames(submat)), '10 min',
+                                     '0 min')),
+                            ifelse(grepl('YM', colnames(submat)), ' YM pretreatment', ' No pretreatment')),
+        col=colorRamp2(breaks=c(-1,0,1), colors = c(col.pal[1], 'white', col.pal[2])),
+        row_names_gp = gpar(fontsize=6),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        column_names_gp = gpar(fontsize=7),
+        )
+hm
+BackupAsPDF(hm, 'YM.pretreatment.ints.heatmap')
+
+
+# plot the reduced number of groups; and subtract t0 from them 
+submat <- ints.mat[,  grepl(paste0(groups.subset.oi, collapse = '|'), colnames(ints.mat))]
+# sweep outt he median intensity
+submat <- sweep(submat, 1, apply(submat[, grepl('RF00', colnames(submat))], 1, mean, na.rm=T))
+submat <- submat[, !grepl('RF00', colnames(submat))]
+
+# first sweep out the median, then maybe try some baseline (T0 no treat or pretreat)
+hm <- Heatmap(submat,
+        name='ints/mean[0 min]',
+        border=T,
+        cluster_columns=FALSE,
+        show_column_dend = FALSE,
+        show_column_names = FALSE,
+        column_split = list(ifelse(grepl('RF05', colnames(submat)), '05 min',
+                              ifelse(grepl('RF10', colnames(submat)), '10 min',
+                                     '0 min')),
+                            ifelse(grepl('YM', colnames(submat)), ' YM pretreatment', ' No pretreatment')),
+        col=colorRamp2(breaks=c(-1,0,1), colors = c(col.pal[1], 'white', col.pal[2])),
+        row_names_gp = gpar(fontsize=6),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        column_names_gp = gpar(fontsize=7),
+        )
+hm
+BackupAsPDF(hm, 'YM.pretreatment.ints.subset.heatmap')
+
+```
+
+linechart plot of GNAQ and GNA11 across time 0, 5, 10 4 lines in total, or two if faceted
+
+```{r, linechart,  fig.height=3.5, fig.width=4}
+gna.set <- c('GNAQ', 'GNA11')
+
+str_extract()
+
+ints.dt[, timepoint := factor(stringr::str_extract(GROUP, '00|05|10'), levels=c('00', '05','10'))]
+ints.dt[, pretreatment := ifelse(grepl('YM|PTX', GROUP), str_extract(GROUP, 'YM|PTX'), 'None')]
+
+g <- ggplot(ints.dt[gene %in% gna.set & GROUP %in% unique(gsub('[.][0-9]$','', groups.oi)),], aes(x=timepoint, color=pretreatment, group=pretreatment, y=LogIntensities)) +
+  geom_smooth(stat = 'summary', fun.y = mean, se =TRUE, show.legend = T, aes(fill=pretreatment), alpha=0.4) +
+  geom_point() +
+  scale_color_manual(values = (col.pal)) + 
+  scale_x_discrete(expand=c(0.04,0.04)) +
+  scale_fill_manual(values = (col.pal)) + 
+  ggtitle('GNAQ & GNA11 response') +
+ # geom_hline(yintercept = 0, linetype=2, alpha=0.6) +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_grid(gene~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80"))
+
+
+BackupAsPDF(g, 'gnaQ.gna11.linecharts')
+```
+

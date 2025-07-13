@@ -1,0 +1,230 @@
+---
+title: "AFmultimer_PIK3CA"
+author: "Martin Gordon"
+date: "2024-11-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+```
+
+
+```{r}
+af.dt <- fread('./output/AFmultimer_runs/allScores.csv')
+setnames(af.dt, new=c('filepath', 'ptm', 'iptm'))
+```
+plot of average iPTM score per bait prey combo
+```{r}
+af.dt[, interactors := stringr::str_extract(filepath, "[A-Z0-9]+__[A-Z0-9]+")]
+af.dt[, c('Bait', 'Prey') := tstrsplit(interactors, '__', keep=c(1,2))]
+af.dt[,gene := 'PIK3CA']
+
+af.dt[, `:=`(BaitGene = multiUniprots2multiGenes(Bait, species='HUMAN'),
+             PreyGene = multiUniprots2multiGenes(Prey, species='HUMAN')
+             )]
+
+# a couple of extra runs..no harm
+af.dt[interactors == 'P42336__P08582',] %>% unique()
+
+af.dt[, geneInteractors := paste0(BaitGene, '__', PreyGene)]
+af.dt[, avg_iptm := mean(iptm, na.rm=T), by=interactors]
+
+af.dt[, sig := ifelse(iptm >= 0.6, 'yes', 'no')]
+```
+quick plot of the alphafold2 iptm distributions 
+
+```{r}
+g <- ggplot(af.dt, aes(x=reorder(PreyGene, (avg_iptm)),  y=iptm, color=sig)) +
+  geom_point() +
+  geom_hline(yintercept=0.6
+             , color='red', linetype=2) +
+  ggtitle('PIK3CA interactors (Swaney et al, 2022)') +
+  scale_color_manual(values=c('no'='black', 'yes'='steelblue4')) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+
+BackupAsPDF(g, 'PIK3CA.afmultimer.interactor.scores.csv', dimensions=c(8,6))
+
+
+paste(unique(af.dt[iptm > 0.6, .(PreyGene, Prey)]$Prey), collapse='|')
+```
+
+Read in the pten data and plot 
+
+```{r}
+pten.scores <-  fread('output/AFmultimer_runs/pten.highScoringModels.allScores.csv')
+setnames(pten.scores, new=c('filepath', 'ptm', 'iptm'))
+pten.scores[, gene := 'PTEN']
+
+
+pten.scores[, interactors := stringr::str_extract(filepath, "[A-Z0-9]+[-]+[0-9]+__[A-Z0-9]+")]
+pten.scores[, c('Bait', 'Prey') := tstrsplit(interactors, '__', keep=c(1,2))]
+
+pten.scores[, BaitOriginal := Bait]
+pten.scores[, Bait := gsub('[-][0-9]{1}','', Bait)]
+
+
+pten.scores[, `:=`(BaitGene = multiUniprots2multiGenes(Bait, species='HUMAN'),
+                   PreyGene = multiUniprots2multiGenes(Prey, species='HUMAN')
+             )]
+
+
+
+pten.scores[, geneInteractors := paste0(BaitGene, '__', PreyGene)]
+pten.scores[, avg_iptm := mean(iptm, na.rm=T), by=interactors]
+
+pten.scores[, sig := ifelse(iptm >= 0.6, 'yes', 'no')]
+```
+
+```{r}
+g <- ggplot(pten.scores, aes(x=reorder(PreyGene, (avg_iptm)),  y=iptm, color=sig)) +
+  geom_point() +
+  geom_hline(yintercept=0.6
+             , color='red', linetype=2) +
+  ggtitle('PTEN interactors') +
+  scale_color_manual(values=c('no'='black', 'yes'='steelblue4')) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'PTEN.afmultimer.interactor.scores.csv', dimensions=c(8,6))
+```
+Weird that for USP7 two o fthe scores diverge greatly..
+Model 4 & 5 scored very well (rank 0 and rank1 I presume)
+```{r}
+pten.scores[PreyGene %in% c('NEDD4', 'USP7', 'WWP2')] %>% 
+  .[order(-iptm)]
+```
+**Contact PAE plots**
+PTEN & PIK3CA contact plots
+```{r}
+pten.pae <- fread('./output/AFmultimer_runs/pten.paeContacts.csv')
+pten.pae[, gene := 'PTEN']
+
+# rsead in PIK3CA contact plot
+pik3ca.pae <- fread('output/AFmultimer_runs/pae_contacts/pik3ca.highScoringModels.PAEcontacts.csv')
+pik3ca.pae[, gene := 'PIK3CA']
+
+# adjust col names dfor merging
+setnames(pten.pae, old="./112224_ptenPrey/P60484-1__A2Q0Z1/relaxed_model_1_multimer_v3_pred_0.contacts.csv:chainRow", new="model")
+setnames(pik3ca.pae, old="P42336__A1L390/relaxed_model_1_multimer_v3_pred_0.contacts.csv:chainRow", new="model")
+
+pae.dt <- rbind(pten.pae, pik3ca.pae)
+```
+
+# identify the interacting pairs and filter for the residues that are in the interface. Find out if any of the high quality edits reside in the interface
+
+Ge thte high quality interactors
+```{r}
+pten.scores[iptm > 0.6, .SD[which.max(iptm)], by=.(geneInteractors)] %>% 
+  .[filepath]
+
+# get the model id
+pten.scores[, modelID := stringr::str_extract(filepath, 'model_[12345]{1}_multimer_v3_pred_0')]
+af.dt[, modelID := stringr::str_extract(filepath, 'model_[12345]{1}_multimer_v3_pred_0')]
+
+pten.interactors <- pten.scores[iptm > 0.6, .SD[which.max(iptm)], by=interactors]
+pik3ca.interactors <- af.dt[iptm > 0.6, .SD[which.max(iptm)], by=interactors]
+```
+
+Tidy the pae table and pull out the contacts
+```{r}
+pae.dt[, interactors := stringr::str_extract(model, "[A-Z0-9]+[-]+[0-9]+__[A-Z0-9]+")]
+# fix the naming convention for one of the proteins
+pae.dt[is.na(interactors), interactors := stringr::str_extract(model, "[A-Z0-9]+__[A-Z0-9]+")]
+
+pae.dt[, c('Bait', 'Prey') := tstrsplit(interactors, '__', keep=c(1,2))]
+pae.dt[, BaitOriginal := Bait]
+pae.dt[, Bait := gsub('[-][0-9]{1}','', Bait)]
+
+pae.dt[, `:=`(BaitGene = multiUniprots2multiGenes(Bait, species='HUMAN'),
+                   PreyGene = multiUniprots2multiGenes(Prey, species='HUMAN')
+             )]
+
+pae.dt[, geneInteractors := paste0(BaitGene, '__', PreyGene)]
+```
+
+```{r}
+pae.dt[, modelID := stringr::str_extract(model, 'model_[12345]{1}_multimer_v3_pred_0')]
+
+hc.contact.dt[BaitGene == 'PIK3CA',]
+hc.contact.dt<- pae.dt[interactors %in%  c(pik3ca.interactors$interactors, pten.interactors$interactors) & modelID %in% c(pik3ca.interactors$modelID, pten.interactors$modelID)]
+
+# we want the residue no Row; assuming here the row is the 1st member of the chain (A which is our bait)
+hc.contact.dt <- hc.contact.dt[, .(model, interactors, geneInteractors, Bait, BaitGene, PreyGene, Prey, BaitResidue=resnoRow, PreyResidue=resnoCol, pae)][BaitResidue != 'resnoRow',]
+
+af.dt[iptm > 0.6, .SD[which.max(iptm)], by=geneInteractors] %>% 
+  .[, .(geneInteractors, filepath)]
+```
+
+*Share the table with Ronald*
+
+Read in the DE results and identify if any of the high quality edits are in
+```{r}
+de.dt <-  fread('112124_mutantHotspots_data/2024_11_22_deseq2.pwcomparisons.wAnnotations.csv')
+
+# for PTEN, something like 22 guides overlap these contact interfaces and are significant
+de.dt[gene == 'PTEN' & first_peptide_idx %in% hc.contact.dt[BaitGene == 'PTEN', unique(BaitResidue)] & sig != 'not' & grepl('22_vs', contrast), ][order(first_peptide_idx),]
+# get the contacts so we can color these sites in chimeraX
+hc.contact.dt[BaitGene == 'PTEN' & unique(BaitResidue) %in% de.dt[gene == 'PTEN' & sig != 'not' & grepl('22_vs_', contrast), unique(first_peptide_idx)],]
+hc.contact.dt
+# show one of the top scoing ppi models with the PTEN bait sites highlighted
+de.dt[gene == 'PIK3CA' & first_peptide_idx %in% hc.contact.dt[BaitGene == 'PIK3CA', unique(BaitResidue)] & sig != 'not' & grepl('22_vs_', contrast), ]
+```
+Look at the individual ppi
+```{r}
+hc.contact.dt[BaitGene == 'PTEN' &  PreyGene == 'LDHA' & model == './112224_ptenPrey/P60484-1__P00338/relaxed_model_1_multimer_v3_pred_0.contacts.csv:A', unique(BaitResidue)]
+
+# get the contacts so we can color these sites in chimeraX
+pten.usp7.residues <- hc.contact.dt[BaitGene == 'PTEN' &  PreyGene == 'USP7' & model =='./112224_ptenPrey/P60484-1__Q93009/relaxed_model_4_multimer_v3_pred_0.contacts.csv:A',]$BaitResidue
+pten.ldha.residues <- hc.contact.dt[BaitGene == 'PTEN' &  PreyGene == 'LDHA' & model == './112224_ptenPrey/P60484-1__P00338/relaxed_model_1_multimer_v3_pred_0.contacts.csv:A', unique(BaitResidue)]
+pten.ARF4.residues <- hc.contact.dt[BaitGene == 'PTEN' &  PreyGene == 'ARF4' & model == './112224_ptenPrey/P60484-1__P18085/relaxed_model_2_multimer_v3_pred_0.contacts.csv:A', unique(BaitResidue)]
+pten.GSTM2.residues<- hc.contact.dt[BaitGene == 'PTEN' &  PreyGene == 'GSTM2' & model == './112224_ptenPrey/P60484-1__P28161/relaxed_model_3_multimer_v3_pred_0.contacts.csv:A', unique(BaitResidue)]
+pten.GTF3C1.residues<- hc.contact.dt[BaitGene == 'PTEN' &  PreyGene == 'GTF3C1' & model == './112224_ptenPrey/P60484-1__Q12789/relaxed_model_4_multimer_v3_pred_0.contacts.csv:A', unique(BaitResidue)]
+
+#definitely something here; consecutive sites and all strongly inhibited
+de.dt[gene =='PTEN' & sig != 'not' & first_peptide_idx %in% pten.GTF3C1.residues, unique(first_peptide_idx)]
+
+# look at the pik3ca interactors and see what we consider a good score
+pik3ca.pik3r2.residues <- pae.dt[BaitGene == 'PIK3CA' &  PreyGene == 'PIK3R2' & model =='P42336__O00459/relaxed_model_1_multimer_v3_pred_0.contacts.csv:A', unique(resnoRow)]
+pik3ca.pik3r1.residues <- pae.dt[BaitGene == 'PIK3CA' &  PreyGene == 'PIK3R1' & model == 'P42336__P27986/relaxed_model_1_multimer_v3_pred_0.contacts.csv:A', unique(resnoRow)]
+pik3ca.pik3r3.residues <- pae.dt[BaitGene == 'PIK3CA' &  PreyGene == 'PIK3R3' & model == 'P42336__Q92569/relaxed_model_1_multimer_v3_pred_0.contacts.csv:A', unique(resnoRow)]
+pik3ca.sec16a.residues <- pae.dt[BaitGene == 'PIK3CA' &  PreyGene == 'SEC16A' & model == 'P42336__O15027/relaxed_model_3_multimer_v3_pred_0.contacts.csv:A', unique(resnoRow)]
+pik3ca.ext2.residues <- pae.dt[BaitGene == 'PIK3CA' &  PreyGene == 'EXT2' & model == 'P42336__Q93063/relaxed_model_4_multimer_v3_pred_0.contacts.csv:A', unique(resnoRow)]
+pik3ca.my06.residues <- pae.dt[BaitGene == 'PIK3CA' &  PreyGene == 'MYO6' & model == 'P42336__Q9UM54/relaxed_model_5_multimer_v3_pred_0.contacts.csv:A', unique(resnoRow)]
+```
+
+```{r}
+af.dt[iptm > 0.6, .SD[which.max(iptm)], by=geneInteractors]
+
+hc.contact.dt[BaitGene == 'PIK3CA',]
+
+
+pik3ca.pik3r2.residues
+```
+
+
+
+Look at the PIK3CA interaction; smaller set as not many interactions found model very welll...
+```{r}
+
+```
+

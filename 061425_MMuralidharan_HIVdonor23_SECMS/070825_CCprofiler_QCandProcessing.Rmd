@@ -1,0 +1,511 @@
+---
+title: "070825_CCprofiler_QCandProcessing"
+author: "Martin Gordon"
+date: "2025-07-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Process the loaded CCprofiler data and see if we can get to the differential analysis section
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(viridis)
+library(pracma)
+library(magick)
+library(eulerr)
+library(CCprofiler)
+library(parallel)
+library(matrixStats)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+
+
+```{r}
+traces_list <- readRDS('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/070825_CCprofiler_retryPrepInput_data/2025_07_08_hiv.d2.features.traces.annotated.rds')
+```
+
+ALign the peptide intensities to see how things look
+```{r}
+# the first frations are quite noisy; restrict to the >= 15
+traces_subset <- subset(traces_list, fraction_ids=seq(20,70,1))
+
+parDir
+parDir <- sub(".+[/]", "", getwd())
+
+alignTraces(traces_subset, min_lag = -5, max_lag = 5, plot=T, PDF=T, name =paste0(parDir,'hiv.sample2.allfract.crossCorr.plot'))
+```
+plot the global peptide intesnities of the 
+```{r}
+plotGlobalIntensities(traces_list, plot = T, PDF=T, name='hiv.donor2.globalintensities.plot')
+```
+
+find missing values and impute by fitting a spline to the data
+```{r}
+#' Find missing values
+#' (defined as having identifications in left and right neigbouring fractions):
+traces_wMissing <- findMissingValues(traces_list,
+                                 bound_left = 1,
+                                 bound_right = 1,
+                                 consider_borders = TRUE)
+
+#' Impute NA values by fitting a spline: (what is the boundary used for curve fitting?)
+traces_wImp <- imputeMissingVals(traces_wMissing, method = "spline")
+
+#' Plot imputation summary; fails due to melt function need to prefix with reshape2
+plotImputationSummary(traces_wMissing, 
+                      traces_wImp, 
+                      PDF = T,
+                      plot_traces = T,
+                      name='hiv.donor2.imputationSummary.plot',
+                      max_n_traces = 2)
+
+saveRDS(traces_wImp,  ScriptAndDatedFileName('hiv.d2.peptide.traces.allfract.wImpute.rds'))
+traces_wImp <- readRDS('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/070825_CCprofiler_QCandProcessing_data/2025_07_09_hiv.d2.peptide.traces.allfract.wImpute.rds')
+```
+
+Normalize across donors
+Normalize using cyclic loess : windowed normalization across runs; based on MA plot, want to remove systematic differences across runs (valid? are the curves different? If so not appropriate)
+Also v slow to run for numerous samples... other approaches to normalize if we dont expect same curve?
+
+```{r}
+traces_norm <- normalizeByCyclicLoess(traces_wImp,  window = 3, step = 1, plot = TRUE, PDF = TRUE, name = "d2_normalizeByCyclicLoess")
+```
+
+# save the normalized output
+
+```{r}
+saveRDS(traces_norm,  ScriptAndDatedFileName('hiv.d2.peptide.traces.allfract.normalized.rds'))
+```
+
+```{r}
+traces_norm <- readRDS('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/070825_CCprofiler_QCandProcessing_data/2025_07_09_hiv.d2.peptide.traces.allfract.normalized.rds')
+```
+
+plot normalized intensities, filter out < consec ids
+```{r}
+#' # Assess total intensity after normalization
+plotGlobalIntensities(traces_norm, plot = T, PDF=T, name = "hivd2.IntensitySummary_postNormalization")
+
+# looks like an issue combining the traces object
+traces_combined <- combineTracesMutiCond(traces_norm)
+
+# Filter by consecutive IDs:
+traces_consec <- filterConsecutiveIdStretches(traces_combined, min_stretch_length = 5,remove_empty = T)
+```
+set up test traces dataset 
+
+```{r}
+test.traces <- examplePeptideTracesList
+class(test.traces) <- "tracesList"
+
+test.traces.comb <-  combineTracesMutiCond(test.traces)
+test.traces.comb$trace_annotation %>% str()
+test.traces.comb$fraction_annotation
+
+# look ok to compare here..
+test.traces.comb %>% print()
+traces_combined %>% print()
+```
+
+
+Investigate why they diverge
+
+Too frustrating and I'm not learning anything here... write my own function to calculate sister peptide correlation scores, and use this to do the filtering
+
+```{r}
+# use the traces.obj for now; will modify to use with BP pipeline
+sec.dt <- fread(traces.obj)
+
+```
+
+Sister peptide cor
+```{r}
+#' functions for filtering sibling peptides
+#' filter by max score and/or average
+filterBySisterPeptideCorrelations <- function(traces.obj, score='mean', plot=T, cutoff=0.2){
+
+  stopifnot(class(traces.obj) == 'traces')
+  stopifnot(score %in% c('mean', 'max'))
+  
+  # ncores to process in parallel
+  cores <- parallel::detectCores() - 2
+
+  
+  .convertTracesToMatrix <- function(traces){
+    return(as.matrix(traces, rownames='id'))
+  }
+  .doPWCorrelations <- function(subMat){
+    cor.mat <- cor(subMat, use='everything', method='pearson')
+    diag(cor.mat) <- NA
+    return(cor.mat)
+  }
+  .calculateColMeans <- function(corMat){
+    matrixStats::colMeans2(corMat, na.rm=T)
+  }
+  .calculateColMax <- function(corMat){
+    matrixStats::colMaxs(corMat, na.rm=T)
+  }
+
+  scoreFunc <- if (score == 'mean'){
+    .calculateColMeans
+    } else {
+    .calculateColMax }
+  
+  intMat <- .convertTracesToMatrix(traces.obj$traces)
+  
+  proteins.oi <- unique(traces.obj$trace_annotation$protein_id)
+  
+  corScores <- pbmcapply::pbmclapply(proteins.oi, function(prot){
+    subMat <- intMat[rownames(intMat) %in% traces.obj$trace_annotation[protein_id == prot, unique(id)],]
+    corMat <- .doPWCorrelations(t(subMat))
+    scores <- scoreFunc(corMat)
+    names(scores) <- colnames(corMat)
+    return(scores)
+  }, mc.cores = cores)
+  names(corScores) <- proteins.oi
+  allcorScores <- unlist(corScores)
+  names(allcorScores) <- gsub("^.*?\\.", "", names(allcorScores))
+  
+  if (plot == TRUE) {
+    p <- ggplot(data.table(corScore = allcorScores), aes(x = corScore)) + 
+      geom_histogram(bins = 30) + theme_classic()
+    plot(p)
+  }
+  filterpeps <- names(allcorScores)[allcorScores > cutoff]
+  traces_filt <- subset(traces.obj, filterpeps, "id")
+  return(traces_filt)
+}
+```
+compare the output of the two
+```{r}
+filterByMaxCorr(traces=test.traces.comb, cutoff = 0.5, plot=T)
+filterBySisterPeptideCorrelations(traces=test.traces.comb, cutoff = 0.5, score='max', plot=T)
+
+undebug(filterBySibPepCorr)
+filterBySibPepCorr(test.traces.comb,
+                                   absolute_spcCutoff = 0.2,
+                                   plot = T)
+```
+test the functions
+```{r}
+filterByMaxCorr(traces=test.traces.comb, cutoff = 0.5, plot=T)
+filterBySibPepCorr(traces=test.traces.comb, plot=T)
+debug(filterBySibPepCorr)
+
+filterBySisterPeptideCorrelations(traces=test.traces.comb, cutoff = 0.5, score='max', plot=T)
+filterBySisterPeptideCorrelations(traces=test.traces.comb, cutoff = 0.5, score='mean', plot=T)
+```
+Filter by max peptide cor score and min peptide cor score
+```{r}
+traces_maxCor <- filterBySisterPeptideCorrelations(traces=traces_consec, cutoff = 0.2, score='max', plot=T)
+traces_meanCor <- filterBySisterPeptideCorrelations(traces=traces_consec, cutoff = 0.5, score='mean', plot=T)
+```
+Now, filter the traces list to this subset of things
+
+```{r}
+goodpeptides <- unique(traces_meanCor$trace_annotation$id)
+
+traces_filtered <- lapply(traces_norm, function(x){
+  subset(x, trace_subset_ids=goodpeptides)
+})
+
+class(traces_filtered) <- "tracesList"
+```
+
+
+```{r}
+traces_filtered <- updateTraces(traces_filtered)
+summary(traces_filtered)
+```
+```{r}
+saveRDS(traces_filtered, ScriptAndDatedFileName('hiv.d2.peptide.traces.allfract.filtered.rds'))
+```
+
+plot some examples?
+```{r}
+design.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/070825_CCprofiler_retryPrepInput_data/2025_07_11_hiv.d2.ccprofiler.designMat.csv')
+```
+
+write a function to plot the elution profiles 
+Useful for the other plots we are sharing...
+
+
+work on htis monday... include the MW function to fit the mw, so we can add a triangle point for the monomer elution
+```{r}
+convertToLong <- function(traces.obj, logTrans=F){
+  long.dt <- setDT(reshape2::melt(traces.obj$traces,idcol='id'))
+  setnames(long.dt, new=c('id', 'fraction', 'intensity'))
+  long.dt[, fraction := as.character(fraction)]
+  
+  ori.dt <- copy(long.dt)
+  message('annotating traces..')
+  long.dt <- long.dt[traces.obj$trace_annotation,, on=.(id)]
+  long.dt <- long.dt[traces.obj$fraction_annotation[,.(filename, fraction=as.character(id), molecular_weight)],, on=.(fraction)]
+  long.dt[, fraction := as.numeric(fraction)]
+  stopifnot(nrow(ori.dt) == nrow(long.dt))
+  return(long.dt)
+}
+plot.dt <- convertToLong(traces_filtered$Infected_2)
+
+
+cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7","#999999")
+
+
+
+p <- ggplot(plot.dt[gene == 'MSL1',]) +
+      geom_line(aes(x=fraction, y=intensity, colour=id, group=id)) +
+      theme_bw() +
+      theme(legend.position="none") + 
+      scale_x_continuous(breaks=seq(1,max(plot.dt$fraction))) +
+      scale_color_manual(values=cbPalette)
+   
+p
+```
+tidy this plot to show what we want
+```{r}
+generateElutionProfiles <- function(sec.long, log=FALSE, legend = TRUE,name="Traces", colour_by = "id", highlight=NULL, highlight_col=NULL, colorMap=NULL, monomer_MW=TRUE) {
+
+
+  if(!is.null(highlight)){
+    traces.long$outlier <- gsub("\\(.*?\\)","",traces.long$id) %in% gsub("\\(.*?\\)","",highlight)
+    if(!any(traces.long$outlier)) highlight <- NULL
+  }
+
+  if(colour_by!="id") {
+    if(!colour_by %in% names(traces$trace_annotation)){
+      stop("colour_by is not availbale in trace_annotation.")
+    }
+    isoform_annotation <- subset(traces$trace_annotation,select=c("id",colour_by))
+    traces.long <- merge(traces.long,isoform_annotation, by.x="id",by.y="id")
+    traces.long[,line:=paste0(get(colour_by),id)]
+  }
+
+  ## Create a reproducible coloring for the peptides plotted
+  if(!is.null(colorMap)){
+    if(!all(unique(traces.long$id) %in% names(colorMap))){
+      stop("Invalid colorMap specified. Not all traces to be plotted are contained in the colorMap")
+    }
+  }else{
+    cbPalette <- c("#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7","#999999")
+    ids <- sort(unique(traces.long[[colour_by]]))
+    if (length(ids) <= length(cbPalette)) {
+      colorMap <- cbPalette[1:length(unique(traces.long[[colour_by]]))]
+      names(colorMap) <- ids
+    } else {
+      colorMap <- createGGplotColMap(unique(traces.long$id))
+    }
+  }
+
+  if(colour_by == "id") {
+    p <- ggplot(traces.long) +
+      geom_line(aes_string(x='fraction', y='intensity', colour='id', group='id'))
+  } else {
+
+    p <- ggplot(traces.long) +
+      geom_line(aes_string(x='fraction', y='intensity', colour=colour_by, group='line'))
+  }
+
+  p <- p + xlab('fraction') +
+    ylab('intensity') +
+    theme_bw() +
+    theme(panel.grid.major = element_blank(),panel.grid.minor = element_blank()) +
+    theme(plot.margin = unit(c(1,.5,.5,.5),"cm")) +
+    ggtitle(name) +
+    scale_color_manual(values=colorMap)
+  #theme(plot.title = element_text(vjust=19,size=10))
+  if (log) {
+    p <- p + scale_y_log10('log(intensity)')
+  }
+  if (!legend) {
+    p <- p + theme(legend.position="none")
+  } else {
+    if (length(unique(traces.long$id)) > 25) {
+      p <- p + theme(legend.position="none")
+    } else {
+      p <- p + theme(legend.position="bottom", legend.text=element_text(size = 5), legend.title = element_blank())
+    }
+  }
+
+  if(!is.null(highlight)){
+    legend_peps <- unique(traces.long[outlier == TRUE, id])
+    if(is.null(highlight_col)){
+      p <- p +
+        geom_line(data = traces.long[outlier == TRUE],
+                  aes_string(x='fraction', y='intensity', color='id'), lwd=2) +
+        scale_color_manual(values=colorMap, breaks = legend_peps)
+      ## scale_color_discrete(breaks = legend_peps)
+    }else{
+      ## legend_map <- unique(ggplot_build(p)$data[[1]]$colour)
+      ## names(legend_map) <- unique(p$data$id)
+      ## legend_map[legend_peps] <- highlight_col
+      ## legend_vals <- rep(highlight_col, ceiling(length(legend_peps)/ length(highlight_col)))[1:length(legend_peps)]
+      p <- p +
+        geom_line(data = traces.long[outlier == TRUE],
+                  aes_string(x='fraction', y='intensity', lty = 'id'),
+                  color = highlight_col, lwd=2)
+      # scale_color_discrete(guide = F)
+      ## scale_color_manual(values = legend_map, limits = legend_peps)
+      # guides(lty = FALSE)
+      # scale_color_manual(limits = legend_peps, values = rep(highlight_col, length(legend_peps))) +
+      # geom_line(aes_string(x='fraction', y='intensity', color='id'))
+    }
+  }
+
+  if ("molecular_weight" %in% names(traces$fraction_annotation)) {
+    fraction_ann <- traces$fraction_annotation
+    tr <- lm(log(fraction_ann$molecular_weight) ~ fraction_ann$id)
+    intercept <- as.numeric(tr$coefficients[1])
+    slope <- as.numeric(tr$coefficients[2])
+    mwtransform <- function(x){exp(slope*x + intercept)}
+    MWtoFraction <- function(x){round((log(x)-intercept)/(slope), digits = 0)}
+    mw <- round(fraction_ann$molecular_weight, digits = 0)
+    breaks_MW <- mw[seq(1,length(mw), length.out = length(seq(min(traces$fraction_annotation$id),
+                                                              max(traces$fraction_annotation$id),10)))]
+    p <- p + scale_x_continuous(name="fraction",
+                                breaks=seq(min(traces$fraction_annotation$id),
+                                           max(traces$fraction_annotation$id),10),
+                                labels=seq(min(traces$fraction_annotation$id),
+                                           max(traces$fraction_annotation$id),10),
+                                sec.axis = dup_axis(trans = ~.,
+                                                    breaks=seq(min(traces$fraction_annotation$id),
+                                                               max(traces$fraction_annotation$id),10),
+                                                    labels = breaks_MW,
+                                                    name = "MW (kDa)"))
+    if (monomer_MW==TRUE){
+      if ("protein_mw" %in% names(traces$trace_annotation)) {
+        subunitMW.dt <- data.table(id=traces$trace_annotation$id,mw=traces$trace_annotation$protein_mw)
+        subunitMW.dt$fraction <- MWtoFraction(subunitMW.dt$mw)
+        subunitMW.dt[,boundary:=MWtoFraction(2*mw)]
+        if (length(unique(subunitMW.dt$mw)) > 1) {
+          p <- p + geom_point(data = subunitMW.dt, mapping = aes(x = fraction, y = Inf, colour=id),shape=18,size=5,alpha=.5)
+        } else {
+          p <- p + geom_vline(data = unique(subunitMW.dt), aes(xintercept = fraction), colour="red", linetype="dashed", size=.5)
+          p <- p + geom_vline(data = unique(subunitMW.dt), aes(xintercept = boundary), colour="red", linetype="dashed", size=.5, alpha=0.5)
+        }
+      } else {
+        message("No molecular weight annotation of the traces. Cannot plot monomer molecular weight.")
+      }
+    }
+  } else {
+    p <- p + scale_x_continuous(name="fraction",
+                                breaks=seq(min(traces$fraction_annotation$id),
+                                           max(traces$fraction_annotation$id),10),
+                                labels=seq(min(traces$fraction_annotation$id),
+                                           max(traces$fraction_annotation$id),10))
+  }
+}
+
+
+
+generateElutionProfiles(plot.dt[gene =='AK2'])
+View(CCprofiler::plot)
+
+
+help(plot)
+examples <- unique(traces_filtered[[1]]$trace_annotation$protein_id)[1:20]
+for(test_proteins in examples){
+  pepTest <- subset(traces_filtered, trace_subset_ids = test_proteins, trace_subset_type = "protein_id")
+  print(pepTest)
+  plot(pepTest)
+}
+
+proteinTraces=exampleProteinTraces
+plot(proteinTraces)
+```
+
+
+```{r}
+View(filterByMaxCorr)
+
+filterByMaxCorr(traces = traces_consec, cutoff = 0.5, plot=T)
+
+filterByMaxCorr(traces = test.traces.comb, cutoff = 0.5, plot = T)
+filterByMaxCorr(traces = test.traces.comb, cutoff = 0.5, plot = T)
+
+filterByMaxCorr(traces_norm$Uninfected_2, cutoff = 0.5, plot=T)
+
+filterByMaxCorr(traces = test.traces.comb, cutoff = 0.2, plot = T, name='test.data')
+undebug(filterByMaxCorr)
+undebug(filterBySibPepCorr)
+
+str(test.traces.comb)
+str(traces_combined)
+
+traces_combined$trace_annotation[protein_id == 'Q9Y6Y8']
+traces_combined$traces[id == 'AHTSSTQLQEELEK.3']
+```
+```{r}
+test.traces.comb
+```
+
+
+Look at sister peptide correlation.. fails.. why? due to protein ID?
+```{r}
+traces_consec$traces %>% dim()
+traces_combined$traces %>% dim()
+
+
+
+
+
+# Filter by maximum correlation for outlier removal:
+traces_maxcor <- filterByMaxCorr(traces_consec,cutoff = 0,plot = T)
+
+traces_combined$fraction_annotation
+
+traces_norm$Infected_2$fraction_annotation %>% str()
+
+traces_maxcor$fraction_annotation %>% str()
+
+traces_consec$fraction_annotation %>% 
+
+# Filter by consecutive SPC:
+pepTracesSPC <- filterBySibPepCorr(pepTracesMaxCorr,
+                                   absolute_spcCutoff = 0.2,
+                                   plot = T, PDF = T)
+
+
+#' # Subset pepTracesNormalized to valid peptides selected 
+#' by consecutive filtering and SPC cutoff
+validPeps <- unique(pepTracesSPC$trace_annotation$id)
+
+traces_filtered <- lapply(traces_norm, function(x){
+  subset(x, trace_subset_ids=validPeps)
+})
+class(traces_filtered) <- "tracesList"
+
+#' Update traces with additional metrics for each fraction:
+traces_filtered <- updateTraces(traces_filtered)
+
+#' Inspect traces list:
+summary(traces_filtered)
+
+saveRDS(traces_filtered, ScriptAndDatedFileName("allsamples.peptide.traces.norm.filtered.rds"))
+```
+```{r}
+
+```
+
+

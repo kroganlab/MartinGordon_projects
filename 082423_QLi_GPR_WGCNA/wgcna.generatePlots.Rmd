@@ -1,0 +1,585 @@
+---
+title: "WGCNA.generatePlots"
+author: "Martin Gordon"
+date: "2023-11-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## packages 
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(WGCNA)
+library(magrittr)
+library(stringr)
+library(fmsb)
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+## Regenerate plots for Qiongyu
+
+Thanks for the discussion today. I am summarizing the changes of figures we discussed.
+Figure 3:
+
+GO enrichment figure with reduced no. of terms. - done
+Heatmap of modules and receptors. - Done 
+Time-course line charts of clusters showing receptors having big changes for the cluster. - Ask Qiongyu if needed, try radar plots
+
+Radar chart maybe?
+
+Read in the data: module assignment from the WGCNA run
+```{r}
+module.assignment <- readRDS('./output/gpcr.11.receptors.moduleAssignment.Rdata')
+exp.mat <- readRDS('./output/gpcr.11.receptors.exp.mat.Rdata') # the expression matrix used as input for each of these
+
+clust.genes <- fread('./output/wgcna.clustergenes.adjmat.csv')
+```
+Read in the expression data and 
+
+```{r}
+protQuant <- fread('data/2022_08_17_ProteinLevelData.lib.csv.gz')
+
+group.noi <- protQuant[!GROUP %like% c("DOR|KOR|MOR|MRX2|MRX4|NK1R|NPFFR1|NPY1R|PTGER1|PTGER4|QRFPR|DOR"),unique(GROUP)]
+group.noi
+
+protQuant <- protQuant[!GROUP %in% group.noi, ]
+protQuant <- protQuant[!GROUP %like% "MOR_LG94",]
+
+protQuant[, `:=`(timeStr = str_extract(GROUP,'[0-9]{2}$'),
+                 receptor = gsub("_[0-9]{2}$", '', protQuant$GROUP)
+               )]
+
+setorder(protQuant, receptor, Protein, timeStr)
+
+protQuant[, batchControlled := LogIntensities - median(LogIntensities, na.rm = TRUE), by = .(Protein, receptor, SUBJECT)]
+protQuant[, vsTimeZero := batchControlled - mean(batchControlled[timeStr == timeStr[!is.na(batchControlled)][1] ]), by = .(Protein, receptor)]
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+```
+
+Run enrichment on this and reduce the complexity of the output to the key 
+
+```{r}
+# change clusterID to factor and order
+clust.genes[, Cluster := factor(Cluster, levels=c('cluster1', 'cluster2', 'cluster3', 'cluster4', 'cluster5', 'cluster6','cluster7', 'cluster8', 'cluster9', 'cluster10', 'cluster11'))]
+
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# our background? only genes used for WGCNA analysis
+universe <- protQuant$gene %>%  unique()
+
+enrich.dt <- enricherOnGroups(clust.genes, groupColumns = 'Cluster', geneColumn = "GeneID", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'Cluster')
+
+#custom ordering
+simp.enrich$simplified[, Cluster := factor(Cluster, levels=c('cluster1', 'cluster2', 'cluster3', 'cluster4', 'cluster5', 'cluster6','cluster7', 'cluster8', 'cluster9', 'cluster10', 'cluster11'))]
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'Cluster', topN = 8, title='GO enrichment of WGCNA modules', 
+                                  row_names_gp = gpar(fontsize = 10), column_names_gp= gpar(fontsize = 6), upperThreshold = 8, cluster_columns =F)
+
+#BackupAsPDF(ht, 'module.go.enrichment.top8.heatmap.')
+
+View(enrichHeatmapBestPerGroup)
+```
+I think just copy over BPs functions and adjust the cells
+
+```{r}
+library (ComplexHeatmap)
+enrichHeatmapBestPerGroup <- function(simplifiedEnrichTable = NULL, fullEnrichTable = NULL,
+                                      pipeLineList = NULL,
+                                      groupColumn= NULL, topN = 1, title="", cols = NULL, 
+                                      negCols = NULL, reduceRedundantsAcrossGroups=TRUE, max_pAdjust = 0.01, minCount = 1,
+                                      annotatePossibleMatches = TRUE,  row_names_gp = gpar(fontsize = 10),
+                                      upperThreshold  = NULL,
+                                      pvalColumn = "p.adjust", ...){
+  if (!is.null(pipeLineList)){
+    if(is.null(simplifiedEnrichTable)) simplifiedEnrichTable <- pipeLineList$simp[[1]]
+    if(is.null(fullEnrichTable)) fullEnrichTable <- pipeLineList$simp[[2]]
+  }
+  if (is.null(groupColumn)) groupColumn <- colnames(simplifiedEnrichTable)[[1]]
+    
+  
+  setorderv(simplifiedEnrichTable, cols = pvalColumn)
+  bestTermPerBait <- simplifiedEnrichTable[simplifiedEnrichTable[[pvalColumn]]<max_pAdjust & Count >= minCount,.(ID=ID[1:topN]),by=groupColumn]
+
+    if (is.null(fullEnrichTable)){
+    fullEnrichTable <- simplifiedEnrichTable
+    reduceRedundantsAcrossGroups <- FALSE
+  }
+
+  if(reduceRedundantsAcrossGroups){  
+    #reduce redundant based on clusters in fullEnrichTable
+    countsByID <- fullEnrichTable[ID %in% bestTermPerBait$ID, .(geneCount  = length(unique(unlist(strsplit(geneID, "/"))))), by = .(ID, cluster)]
+    # get the term with most genes across whole dataset per term-cluster
+    setorder(countsByID, -geneCount)
+    bestTerms <- countsByID[,.SD[1],by=cluster]$ID
+  } else bestTerms <- unique(bestTermPerBait$ID)
+  
+  if (!is.null(negCols) & !is.null(cols)){
+    negOnly <- setdiff(negCols, cols)
+    if (length(negOnly) > 0)
+      message ("Columns specified in negCols not found in cols, these will be removed ", paste (negOnly, collapse = ", "))
+    negCols <- intersect (cols, negCols)
+  }
+  if (!is.null(negCols) & length(negCols) == 0){
+    warning ("negCols is set to an empty vector. Did you get the right names? Set to NULL(default) for no negative columns")
+  }
+    
+  main.wide <- dcast (fullEnrichTable[ID %in% bestTerms], as.formula(paste("Description", groupColumn, sep="~")), value.var="p.adjust")
+  for(col in unique(c(cols,negCols))){
+    if (is.null(main.wide[[col]])) main.wide[[col]] <- NA
+  }
+  
+  main.mat <- -log10(as.matrix(main.wide, rownames = "Description"))
+  main.mat[is.na(main.mat)] <- 0
+  if (!is.null(upperThreshold)){
+    main.mat[main.mat > upperThreshold] <- upperThreshold
+  }
+  if (all(grepl("^GO_", rownames(main.mat)))){
+    rownames(main.mat) <- fixMsigdbGONames(rownames(main.mat))
+  }
+  
+  counts.wide <- dcast (fullEnrichTable[ID %in% bestTerms], as.formula(paste("Description", groupColumn, sep="~")), value.var="Count")
+  for(col in unique(c(cols,negCols))){
+    if (is.null(counts.wide[[col]])) counts.wide[[col]] <- NA
+  }
+  counts.mat <- as.matrix(counts.wide, rownames="Description")
+  
+  
+  geneTable <- fullEnrichTable[ID %in% bestTerms, .(gene = unlist(strsplit(geneID, split="/"))),by = ID]
+  geneTable[,cleanName := fixMsigdbGONames(ID)]
+  
+  if (!is.null(cols)){
+    if (! all(cols %in% colnames(counts.mat) & cols %in% colnames(main.mat))){
+      message ("Not all requested columns for heatmap found in data")
+      message ("main.mat ", paste(colnames(main.mat), collapse=" "))
+      message ("counts.mat ", paste(colnames(counts.mat), collapse=" "))
+    }else{
+      counts.mat<- counts.mat[,cols]
+      main.mat<- main.mat[,cols]
+    }
+  }
+
+  if (annotatePossibleMatches==TRUE){
+    genesInUniverseCounts <- unique(fullEnrichTable[, .( geneCount = as.integer(gsub("[0-9]+/", "", GeneRatio))), by = c(groupColumn)])
+    if (nrow(genesInUniverseCounts) != length(unique(genesInUniverseCounts[[groupColumn]]))){
+      stop("non-unique gene counts per group. If you didn't combine multiple differently grouped enrichments, this is unexpected. If it is, set annotatePossibleMatches = FALSE")
+    }
+    cols <- colnames(main.mat)
+    setkeyv(genesInUniverseCounts, groupColumn)
+    topBars <- HeatmapAnnotation(`Group Sizes` = anno_barplot ( genesInUniverseCounts[cols, geneCount] ))
+  #   if (!is.null(top_annotation)){
+  #     warning("over writing non-null top annotation with possible matches")
+  #     #top_annotation <- top_annotation %v% topBars
+  #   }#else{
+  #     top_annotation <- topBars
+  #   #}
+  }else{
+    topBars <- NULL
+  }
+  
+  hm <- heatmapNumbered (main.mat, counts.mat, negCols, title, max_pAdjust = max_pAdjust, bottom_annotation = topBars, row_names_gp = row_names_gp,
+                         upperThreshold = upperThreshold,...)
+  
+  invisible(list(geneTable = geneTable, main.mat = main.mat, counts.mat = counts.mat, hmList = hm))
+}
+
+# modify this one
+
+heatmapNumbered <- function (main.mat, counts.mat, negCols = NULL, title="",
+                             borderMatrix = NULL, borderColFun = NULL,
+                             borderMM = 2,
+                             brewerPalette = "Blues",
+                             show_column_dend = FALSE,
+                             show_row_dend = FALSE,
+                             border = TRUE,
+                             max_pAdjust = 0.01,
+                             row_names_gp = gpar(fontsize = 3),
+                             column_names_gp = gpar(fontsize = 3),
+                             upperThreshold = NULL,
+                             colors = NULL,
+                             ...){
+
+  heatmap_legend_param = list(legend_direction="horizontal", title = "-log10(adj.p)") #global enrich\n
+  
+  if (is.null(colors)){  # by default we pass a long vector of colors and let ComplexHeatmap define the ranges
+    Blues = colorRampPalette(RColorBrewer::brewer.pal(9, brewerPalette))
+    colors <- Blues(100)
+    
+    # if we get an upperTreshold, we define the limits in the colors object
+    if(!is.null(upperThreshold))
+      colors <- circlize::colorRamp2(breaks =seq(0, upperThreshold, length.out = 100), colors = colors)
+    
+    
+    if (!is.null(negCols)){
+      limit <- ifelse(is.null (upperThreshold), 4, upperThreshold)
+      
+      #colors <- circlize::colorRamp2 (breaks=seq(from=-max(main.mat), to = max(main.mat), length.out=101), colors =colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdBu")))(101))
+      colors <- circlize::colorRamp2 (breaks=seq(from=-limit, to = limit, length.out=101), colors =colorRampPalette(rev(RColorBrewer::brewer.pal(11, "RdBu")))(101))
+      main.mat[,negCols] = -main.mat[, negCols]
+      heatmap_legend_param = c (heatmap_legend_param, list(at=c(-limit,-limit/2,0,limit/2,limit), labels = c(limit,limit/2,0,limit/2,limit)) )
+    }
+  }  
+  
+  ##Plot main figure heatmap
+  hm <- ComplexHeatmap::Heatmap(main.mat, col = colors, border = border, rect_gp = gpar(col = "grey", lwd = 1),
+                                #cluster_rows = ddr,
+                                column_title = title,
+                                column_names_rot = 90, row_names_gp = row_names_gp, column_names_gp = column_names_gp,
+                                show_row_dend = show_row_dend, show_column_dend = show_column_dend, heatmap_legend_param = heatmap_legend_param,
+                                row_names_max_width = 2*max_text_width(rownames(main.mat), gp = gpar(fontsize = 6)),
+                                cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.null(borderMatrix) & !is.null(borderColFun)){
+                                    lwd <- unit(borderMM,"mm")
+                                    grid.rect(x, y, width=width, height=height, gp = gpar(fill = borderColFun(borderMatrix[i,j]), col = NA))
+                                    grid.rect(x, y, width=unit(0.8, "snpc"), height= unit(0.4, "snpc"), gp = gpar(fill = fill, col = NA))
+                                  }
+                                  if (!is.na(counts.mat[i,j])){
+                                    color <- ifelse (abs(main.mat[i,j]) < -log10(max_pAdjust), "grey", "white") # "white" #
+                                    grid.text(sprintf("%.0f", counts.mat[i, j]), x, y, gp = gpar(fontsize=6, col=color))
+                                  }
+                                }, ...) #+1  # this makes it a list!
+  
+  
+  if (!is.null(borderMatrix) & !is.null(borderColFun)){
+    legendList <-  list (Legend(col_fun = colorFun, title= "viral enrich\n-log10(p)"))
+    hm <- hm + 1 # this makes it a list so I can add annotations to it
+  } else{
+    legendList <- list()
+  }
+  
+  hm <- draw(hm,heatmap_legend_side="top", annotation_legend_list = legendList,
+             annotation_legend_side = "top")
+  
+  invisible (hm)
+  
+}
+```
+
+```{r}
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'Cluster', topN = 8, title='GO enrichment of WGCNA modules', 
+                                  row_names_gp = gpar(fontsize = 8), column_names_gp= gpar(fontsize = 6), upperThreshold = 8, cluster_columns =F)
+
+BackupAsPDF(ht, dimensions=c(7,8))
+
+heatmapNumbered(simp.enrich$simplified,simp.enrich$clusterInfo)
+
+heatmapNumbered()
+
+
+```
+
+
+Now generate a heatmap of modules x receptors (receptors on x, modules on y axis)
+per gene take the max shift per receptor/module combo, then take the median of this value per receptor/module combo
+
+
+```{r}
+# find the max shift vsT0 per protein/receptor (check this calculation is correct)
+protQuant[, maxVsT0 :=  ifelse(max(vsTimeZero) > abs(min(vsTimeZero)), max(vsTimeZero), min(vsTimeZero)), by=.(Protein,receptor)]
+names(clust.genes) <- c('gene', 'Cluster')
+
+# now add the cluster info to the protQuant 
+pQuant <- protQuant[clust.genes, Cluster := i.Cluster, on=c('gene','gene')] 
+
+#rename
+pQuant[receptor == 'MOR_DAMGO', receptor := 'MOR']
+
+# use this to filter and calculate the median value per module/receptor
+pQuant[!is.na(Cluster), medianMaxShiftvsT0 := median(maxVsT0, na.rm=T), by=.(Cluster,receptor)]
+
+pQuant <- pQuant[!is.na(Cluster), .(receptor,Cluster,medianMaxShiftvsT0)] %>%  unique()
+
+```
+
+Draw the heatmap, may need to adjust coloring
+Names based on top 4 terms plot
+
+```{r}
+# add this for cluster coloring 
+col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD")  #"#999933" '#DDCC77' "grey"
+
+
+receptors <- pQuant$receptor %>%  unique()
+\
+# heatmap annotation\
+row_ha <- HeatmapAnnotation(receptor=receptors, 
+                        col=list(receptor = c("DOR"=col.pal[1], 'KOR'=col.pal[2], 'MOR'=col.pal[3], 'MRX2'=col.pal[4], 'MRX4'=col.pal[5], 'NK1R'=col.pal[6], 'NPFFR1'=col.pal[7], 'NPY1R'=col.pal[8], 'PTGER1'=col.pal[9], 'PTGER4'=col.pal[10], 'QRFPR'=col.pal[11])) )
+
+p.mat <- dcast(pQuant, Cluster~receptor, value.var = 'medianMaxShiftvsT0') %>% as.matrix(rownames='Cluster') 
+
+ha <- Heatmap(p.mat, top_annotation =row_ha,
+          name = "max log2(intensity/\nmean(timeZero))")
+
+BackupAsPDF(ha, 'receptor.module.medianMaxShiftvsT0.heatmap.')
+
+rownames(p.mat) <- c('C1 Endosome trafficking', 'C2 PM structure/adhesion', 'C3 Actin cytoskeleton', 'C4 Golgi trafficking', 'C5 G-Protein coupled receptor signalling', 
+                     'C6 Protein Kinase C', 'C7 Clathrin', 'C8 Cytoplasmic stress granule', 'C9 Actin polymerization', 'C10 Cell morphogenesis', 'C11 RNA processing')
+
+ha <- Heatmap(p.mat, 
+              top_annotation =row_ha,
+              name = "max log2(intensity/\nmean(timeZero))",
+              row_names_gp = gpar(fontsize=8)
+          )
+
+BackupAsPDF(ha, 'receptor.moduleNames.medianMaxShiftvsT0.heatmap.')
+```
+Regen linecharts and generate a radar plot for each of the receptor/modules
+
+```{r}
+
+# calculate the median shift vs T0 per timepoint/cluster/receptor
+protQuant[, medianVsTimeZero := median(vsTimeZero, na.rm=T), by=.(Cluster, receptor, timeStr)]
+
+protQuant[, GO.terms := fcase(Cluster == 'cluster1', 'C1 Endosome trafficking',
+                              Cluster == 'cluster2', 'C2 PM structure/adhesion',
+                              Cluster == 'cluster3', 'C3 Actin cytoskeleton',
+                              Cluster == 'cluster4', 'C4 Golgi trafficking',
+                              Cluster == 'cluster5', 'C5 G-Protein coupled receptor signalling',
+                              Cluster == 'cluster6', 'C6 Protein Kinase C',
+                              Cluster == 'cluster7', 'C7 Clathrin',
+                              Cluster == 'cluster8', 'C8 Cytoplasmic stress granule',
+                              Cluster == 'cluster9', 'C9 Actin polymerization',
+                              Cluster == 'cluster10', 'C10 Cell morphogenesis',
+                              Cluster == 'cluster11', 'C11 RNA processing'
+                              )]
+
+protQuant <- protQuant[!is.na(Cluster),]
+
+protQuant$GO.terms <- factor(protQuant$GO.terms, levels=c("C1 Endosome trafficking", "C2 PM structure/adhesion","C3 Actin cytoskeleton","C4 Golgi trafficking","C5 G-Protein coupled receptor signalling","C6 Protein Kinase C",
+                                                              "C7 Clathrin", "C8 Cytoplasmic stress granule", "C9 Actin polymerization", "C10 Cell morphogenesis","C11 RNA processing"))
+
+
+g <- ggplot(protQuant[!is.na(Cluster)], aes(x=timeStr, y=medianVsTimeZero, group=receptor, color=receptor)) + 
+  stat_summary(fun = "median", geom = "line") +
+  scale_color_manual(values = col.pal) + 
+  ggtitle('Median expression vs Time 0') +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~GO.terms, scales='free_y', ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   strip.text = element_text(size = 6))
+
+BackupAsPDF(g, 'medianVsT0.modulenamepanel.linechart.', dimensions = c(8,8))
+
+g <- ggplot(protQuant[!is.na(Cluster)], aes(x=timeStr, y=medianVsTimeZero, group=GO.terms, color=GO.terms)) + 
+  stat_summary(fun = "median", geom = "line") +
+  scale_color_manual(values = col.pal) + 
+  ggtitle('Median expression vs Time 0') +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  facet_wrap(~receptor, scales='free_y', ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   strip.text = element_text(size = 6))
+
+g
+
+BackupAsPDF(g, 'medianVsT0.receptornamepanel.linechart.', dimensions = c(8,8))
+```
+
+Radar plot of the different receptors x modules
+Simply too many variables to parse.. need to reduce number of modules/receptors
+
+```{r}
+# coordinator function for generating radar plots: see https://stackoverflow.com/questions/42562128/ggplot2-connecting-points-in-polar-coordinates-with-a-straight-line-2#42572133
+coord_radar <- function (theta = "x", start = 0, direction = 1) {
+  theta <- match.arg(theta, c("x", "y"))
+  r <- if (theta == "x") "y" else "x"
+  ggproto("CordRadar", CoordPolar, theta = theta, r = r, start = start, 
+          direction = sign(direction),
+          is_linear = function(coord) TRUE)
+}
+
+radar.data <- protQuant[!is.na(Cluster)][, .(receptor, GO.terms, medianMaxShiftvsT0)] %>%  
+  unique()
+
+g <- ggplot(radar.data, aes(x=GO.terms, y=medianMaxShiftvsT0, group=receptor, color=receptor)) + 
+  stat_summary(fun = "median", geom = "line") +
+  scale_color_manual(values = col.pal) + 
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+ # facet_wrap(~receptor, ncol=3) +
+  theme_classic() +
+  scale_x_discrete(expand=c(0,0.03)) +
+  theme(
+   strip.text = element_text(size = 6)) +
+  coord_radar() +
+  
+g
+
+
+```
+Write out this dt to regenerate the plotting in near future
+```{r}
+#fwrite(protQuant, './output/11receptorWGCNAproteinAbundance.csv')
+```
+
+# regenerate the heatmap but perform column lcustering
+
+```{r}
+wgcna.clusters.adj <- fread('./output/wgcna.clustergenes.adjmat.csv')
+
+wgcna.clusters.adj[,.N, Cluster]
+
+
+prot.mat <- protQuant
+
+
+prot.mat
+
+modules.adj
+```
+
+This is wrong; need to cluster some other way; as clustering within splits
+Cluster on something else; maxLog2FC vs T0? 
+
+Look at later...
+
+Take order from here and implement on the matrix
+```{r}
+mss.out <- fread('./data/2022_08_31_NiceFitsPower3.csv')
+
+exp.mat <- dcast(mss.out[gene %in% rownames(prot.mat)],gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+       
+clusterwNa <- function(mat, na.val=0, ...){
+  
+  mat[is.na(mat)] <- na.val
+  return(hclust(dist(mat, method='euclidean')))
+}
+
+clust.obj <- clusterwNa(t(exp.mat))
+plot(clust.obj)
+
+cols.cor <- cor(exp.mat,  use = "pairwise.complete.obs", method = "pearson")
+hclust(dist(1-cols.cor)) %>% plot()
+```
+provide this vector 
+```{r}
+col.order.vec <- colnames(prot.mat)
+col.order.vec[col.order.vec %like% 'QRFPR']
+
+new.col.order.vec <- c("NK1R_00_batch.01", "NK1R_00_batch.02", "NK1R_00_batch.03", "NK1R_01_batch.01", "NK1R_01_batch.02", "NK1R_01_batch.03", "NK1R_05_batch.01", "NK1R_05_batch.02", "NK1R_05_batch.03",
+                       "NK1R_10_batch.01", "NK1R_10_batch.02", "NK1R_10_batch.03", "NK1R_30_batch.01", "NK1R_30_batch.02", "NK1R_30_batch.03",
+                       "PTGER1_00_batch.04", "PTGER1_00_batch.05", "PTGER1_00_batch.06", "PTGER1_01_batch.04", "PTGER1_01_batch.05", "PTGER1_01_batch.06", "PTGER1_05_batch.04", "PTGER1_05_batch.05", "PTGER1_05_batch.06",
+                       "PTGER1_10_batch.04", "PTGER1_10_batch.05","PTGER1_10_batch.06" ,"PTGER1_30_batch.04", "PTGER1_30_batch.05", "PTGER1_30_batch.06",
+                       "NPY1R_00_batch.07", "NPY1R_00_batch.08", "NPY1R_00_batch.09", "NPY1R_01_batch.07", "NPY1R_01_batch.08", "NPY1R_01_batch.09", "NPY1R_05_batch.07", "NPY1R_05_batch.08", "NPY1R_05_batch.09",
+                       "NPY1R_10_batch.07", "NPY1R_10_batch.08", "NPY1R_10_batch.09", "NPY1R_30_batch.07", "NPY1R_30_batch.08", "NPY1R_30_batch.09",
+                       "MRX2_00_batch.07", "MRX2_00_batch.08", "MRX2_00_batch.09", "MRX2_01_batch.07","MRX2_01_batch.08", "MRX2_01_batch.09", "MRX2_05_batch.07", "MRX2_05_batch.08", "MRX2_05_batch.09", 
+                       "MRX2_10_batch.07", "MRX2_10_batch.08", "MRX2_10_batch.09","MRX2_30_batch.07", "MRX2_30_batch.08", "MRX2_30_batch.09",
+                       "KOR_00_batch.10", "KOR_00_batch.11", "KOR_00_batch.12", "KOR_01_batch.10", "KOR_01_batch.11", "KOR_01_batch.12", "KOR_05_batch.10", "KOR_05_batch.11", "KOR_05_batch.12",
+                       "KOR_10_batch.10", "KOR_10_batch.11", "KOR_10_batch.12","KOR_30_batch.10", "KOR_30_batch.11", "KOR_30_batch.12",
+                       "PTGER4_00_batch.04", "PTGER4_00_batch.05", "PTGER4_00_batch.06", "PTGER4_01_batch.04", "PTGER4_01_batch.05", "PTGER4_01_batch.06", "PTGER4_05_batch.04", "PTGER4_05_batch.05", "PTGER4_05_batch.06", 
+                       "PTGER4_10_batch.04","PTGER4_10_batch.05","PTGER4_10_batch.06", "PTGER4_30_batch.04", "PTGER4_30_batch.05", "PTGER4_30_batch.06",
+                       "DOR_00_batch.10", "DOR_00_batch.11", "DOR_00_batch.12", "DOR_01_batch.10", "DOR_01_batch.11","DOR_01_batch.12", "DOR_05_batch.10", "DOR_05_batch.11", "DOR_05_batch.12",
+                       "DOR_10_batch.10", "DOR_10_batch.11", "DOR_10_batch.12", "DOR_30_batch.10","DOR_30_batch.11", "DOR_30_batch.12",
+                       "MOR_DAMGO_00_batch.10", "MOR_DAMGO_00_batch.11", "MOR_DAMGO_00_batch.12", "MOR_DAMGO_01_batch.10", "MOR_DAMGO_01_batch.11", "MOR_DAMGO_01_batch.12","MOR_DAMGO_05_batch.10", "MOR_DAMGO_05_batch.11", 
+                       "MOR_DAMGO_05_batch.12", "MOR_DAMGO_10_batch.10", "MOR_DAMGO_10_batch.11", "MOR_DAMGO_10_batch.12", "MOR_DAMGO_30_batch.10", "MOR_DAMGO_30_batch.11", "MOR_DAMGO_30_batch.12",
+                       "NPFFR1_00_batch.01", "NPFFR1_00_batch.02", "NPFFR1_00_batch.03", "NPFFR1_01_batch.01", "NPFFR1_01_batch.02", "NPFFR1_01_batch.03", "NPFFR1_05_batch.01", "NPFFR1_05_batch.02", "NPFFR1_05_batch.03", 
+                       "NPFFR1_10_batch.01", "NPFFR1_10_batch.02","NPFFR1_10_batch.03", "NPFFR1_30_batch.01", "NPFFR1_30_batch.02", "NPFFR1_30_batch.03",
+                       "MRX4_00_batch.07", "MRX4_00_batch.08", "MRX4_00_batch.09", "MRX4_01_batch.07", "MRX4_01_batch.08", "MRX4_01_batch.09", "MRX4_05_batch.07", "MRX4_05_batch.08", "MRX4_05_batch.09",
+                       "MRX4_10_batch.07", "MRX4_10_batch.08", "MRX4_10_batch.09","MRX4_30_batch.07", "MRX4_30_batch.08", "MRX4_30_batch.09",
+                       "QRFPR_00_batch.01", "QRFPR_00_batch.02", "QRFPR_00_batch.03", "QRFPR_01_batch.01", "QRFPR_01_batch.02", "QRFPR_01_batch.03", "QRFPR_05_batch.01", "QRFPR_05_batch.02", "QRFPR_05_batch.03", 
+                       "QRFPR_10_batch.01", "QRFPR_10_batch.02" ,"QRFPR_10_batch.03","QRFPR_30_batch.01", "QRFPR_30_batch.02", "QRFPR_30_batch.03")
+                       
+
+                       
+prot.mat.bk <- prot.mat                       
+     
+prot.mat <-  prot.mat[, new.col.order.vec] 
+colnames(prot.mat)
+                    
+
+Heatmap(prot.mat,
+        cluster_columns = F,
+        column_split = tstrsplit(colnames(prot.mat), "[_.]")[[1]],
+        )   
+```
+
+
+```{r}
+col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD")  #"#999933" '#DDCC77' "grey"
+
+# add split order
+split <- factor(modules.adj, levels=c('1','2','3','4','5','6','7','8','9','10','11'))
+#split <- factor(modules.tom, levels=c('1','2','3','4','5','6'))
+
+split_level = intersect(1:11, split)
+
+# add wgcna module annotation
+row_ha <- rowAnnotation(modules=modules.adj, 
+                        #set any annotaiton settings for CH 
+                        annotation_legend_param = list(modules = list(
+                       	ncol = 2, 
+                       	at = split_level,
+                       	title = "wgcna modules")))#,
+                        #setting annotation cols
+                        col=list(modules = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3],
+                                                       '4'=col.pal[4], '5'=col.pal[5], '6'=col.pal[6], 
+                                                       '7'=col.pal[7], '8'=col.pal[8],'9'=col.pal[9], 
+                                                       '10'=col.pal[10], '11'=col.pal[11])))
+
+
+colnames(prot.mat)
+hm <- Heatmap(prot.mat, 
+              cluster_columns = FALSE,  
+              show_row_dend = FALSE,
+              split = split,
+              name = "log2(intensity/\nmean(timeZero))",
+              column_split = tstrsplit(colnames(prot.mat), "[_.]")[[1]],
+              na_col = 'darkgrey',
+              #row_title =sprintf("%d Proteins",
+              #              nrow(prot.mat)),
+              row_names_gp = gpar (fontsize= 1),
+              column_names_gp = gpar (fontsize= 3),
+              cluster_row_slices = F,
+              cluster_column_slices = F,
+              row_title = "%s",
+              row_title_side = 'right',
+              show_row_names = F,
+              row_title_gp = gpar (fontsize= 9),
+              column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=12))
+
+BackupAsPDF(hm, 'heatmap.wgcna.modules.colclustered.nocol', dimensions=c(7,8))
+```
+```{r}
+random_text = function(n) {
+    sapply(1:n, function(i) {
+        paste0(sample(letters, sample(4:10, 1)), collapse = "")
+    })
+}
+text_list = list(
+    text1 = random_text(4),
+    text2 = random_text(4),
+    text3 = random_text(4),
+    text4 = random_text(4)
+)
+# note how we set the width of this empty annotation
+ha = rowAnnotation(foo = anno_empty(border = FALSE, 
+    width = max_text_width(unlist(text_list)) + unit(4, "mm")))
+
+Heatmap(matrix(rnorm(1000), nrow = 100), name = "mat", row_km = 4, right_annotation = ha)
+for(i in 1:4) {
+    decorate_annotation("foo", slice = i, {
+        grid.rect(x = 0, width = unit(2, "mm"), gp = gpar(fill = i, col = NA), just = "left")
+        grid.text(paste(text_list[[i]], collapse = "\n"), x = unit(4, "mm"), just = "left")
+    })
+}
+```
+

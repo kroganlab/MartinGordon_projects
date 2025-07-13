@@ -1,0 +1,294 @@
+---
+title: "070325_SECAT_filePreparation"
+author: "Martin Gordon"
+date: "2025-07-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Prepare input files for the SECAT pipeline. Take a the files prepared for CCProfiler and mport into SECAT
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(viridis)
+library(pracma)
+library(magick)
+library(eulerr)
+library(CCprofiler)
+library(parallel)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+be careful with nomenclateure; when people talk about peptides, they usually mean peptide ions (peptide + charge)
+
+Go back to the MSStats format and load
+Over 1.5k peptides map to multiple proteins; isoforms, non-isoforms etc.
+I think for now (pipeline testing) I will drop these problematic proteins
+
+```{r}
+mss.dt <- fread('./061625_D3_MSstatsSmmarization_data/2025_07_01_hiv.d123.mss.feature.csv.gz')
+
+mss.dt[, peptide := paste0(sequence,'.', precursorCharge)]
+pep.multimappers <- mss.dt[, length(unique(protein)), by=.(peptide)][V1>2]
+pep.multimappers
+mss.dt[peptide == 'LLLPGELAK.2',  .(protein, sample)] %>% unique()
+
+mss.dt <- mss.dt[!peptide %in% pep.multimappers,]
+```
+Keep only proteotypic proteins
+```{r}
+mss.dt <- mss.dt[!peptide %in% pep.multimappers,]
+mss.dt <- mss.dt[,.(sample, fraction, protein, peptide, intensity)]
+
+# alos drop protein groups
+mss.dt <- mss.dt[!grepl(';', protein)]
+```
+Also, clearly isoforms have been included in the search... 
+We want to keep things as simple as possible... 
+Isoforms only included in the search for the third donor to further confuse things... just dropping this set
+```{r}
+mss.dt[, gene := multiUniprots2multiGenes(protein, species='HUMAN')]
+
+to.keep <- mss.dt[grepl('-', gene), unique(gene)] %>% 
+  grep('^H',.,value=T)
+
+isoforms.to.drop <- mss.dt[(grepl('-', protein) & !gene %in% to.keep), unique(gene)]
+
+mss.dt <- mss.dt[!gene %in% isoforms.to.drop] 
+
+fwrite(mss.dt, ScriptAndDatedFileName('hiv.d123.noProtGroupsOrIsoforms.csv.gz'))
+```
+How many proteins overlap in the 3 conditions?
+```{r}
+mss.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/070325_SECAT_filePreparation_data/2025_07_03_hiv.d123.noProtGroupsOrIsoforms.csv.gz')
+
+mss.dt[,.SD[, unique(protein)], by=sample] 
+
+prot.ls <- mss.dt[,.SD[, unique(protein)], by=sample] %>% 
+  split(., .$sample)
+prot.ls <- lapply(prot.ls, function(x) x$V1)
+
+# only 4141 k proteins presnet across all datasets...
+# this wont work as I will loose the viral proteins
+Reduce(intersect, prot.ls) %>% 
+  length()
+```
+4.1k overlappung IDs.. probably not great
+
+```{r}
+plot(eulerr::euler(prot.ls), quantities=T)
+
+ggplot(mss.dt[,length(unique(protein)), by=sample], aes(x=sample, y=V1)) +
+  geom_bar(stat='identity')
+```
+prepare the peptide ID file 
+
+```{r}
+secat.pep.dt
+
+secat.pep.dt <- mss.dt[, .(run_id=paste0(sample,'_',fraction), protein_id=protein, peptide_id=peptide,peptide_intensity=intensity)]
+#fwrite(secat.pep.dt[grepl('_2_', run_id)], ScriptAndDatedFileName('secat.peptide.file.donor2only.csv.gz'))
+
+
+# write it in wide format as its the default for the pipeline
+fwrite(dcast(secat.pep.dt[grepl('_2_', run_id)], protein_id+peptide_id~run_id, value.var='peptide_intensity'),  ScriptAndDatedFileName('secat.peptide.file.donor2only.csv.gz'))
+
+fread('./070325_SECAT_filePreparation_data/input/scott2017_experimentaldesign.csv')
+fread('./070325_SECAT_filePreparation_data/input/scott2017_peptidelevel_intensity.tsv')
+```
+
+
+## 07-09-25
+Read in the example data and compare with ours to find the issue... I think it may be the col ordering causing the pipeline to fail... if this is case it is a simple fix (I think...)
+
+```{r}
+sec.test.ints <- fread('./data/secat_testdata/E1605191849_feature_alignment.tsv.gz')
+sec.fract.ints <- fread('./data/secat_testdata/hek293_sec_mw.csv')
+
+
+head(sec.fract.ints)
+head(sec.test.ints)
+
+
+
+
+sec.test.ints
+
+```
+Now compare to our data
+```{r}
+sec.data <- fread('./070325_SECAT_filePreparation_data/2025_07_08_secat.peptide.file.donor2only.csv.gz')
+sec.fract <- fread('./070325_SECAT_filePreparation_data/2025_07_08_secat.fraction.anno.d2only.csv')
+
+head(sec.fract)
+head(sec.data)
+
+fwrite(sec.data,sep="\t", ScriptAndDatedFileName('secat.peptide.file.donor2only.tsv.gz'))
+```
+Now generate each of the peptide ints files for pairwise comparisons
+
+```{r}
+sec.data[!grepl('Challenged', run_id), unique(run_id)]
+
+fwrite(sec.data[!grepl('Challenged', run_id),], sep="\t", ScriptAndDatedFileName('hiv.d2.InfectedVsUninfected.tsv.gz'))
+fwrite(sec.data[!grepl('Infected', run_id),], sep="\t", ScriptAndDatedFileName('hiv.d2.ChallengedVsUninfected.tsv.gz'))
+fwrite(sec.data[!grepl('Uninfected', run_id),], sep="\t", ScriptAndDatedFileName('hiv.d2.InfectedVsChallenged.tsv.gz'))
+```
+Do the same with the annotation information
+```{r}
+# reset as using just d2
+sec.fract[, replicate_id := 1]
+
+fwrite(sec.fract[!grepl('Challenged', run_id),],ScriptAndDatedFileName('hiv.d2.InfectedVsUninfected.fractionAnnotation.csv'))
+fwrite(sec.fract[!grepl('Infected', run_id),], ScriptAndDatedFileName('hiv.d2.ChallengedVsUninfected.fractionAnnotation.csv'))
+fwrite(sec.fract[!grepl('Uninfected', run_id),], ScriptAndDatedFileName('hiv.d2.InfectedVsChallenged.fractionAnnotation.csv'))
+```
+
+```{r}
+(sec.test.ints[,.(filename, ProteinName, transition_group_id, Intensity)])$ProteinName %>% unique()
+```
+
+
+
+Now try the SEC annotation file. Columns must match the run id in the peptide intensity file
+
+```{r}
+anno.dt <- secat.pep.dt[, .(run_id)] %>% 
+  unique()
+anno.dt[, c('condition_id', 'replicate_id', 'sec_id') := tstrsplit(run_id, '_', keep=c(1,2,3))]
+anno.dt[, sec_id := as.numeric(sec_id)]
+setorder(anno.dt, sec_id, condition_id)
+
+# now annotate with the molecular weight using mw standards 
+# done already for CCprofiler prep; just read this info in...
+ccp <- readRDS('062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_24_hiv.d123.huAnnotated.peptide.traces.rds')
+anno.dt[ccp$Challenged_1$fraction_annotation, sec_mw := i.molecular_weight, on=c(sec_id = 'id')]
+
+fwrite(anno.dt[, .(run_id, sec_id, sec_mw, condition_id, replicate_id)],  ScriptAndDatedFileName('secat.fraction.anno.csv'))
+
+
+# for D2 only
+fwrite(anno.dt[grepl('_2_', run_id), .(run_id, sec_id, sec_mw, condition_id, replicate_id)],  ScriptAndDatedFileName('secat.fraction.anno.d2only.csv'))
+```
+
+I think incase it fails I should also prepare the 'full' datatable and see if we can get this running
+
+```{r}
+full.anno.dt <- lapply(names(ccp), function(x){
+  print(x)
+  return(ccp[[x]]$fraction_annotation)
+  }) %>% 
+  rbindlist()
+
+full.anno.dt[, c('condition_id', 'replicate_id', 'sec_id') := tstrsplit(filename, '_|[.]', keep=c(1,2,3))]
+full.anno.dt[,.N, by=.(condition_id)] # looks good
+
+fwrite(full.anno.dt[replicate_id != 3, .(run_id=paste0(condition_id, '_', replicate_id, '_', sec_id), sec_id, sec_mw=molecular_weight, condition_id, replicate_id)], ScriptAndDatedFileName('secat.anno.fraction.noRep3.allFractions.csv')
+```
+
+Ok, now we will take the same proteins from this set so that the 
+```{r}
+# done already for CCprofiler prep; just read this info in...
+ccp <- readRDS('070125_CCProfiler_PreProcessing_data/2025_07_02_hiv.d123.peptide.allmissingfrac.traces.rds')
+
+lapply(names(ccp), function(x){
+  
+  print(ccp[[x]]$traces)
+})
+
+
+secat.pep.dt[!grepl('_3_', run_id), unique(run_id)]
+```
+
+## 08-07-25
+
+Runs failed. Need to try rerunning and supplying matrix format input file
+
+```{r}
+dcast(secat.pep.dt, protein_id+peptide_id~run_id, value.var = 'peptide_intensity')
+
+
+
+colnames(secat.pep.dt)
+```
+
+```{r}
+pep.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/070125_CCProfiler_PreProcessing_data/2025_07_02_hiv.d123.mss.peptide.noMods.csv.gz')
+pep.dt
+
+
+
+go.test <- fread('/Users/martingordon/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_18_enrich.go.bp.csv.gz')
+
+
+gsea <- fread('/Users/martingordon/Documents/projects/032125_ABanerjee_RNAseq/042325_DifferentialAnalysis_RegeneratePlots_data/2025_04_25_gsea.gobp.subsetContrasts.csv')
+gsea <- gsea[contrast == 'dEX11_HKCA-WT_HKCA']
+
+
+gsea[padj < 0.05 & grepl('stress', pathway)]
+
+
+
+
+fwrite(gsea[padj < 0.05 & grepl('CD[80|68|', leadingEdge)], ScriptAndDatedFileName('gsea.mutVsWt.hkca.CDgenesInpathway.csv'))
+gsea[padj < 0.05 & grepl('[|]+TLR5', leadingEdge)]
+
+gsea[padj < 0.05 & grepl('[|]+CD', leadingEdge)]
+gsea[padj < 0.05 & grepl('comp', pathway)]
+gsea[grepl('complement', pathway)]
+gsea$contrast
+enrich.allcontrasts <- fread('/Users/martingordon/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_18_enrich.simplified.go.bp.csv.gz')
+
+enrich.allcontrasts$enrich.grp %>%  unique() %>% 
+  gsub('[.]up|down', '', .) %>% 
+  unique()
+
+
+gsea[grepl('phagocytosis', pathway) ]
+go.test[grepl("dEX11_HKCA-WT_HKCA", enrich.grp) & p.adjust < 0.05]
+
+gsea$contrast %>% unique()
+
+go.test[grepl('phago', ID) & p.adjust < 0.05]
+
+go.test[grepl('dEX11_HKCA-WT_HKCA', enrich.grp)][grepl('CD8[06]', geneID),]
+go.test[grepl('dEX11_HKCA-WT_HKCA', enrich.grp)][grepl('complement', ID),]
+
+examplePCPdataLong[grep('[()]', peptide_id)]
+
+"dEX11_HKCA-WT_HKCA"
+
+
+```
+
+limit this to proteotpyic peptides; drop those peptides that map to more than one protein
+```{r}
+pep.dt[, length(unique(protein)), by=sequence]
+```
+
+
+```{r}
+pep.traces <- readRDS('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/070125_CCProfiler_PreProcessing_data/2025_07_02_hiv.d123.peptide.traces.allfract.wImpute.rds')
+pep.traces$Challenged_1$fraction_annotation %>% str()
+```
+

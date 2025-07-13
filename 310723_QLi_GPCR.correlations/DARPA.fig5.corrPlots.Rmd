@@ -1,0 +1,854 @@
+---
+title: "WGCNA.paperFig5.correlationPlots"
+author: "Martin Gordon"
+date: "2023-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Generating plots of the correlation scores from figure 5 in the DARPA proteomics paper
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(WGCNA)
+library(magrittr)
+library(preprocessCore) # quantile normalisation
+library(stringr)
+library(matrixStats)
+library(simplifyEnrichment)
+library(fmsb)
+library(readxl)
+library(ggbeeswarm)
+library(ggrepel)
+library(curl)
+library(dendextend) # extension for dendogram
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+
+# helper scripts for module/network export etc
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+source ("/Users/martingordon/Documents/utils/mg_utils/plottingHelperFunctions.R")
+
+```
+
+plots we wish to generate
+- rank plot of the correlation scores
+- heatmaps of the top ranking genes [maybe take top 10-20 per group] and plot log2FC and correlation values
+- a kind of scatterplot of the correlation scores
+
+lets first look at the data we have; are these cor scores correctly calculated?
+
+06/09/23
+-----
+Correlations with the IUPHAR classification
+
+lets first check the raw data 
+
+```{r}
+pred <- fread("./data/predictionScores.txt")
+exp <- fread ("./data/experimentalScores.txt")
+iupar <- data.table(read_xlsx("./data/IUPHAR_11GPCRs_Gprotein_class_primary.xlsx"))
+
+iupar
+
+exp.long <- melt(exp, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+pred.long <- melt(pred, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+
+# convert to long format
+iupar.long <- melt(iupar, id.vars = 'GPCR', measure.vars = grep('GPCR', colnames(iupar), invert=T),  variable.name = "GProtein", value.name = "score") %>% 
+  .[, score := as.numeric(score)] 
+```
+
+
+```{r scores.list}
+scores.list <- list(exp = exp.long,
+                    pred = pred.long,
+                    iupar = iupar.long)
+```
+Convert the scores to a matrix
+
+```{r}
+scores.mat <- lapply(scores.list, function(x){
+  dcast(x, GProtein~GPCR, value.var = 'score') %>% 
+    as.matrix(rownames = 'GProtein')
+})
+
+lapply(scores.mat, colnames)
+```
+apply the scores mat to the data
+```{r}
+scores.mat <- lapply(scores.mat, function(x){
+  colnames(x) <- c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+  return(x)
+})
+```
+
+reorder the mss columns to follow the order above 
+
+Restrict the analysis to the sig genes from the APEX experiment (pval < 0.005 & abs log2FC(1.5))
+
+```{r}
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+
+mss.out <- fread('./data/2022_08_31_NiceFitsPower3.csv')
+
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+
+# filter to sig genes and reorder
+sig.genes <- mss.out[pvalue < 0.005 & abs(log2FC) > log2(1.5) & receptor != 'MOR.LG94', unique(gene) ]
+exp.mat <- exp.mat[rownames(exp.mat) %in% sig.genes,]
+
+
+# renanme MOR DAMGO to MOR
+colnames(exp.mat) <- c('DOR', 'KOR', 'MOR', 'MRX2', 'MRX4', 'NK1R', 'NPFFR1', 'NPY1R','PTGER1', 'PTGER4','QRFPR')
+
+# reorder the cols to match the matrices
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+
+exp.mat[1:10,1:10]
+exp.mat <- exp.mat[, col.order]
+exp.mat[1:10,1:10]
+
+
+# sanit check; looks fine
+lapply(scores.mat, colnames)
+```
+
+run the correlations for each of the datasets
+
+```{r}
+# cors run colwise with the two vectors
+cor.list <- lapply(scores.mat, function(x){
+  cor(t(exp.mat), t(x), use= "pairwise.complete.obs")
+})
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "gene")
+  return(x)
+})
+```
+
+count number of observations, only want to take results with vals observed for all receptors to reduce FPs
+
+```{r}
+cor.long$iupar[, .SD[which.max(R)], by=GProtein]
+
+# most of these have values for the 11 receptors
+obs.counts <- mss.out[!is.na(log2FC) & receptor != 'MOR.LG94' & gene %in% sig.genes, .N, by = gene]
+hist(obs.counts$N, breaks=seq(1,11))
+
+```
+
+add this info to the correlation res
+
+```{r}
+lapply(cor.long, function(x){
+  
+  x[obs.counts, numObservations := N, on = 'gene']
+  setorder(x, -numObservations, -R, na.last = TRUE) #strongest associations at top
+})
+
+```
+Now that we have the correlations, what are the top hits per gprotein 
+
+```{r}
+#col.pal <-  randomcoloR::distinctColorPalette(k=length(unique(cor.long$iupar$GProtein)))
+
+# strong +/- correlation to IUPHAR classification
+g <-  cor.long$iupar[abs(R) > .7, .N, by=GProtein] %>% 
+  ggplot(., aes(x=reorder(GProtein,-N), y=N, fill=GProtein)) +
+  geom_bar(stat='Identity') + 
+  ggtitle('Strong correlations abs(r) > 0.7') +
+  xlab('IUPHAR classification') +
+  ylab('N') +
+  scale_fill_manual(values=col.pal) +
+  theme_classic()
+
+g
+
+BackupAsPDF(g, 'apex.sigHits.pearsonR.0.7.barplot.')
+```
+```{r}
+# strong +/- correlation to IUPHAR classification
+g <-  cor.long$iupar[abs(R) > .6, .N, by=GProtein] %>% 
+  ggplot(., aes(x=reorder(GProtein,-N), y=N, fill=GProtein)) +
+  geom_bar(stat='Identity') + 
+  ggtitle('Moderate correlations abs(r) > 0.6') +
+  xlab('IUPHAR classification') +
+  ylab('N') +
+  scale_fill_manual(values=col.pal) +
+  theme_classic()
+
+g
+
+BackupAsPDF(g, 'apex.sigHits.pearsonR.0.6.barplot.')
+```
+
+
+As a start, maybe we should check if these APEX hits are enriched for high cor scores relative to bg?
+One way we could look at promising hits is to create a background, (maybe random geneset the same size as our sig hits, find a 
+
+```{r}
+apply(iupar[,-1],2, sum)
+nrow(iupar)
+```
+
+What does the distribution of r scores look like for each of the GProteins?
+Is this a concern? Why the 0 inflation for Gs? is it just bc the binary vecotr only has two 1's?
+```{r}
+col.pal <-  c("#AFC4C4","#C472C9" ,"#B7D878")
+
+g <- ggplot(cor.long$iupar, aes(x=R, fill=GProtein)) + 
+  geom_histogram() +
+  scale_fill_manual(values=col.pal) +
+  theme_classic() +
+  facet_wrap(~GProtein)
+
+BackupAsPDF(g, 'apex.sigHits.pearsonCor.histogram')
+
+```
+
+rank plot of the
+# 
+```{r}
+
+cor.long$iupar[, lab:= '']
+cor.long$iupar[abs(R) > 0.7, lab:= gene]
+
+lapply(seq_along(gprots), function(x,i){
+  
+  g <- ggplot(data=cor.long$iupar[GProtein == x[[i]]], aes(x=reorder(gene,R), y=R, col=GProtein, label=lab)) +
+    geom_point(size=1) +
+    geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+    geom_text_repel(data=cor.long$iupar[GProtein == x[[i]]], aes(label=lab),segment.linetype=3, segement.color='grey', max.overlaps = 30,size=1.5) +
+    xlab('genes (Pearson r ordered)') +
+    theme_classic() +
+    scale_x_discrete(expand=expansion(add=50)) +
+    scale_color_manual(values=c(col.pal[[i]])) +
+    ggtitle(paste0(x[[i]], ' Pearson r')) +
+    theme(axis.text.x = element_blank()
+        )
+  
+ BackupAsPDF(g, 'rankplot.Gprots.R0.7.')
+},x=gprots)
+
+```
+another rankplot with many of the median values removed
+What about only plotting the top 20 percentile in each direction?
+
+```{r}
+cor.dt <- cor.long$iupar[numObservations ==11,]
+cor.dt
+```
+
+```{r}
+
+lapply(seq_along(gprots), function(x,i){
+  
+g <- ggplot(data=cor.dt[GProtein == x[[i]]], aes(x=reorder(gene,R), y=R, col=GProtein, label=lab)) +
+    geom_point(size=1) +
+    geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+    geom_text_repel(data=cor.dt[GProtein == x[[i]]], aes(label=lab),segment.linetype=3, segement.color='grey', max.overlaps = 30,size=1.5) +
+    xlab('genes (Pearson r ordered)') +
+    theme_classic() +
+    scale_x_discrete(expand=expansion(add=50)) +
+    scale_color_manual(values=c(col.pal[[i]])) +
+    ggtitle(paste0(x[[i]], ' Pearson r')) +
+    theme(axis.text.x = element_blank()
+        )
+  
+ BackupAsPDF(g, 'rankplot.Gprots.all.R0.7.')
+},x=gprots)
+
+```
+
+lets try generate dendograms of the correlation scores
+do the requested plots first and come back to this tomorrow maybe..
+show BP tomorrow morning and refine clusters maybe before inputting to heatmap
+
+too many nodes to visualise effectively; drop the nodes with no real correlation to GProteins
+only plot nodes with a weak cor score (> 0.5)
+
+
+```{r}
+gprot.cor.list
+
+lapply(seq_along(gprot.cor.list), function(x,n,i){
+  x[[i]] <-  x[[i]][abs(R) > 0.5,]
+  
+  mat <- as.matrix(x[[i]][,.(gene,R)], rownames='gene')
+  hc <- hclust(dist(mat))
+  
+  # create dendogram object
+  dend <- as.dendrogram(hc)
+  cut_height <- 0.3 # modify to set cut height
+  cut_tree <- dendextend::cutree(dend, h = cut_height, order_clusters_as_data = FALSE)
+  
+  # at the set height, extract the cluster members and calculate their mean cor score to the GProtein
+  # so, need to extract genes of each cluster (names)  calculate the mean/median R value of this cluster and then use this as the lables inn color_branches
+  clust.summary.vec <- c()
+  
+  for (clust  in unique(cut_tree)){
+    genes.oi <-  names(cut_tree[cut_tree == clust])
+    mean.val <-  x[[i]][gene %in% genes.oi, mean(R)]
+    clust.summary.vec <- c(clust.summary.vec, mean.val)
+  }
+  print(clust.summary.vec)
+  clust.summary.vec <- round(clust.summary.vec,2)
+  
+  d.plot <- dend %>%
+    dendextend::color_branches(., h = cut_height, groupLabels = clust.summary.vec) %>%
+    dendextend::set(., "labels_cex", 0.2)
+
+  
+  # saving output 
+  #change names
+  outDir <-  '310723_QLi_GPCR.correlations_data/'
+  fName <-  gsub('/', '_',n[[i]])
+  
+  timeStp <- format(Sys.time(),  "%Y_%m_%d__%H_%M__%S")
+  pdf(paste0(outDir,fName, '.R0.5.dendogram.', timeStp,'.pdf'), width=10, height=7)
+  plot(d.plot, main=paste0(n[[i]], ' Pearson r (>0.5)'))
+  dev.off()
+
+    #ggsave(paste0(n[[i]], 'Ro.5.dendogram'), plot=plot(d.plot, main=paste0(n[[i]], ' Pearson r (>0.5)'))
+   # BackupAsPDF(plot(d.plot), paste0(n[[i]], '.R0.5.dendo.'))
+    #plot(main=paste0(n[[i]], ' Pearson r (>0.5)'))
+},x=gprot.cor.list, n=names(gprot.cor.list))
+
+```
+what about subsampling 
+
+```{r}
+#subset to top values either side of the 
+lapply(seq_along(gprots), function(x,i){
+  
+g <- ggplot(data=cor.dt[GProtein == x[[i]]], aes(x=reorder(gene,R), y=R, col=GProtein, label=lab)) +
+    geom_point(size=1) +
+    geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+    geom_text_repel(data=cor.dt[GProtein == x[[i]]], aes(label=lab),segment.linetype=3, segement.color='grey', max.overlaps = 30,size=1.5) +
+    xlab('genes (Pearson r ordered)') +
+    theme_classic() +
+    scale_x_discrete(expand=expansion(add=50)) +
+    scale_color_manual(values=c(col.pal[[i]])) +
+    ggtitle(paste0(x[[i]], ' Pearson r')) +
+    theme(axis.text.x = element_blank()
+        )
+
+g
+ BackupAsPDF(g, 'rankplot.Gprots.all.R0.7.')
+},x=gprots)
+```
+geenrate plot of cor scores vs log2FC
+can use this to filter out genes that have a small log2FC 
+
+we have 11 scores, 1 per receptor
+x axis cor scores, y axis log2FC
+
+
+combine the mss_subset with cor scores
+keep only things with 11 observations 
+
+```{r}
+# subset to the genes with 11 observations
+mss.subset <- mss.out[receptor != 'MOR.LG94' & gene %in% cor.dt$gene, .(receptor,gene,log2FC,pvalue)]
+
+# calculate some summary statistics per gene; mean, median,SD, variance mad...
+mss.subset[, `:=`(Mean=mean(log2FC), Median=median(log2FC), sd=sd(log2FC), Variance=var(log2FC), MAD=mad(log2FC)), by=gene]
+
+
+# want all possible combos per key so use allow.cartesian
+merged.dt <- merge(x=mss.subset, y=cor.dt[,.(gene,GProtein,R)], all.x=T, all.y=T, by.x='gene', by.y='gene', allow.cartesian = T)
+
+#sanitry check
+#merged.dt[, .N, by=gene]$N %>%  range()
+```
+
+now lets create a 'volcano plot' of correlation and log2FC scores
+These are R scores vs log2FC values
+
+mean-median log2FC + variance?
+label the most significant genes
+geometric mean of log2FC and correlation (need to just take mean of cor as otherwise will be outweighted by log2FC vals)
+
+```{r}
+# geo mean of the abs R and summary values per gene
+merged.dt[, sigScore := sqrt(abs(R) * abs(Mean)), by=gene]
+
+# just label thethings in the top 25% 
+merged.dt[, lab := ifelse(sigScore >= quantile(merged.dt$sigScore, .75), gene, '')]
+
+unique(merged.dt)
+
+g <- ggplot(merged.dt, aes(x=R, y=Median, col=MAD)) +
+  geom_point() +
+  facet_wrap(~GProtein, nrow=3) +
+  scale_color_gradient_colorRamp2(breaks = c(0, 2), colors = c('black', 'red'), name='Median Absolute Deviation') +  
+  xlab('Pearson r') +
+  ylab('Median Log2FC (all receptors)') +
+  geom_vline(xintercept=0, linetype=3, alpha=0.6) +
+  geom_hline(yintercept=0, linetype=3, alpha=0.6) +
+  theme_bw() + 
+  theme(legend.text=element_text(size=8),
+        legend.title =element_text(size=8))
+
+g
+BackupAsPDF(g, 'medianLog2FC.Rscore.unlabeled.scatterplot.', dimensions=c(8,10)) 
+
+
+g <- ggplot(merged.dt, aes(x=R, y=Mean, col=sd)) +
+  geom_point() +
+  facet_wrap(~GProtein, nrow=3) +
+  scale_color_gradient_colorRamp2(breaks = c(0, 2), colors = c('black', 'red'), name='Standard Deviation') +  
+  xlab('Pearson r') +
+  ylab('Mean Log2FC (all receptors)') +
+  geom_vline(xintercept=0, linetype=3, alpha=0.6) +
+  geom_hline(yintercept=0, linetype=3, alpha=0.6) +
+  theme_bw() + 
+  theme(legend.text=element_text(size=8),
+        legend.title =element_text(size=8))
+g
+BackupAsPDF(g, 'meanLog2FC.Rscore.unlabeled.scatterplot.', dimensions=c(8,10)) 
+
+```
+Just too many things to plot;
+iterate through the GProteins and plot and label the extreme values in each
+
+```{r}
+# just take summary scores dt
+merged.dt <- merge(x=unique(mss.subset[,.(gene,Mean,Median,sd,Variance,MAD)]), y=cor.dt[,.(gene,GProtein,R)], all.x=T, all.y=T, by.x='gene', by.y='gene', allow.cartesian = T)
+
+#subset to top values either side of the 
+lapply(seq_along(gprots), function(x,i){
+  
+  gprot.dt <-  merged.dt[GProtein == x[[i]], ]
+
+  gprot.dt[, sigScore := sqrt(abs(R) * abs(Mean)) ]
+
+  # just label the things in the top 10% 
+  gprot.dt[, lab := ifelse(sigScore >= quantile(gprot.dt$sigScore, .9), gene, '')]
+  
+  g <- ggplot(gprot.dt, aes(x=R, y=Mean, col=Variance), label=lab) +
+    geom_point() +
+    geom_text_repel(aes(label=lab),segment.linetype=3, max.overlaps = 20,size=1.5) +
+    scale_color_gradient_colorRamp2(breaks = c(0, 2,4), colors = c('black', 'darkred', 'red'), name='Variance') +  
+    xlab('Pearson r') +
+    ylab('Mean Log2FC (all receptors)') +
+    geom_vline(xintercept=0, linetype=3, alpha=0.6) +
+    geom_hline(yintercept=0, linetype=3, alpha=0.6) +
+    ggtitle(paste0(x[[i]], ' r vs log2FC')) +
+    theme_bw() + 
+    theme(legend.text=element_text(size=8),
+        legend.title =element_text(size=8))
+
+ BackupAsPDF(g, 'log2FC.R.scatterplot.', dimensions=c(8,6))
+},x=gprots)
+```
+
+
+
+tried geom_violin, but labelling the individual top hits in each would require splitting the plot
+trouble plotting with jitter; maybe if we plot the 3 individually this will be more manageable
+
+plot with jitter to show individual points
+```{r}
+cor.dt[, lab := ifelse(abs(R) >= 0.6, gene, '')]
+
+
+g <- ggplot(cor.dt, aes(x=GProtein, y=R, col=GProtein, label=lab)) + 
+  geom_violin(position = position_dodge(1), width = 1) +
+  geom_boxplot(width=0.1) +
+  geom_jitter(data=cor.dt[abs(R) > 0.6,], alpha=0.6, position=position_jitter(seed = 1)) +
+  geom_text_repel(data=cor.dt[abs(R) > 0.6,], aes(label=lab), segment.linetype=3, size=3, 
+                  position = position_jitter(seed = 1)) +
+  #scale_fill_manual(values = c(col.pal)) +
+  scale_color_manual(values = c(col.pal)) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'r0.6.labelled.violinwJitter.', dimensions=c(10,8))
+
+
+
+g <- ggplot(cor.dt, aes(x=GProtein, y=R, col=GProtein, label=lab)) + 
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(data=cor.dt[abs(R) > 0.6,], alpha=0.6, position=position_jitter(seed = 1)) +
+  geom_text_repel(data=cor.dt[abs(R) > 0.6,], aes(label=lab), segment.linetype=3, size=3, 
+                  position = position_jitter(seed = 1)) +
+  scale_color_manual(values = c(col.pal)) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'r0.6.labelled.boxplotwJitter.', dimensions=c(10,8))
+```
+now that we have these, take R scores > 0.6 and cluster using their correlation scores and their log2FC values and see how the output looks
+
+Cluster all things with a (abs) correlation score over 0.6
+
+```{r}
+genes.oi <- cor.dt[abs(R) > 0.6, unique(gene)]
+
+cor.mat <- dcast(cor.dt, gene~GProtein, value.var = 'R') %>% 
+  as.matrix(rownames='gene')
+
+subMat <-  cor.mat[rownames(cor.mat) %in% genes.oi,]
+
+
+hm <- Heatmap(subMat,
+        cluster_columns = F, 
+        show_column_names = F,
+        name='Pearson r',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 5),
+         column_names_gp = gpar (fontsize= 8),
+         column_split = colnames(subMat),
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title='abs Pearson r > 0.6')
+
+BackupAsPDF(hm, 'R.0.6.gprotein.heatmap', dimensions = c(6,8))
+```
+plot the same genes, except using log2FC and per receptor
+
+```{r}
+# change name for plotting
+mss.subset[receptor == 'MOR.DAMGO', receptor := 'MOR']
+
+lfc.mat <- dcast(mss.subset, gene~receptor, value.var = 'log2FC') %>% 
+  as.matrix(rownames='gene')
+
+# extract the sig genes and reorder columns to match the scoring mat
+subMat <-  lfc.mat[rownames(lfc.mat) %in% genes.oi, colnames(scores.mat$iupar)]
+
+
+ha <- HeatmapAnnotation(Gi.Go  = as.logical(scores.mat$iupar[1,]),
+                        Gq.G11 = as.logical(scores.mat$iupar[2,]),
+                        Gs     = as.logical(scores.mat$iupar[3,]),
+                        
+                        col=list(Gi.Go=c('TRUE'='green', 'FALSE'='lightgrey'),
+                                 Gq.G11=c('TRUE'='red', 'FALSE'='lightgrey'),
+                                 Gs=c('TRUE'='blue', 'FALSE'='lightgrey')),
+                        
+                        show_legend = c(F,F,F))
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        show_column_names = T,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+hm <- draw(hm, column_title='abs Pearson r > 0.6')
+
+BackupAsPDF(hm, 'R.0.6.receptor.log2FC.heatmap', dimensions = c(7,11))
+```
+dominated by higher cor scores in GqG11 (looking at distributions, more likely to achieve high cor score?)
+instead, lets take the 5 and 95% quantiles and plot these
+
+```{r}
+genes.oi <- sapply(gprots, function(x){
+  sub.dt <- cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.95) | R <= quantile(R,0.05), unique(gene)])
+}) %>% c() %>% unique()
+
+# each GProtein cor has returned many unique values. Perhaps a good sign!
+genes.oi %>%  length()
+
+```
+cor score plot of the quantiles
+```{r}
+subMat <-  cor.mat[rownames(cor.mat) %in% genes.oi,]
+
+hm <- Heatmap(subMat,
+        cluster_columns = F, 
+        show_column_names = F,
+        name='Pearson r',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 3),
+         column_names_gp = gpar (fontsize= 8),
+         column_split = colnames(subMat),
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title='5% and 95% quantiles')
+
+BackupAsPDF(hm, 'R.05.95.quantiles.gprotein.heatmap', dimensions = c(6,11))
+```
+```{r}
+# extract the sig genes and reorder columns to match the scoring mat
+subMat <-  lfc.mat[rownames(lfc.mat) %in% genes.oi, colnames(scores.mat$iupar)]
+
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        show_column_names = T,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 3),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+hm <- draw(hm, column_title='5% and 95% quantiles')
+
+BackupAsPDF(hm, 'R.05.95.quantiles.log2FC.heatmap', dimensions = c(7,12.5))
+```
+I think we might be overplotting; take the 2 and 98% quantiles
+150 proteins in total
+```{r}
+genes.oi <- sapply(gprots, function(x){
+  sub.dt <- cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.98) | R <= quantile(R,0.02), unique(gene)])
+}) %>% c() %>% unique()
+
+# each GProtein cor has returned many unique values. Perhaps a good sign!
+genes.oi %>%  length()
+```
+
+after plotting both these views, we can look at the distribution of log2FC vs cor scores and also the 
+
+```{r}
+subMat <-  cor.mat[rownames(cor.mat) %in% genes.oi,]
+
+hm <- Heatmap(subMat,
+        cluster_columns = F, 
+        show_column_names = F,
+        name='Pearson r',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4.5),
+         column_names_gp = gpar (fontsize= 8),
+         column_split = colnames(subMat),
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title='2% and 98% quantiles')
+
+
+BackupAsPDF(hm, 'R.02.98.quantiles.gprotein.heatmap', dimensions = c(6,8))
+```
+and log2FC scores
+```{r}
+# extract the sig genes and reorder columns to match the scoring mat
+subMat <-  lfc.mat[rownames(lfc.mat) %in% genes.oi, colnames(scores.mat$iupar)]
+
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        show_column_names = T,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 5),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+hm <- draw(hm, column_title='2% and 98% quantiles')
+
+BackupAsPDF(hm, 'R.02.98.quantiles.log2FC.heatmap', dimensions = c(8,11))
+```
+plot the 5 and 10% quantile genes for each dataset 
+Reduce overplotting and help focus on specific results
+
+```{r}
+genes.oi <- sapply(gprots, function(x){
+  sub.dt <- cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.95) | R <= quantile(R,0.05), unique(gene)])
+}) %>% c() %>% unique()
+
+
+g <- ggplot(merged.dt[gene %in% genes.oi,], aes(x=R, y=Mean, col=sd)) +
+  geom_point() +
+  facet_wrap(~GProtein, nrow=3) +
+  scale_color_gradient_colorRamp2(breaks = c(0, 2), colors = c('black', 'red'), name='Standard Deviation') +  
+  xlab('Pearson r') +
+  ylab('Mean Log2FC (all receptors)') +
+  geom_vline(xintercept=0, linetype=3, alpha=0.6) +
+  geom_hline(yintercept=0, linetype=3, alpha=0.6) +
+  theme_bw() + 
+  theme(legend.text=element_text(size=8),
+        legend.title =element_text(size=8))
+g
+BackupAsPDF(g, 'meanLog2FC.Rscore.unlabeled.quantile.05.95.scatterplot.', dimensions=c(8,10)) 
+```
+top quantile (5% and 95%) quantile genes plotted individually per GProtein and label
+maybe more helpful to overlay these top scoring correlated proteins on the plot and col red? Hopefully then people can see if the scores match
+Plot by receptor and color? Instead of taking average over alll log2FC values, we only want to toake average over 
+```{r}
+#subset to top values either side of the 
+lapply(seq_along(gprots), function(x,i){
+  
+  gprot.dt <-  merged.dt[GProtein == x[[i]], ]
+  genes.oi <- gprot.dt[R >= quantile(R,0.95) | R <= quantile(R,0.05), unique(gene)]
+  gprot.dt <- gprot.dt[gene %in% genes.oi,]
+
+  gprot.dt[, sigScore := sqrt(abs(R) * abs(Mean)) ]
+
+  # just label the things in the top 10% 
+ # gprot.dt[, lab := ifelse(sigScore >= quantile(gprot.dt$sigScore, .7), gene, '')]
+  
+  g <- ggplot(gprot.dt, aes(x=R, y=Mean, col=Variance), label=gene) +
+    geom_point() +
+    geom_text_repel(aes(label=gene),segment.linetype=3, max.overlaps = 20,size=1.5) +
+    scale_color_gradient_colorRamp2(breaks = c(0, 1.5,3), colors = c('black', 'darkred', 'red'), name='Variance') +  
+    xlab('Pearson r') +
+    ylab('Mean Log2FC (all receptors)') +
+    geom_vline(xintercept=0, linetype=3, alpha=0.6) +
+    geom_hline(yintercept=0, linetype=3, alpha=0.6) +
+    ggtitle(paste0(x[[i]], ' r vs log2FC 5% and 95% quantiles')) +
+    theme_bw() + 
+    theme(legend.text=element_text(size=8),
+        legend.title =element_text(size=8))
+
+ BackupAsPDF(g, 'log2FC.R.quantile.05.95.scatterplot.', dimensions=c(8,6))
+},x=gprots)
+
+```
+28-11-23
+----
+Generate plots with only the log2FC values used per GProtein group
+
+```{r}
+# just take summary scores dt
+merged.dt <- merge(x=unique(mss.subset[,.(gene,receptor,log2FC,pvalue)]), y=cor.dt[,.(gene,GProtein,R)], all.x=T, all.y=T, by.x='gene', by.y='gene', allow.cartesian = T)
+
+#subset to top values either side of the 
+lapply(seq_along(gprots), function(x,i){
+  
+  # extract subDT with relevant genes
+  gprot.dt <-  merged.dt[GProtein == x[[i]], ]
+  genes.oi <- gprot.dt[R >= quantile(R,0.95) | R <= quantile(R,0.05), unique(gene)]
+  gprot.dt <- gprot.dt[gene %in% genes.oi,]
+  
+  
+  # calculate summary stats per gprotein group
+  if (x[[i]] == 'Gs'){
+   sub.dt <- gprot.dt[receptor %in% c('PTGER4', 'NK1R'),] %>% 
+     .[, `:=`(Mean=mean(log2FC), Median=median(log2FC), sd=sd(log2FC), Variance=var(log2FC), MAD=mad(log2FC)), by=gene]
+
+  } else if (x[[i]] == 'Gq/G11'){
+   sub.dt <-  gprot.dt[receptor %in% c('MRX2', 'MRX4', 'PTGER1', 'QRFPR','NK1R'),] %>% 
+     .[, `:=`(Mean=mean(log2FC), Median=median(log2FC), sd=sd(log2FC), Variance=var(log2FC), MAD=mad(log2FC)), by=gene]
+
+  } else if (x[[i]] == 'Gi/Go'){
+   sub.dt <-  gprot.dt[receptor %in% c('MRX2', 'NPFFR1', 'NPY1R', 'DOR','KOR', 'MOR', 'QRFPR'),] %>% 
+     .[, `:=`(Mean=mean(log2FC), Median=median(log2FC), sd=sd(log2FC), Variance=var(log2FC), MAD=mad(log2FC)), by=gene]
+  }
+  
+  sub.dt[, sigScore := sqrt(abs(R) * abs(Mean)) ]
+  # extract cols we want and remove the duplicate rows
+  sub.dt <- sub.dt[, .(gene, R, Mean, Median, sd, Variance, MAD)] %>% unique()
+
+  # just label the things in the top 10% 
+ # gprot.dt[, lab := ifelse(sigScore >= quantile(gprot.dt$sigScore, .7), gene, '')]
+  
+  g <- ggplot(sub.dt, aes(x=R, y=Mean, col=Variance), label=gene) +
+       geom_point() +
+       geom_text_repel(aes(label=gene),segment.linetype=3, max.overlaps = 20,size=1.5) +
+       scale_color_gradient_colorRamp2(breaks = c(0, 1.5,3), colors = c('black', 'darkred', 'red'), name='Variance') +  
+       xlab('Pearson r') +
+       ylab('Mean Log2FC (IUPAR group receptors)') +
+       geom_vline(xintercept=0, linetype=3, alpha=0.6) +
+       geom_hline(yintercept=0, linetype=3, alpha=0.6) +
+       ggtitle(paste0(x[[i]], ' r vs log2FC 5% and 95% quantiles')) +
+       theme_bw() + 
+       theme(legend.text=element_text(size=8),
+        legend.title =element_text(size=8))
+
+ BackupAsPDF(g, 'log2FCGProtSubset.R.quantile.05.95.scatterplot.', dimensions=c(8,6))
+},x=gprots)
+```
+Generate the same plot with the full dataset
+
+```{r}
+#subset to top values either side of the 
+lapply(seq_along(gprots), function(x,i){
+  
+  gprot.dt <-  merged.dt[GProtein == x[[i]], ]
+  
+  # calculate summary stats per gprotein group
+  if (x[[i]] == 'Gs'){
+   sub.dt <- gprot.dt[receptor %in% c('PTGER4', 'NK1R'),] %>% 
+     .[, `:=`(Mean=mean(log2FC), Median=median(log2FC), sd=sd(log2FC), Variance=var(log2FC), MAD=mad(log2FC)), by=gene]
+
+  } else if (x[[i]] == 'Gq/G11'){
+   sub.dt <-  gprot.dt[receptor %in% c('MRX2', 'MRX4', 'PTGER1', 'QRFPR','NK1R'),] %>% 
+     .[, `:=`(Mean=mean(log2FC), Median=median(log2FC), sd=sd(log2FC), Variance=var(log2FC), MAD=mad(log2FC)), by=gene]
+
+  } else if (x[[i]] == 'Gi/Go'){
+   sub.dt <-  gprot.dt[receptor %in% c('MRX2', 'NPFFR1', 'NPY1R', 'DOR','KOR', 'MOR', 'QRFPR'),] %>% 
+     .[, `:=`(Mean=mean(log2FC), Median=median(log2FC), sd=sd(log2FC), Variance=var(log2FC), MAD=mad(log2FC)), by=gene]
+  }
+  
+  sub.dt[, sigScore := sqrt(abs(R) * abs(Mean)) ]
+  # extract cols we want and remove the duplicate rows
+  sub.dt <- sub.dt[, .(gene, R, Mean, Median, sd, Variance, MAD,sigScore)] %>% unique()
+  
+  
+  # just label the things in the top 10% 
+  sub.dt[, lab := ifelse(sigScore >= quantile(sub.dt$sigScore, .9), gene, '')]
+  
+  g <- ggplot(sub.dt, aes(x=R, y=Mean, col=Variance), label=lab) +
+    geom_point() +
+    geom_text_repel(aes(label=lab),segment.linetype=3, max.overlaps = 20,size=1.5) +
+    scale_color_gradient_colorRamp2(breaks = c(0, 2,4), colors = c('black', 'darkred', 'red'), name='Variance') +  
+    xlab('Pearson r') +
+    ylab('Mean Log2FC (IUPAR group receptors)') +
+    geom_vline(xintercept=0, linetype=3, alpha=0.6) +
+    geom_hline(yintercept=0, linetype=3, alpha=0.6) +
+    ggtitle(paste0(x[[i]], ' r vs log2FC')) +
+    theme_bw() + 
+    theme(legend.text=element_text(size=8),
+        legend.title =element_text(size=8))
+
+ BackupAsPDF(g, 'log2FC.GProtSubset.R.scatterplot.', dimensions=c(8,6))
+},x=gprots)
+```
+
+
+
+write out these results for the scores to the WGCNA directory
+
+```{r}
+#lapply(seq_along(cor.long), function(x,n,i){
+#  fwrite(x[[i]][numObservations == 11], paste0('output/', n[[i]], '.proteinClassificationCorrelations.csv'))
+#},x=cor.long, n=names(cor.long))
+```
+
+read in this data and plot the correlation ranks, then a heatmap of the top scores per gene
+
+
+
+
+```{r}
+cor.long$iupar$GProtein
+
+lapply(cor.long$iupar$GProtein, function(x){
+  
+  ggplot(cor.long$iupar[ GProtein == x,], aes(x=reorder(gene,-R), y=R)) + geom_point()
+  
+})
+
+
+```
+
+

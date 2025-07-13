@@ -1,0 +1,175 @@
+---
+title: "DARPA33_contrastsofcontrast"
+author: "Martin Gordon"
+date: "2023-07-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Running contrast of contrast analysis
+
+#Two way ANOVA: assess effect of two predictor vs one (continuous) outcome variable 
+# A two-way ANOVA test reveals the results of two independent variables on a dependent variable. ANOVA test results can then be used in an F-test, a statistical test used to determine whether two populations with normal distributions share variances or a standard deviation, on the significance of the regression formula overall.
+
+Issue with groups having the same sample size: should I include the discarded sample?
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library (emmeans)
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+Samples are pre-treated with antagonists (AT29, AT53 and AT99), and then treated +/- PGE00 PGE_30. Observed time is t0 and t30
+
+
+The two way anova is agonist x time post-treatment
+
+Main goal is to detect psilocin-dependent phosphorylation that is unique to the antagonist case. To answer that, these statistics look for significant differences in the time-post-treatment effect (TPT) with and without antagonist, and then we inspect the data to see if the differences are in the direction of interest.
+
+# Fit linear models, one per "protein"
+protein is actually a phopho-site-combination
+```{r}
+# including the dropped sample for now
+tprotQuant <- fread ("/Users/martingordon/Documents/projects/071023_QLi_DARPA/DARPA_33_data/2023_07_10_ProteinLevelData.csv.gz")
+
+str(tprotQuant)
+
+str_extract("AT[0-9]{2}", protQuant$GROUP)
+# parse GROUP names to define the actual columns that the linear models will work on
+# this work depends on how your columsn are defined
+tprotQuant[, ant :=  as.factor(str_extract(GROUP,"AT[0-9]{2}"))]
+tprotQuant[, status := as.factor(ifelse(grepl("00", GROUP), "00", "30"))]
+tprotQuant
+
+# linearModelsAllProteins can this function which computes statistic for a contrast of two different log2FC
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~status|ant){  # how does the treatment effect change per antagonist level? basically compare treatment effect within each antagonist level
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+# postProcessFunction = emmeans.contrastOfContrasts tells it to use the function above after doing anova.
+# it is optional, adds significant time to the computation (~5x), but is nice to
+# put a magnitude and p value on specific differences of differences
+#
+# cl = 6 parameter says to use 6 processes.  Set to NULL if multiprocess is failing, or higher or lower as you wish.
+# Numbers near the number of processors available in your machine is probably counterproductive.
+lm.out <- linearModelsAllProteins(protQuant, 
+                                  formulaList = list(interaction = LogIntensities~status + ant + ant:status ), # you could define other models here, but we name and define one model. 
+                                  splitColumn = "Protein", postProcessFunction = emmeans.contrastOfContrasts, cl = 6) |> suppressWarnings()
+```
+
+# inspect anova p values per term
+V weak evidence of antagonist effect: looks to be mainly treatment
+```{r}
+
+ggplot (lm.out$anova, aes(x = p.value)) + geom_histogram(boundary = c(0.0), 
+                                                         # adjust binwidth to as narrow as is legible
+                                                         binwidth = 0.005)+
+  facet_wrap(~term)
+
+
+```
+
+## adjusted p values in anova
+```{r}
+lm.out$anova[, fdr := p.adjust(p.value, method = "BH"), by = term]
+```
+
+
+## T0 v T30 effects viewed as a heatmap
+All look v similiar
+
+```{r}
+#play with thresholds here
+sigProtein <- lm.out$anova[term %in% c( "status") & fdr < 0.05, Protein]
+
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+
+Heatmap (prot.mat, cluster_columns = FALSE, 
+         column_split = list (str_extract(colnames(prot.mat),"AT[0-9]{2}"),
+                              str_extract(colnames(prot.mat),"PGE[0-9]{2}")))
+```
+
+
+
+
+## Antagonist effects
+
+
+```{r}
+#play with thresholds here
+# no hits by fdr so reduce threshold
+sigProtein <- lm.out$anova[term %in% c( "ant") & p.value < 0.001, Protein]
+sigProtein
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat)
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+rownames(prot.mat)
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+Heatmap (prot.mat, cluster_columns = FALSE, 
+         column_split = list (str_extract(colnames(prot.mat),"AT[0-9]{2}"),
+                              str_extract(colnames(prot.mat),"PGE[0-9]{2}")))
+
+```
+
+## interaction effects 
+(different antagonist post-treatment response)
+Plotting logIntes
+
+```{r, fig.width = 8, fig.height = 8}
+#play with thresholds here
+# there weren't many hits by fdr, so use a strong p.value
+sigProtein <- lm.out$anova[term %in% c( "status:ant") & p.value < 0.001, Protein]
+
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+Heatmap (prot.mat, cluster_columns = FALSE, 
+         column_split = list ( column_split = list (str_extract(colnames(prot.mat),"AT[0-9]{2}"),
+                              str_extract(colnames(prot.mat),"PGE[0-9]{2}"))))
+
+```
+## interaction effects observed in contrast of contrasts
+
+Value here is we can require a magnitude of difference.  See below where I require abs(estimate) > 1.0.  Signs are confusing here because the loss of a negative effect will show as  a positive effect, and vice versa. 
+
+```{r, fig.width = 8, fig.height = 8}
+
+lm.out$postProcess
+#play with thresholds here
+# there weren't many hits by fdr, so use a strong p.value
+sigProtein <- lm.out$postProcess[ p.value < 0.001 & abs(estimate) > 0.5, Protein]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+
+Heatmap (prot.mat, cluster_columns = FALSE, 
+         column_split = list (column_split = list (str_extract(colnames(prot.mat),"AT[0-9]{2}"),
+                              str_extract(colnames(prot.mat),"PGE[0-9]{2}"))))
+```
+

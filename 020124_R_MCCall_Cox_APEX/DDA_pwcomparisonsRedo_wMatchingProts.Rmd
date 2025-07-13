@@ -1,0 +1,862 @@
+---
+title: "redo_pwcomparions_wMatchProts"
+author: "Martin Gordon"
+date: "2024-02-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Redo of the pairwise comparisons with the matching proteins included
+
+Todo 
+--
+Find out why the unique merging has N number of different rows
+
+```{r}
+library(data.table)
+library (ComplexHeatmap)
+library (circlize)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(magrittr)
+library(MSstats)
+library(ggrepel)
+library(circlize)
+library(patchwork)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+
+```{r}
+spec.proc <- prepareDataForMSStats('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/combined/txt/evidence.txt',
+                                   './docs/keys.txt')
+
+spec.rmc.proc <- prepareDataForMSStats('~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/code/evidenceApex12.txt',
+                                       '~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/keys.tidy.txt')
+```
+
+lets process this data ourselves..
+```{r}
+spec <- fread('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/combined/txt/evidence.txt')
+keys <- fread('./docs/keys.txt')
+
+spec <- merge(x=spec, y=keys, by.x='Raw file', by.y='RawFile')
+
+#remove contaminants
+spec <- spec[!grepl("^$|CON__|REV__", Proteins),]
+
+# just map to sequences for the matches and append modifications... better approach wou
+#spec[Type ==  "TIMS-MULTI-MATCH", `Modified sequence` := paste0(Modifications,Sequence)]
+#spec[Type ==  "TIMS-MULTI-MATCH", `Modified sequence` := Sequence]
+
+# for this assuming the mod id is a combo of the modifications and sequence cols only...##
+
+mod.seqs <- spec[Type !=  "TIMS-MULTI-MATCH", .(`Modified sequence`), by=.(Sequence,Modifications)] %>% unique()
+
+# merge this info to the match prots
+nrow(spec[Type == "TIMS-MULTI-MATCH",])
+nrow(spec[Type != "TIMS-MULTI-MATCH",])
+spec %>% nrow()
+
+nrow(spec)
+
+# wht are we gaining nearly 1k extra rows?....
+spec.match <- merge(x=spec[Type == "TIMS-MULTI-MATCH", -c("Modified sequence")], y=mod.seqs, all.x=TRUE, all.y=FALSE, by=c('Sequence', 'Modifications'))
+spec <- rbind(x=spec.match, y=spec[Type !=  "TIMS-MULTI-MATCH",])
+
+
+# sum the intensity values for multiple peptides in each run
+spec.noDups <- spec[, .(Intensity = sum(Intensity), count.features = .N),
+                                by = .(Proteins, 
+                                       `Modified sequence`,
+                                        Charge,
+                                        IsotopeLabelType,
+                                        Condition,
+                                        BioReplicate,
+                                        Run)]
+
+spec.mod.proc <- spec.noDups[,.(ProteinName = Proteins,
+                                               PeptideSequence = `Modified sequence`,
+                                                PrecursorCharge = Charge,
+                                                FragmentIon = NA,
+                                                ProductCharge  = NA,
+                                                IsotopeLabelType,
+                                                Condition,
+                                                BioReplicate,
+                                                Run,
+                                                Intensity)]
+
+nrow(spec.mod.proc[!is.na(Intensity)])
+nrow(spec.proc[!is.na(Intensity)])
+```
+
+
+```{r}
+# no multiple feature peptide ions detected
+spec.proc[!is.na(Intensity),.N, by=.(PeptideSequence,PrecursorCharge,Run)][N >1]
+spec.mod.proc[!is.na(Intensity),.N, by=.(PeptideSequence,PrecursorCharge,Run)][N >1]
+```
+
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(length(unique(spec.proc$Condition)))
+col.pal
+
+unique(spec.mod.proc$Condition)
+spec.list <-  list('ori'=spec.proc,
+                   'cox'=spec.rmc.proc,
+                   'ori-w-matches' = spec.mod.proc)
+
+
+# change labelling to match others
+spec.list[[2]][,Condition := ifelse(Condition == 'EccC', 'EccCmut_inf_BR1', 'WT_inf_BR1')]
+# assign biorep 1-3 based on Run ID
+spec.list[[2]][, BioReplicate := ifelse(Run == 1 | Run == 4, 1,
+                                        ifelse(Run == 2 | Run == 5, 2, 3)) ] 
+
+lapply(seq_along(spec.list), function(x, n, i){
+
+g <- ggplot(x[[i]][!is.na(Intensity),.N, by=.(Condition,BioReplicate,Run)], aes(x=reorder(interaction(Condition,BioReplicate,Run)), y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N features per sample') +
+  ggtitle(n[[i]]) +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+g
+
+ BackupAsPDF(g, paste0(n[[i]],'.rawFeatureCounts.barplot'))
+
+}, x=spec.list, n=names(spec.list))
+```
+
+How do the intensities look?
+
+```{r}
+
+lapply(seq_along(spec.list), function(x, n, i){
+
+g <- ggplot(x[[i]], aes(x=reorder(interaction(Condition,BioReplicate,Run)), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  ggtitle('N features per sample') +
+  ggtitle(n[[i]]) +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+g
+
+ BackupAsPDF(g, paste0(n[[i]],'.rawIntensities.boxplots'))
+
+}, x=spec.list, n=names(spec.list))
+```
+PCA of features
+No real changes 
+
+```{r}
+                                 
+lapply(seq_along(spec.list), function(x,n,i){
+
+  featureMat <- dcast(x[[i]],
+                     paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") |> as.matrix(rownames = "PeptideSequence")
+
+  featureMat <- featureMat[complete.cases(featureMat), ]
+
+  pcaOut <- prcomp(t(log2(featureMat)))
+
+  colInfo <- data.table(colname = colnames(featureMat))
+  colInfo[,c("status","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+  colInfo[, biorep := str_extract(status,"[123]$") ]
+
+  #PCA  
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    theme_bw() + 
+    ggtitle(n[[i]]) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+    scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = 21:25) +
+    #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+  BackupAsPDF(p, paste0(n[[i]],".PCA_Complete_Features"))
+  
+}, x=spec.list, n=names(spec.list))
+
+```
+Heatmaps of the features in each; can we see v obvious intensity inflation for the summed 
+
+```{r}
+
+lapply(seq_along(spec.list), function(x,n,i){
+
+  featureMat <- dcast(x[[i]],
+                     paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") |> as.matrix(rownames = "PeptideSequence")
+  
+  #  log transform
+  featureMat <-  log2(featureMat)
+  
+  # create annotation
+  ann <- data.table(replicate=str_extract(colnames(featureMat),'[1-3]$'),
+                  biogroup=str_extract(colnames(featureMat),'BR[1-3]'),
+                  status=ifelse(grepl("EccC", colnames(featureMat)), 'EccCmut', 'WT'))
+
+
+  colours <- list('biogroup' = c('BR1' = '#4477AA', 'BR2'="#228833", 'BR3'="#CCBB44"),
+                'replicate' = c('1' = '#4477AA', '2'='#66CCEE', '3'="#228833"),
+                'status' =c('WT'="#CCBB44", 'EccCmut'='#EE6677')
+                )
+
+  colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+  # subset the data
+  submat <- featureMat[sample(rownames(featureMat), 2000), ]
+  
+  print(dim(featureMat))
+  
+  hm <- Heatmap(submat, 
+                cluster_rows=clusterWNA(submat),
+                show_row_names = F, 
+                cluster_columns = T, 
+                top_annotation = colAnn, 
+                row_title = paste0(nrow(submat), ' N features'), 
+                na_col = 'darkgrey', 
+                name='LogIntensities', 
+                column_names_gp = gpar(fontsize=6))
+  hm
+  BackupAsPDF(hm, paste0(n[[i]],'.features.clustered.heatmap'))
+
+
+  submat <-  featureMat[complete.cases(featureMat),]
+
+  hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, row_title = paste0(nrow(submat), ' N features'), cluster_columns = T, top_annotation = colAnn, na_col = 'darkgrey', name='LogIntensities', column_names_gp = gpar(fontsize=6))
+  hm
+  BackupAsPDF(hm, paste0(n[[i]],'.features.completeCases.clustered.heatmap'))
+
+
+  submat <- sweep(submat,1, STATS=apply(submat, 1, median, na.rm=T))
+  hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, row_title = paste0(nrow(submat), ' N features'),  na_col = 'darkgrey',name='LogIntensities/Median',  column_names_gp = gpar(fontsize=6))
+  BackupAsPDF(hm, paste0(n[[i]],'.features.medianScaled.clustered.heatmap'))
+
+}, x=spec.list, n=names(spec.list))
+
+
+
+lapply(seq_along(spec.list), function(x,n,i){
+  
+  featureMat <- dcast (x[[i]],
+                     paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") |> as.matrix(rownames = "PeptideSequence")
+
+#  log transform
+featureMat <-  log2(featureMat)
+
+dim(featureMat)
+dim(featureMat[complete.cases(featureMat),]) #only 234 cases...
+colnames(featureMat)
+
+# create annotation
+ann <- data.table(replicate=str_extract(colnames(featureMat),'[1-3]$'),
+                  biogroup=str_extract(colnames(featureMat),'BR[1-3]'),
+                  status=ifelse(grepl("EccCmut", colnames(featureMat)), 'EccCmut', 'WT'))
+
+
+colours <- list('biogroup' = c('BR1' = '#4477AA', 'BR2'="#228833", 'BR3'="#CCBB44"),
+                'replicate' = c('1' = '#4477AA', '2'='#66CCEE', '3'="#228833"),
+                'status' =c('WT'="#CCBB44", 'EccCmut'='#EE6677')
+                )
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+
+
+# subset the data
+submat <- featureMat[sample(rownames(featureMat), 2000), ]
+  
+
+hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities', column_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm, 'features.clustered.heatmap')
+
+
+submat <-  featureMat[complete.cases(featureMat),]
+
+hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities', column_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm, 'features.completeCases.clustered.heatmap')
+
+
+submat <- sweep(submat,1, STATS=apply(submat, 1, median, na.rm=T))
+hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities/Median',  column_names_gp = gpar(fontsize=6))
+hm
+
+}, x=spec.list, n=names(spec.list))
+
+```
+Matching between Runs?
+I dont think we will gain much from these comparisons
+
+prepare the spec files.. not working for the matchbetweenRuns set
+
+```{r}
+lapply(seq_along(spec.list), function(x,n,i){
+  
+  x[[i]][, oldName := paste0(Condition, '.',BioReplicate)]
+  x[[i]][, TechReplicate := BioReplicate]
+  x[[i]][, BioReplicate := str_extract(Condition, '[123]$')]
+  x[[i]][, Condition := str_extract(Condition, "WT|EccCmut")]
+
+},x=spec.list, n=names(spec.list))
+
+# now process the data 
+dp.list <- lapply(seq_along(spec.list), function(x,n,i){
+  
+  dp.out <- MSstats::dataProcess(x[[i]], 
+                              MBimpute =  FALSE, 
+                              featureSubset = "highQuality", 
+                              remove_uninformative_feature_outlier = TRUE)
+  
+  return(dp.out)
+
+},x=spec.list, n=names(spec.list))
+
+names(dp.list) <-  names(spec.list)
+```
+save mss processed output
+```{r}
+lapply(seq_along(dp.list), function(x,n,i){
+  
+  saveRDS(x[[i]], paste0("./output/", n[[i]], ".150224_dp.out.rds"))
+  fwrite (x[[i]]$ProteinLevelData, paste0("./output/", n[[i]],".AB.ProteinLevelData.csv"))
+  fwrite (x[[i]]$FeatureLevelData,  paste0("./output/", n[[i]],".AB.FeatureLevelData.csv.gz"))
+
+}, x=dp.list, n=names(dp.list))
+```
+Read in output of the dataProcess function 
+
+```{r}
+dp.list <- list("ori" = readRDS("./output/ori.150224_dp.out.rds"),
+                "cox" = readRDS("./output/cox.150224_dp.out.rds"),
+                "ori-w-matches" = readRDS("./output/ori-w-matches.150224_dp.out.rds")
+                )
+```
+
+
+Read in the three p.quants and do boxplots and counts of proteins in each of the samples
+
+```{r}
+p.quant.list <- list("ori" = fread('./output/ori.AB.ProteinLevelData.csv'),
+                     "cox" = fread('./output/cox.AB.ProteinLevelData.csv'),
+                     "ori-w-matches" =  fread('./output/ori-w-matches.AB.ProteinLevelData.csv')
+                     )
+
+names(p.quant.list)
+```
+
+boxplots of normalised intensities
+
+```{r}
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  g <- ggplot(x[[i]], aes (x=interaction(SUBJECT, GROUP,RUN), y = LogIntensities, fill = GROUP)) +
+  geom_boxplot() +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, paste0(n[[i]], 'proteinIntensities.boxplots'))
+  
+}, x=p.quant.list, n=names(p.quant.list))
+
+```
+
+Protein Counts per sample
+
+```{r}
+
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  g <- ggplot(x[[i]][,.N, by=.(GROUP,SUBJECT,RUN)], aes (x=interaction(SUBJECT, GROUP,RUN), y = N, fill = GROUP)) +
+  geom_bar(stat='Identity') +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, paste0(n[[i]], 'nProteins.barplot'))
+  
+}, x=p.quant.list, n=names(p.quant.list))
+```
+Lets just quickly check the PCA with all three samples, then proceed with ours with matched runs enabled.
+
+```{r}
+p.quant.list
+lapply(seq_along(p.quant.list), function(x,n,i){
+
+  featureMat <- dcast(x[[i]],
+                     Protein~interaction(GROUP,SUBJECT,originalRUN), value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+
+  featureMat <- featureMat[complete.cases(featureMat), ]
+
+  pcaOut <- prcomp(t(log2(featureMat)))
+
+  colInfo <- data.table(colname = colnames(featureMat))
+  colInfo[,c("status","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+  colInfo[, biorep := str_extract(status,"[123]$") ]
+
+  #PCA  
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    theme_bw() + 
+    ggtitle(n[[i]]) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+    scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = 21:25) +
+    #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+  BackupAsPDF(p, paste0(n[[i]],".PCA_Complete_Proteins"))
+  
+}, x=p.quant.list, n=names(p.quant.list))
+```
+I dont know if we can proceed with analysing the BR1 group for the mutant.. may need to proceed with just one per group
+None of these proteins recovered....
+
+
+```{r}
+biotin.carboxylases.up <- c("O00763","P05165","P11498","Q13085","Q96RQ3")
+
+lapply(p.quant.list, function(x){
+  
+  x[,ProteinName := tidyUniProtNames(Protein)]
+  
+})
+
+p <- ggplot(p.quant.list[[1]][ProteinName %in% biotin.carboxylases.up], 
+            aes (x = interaction ( SUBJECT, GROUP,RUN ), y = LogIntensities, color = Protein)) + 
+  geom_line(aes(group = Protein)) + 
+  geom_point(aes(shape = as.factor(SUBJECT))) +
+  theme(axis.text.x = element_text(angle=90))
+p
+
+```
+
+Looking at the PCA, doesnt seem clear and obvious 'pairing' between the samples..
+Regardless, handle this pairing design by adding batch term to model to control for random effect
+
+```{r}
+dp.list <- lapply(seq_along(dp.list), function(x,n,i){
+  
+  p.q <- setDT(x[[i]]$ProteinLevelData)
+  f.q <- setDT(x[[i]]$FeatureLevelData)
+  
+  # subject is 
+  p.q[, SUBJECT := paste0('batch.', SUBJECT)]
+  f.q[, SUBJECT := paste0('batch.', SUBJECT)]
+  
+  x[[i]]$ProteinLevelData <- p.q
+  x[[i]]$FeatureLevelData <- f.q
+  
+  return(x[[i]])
+  
+},x=dp.list, n=names(dp.list))
+```
+Run MSstats and compare number of hits
+====
+If not many, proceed as is 
+
+```{r}
+contrasts.mat <- matrix(c(-1,1), nrow=1, ncol=2)
+colnames(contrasts.mat) <-  c('WT', 'EccCmut')
+rownames(contrasts.mat) <- 'EccCmut-WT'
+
+mss.list <- lapply(seq_along(dp.list), function(x,n,i){
+  
+  mss <- groupComparison(contrast.matrix=contrasts.mat, data=x[[i]])
+  mss.dt <- setDT(mss$ComparisonResult)
+  return(mss.dt)
+  
+},x=dp.list, n=names(dp.list))
+
+names(dp.list) <- names(p.quant.list)
+names(mss.list) <- names(p.quant.list)
+```
+
+tidy the protein names, get gene names and extract the sig hits
+
+```{r}
+# function to extract UniProtID substr from longer string and collapse
+tidyUniProtNames <-  function(Protein, sep=';'){
+ return(sapply(strsplit(Protein, split = ';', fixed=T), function(x){ 
+   # assuming the UNIPROT are surrounded by '|'
+  str_extract(x,  "(?<=[|])[A-Z0-9]+(?=[|])") %>% 
+    paste(., collapse=sep)
+  }))
+}
+
+mss.comb <- rbindlist(mss.list, use.names = T, idcol=T)
+mss.comb[, ProteinName := tidyUniProtNames(as.character(Protein))]
+
+mss.comb[, gene := multiUniprots2multiGenes(ProteinName)]
+mss.comb[, sig := 'not']
+
+#lets perfrom the multiple testing ourselves after removing things absent in both conditions
+mss.comb[abs(log2FC) > 0.58 & adj.pvalue < 0.05, sig := ifelse(log2FC > 0, 'up' , 'down')]
+```
+
+N sig hits per comparison:
+Low number of hits in our comparisons a result of the multiple testing correction..
+
+```{r}
+mss.comb[sig != 'not',.N, by=.(.id,sig)]
+
+g <-  ggplot(mss.comb[sig != 'not',.N, by=.(.id,sig)], aes(x=.id, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N sig hits') +
+  scale_fill_manual(values=c('up'='red', 'down'='blue'))
+g
+BackupAsPDF(g, 'N.sighits.byMatches')
+
+mss.comb[, sig := 'not']
+#lets perfrom the multiple testing ourselves after removing things absent in both conditins
+mss.comb[abs(log2FC) > 0.58 & adj.pvalue < 0.05, sig := ifelse(log2FC > 0, 'up' , 'down')]
+
+g <-  ggplot(mss.comb[sig != 'not' & issue != 'oneConditionMissing', .N, by=.(.id,sig)], aes(x=.id, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N sig hits (raw pval < 0.05') +
+  scale_fill_manual(values=c('up'='red', 'down'='blue'))
+g
+BackupAsPDF(g, 'N.sighits.rawPval.byMatches')
+```
+
+How compariable are thelog2FC  estimates?
+Look at scatterplots of the values
+
+```{r}
+mss.comb[,.id := gsub('-','_', .id)]
+
+mss.comb.wide <-dcast(mss.comb, Protein+gene~.id, value.var='log2FC')
+
+g <-  ggplot(mss.comb.wide, aes(x=ori, y=ori_w_matches)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope=1, col='red') +
+  geom_vline(xintercept=0, linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6)
+
+g
+
+
+gg <-  ggplot(mss.comb.wide, aes(x=cox, y=ori_w_matches)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope=1, col='red') +
+  geom_vline(xintercept=0, linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6)
+
+gg
+
+ggg <-  ggplot(mss.comb.wide, aes(x=ori, y=cox)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope=1, col='red') +
+  geom_vline(xintercept=0, linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.6)
+
+ggg
+#  ggtitle('N sig hits (raw pval < 0.05') +
+ # scale_fill_manual(values=c('up'='red', 'down'='blue'))
+
+BackupAsPDF(g + gg + ggg, 'log2FC.acatterplots', dimensions = c(14,8))
+
+mss.comb[, unique(.id), ]
+
+
+mss.comb[.id == 'ori_w_matches' & issue == 'oneConditionMissing', ]
+```
+
+Look at the heatmap of sig results for each 
+
+```{r}
+sigProts <- mss.comb[sig != 'not', unique(ProteinName), by=.id]
+
+sigProts[,.N, by=.id]
+
+p.quant.comb <- rbindlist(p.quant.list, idcol = T)
+p.quant.comb[,ProteinName := tidyUniProtNames(Protein)]
+
+ori.mat <- dcast(p.quant.comb[.id == 'ori',], ProteinName~interaction(GROUP,SUBJECT,originalRUN), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='ProteinName')
+
+ori.wm.mat <- dcast(p.quant.comb[.id == 'ori-w-matches',], ProteinName~interaction(GROUP,SUBJECT,originalRUN), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='ProteinName')
+
+cox.mat <- dcast(p.quant.comb[.id == 'cox',], ProteinName~interaction(GROUP,SUBJECT,originalRUN), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='ProteinName')
+```
+
+plot the significant hits in each of these comparisons
+
+```{r}
+mat <-  cox.mat[rownames(cox.mat) %in% sigProts[.id == 'cox',V1],]
+
+Heatmap(cox.mat, cluster_rows = clusterWNA(cox.mat))
+Heatmap(ori.mat, cluster_rows = clusterWNA(ori.mat))
+
+submat <- ori.wm.mat[rownames(ori.wm.mat) %in% sigProts[.id == 'ori_w_matches', V1],]
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat))
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        column_split = ifelse(grepl('Ecc', colnames(submat)), 'Ecc', 'WT')
+        )
+BackupAsPDF(hm, 'searchWMatches.sighits.heatmap', dimensions=c(8,8))
+```
+```{r}
+submat <- ori.mat[rownames(ori.mat) %in% sigProts[.id == 'ori', V1],]
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat))
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        column_split = ifelse(grepl('Ecc', colnames(submat)), 'Ecc', 'WT')
+        )
+
+BackupAsPDF(hm, 'ori.sighits.heatmap', dimensions=c(8,8))
+
+```
+cox heatmaps
+
+```{r}
+submat <- cox.mat[rownames(cox.mat) %in% sigProts[.id == 'ori', V1],]
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat))
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        column_split = ifelse(grepl('Ecc', colnames(submat)), 'Ecc', 'WT')
+        )
+
+BackupAsPDF(hm, 'cox.sighits.heatmap', dimensions=c(8,12))
+
+
+# what aboutt he entire cox matrix
+hm <- Heatmap(cox.mat, 
+        cluster_rows = clusterWNA(cox.mat),
+        show_row_names = F,
+        column_split = ifelse(grepl('Ecc', colnames(submat)), 'Ecc', 'WT')
+        )
+hm
+BackupAsPDF(hm, 'cox.fullDT.heatmap', dimensions=c(8,12))
+```
+
+THis is not a good comparison between the groups.. too many missing values, 
+Maybe want to use SAINT instead?? 
+I think first we rerun with the correct parameters enabled... allow a fair comparison between the groups..
+
+
+
+
+tidy the datatables, get gene names, highlight sig genes
+
+
+When we remove missing value hits, there is no significantly different things between the conditions...
+
+Looking the matrices, out of the 2k proteins detected, 
+
+ # our first run
+[1] 3120   19
+[1] 287  19 # complete cases
+
+# cox run
+[1] 2527    7
+[1] 848   7 # complete cases
+
+# run with peptide matches
+[1] 3699   19
+[1] 660  19 # complete cases
+
+
+```{r}
+lapply(p.quant.list, function(x){
+  x <- dcast(x, Protein~interaction(GROUP,SUBJECT,originalRUN), value.var = 'LogIntensities')
+  dim(x) %>% print()
+  
+  x <- x[complete.cases(x),]
+  dim(x) %>%  print()
+})
+```
+
+
+
+```{r}
+lapply(mss.list, function(x){
+  
+  x[, ProteinName := lapply(Protein, function(x){ tidyUniProtNames(x)})]
+  
+})
+  
+  
+  grep("(?<=[|])[A-Z1-9]+")
+  
+  q(?=u) #matches a q that is followed by a u, without making the u part of the match
+  
+  (?<=a) # only matches b preceded by an a
+  
+}
+
+test <- as.character(mss.list[[1]]$Protein)
+
+
+sapply(strsplit(test, split = ';', fixed=T), function(x){ 
+  str_extract(x,  "(?<=[|])[A-Z0-9]+(?=[|])") %>% 
+    paste(., collapse=';')
+  })
+
+
+
+
+unlist()
+strsplit(test[1],
+
+help(strsplit)
+
+strsplit(test, split=';', fixed = TRUE)
+
+
+strsplit()
+
+grep("(?<=[|])[A-Z0-9]+(?=[|])", perl=TRUE, mss.list[[1]]$Protein, ignore.case = F, value = TRUE)
+
+str_extract(mss.list[[1]]$Protein, "(?<=[|])[A-Z0-9]+(?=[|])")
+
+grep("[A-Z0-9]+(?=\\|)", mss.list[[1]]$Protein, value = T)
+
+mss.list[[1]]$Protein
+
+lapply(seq_along(mss.list), function(x,n,i){
+  
+  x[[i]][,ProteinName := gsub('sp[|]', '', Protein)]
+  x[[i]][,ProteinName := gsub('[|].+', '', ProteinName)]
+  
+  print(x[[i]][, .(Protein,ProteinName)])
+  
+}, x=mss.list, n=names(mss.list))
+
+
+lapply(mss.list, function(x){
+  print(x[abs(log2FC) > 0.58 & adj.pvalue < 0.05,])
+  print(x[abs(log2FC) > 0.58 & pvalue < 0.05,])
+})
+```
+
+
+
+```{r}
+mss.list %>%  names()
+```
+
+
+
+not used 
+-----
+ 
+```{r}
+spec <- fread('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/combined/txt/evidence.txt')
+keys <- fread('./docs/keys.txt')
+
+spec <- merge(x=spec, y=keys, by.x='Raw file', by.y='RawFile')
+
+#remove contaminants
+spec <- spec[!grepl("^$|CON__|REV__", Proteins),]
+
+# for this assuming the mod id is a combo of the modifications and sequence cols only...
+mod.seqs <- spec[Type !=  "TIMS-MULTI-MATCH", .(`Modified sequence`), by=.(
+                                        Sequence,
+                                        Modifications)] %>% unique()
+
+# merge this info to the match prots
+spec.match <- merge(x=spec[Type == "TIMS-MULTI-MATCH", -c("Modified sequence")], y=mod.seqs, by=c('Sequence', 'Modifications'))
+```
+ 
+
+
+try w/o the new sequences just drop the matched prots for testing...
+works... need to find a better way to handle the naming of the matched proteins....
+```{r}
+spec <- fread('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/combined/txt/evidence.txt')
+keys <- fread('./docs/keys.txt')
+
+spec <- merge(x=spec, y=keys, by.x='Raw file', by.y='RawFile')
+
+#remove contaminants
+spec <- spec[!grepl("^$|CON__|REV__", Proteins),]
+
+#spec <- spec[Type !=  "TIMS-MULTI-MATCH",]
+
+# just map to sequences for the matches... adding in the mod info causes the pipeline to fail
+# dfix this first and reun
+spec[Type ==  "TIMS-MULTI-MATCH", `Modified sequence` := paste0(Sequence,Modifications)]
+
+# sum the intensity values for multiple peptides in each run
+spec.noDups <- spec[, .(Intensity = sum(Intensity), count.features = .N),
+                                by = .(Proteins, 
+                                       `Modified sequence`,
+                                        Charge,
+                                        IsotopeLabelType,
+                                        Condition,
+                                        BioReplicate,
+                                        Run)]
+
+
+spec.mod.proc <- spec.noDups[,.(ProteinName = Proteins,
+                                               PeptideSequence = `Modified sequence`,
+                                                PrecursorCharge = Charge,
+                                                FragmentIon = NA,
+                                                ProductCharge  = NA,
+                                                IsotopeLabelType,
+                                                Condition,
+                                                BioReplicate,
+                                                Run,
+                                                Intensity)]
+
+
+
+
+
+spec.mod.proc[, oldName := paste0(Condition, '.',BioReplicate)]
+spec.mod.proc[, TechReplicate := BioReplicate]
+spec.mod.proc[, BioReplicate := str_extract(Condition, '[123]$')]
+spec.mod.proc[, Condition := str_extract(Condition, "WT|EccCmut")]
+
+
+
+dp.out <- MSstats::dataProcess(spec.mod.proc, 
+                              MBimpute =  FALSE, 
+                              featureSubset = "highQuality", 
+                              remove_uninformative_feature_outlier = TRUE)
+
+```
+
+

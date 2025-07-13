@@ -1,0 +1,1579 @@
+---
+title: "091824_dataPreparationforJyoti"
+author: "Martin Gordon"
+date: "2024-09-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+Goals
+i) Produce plot of relative abundances of viral and host mapped reads per cell-line (done)
+ii) Produce a CPM plot: Counts per million (CPM) mapped reads are the number of raw reads mapped to a transcript, scaled by the number of sequencing reads in your sample, multiplied by a million
+  Is this metric suitable? We are only counting hits to leader +1 position, so I think its ok (I dont think we need to consider gene length as only counting 5' end of transcript)
+iii) Produce normalized counts for both the mouse and human RNAseq datasets
+
+Do a scatterplot of log2FC and GO enrichment pvalues;
+
+Reason ORF9b fails to recover significant numbers of mappings? perhaps its due to 
+
+```{r}
+library(DESeq2)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(circlize)
+library(ComplexHeatmap)
+library(ggrepel)
+library(readxl)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj; eg facet_grid allow x/y axis to vary
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+library(viridis)
+library(readxl)
+library(viridis)
+
+library(biomaRt)
+
+# RNAseq DE functions
+library(tximport)
+library(DESeq2)
+library(IHW)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+source("../../utils/mg_utils/r_utils/differentialTesting.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+```
+
+id mapping txt file
+
+```{r}
+id.mapping.dt <- read_xlsx('./docs/human_to_RFE_gene_conversion_table_FINAL.xlsx')
+
+isGenes <- fread('/Users/martingordon/Documents/projects/022624_AViDD_AB_PH_data/docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+```
+
+read in the dds objects for bat and human and generate the normalized count matrices
+```{r}
+bat.vsMock.dds <- readRDS('./080824_PWcomparisons_data/2024_08_13_dds.bat.vsMock.rds')
+hu.vsMock.dds <- readRDS('./080824_PWcomparisons_data/2024_08_13_dds.human.vsMock.rds')
+
+bat.mat <- assay(vst(bat.vsMock.dds, blind=F))
+hu.mat <- assay(vst(hu.vsMock.dds, blind=F))
+
+fwrite(data.table(hu.mat, keep.rownames = T), ScriptAndDatedFileName('humanCounts.normalized.csv'))
+fwrite(data.table(bat.mat, keep.rownames = T), ScriptAndDatedFileName('batCounts.normalized.csv'))
+```
+Read in the info on reads mapped to viral vs human reference and produce counts of relative abundance
+
+```{r}
+idxstats <- lapply(dir('./output/idxStats', full.names = T, pattern='.+idxstats'), fread)
+names(idxstats) <-  gsub('.sorted.bam.idxstats', '', dir('./output/idxStats', full.names = F, pattern='.+idxstats'))
+
+mapstats.dt <- rbindlist(idxstats, idcol='sample')
+setnames(mapstats.dt, old=c('V1', 'V2', 'V3','V4'), new=c('reference', 'reference_len', 'Nmapped', 'Nunmapped'))
+
+mapstats.dt[, `:=`(timepoint=factor(ifelse(grepl('Mock', sample), '', str_extract(sample, '[0-9]{1,2}h')), levels=c('','6h', '12h', '24h', '48h')),
+                   host=ifelse(grepl('MRC5', sample), 'human', 'bat'),
+                   virus=factor(ifelse(grepl('Mock', sample), 'Mock', gsub('MRC5_|RFe_|_[0-9]{1,2}h.+', '', sample)), levels=c('Mock','WA', 'N_P80T', '9bI_N_P80T'))
+                 )]
+
+# filter out unmapped segements; these are likely contigs/scaffolds
+# also probably want to restrict to just the main chromosomes
+mapstats.dt <- mapstats.dt[Nmapped > 0,]
+mapstats.dt <- mapstats.dt[grep('NC_0000|NC_012920.1|MN985325.1|NC_046',reference),]
+
+mapstats.dt[, ref_genome := ifelse(reference == 'MN985325.1', 'SARS CoV 2',
+                                   ifelse(reference %like% 'NC_046', 'bat', 'human'))]
+
+
+
+#summarise counts per ref genome per sample
+summary.dt <- mapstats.dt[, .(counts = sum(Nmapped, na.rm=T)), by=.(sample,ref_genome,timepoint,virus,host)]
+
+g <- ggplot(mapstats.dt[!virus == '9bI_N_P80T' & !timepoint %in% c(''), ], aes(x=sample, y=Nmapped, fill=ref_genome)) +
+  geom_col(position='fill') +
+  ggtitle('Proportion of reads mapping to host & viral genomes') +
+  ylab('Proportion mapped reads') +
+  facet_grid2(host~timepoint, scales='free',independent = T) +
+  scale_fill_brewer(type='qual', palette = 3) +
+  scale_x_discrete(label=abbreviate) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=6))
+g
+BackupAsPDF(g, 'proportionOfReads.mapping.noDoubleMut.barplot', dimensions=c(9,5))
+```
+
+Compare this plot to Jyotis qpcr
+Good news is trends look the same; no issues with sample swapping
+Try visualize as different types of plots, maybe put the bars side by side and only plot viral proportion
+Now need to reproduce the viral transcript plots; try the CPM counts 
+
+```{r}
+g <- ggplot(summary.dt[timepoint != '',], aes(fill=ref_genome, y=counts, x=reorder(sample, as.numeric(virus)))) + 
+  geom_bar(position="fill", stat="identity") +
+  ggtitle('Proportion of reads mapping to host & viral genomes') +
+  ylab('Proportion mapped') +
+  xlab('sample') +
+  facet_grid2(host~timepoint, scales='free',independent = T) +
+  scale_fill_brewer(type='qual', palette = 3) +
+  scale_x_discrete(label=abbreviate) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=6))
+g
+
+BackupAsPDF(g, 'proportionOfReads.mapping.barplot', dimensions=c(9,5))
+```
+
+calculate proportions for plotting' absolute numbers not interesting in RNAseq 
+```{r}
+summary.dt[, sumCounts := sum(counts, na.rm=T), by=sample]
+summary.dt[, proportionCounts := round(counts/sumCounts,6)]
+summary.dt[, rep := gsub('_','', str_extract(sample,'_[123]'))]
+summary.dt[,.N, by=.(timepoint, virus,rep)]
+
+
+collapesd.dt <- summary.dt[, .(avgProportion = mean(proportionCounts, na.rm=T)), by=.(ref_genome,timepoint,virus,host)]
+
+
+g <- ggplot(collapesd.dt[!virus %in% c('Mock','9bI_N_P80T') & ref_genome == 'SARS CoV 2',], aes(x=timepoint, y=avgProportion, fill=virus)) +
+  geom_bar(position='dodge', stat="identity") +
+  ylab('Avg proportion of viral reads') +
+  facet_grid2(host~., scales='free', independent=T) +
+  scale_fill_brewer(type='qual', palette = 3) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=6))
+g
+BackupAsPDF(g, 'ViralproportionOfReads.collapsed.grouped.noDoubleMut.barplot', dimensions=c(9,5))
+
+
+g <- ggplot(summary.dt[!virus %in% c('Mock','9bI_N_P80T') & timepoint != '' & ref_genome == 'SARS CoV 2',], aes(fill=virus, y=proportionCounts, x=interaction(virus,timepoint))) + 
+  stat_summary(fun.y = mean, geom = "bar") + 
+  stat_summary(fun.data = mean_se, geom = "errorbar", alpha=0.4) +
+  ggtitle('Proportion of reads mapping to viral genomes') +
+  ylab('Average proportion mapped') +
+  xlab('sample') +
+  facet_grid2(host~timepoint, scales='free',independent = T) +
+ # facet_grid2(host~.,scales='free_x') +
+  scale_fill_brewer(type='qual', palette = 3) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'ViralproportionOfReads.collapsed.noDoubleMut.barplot', dimensions=c(9,5))
+
+# write out the mapping stats from the bam file to 
+fwrite(summary.dt[,.(sample, ref_genome, timepoint, virus, rep, counts, proportionCounts)], ScriptAndDatedFileName('mappingStatsfromBam.csv'))
+```
+Ok, now get the counts of the mapped viral transcripts
+Clearly the counts for ORF9b are very low.. looks like this could be reason for low counts. For now drop I think and realign against the assebmled genomes
+Plot the cpm values for each of the different groups, use a stacked barplot similar to t
+
+Look at the gff file and subset the transcripts to what is available there
+
+```{r}
+viralCounts.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/083024_viralComparisons_data/2024_08_31_viral.subgenomicRNA.counts.csv')
+
+viralCounts.dt[sample %like% 'RFe_WA']
+# cpm; allows comparison of across groups
+viralCounts.dt[, cpm := count/sum(count, na.rm=T)*10^6, by=sample]
+
+# cpm mat
+cpm.mat <- dcast(viralCounts.dt[splice.name != 'Nstar'], splice.name~sample, value.var='cpm') %>% 
+  as.matrix(rownames='splice.name')
+
+# log transform the values
+
+# split into human and viral matrices
+hu.mat <- cpm.mat[, grep('MRC5', colnames(cpm.mat), value = T)]
+bat.mat <- cpm.mat[, grep('RFe.+N_P80T', colnames(cpm.mat), value = T)]
+
+hu.submat <- sweep(hu.mat, 1, apply(hu.mat, 1, median, na.rm=T))
+bat.submat <- sweep(bat.mat, 1, apply(bat.mat, 1, median, na.rm=T))
+
+hm_list <- Heatmap(hu.submat, 
+        show_row_names = T, 
+        show_column_names = F,
+        name='human log2 CPM/median CPM',
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        cluster_rows = clusterWNA(hu.submat),
+        column_split = list(factor(str_extract(colnames(hu.submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+                            factor(gsub('MRC5_|_[0-9]{1,2}h.+', '', colnames(hu.submat)), levels=c('WA', 'N_P80T', '9b_T72I_N_P80T'))),
+        col=colorRamp2(breaks=c(-2,0,2), colors = c(redbluColpal[1], redbluColpal[3], redbluColpal[5])), 
+       # cluster_columns = clusterWNA(t(hu.submat)),
+        cluster_columns=F,
+        border = T) +
+Heatmap(bat.submat, 
+        border=T,
+        show_column_names = F,
+        name='bat log2 CPM/median CPM',
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        column_split = list(factor(str_extract(colnames(bat.submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+                            factor(gsub('RFe_|_[0-9]{1,2}h.+', '', colnames(bat.submat)), levels=c('WA', 'N_P80T', '9b_T72I_N_P80T'))),
+        col=colorRamp2(breaks=c(-2,0,2), colors = viridis(3)), 
+        cluster_columns = F)
+
+BackupAsPDF(draw(hm_list, ht_gap = unit(0.5, "cm")), 'Viral.cpm.medianScaled.heatmap', dimensions = c(17,6))
+```
+
+
+```{r}
+hm_list <- Heatmap(hu.submat, 
+        show_row_names = T, 
+        show_column_names = T,
+        name='human log2 CPM/median CPM',
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        column_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(hu.submat),
+        column_split = factor(str_extract(colnames(hu.submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+                            
+        col=colorRamp2(breaks=c(-2,0,2), colors = c(redbluColpal[1], redbluColpal[3], redbluColpal[5])), 
+       # cluster_columns = clusterWNA(t(hu.submat)),
+        cluster_columns=F,
+        border = T) +
+Heatmap(bat.submat, 
+        border=T,
+        show_column_names = T,
+        name='bat log2 CPM/median CPM',
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        column_names_gp = gpar(fontsize=6),
+        column_split = factor(str_extract(colnames(bat.submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col=colorRamp2(breaks=c(-2,0,2), colors = viridis(3)), 
+        cluster_columns = F)
+
+BackupAsPDF(draw(hm_list, ht_gap = unit(0.5, "cm")), 'Viral.cpm.medianScaled.noViralSplit.heatmap', dimensions = c(10,6))
+```
+
+ORF9b has clearly lower counts than the other groups, so drop for now
+```{r}
+# cpm mat
+cpm.mat <- dcast(viralCounts.dt[!splice.name %in% c('Nstar', 'orf9b')], splice.name~sample, value.var='cpm') %>% 
+  as.matrix(rownames='splice.name')
+
+
+cpm.mat <- log2(cpm.mat)
+# log transform the values
+
+# split into human and viral matrices
+hu.mat <- cpm.mat[, grep('MRC5', colnames(cpm.mat), value = T)]
+bat.mat <- cpm.mat[, grep('RFe.+N_P80T', colnames(cpm.mat), value = T)]
+
+hu.submat <- sweep(hu.mat, 1, apply(hu.mat, 1, median, na.rm=T))
+bat.submat <- sweep(bat.mat, 1, apply(bat.mat, 1, median, na.rm=T))
+```
+
+
+```{r}
+hm_list <- Heatmap(hu.submat, 
+        show_row_names = T, 
+        show_column_names = T,
+        name='human log2 CPM/median CPM',
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        column_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(hu.submat),
+        column_split = factor(str_extract(colnames(hu.submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+                            
+        col=colorRamp2(breaks=c(-2,0,2), colors = c(redbluColpal[5], redbluColpal[3], redbluColpal[1])), 
+       # cluster_columns = clusterWNA(t(hu.submat)),
+        cluster_columns=F,
+        border = T) +
+Heatmap(bat.submat, 
+        border=T,
+        show_column_names = T,
+        name='bat log2 CPM/median CPM',
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        column_names_gp = gpar(fontsize=6),
+        column_split = factor(str_extract(colnames(bat.submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col=colorRamp2(breaks=c(-2,0,2), colors = viridis(3)), 
+        cluster_columns = F)
+
+hm_list
+BackupAsPDF(draw(hm_list, ht_gap = unit(0.5, "cm")), 'Viral.cpm.medianScaled.noViralSplit.noORF9b.heatmap', dimensions = c(10,6))
+```
+Another plot with no genomic and no orf9b
+
+```{r}
+# cpm mat
+cpm.mat <- dcast(viralCounts.dt[!splice.name %in% c('Nstar', 'orf9b', 'genomic')], splice.name~sample, value.var='cpm') %>% 
+  as.matrix(rownames='splice.name')
+
+cpm.mat <- log2(cpm.mat)
+# log transform the values
+
+# split into human and viral matrices
+hu.mat <- cpm.mat[, grep('MRC5', colnames(cpm.mat), value = T)]
+bat.mat <- cpm.mat[, grep('RFe.+N_P80T', colnames(cpm.mat), value = T)]
+
+hu.submat <- sweep(hu.mat, 1, apply(hu.mat, 1, median, na.rm=T))
+bat.submat <- sweep(bat.mat, 1, apply(bat.mat, 1, median, na.rm=T))
+```
+
+
+```{r}
+hm_list <- Heatmap(hu.submat, 
+        show_row_names = T, 
+        show_column_names = T,
+        name='human log2 CPM/median CPM',
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        column_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(hu.submat),
+        column_split = factor(str_extract(colnames(hu.submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+                            
+        col=colorRamp2(breaks=c(-1,0,1), colors = c(redbluColpal[5], redbluColpal[3], redbluColpal[1])), 
+       # cluster_columns = clusterWNA(t(hu.submat)),
+        cluster_columns=F,
+        border = T) +
+Heatmap(bat.submat, 
+        border=T,
+        show_column_names = T,
+        name='bat log2 CPM/median CPM',
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        column_names_gp = gpar(fontsize=6),
+        column_split = factor(str_extract(colnames(bat.submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col=colorRamp2(breaks=c(-1,0,1), colors = viridis(3)), 
+        cluster_columns = F)
+
+hm_list
+BackupAsPDF(draw(hm_list, ht_gap = unit(0.5, "cm")), 'Viral.cpm.medianScaled.noViralSplit.noORF9bGenomic.heatmap', dimensions = c(10,6))
+```
+Plot the cpm of the different transcripts 
+Do a barplot of the CPM on original scale
+```{r}
+viralCounts.dt[, splice.name := factor(splice.name, levels=c('genomic', 'S', 'orf3', 'E', 'M', 'orf6', 'orf7', 'orf8', 'N', 'orf9b', 'Nstar'))]
+viralCounts.dt[, virus := factor(virus, levels=c('N_P80T', '9b_T72I_N_P80T','WA'))]
+viralCounts.dt[, timepoint := factor(timepoint, levels=c('6h', '12h','24h', '48h'))]
+
+g <- ggplot(viralCounts.dt[host=='human' & !splice.name %in% c('genomic', 'orf9b', 'Nstar')], aes(x=virus, color=virus, y=log2(cpm+1))) +
+  stat_summary(fun.y = mean, geom = "point", color='black', alpha=0.6) + 
+  stat_summary(fun.data = mean_se, geom = "errorbar", alpha=0.6, color='black', width=0.3) +
+  geom_point(size=2) +
+  facet_grid2(splice.name~timepoint, scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'human.virallog2CPM.counts', dimensions=c(10,9))
+
+
+# now lets show the CPM counts barplot with the individual points overlaid on top 
+g <- ggplot(viralCounts.dt[host=='human' & !splice.name %in% c('genomic', 'orf9b', 'Nstar')], aes(x=virus, color=virus, y=cpm, fill=virus)) +
+  stat_summary(fun.y = mean, geom = "bar", alpha=0.6) + 
+  stat_summary(fun.data = mean_se, geom = "errorbar", alpha=0.6, color='black', width=0.5) +
+#  geom_point(size=2) +
+  facet_grid2(splice.name~timepoint, scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  scale_fill_brewer(type='qual',palette=3) +
+  scale_shape_manual(values=c(21)) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'human.viralCPM.counts', dimensions=c(10,9))\
+
+```
+Do the same with bat
+
+```{r}
+g <- ggplot(viralCounts.dt[host=='bat' & virus != 'WA' & !splice.name %in% c('genomic', 'orf9b', 'Nstar')], aes(x=virus, color=virus, y=log2(cpm+1))) +
+  stat_summary(fun.y = mean, geom = "point", color='black', alpha=0.6) + 
+  stat_summary(fun.data = mean_se, geom = "errorbar", alpha=0.6, color='black', width=0.3) +
+  geom_point(size=2) +
+  facet_grid2(splice.name~timepoint, scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'bat.virallog2CPM.counts', dimensions=c(10,9))
+
+
+# now lets show the CPM counts barplot with the individual points overlaid on top 
+g <- ggplot(viralCounts.dt[host=='bat' & virus != 'WA' & !splice.name %in% c('genomic', 'orf9b', 'Nstar')], aes(x=virus, color=virus, y=cpm, fill=virus)) +
+  stat_summary(fun.y = mean, geom = "bar", alpha=0.6) + 
+  stat_summary(fun.data = mean_se, geom = "errorbar", alpha=0.6, color='black', width=0.5) +
+#  geom_point(size=2) +
+  facet_grid2(splice.name~timepoint, scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  scale_fill_brewer(type='qual',palette=3) +
+  scale_shape_manual(values=c(21)) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'bat.viralCPM.counts', dimensions=c(10,9))
+```
+
+Repeat with genomic and orf9b
+
+```{r}
+g <- ggplot(viralCounts.dt[host=='human' & !splice.name %in% c('Nstar')], aes(x=virus, color=virus, y=log2(cpm+1))) +
+  stat_summary(fun.y = mean, geom = "point", color='black', alpha=0.6) + 
+  stat_summary(fun.data = mean_se, geom = "errorbar", alpha=0.6, color='black', width=0.3) +
+  geom_point(size=2) +
+  facet_grid2(splice.name~timepoint, scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'human.virallog2CPMwGenomicOrf9b.counts', dimensions=c(10,9))
+
+
+# now lets show the CPM counts barplot with the individual points overlaid on top 
+g <- ggplot(viralCounts.dt[host=='human' & !splice.name %in% c('Nstar')], aes(x=virus, color=virus, y=cpm, fill=virus)) +
+  stat_summary(fun.y = mean, geom = "bar", alpha=0.6) + 
+  stat_summary(fun.data = mean_se, geom = "errorbar", alpha=0.6, color='black', width=0.5) +
+#  geom_point(size=2) +
+  facet_grid2(splice.name~timepoint, scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  scale_fill_brewer(type='qual',palette=3) +
+  scale_shape_manual(values=c(21)) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'human.viralCPM.wGenomicOrf9b.counts', dimensions=c(10,9))
+```
+repeat with bat
+```{r}
+g <- ggplot(viralCounts.dt[host=='bat' & virus != 'WA' & !splice.name %in% c('Nstar')], aes(x=virus, color=virus, y=log2(cpm+1))) +
+  stat_summary(fun.y = mean, geom = "point", color='black', alpha=0.6) + 
+  stat_summary(fun.data = mean_se, geom = "errorbar", alpha=0.6, color='black', width=0.3) +
+  geom_point(size=2) +
+  facet_grid2(splice.name~timepoint, scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'bat.virallog2CPM.wGenomicORF9b.counts', dimensions=c(10,9))
+
+# now lets show the CPM counts barplot with the individual points overlaid on top 
+g <- ggplot(viralCounts.dt[host=='bat' & virus != 'WA' & !splice.name %in% c( 'Nstar')], aes(x=virus, color=virus, y=cpm, fill=virus)) +
+  stat_summary(fun.y = mean, geom = "bar", alpha=0.6) + 
+  stat_summary(fun.data = mean_se, geom = "errorbar", alpha=0.6, color='black', width=0.5) +
+#  geom_point(size=2) +
+  facet_grid2(splice.name~timepoint, scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  scale_fill_brewer(type='qual',palette=3) +
+  scale_shape_manual(values=c(21)) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'bat.viralCPM..wGenomicORF9b.counts', dimensions=c(10,9))
+```
+Maybe do a linechart of the counts of the viral transcripts for bat and human
+
+```{r}
+# now lets show the CPM counts barplot with the individual points overlaid on top 
+g <- ggplot(viralCounts.dt[host=='bat' & virus != 'WA' & !splice.name %in% c( 'Nstar')], aes(x=timepoint, color=virus, y=log2(cpm), shape=as.factor(rep), group=virus)) +
+  stat_summary(geom='line', fun.y='mean') +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width=0.1) +
+  #geom_point(size=2) +
+  facet_grid2(splice.name~., scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  scale_fill_brewer(type='qual',palette=3) +
+ # scale_shape_manual(values=c(21)) +
+  theme_bw()
+
+g
+
+BackupAsPDF(g, 'bat.viralCPM.wGenomicORF9b.linechart', dimensions=c(8,12))
+```
+```{r}
+# now lets show the CPM counts barplot with the individual points overlaid on top 
+g <- ggplot(viralCounts.dt[host=='bat' & !splice.name %in% c( 'Nstar')], aes(x=timepoint, color=virus, y=log2(genomicNormCount), shape=as.factor(rep), group=virus)) +
+  stat_summary(geom='line', fun.y='mean') +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width=0.1) +
+  #geom_point(size=2) +
+  facet_grid2(splice.name~., scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  scale_fill_brewer(type='qual',palette=3) +
+ # scale_shape_manual(values=c(21)) +
+  theme_bw()
+g
+BackupAsPDF(g, 'bat.viralgenomicNorm.wGenomicORF9b.linechart', dimensions=c(8,12))
+```
+
+linechart for human
+```{r}
+# now lets show the CPM counts barplot with the individual points overlaid on top 
+g <- ggplot(viralCounts.dt[host=='human' & !splice.name %in% c( 'Nstar')], aes(x=timepoint, color=virus, y=log2(cpm+1), shape=as.factor(rep), group=virus)) +
+  stat_summary(geom='line', fun.y='mean') +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width=0.1) +
+  #geom_point(size=2) +
+  facet_grid2(splice.name~., scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  scale_fill_brewer(type='qual',palette=3) +
+ # scale_shape_manual(values=c(21)) +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'human.viralCPM..wGenomicORF9b.linechart', dimensions=c(8,12))
+```
+Do the genomic normalized and retry; points look quite similar, so I think it is fine to use the 
+
+```{r}
+# now lets show the CPM counts barplot with the individual points overlaid on top 
+g <- ggplot(viralCounts.dt[host=='human' & !splice.name %in% c( 'Nstar')], aes(x=timepoint, color=virus, y=log2(genomicNormCount+1), shape=as.factor(rep), group=virus)) +
+  stat_summary(geom='line', fun.y='mean') +
+  stat_summary(fun.data = mean_se, geom = "errorbar", width=0.1) +
+  #geom_point(size=2) +
+  facet_grid2(splice.name~., scales='free', independent = T) +
+  scale_color_brewer(type='qual',palette=3) +
+  scale_fill_brewer(type='qual',palette=3) +
+ # scale_shape_manual(values=c(21)) +
+  theme_bw()
+g
+BackupAsPDF(g, 'human.viralgenomicNorm.wGenomicORF9b.linechart', dimensions=c(8,12))
+```
+
+
+I think now do a scatterplot of the viral counts of
+
+```{r}
+viralCounts.dt %>%  colnames()
+
+ggplot(viralCounts.dt, aes(x=splice.name, y=cpm[virus == 'WA'],)) +
+  geom_point()
+
+viralCounts.wide.dt <- dcast(viralCounts.dt, splice.name+timepoint~host+virus, value.var = c("cpm", "genomicNormCount"), fun.aggregate = mean, na.rm=T)
+
+g <- ggplot(viralCounts.wide.dt[!splice.name %in% c('Nstar'),], aes(x=log2(cpm_bat_N_P80T), y=log2(cpm_bat_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5, shape=21) +
+  xlab('N_P80T log2(cpm)') +
+  ylab('9b_T72I_N_P80T log2(cpm)') +
+  ggtitle('Bat SARS-CoV-2 sgRNA expression') +
+  facet_wrap(~timepoint,scales='free') +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+  ggh4x::facetted_pos_scales(
+    x = list(
+      scale_x_continuous(limits = c(6, 18), breaks=seq(6,18,2)),
+      scale_x_continuous(limits = c(6, 18), breaks=seq(6,18,2)),
+      scale_x_continuous(limits = c(6, 18), breaks=seq(6,18,2)),
+      scale_x_continuous(limits = c(6, 18), breaks=seq(6,18,2))
+    ),
+    y = list(
+      scale_y_continuous(limits = c(6, 18), breaks=seq(6,18,2)),
+      scale_y_continuous(limits = c(6, 18), breaks=seq(6,18,2)),
+      scale_y_continuous(limits = c(6, 18), breaks=seq(6,18,2)),
+      scale_y_continuous(limits = c(6, 18), breaks=seq(6,18,2))
+    )
+  ) +
+  theme_bw()
+g
+BackupAsPDF(g, 'bat.viralCPM.linechart')
+
+
+# try with genomic normalized 
+g <- ggplot(viralCounts.wide.dt[!splice.name %in% c('Nstar', 'genomic')], aes(x=log2(genomicNormCount_bat_N_P80T), y=log2(genomicNormCount_bat_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5, shape=21) +
+  xlab('N_P80T log2(sgRNA/genomic)') +
+  ylab('9b_T72I_N_P80T log2(sgRNA/genomic)') +
+  ggtitle('Bat SARS-CoV-2 sgRNA expression') +
+  facet_wrap(~timepoint, scales='free') +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+  ggh4x::facetted_pos_scales(
+    x = list(
+      scale_x_continuous(limits = c(-4, 10), breaks=seq(-4,10,2)),
+      scale_x_continuous(limits = c(-6, 7), breaks=seq(-6,7,2)),
+      scale_x_continuous(limits = c(-8, 5), breaks=seq(-8,5,2)),
+      scale_x_continuous(limits = c(-7, 7), breaks=seq(-7,7,2))
+    ),
+    y = list(
+      scale_y_continuous(limits = c(-4, 10), breaks=seq(-4,10,2)),
+      scale_y_continuous(limits = c(-6, 7), breaks=seq(-6,7,2)),
+      scale_y_continuous(limits = c(-8, 5), breaks=seq(-8,5,2)),
+      scale_y_continuous(limits = c(-7, 7), breaks=seq(-7,7,2))
+    )
+  ) +
+  theme_bw()
+g
+BackupAsPDF(g, 'bat.viralCgenomicNorm.linechart')
+```
+
+repeat w/o ORF9b
+```{r}
+g <- ggplot(viralCounts.wide.dt[!splice.name %in% c('Nstar', 'genomic', 'orf9b'),], aes(x=log2(cpm_bat_N_P80T), y=log2(cpm_bat_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5, shape=21) +
+  xlab('N_P80T log2(cpm)') +
+  ylab('9b_T72I_N_P80T log2(cpm)') +
+  ggtitle('Bat SARS-CoV-2 sgRNA expression') +
+  facet_wrap(~timepoint, scales='free') +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+  ggh4x::facetted_pos_scales(
+    x = list(
+      scale_x_continuous(limits = c(13, 18), breaks=seq(13,18,1)),
+      scale_x_continuous(limits = c(13, 18), breaks=seq(13,18,1)),
+      scale_x_continuous(limits = c(13, 18), breaks=seq(13,18,1)),
+      scale_x_continuous(limits = c(13, 18), breaks=seq(13,18,1))
+    ),
+    y = list(
+      scale_y_continuous(limits = c(13, 18), breaks=seq(13,18,1)),
+      scale_y_continuous(limits = c(13, 18), breaks=seq(13,18,1)),
+      scale_y_continuous(limits = c(13, 18), breaks=seq(13,18,1)),
+      scale_y_continuous(limits = c(13, 18), breaks=seq(13,18,1))
+    )
+  ) +
+  theme_bw()
+g
+BackupAsPDF(g, 'bat.viralCPM.noGenomicnoORF9b.linechart')
+
+
+library(tidymodels)
+
+g <- ggplot(viralCounts.wide.dt[!splice.name %in% c('Nstar', 'genomic', 'orf9b'),], aes(x=log2(cpm_bat_N_P80T), y=log2(cpm_bat_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5, shape=21) +
+  xlab('N_P80T log2(cpm)') +
+  ylab('9b_T72I_N_P80T log2(cpm)') +
+  ggtitle('Bat SARS-CoV-2 sgRNA expression') +
+  facet_wrap(~timepoint) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+  coord_obs_pred() +
+  theme_bw()
+g
+BackupAsPDF(g, 'bat.viralCPM.noGenomicnoORF9b.linechart', dimensions = c(7,7))
+
+
+# try with genomic normalized 
+g <- ggplot(viralCounts.wide.dt[!splice.name %in% c('Nstar', 'genomic', 'orf9b')], aes(x=log2(genomicNormCount_bat_N_P80T), y=log2(genomicNormCount_bat_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5, shape=21) +
+  xlab('N_P80T log2(sgRNA/genomic)') +
+  ylab('9b_T72I_N_P80T log2(sgRNA/genomic)') +
+  ggtitle('Bat SARS-CoV-2 sgRNA expression') +
+  facet_wrap(~timepoint) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+  coord_obs_pred() +
+  theme_bw()
+g
+BackupAsPDF(g, 'bat.viralgenomicNorm.noORF9b.linechart', dimensions=c(7,7))
+```
+
+plot the same with human
+```{r}
+library(patchwork)
+
+g <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar')], aes(x=log2(cpm_human_WA), y=log2(cpm_human_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('WA log2(cpm)') +
+  ylab('N_P80T log2(cpm)') +
+  ggtitle('Human SARS-CoV-2 sgRNA expression') +
+  facet_wrap(~timepoint) +
+  coord_obs_pred() +
+  theme_bw()
+
+q <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar')], aes(x=log2(cpm_human_WA), y=log2(cpm_human_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('WA log2(cpm)') +
+  ylab('9b_T72I_N_P80T log2(cpm)') +
+  facet_wrap(~timepoint) +
+  guides(color = FALSE, fill=FALSE) +
+  coord_obs_pred() +
+  theme_bw()
+
+p <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar')], aes(x=log2(cpm_human_N_P80T), y=log2(cpm_human_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('N_P80T log2(cpm)') +
+  ylab('9b_T72I_N_P80T log2(cpm)') +
+  facet_wrap(~timepoint) +
+  guides(color = FALSE, fill=FALSE) +
+  coord_obs_pred() +
+  theme_bw()
+
+BackupAsPDF(g/q/p, 'human.viralCPM_linechart', dimensions=c(10,10))
+```
+repeat with genomic and orf9b removed
+
+```{r}
+library(patchwork)
+
+g <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar', 'genomic', 'orf9b')], aes(x=log2(cpm_human_WA), y=log2(cpm_human_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('WA log2(cpm)') +
+  ylab('N_P80T log2(cpm)') +
+  ggtitle('Human SARS-CoV-2 sgRNA expression') +
+  facet_wrap(~timepoint) +
+  coord_obs_pred() +
+  theme_bw()
+
+q <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar', 'genomic', 'orf9b')], aes(x=log2(cpm_human_WA), y=log2(cpm_human_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('WA log2(cpm)') +
+  ylab('9b_T72I_N_P80T log2(cpm)') +
+  facet_wrap(~timepoint) +
+  coord_obs_pred() +
+  guides(color = FALSE, fill=FALSE) +
+  theme_bw()
+
+p <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar','genomic', 'orf9b')], aes(x=log2(cpm_human_N_P80T), y=log2(cpm_human_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('N_P80T log2(cpm)') +
+  ylab('9b_T72I_N_P80T log2(cpm)') +
+  facet_wrap(~timepoint) +
+  coord_obs_pred() +
+  guides(color = FALSE, fill=FALSE) +
+  theme_bw()
+
+g/q/p
+BackupAsPDF(g/q/p, 'human.viralCPM_noGenomicORF9b_linechart', dimensions=c(10,10))
+```
+
+Try the same plot with genomic normalized 
+
+```{r}
+g <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar', 'genomic')], aes(x=log2(genomicNormCount_human_WA), y=log2(genomicNormCount_human_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('WA log2(sgRNA/genomic)') +
+  ylab('N_P80T log2(sgRNA/genomic)') +
+  ggtitle('Human SARS-CoV-2 sgRNA expression') +
+  facet_wrap(~timepoint) +
+  coord_obs_pred() +
+  theme_bw()
+
+q <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar', 'genomic')], aes(x=log2(genomicNormCount_human_WA), y=log2(genomicNormCount_human_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('WA log2(sgRNA/genomic+1)') +
+  ylab('9b_T72I_N_P80T log2(sgRNA/genomic)') +
+  facet_wrap(~timepoint) +
+  guides(color = FALSE, fill=FALSE) +
+  coord_obs_pred() +
+  theme_bw()
+
+p <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar', 'genomic')], aes(x=log2(genomicNormCount_human_N_P80T), y=log2(genomicNormCount_human_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('N_P80T log2(sgRNA/genomic)') +
+  ylab('9b_T72I_N_P80T log2(sgRNA/genomic)') +
+  facet_wrap(~timepoint) +
+  guides(color = FALSE, fill=FALSE) +
+  coord_obs_pred() +
+  theme_bw()
+
+BackupAsPDF(g/q/p, 'human.viralgenomicNorm_linechart', dimensions=c(10,10))
+```
+
+
+Try again but remove orf9b
+```{r}
+g <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar', 'genomic', 'orf9b')], aes(x=log2(genomicNormCount_human_WA), y=log2(genomicNormCount_human_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('WA log2(sgRNA/genomic)') +
+  ylab('N_P80T log2(sgRNA/genomic)') +
+  ggtitle('Human SARS-CoV-2 sgRNA expression') +
+  facet_wrap(~timepoint) +
+  coord_obs_pred() +
+  theme_bw()
+
+q <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar', 'genomic', 'orf9b')], aes(x=log2(genomicNormCount_human_WA), y=log2(genomicNormCount_human_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('WA log2(sgRNA/genomic+1)') +
+  ylab('9b_T72I_N_P80T log2(sgRNA/genomic)') +
+  facet_wrap(~timepoint) +
+  guides(color = FALSE, fill=FALSE) +
+  coord_obs_pred() +
+  theme_bw()
+
+p <- ggplot(viralCounts.wide.dt[timepoint != '6h' & !splice.name %in% c('Nstar', 'genomic', 'orf9b')], aes(x=log2(genomicNormCount_human_N_P80T), y=log2(genomicNormCount_human_9b_T72I_N_P80T), fill=splice.name)) +
+  geom_point(size=2.5,shape=21) +
+  geom_abline(intercept=0, slope=1, alpha=0.6, linetype=2) +
+ # scale_shape_manual(name = 'virus', values =c('WA-N_P80T'=21,'WA-9b_T72I_N_P80T'=22), labels = c('c2','c1')) +
+  xlab('N_P80T log2(sgRNA/genomic)') +
+  ylab('9b_T72I_N_P80T log2(sgRNA/genomic)') +
+  facet_wrap(~timepoint) +
+  guides(color = FALSE, fill=FALSE) +
+  coord_obs_pred() +
+  theme_bw()
+
+BackupAsPDF(g/q/p, 'human.viralgenomicNorm_noORF9b_linechart', dimensions=c(9,9))
+```
+
+Share what we have at the moment, along with the wide format of the viral
+
+```{r}
+#fwrite(viralCounts.wide.dt, ScriptAndDatedFileName('viralsgRNANormalizedCounts.meanSummary.csv'))
+
+viralCounts.wide.dt <- dcast(viralCounts.dt, splice.name+timepoint~host+virus+rep, value.var = c("cpm", "genomicNormCount"))
+#fwrite(viralCounts.wide.dt, ScriptAndDatedFileName('viralsgRNANormalizedCounts.csv'))
+```
+
+Run linear models on each viral transcript to assess differential expression in each group
+```{r}
+emmeans.contrastOfContrasts <- function (l, factorFormula =  ~group){  
+  emm <- emmeans::emmeans(l, specs =  factorFormula) #estimate marginal means
+  #contrasts <- contrast(emm, method = "pairwise", adjust = "none")
+  contrast1 <- pairs(emm, reverse=TRUE) # set WA as baseline
+  return (as.data.table(summary(contrast1)))
+}
+
+lm.out <- linearModelsAllProteins(counts.dt[host =='human',], 
+                                  formulaList = list(BasicModel =  log2_genomicNormCount ~ group),
+                                  splitColumn = "splice.name", 
+                                  postProcessFunction = emmeans.contrastOfContrasts, cl = 6)
+
+contrasts.oi <- c(unique(grep('6h.+6h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('12h.+12h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('24h.+24h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('48h.+48h', lm.out$postProcess$contrast, value=T))
+                  )
+
+
+
+lm.out$postProcess
+human.lm.out <- lm.out$postProcess[splice.name != 'genomic' & contrast %in% contrasts.oi,]
+human.lm.out[, p.adj := p.adjust(p.value, method='BH')]
+```
+
+Read in the counts data and format
+```{r}
+# read in the viral counts and plot and calculate fold change
+counts.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/083024_viralComparisons_data/2024_08_31_viral.subgenomicRNA.counts.csv', stringsAsFactors = F)
+counts.dt[, genomicNormalizedCount := count/count[splice.name == 'genomic'], by=.(sample)]
+counts.dt[, N_P80TNormalizedCount := genomicNormalizedCount/genomicNormalizedCount[virus == 'N_P80T'], by=.(splice.name, host,timepoint, rep)]
+
+counts.dt[splice.name == 'nonc_9b', splice.name := 'orf9b']
+
+# reorder factors
+counts.dt[, splice.name := factor(splice.name, levels=c('genomic', 'S', 'orf3', 'E', 'M', 'orf6', 'orf7', 'orf8', 'N', 'orf9b', 'Nstar'))]
+counts.dt[, virus := factor(virus, levels=c("WA","N_P80T","9b_T72I_N_P80T"))]
+counts.dt[, timepoint := factor(timepoint, levels=c("6h","12h","24h","48h"))]
+
+# format for lm
+counts.dt[, condition := gsub('_[0-9]{1,2}h.+$', '', sample)]
+counts.dt[, log2_genomicNormCount := log2(genomicNormCount)]
+counts.dt[, group := gsub('_[123]$','', sample)]
+```
+
+Run linear models on each viral transcript to assess differential expression in each group
+```{r}
+emmeans.contrastOfContrasts <- function (l, factorFormula =  ~group){  
+  emm <- emmeans::emmeans(l, specs =  factorFormula) #estimate marginal means
+  #contrasts <- contrast(emm, method = "pairwise", adjust = "none")
+  contrast1 <- pairs(emm, reverse=TRUE) # set WA as baseline
+  return (as.data.table(summary(contrast1)))
+}
+
+lm.out <- linearModelsAllProteins(counts.dt[host =='human',], 
+                                  formulaList = list(BasicModel =  log2_genomicNormCount ~ group),
+                                  splitColumn = "splice.name", 
+                                  postProcessFunction = emmeans.contrastOfContrasts, cl = 6)
+
+contrasts.oi <- c(unique(grep('6h.+6h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('12h.+12h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('24h.+24h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('48h.+48h', lm.out$postProcess$contrast, value=T))
+                  )
+
+
+
+lm.out$postProcess
+human.lm.out <- lm.out$postProcess[splice.name != 'genomic' & contrast %in% contrasts.oi,]
+human.lm.out[, p.adj := p.adjust(p.value, method='BH')]
+```
+
+Generate barplots of sig results
+
+```{r}
+fwrite(human.lm.out[, .(splice.name, contrast, log2FC=estimate, SE, df, p.value, p.adj)], ScriptAndDatedFileName('human.viralStats.csv'))
+
+hu.viralStats <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/091824_dataPreparationforJyoti_data/2024_09_20_human.viralStats.csv')
+hu.viralStats[, comparison := gsub('_[0-9]{1,2}h', '', contrast)]
+hu.viralStats[, timepoint := factor(str_extract(contrast, '[0-9]{1,2}h'), levels=c('6h', '12h', '24h', '48h'))]
+hu.viralStats[, splice.name := factor(splice.name, levels=c('genomic', 'S', 'orf3', 'E', 'M', 'orf6', 'orf7', 'orf8', 'N', 'orf9b', 'Nstar'))]
+
+hu.viralStats[,'p.adj < 0.05' := ifelse(p.adj < 0.05, 'yes', 'no')]
+
+col.pal <- randomcoloR::distinctColorPalette(k=3)
+
+g <- ggplot(hu.viralStats, aes(x=reorder(splice.name, -splice.name), y=log2FC, fill=timepoint, alpha=`p.adj < 0.05`)) +
+  geom_bar(position='dodge', stat='Identity') +
+  #geom_errorbar(aes(ymin=-SE, ymax=SE), position = position_dodge()) +
+  xlab('Viral Transcript') +
+  facet_wrap(~comparison) +
+  coord_flip() +
+  scale_alpha_manual(values=c('yes'=0.9, 'no'=0.5)) +
+  scale_fill_brewer(type='seq', palette=1) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'human.viralsgRNA.compairsons.barplot', dimensions=c(10,6))
+
+
+g <- ggplot(hu.viralStats[splice.name != 'orf9b',], aes(x=reorder(splice.name, -splice.name), y=log2FC, fill=timepoint, alpha=`p.adj < 0.05`)) +
+  geom_bar(position='dodge', stat='Identity') +
+  #geom_errorbar(aes(ymin=-SE, ymax=SE), position = position_dodge()) +
+  xlab('Viral Transcript') +
+  facet_wrap(~comparison) +
+  coord_flip() +
+  scale_alpha_manual(values=c('yes'=0.9, 'no'=0.5)) +
+  scale_fill_brewer(type='seq', palette=1) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'human.viralsgRNA.compairsons.noORF9b.barplot', dimensions=c(10,6))
+
+
+g <- ggplot(hu.viralStats[splice.name != 'orf9b',], aes(y=reorder(splice.name, -splice.name), x=log2FC, fill=timepoint, alpha=`p.adj < 0.05`)) +
+  geom_bar(position='dodge', stat='Identity') +
+  #geom_errorbar(aes(ymin=-SE, ymax=SE), position = position_dodge()) +
+  xlab('log2FC (sgRNA/genomic)') +
+  ggtitle('Comparisons of viral transcript expression in MRC5') +
+  ylab('') +
+  facet_grid(~comparison, scales='free_y') +
+ # coord_flip() +
+  scale_alpha_manual(values=c('yes'=0.99, 'no'=0.6)) +
+  scale_fill_brewer(type='seq', palette=1) +
+  theme_bw() #+
+  #theme(axis.text.y=element_blank(),
+  #      axis.ticks.x = element_blank())
+g
+BackupAsPDF(g, 'human.viralsgRNA.compairsons.noORF9b.barplot', dimensions=c(10,6))
+```
+
+
+repeat the analysis with bat
+Drop WA from the measurements as too noisy
+```{r}
+
+emmeans.contrastOfContrasts <- function (l, factorFormula =  ~group){  
+  emm <- emmeans::emmeans(l, specs =  factorFormula) #estimate marginal means
+  #contrasts <- contrast(emm, method = "pairwise", adjust = "none")
+  contrast1 <- pairs(emm, reverse=TRUE) # set WA as baseline
+  return (as.data.table(summary(contrast1)))
+}
+
+lm.out <- linearModelsAllProteins(counts.dt[host =='bat' & virus != 'WA',], 
+                                  formulaList = list(BasicModel =  log2_genomicNormCount ~ group),
+                                  splitColumn = "splice.name", 
+                                  postProcessFunction = emmeans.contrastOfContrasts, cl = 6)
+
+contrasts.oi <- c(unique(grep('6h.+6h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('12h.+12h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('24h.+24h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('48h.+48h', lm.out$postProcess$contrast, value=T))
+                  )
+```
+
+```{r}
+lm.out$postProcess
+
+bat.lm.out <- lm.out$postProcess[splice.name != 'genomic' & contrast %in% contrasts.oi,]
+bat.lm.out[, p.adj := p.adjust(p.value, method='BH')]
+
+fwrite(bat.lm.out[, .(splice.name, contrast, log2FC=estimate, SE, df, p.value, p.adj)], ScriptAndDatedFileName('bat.viralStats.csv'))
+
+bat.viralStats <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/091824_dataPreparationforJyoti_data/2024_09_20_bat.viralStats.csv')
+bat.viralStats[, comparison := gsub('_[0-9]{1,2}h', '', contrast)]
+bat.viralStats[, timepoint := factor(str_extract(contrast, '[0-9]{1,2}h'), levels=c('6h', '12h', '24h', '48h'))]
+bat.viralStats[, splice.name := factor(splice.name, levels=c('genomic', 'S', 'orf3', 'E', 'M', 'orf6', 'orf7', 'orf8', 'N', 'orf9b', 'Nstar'))]
+
+f.bat.viralStats <- bat.viralStats[comparison == "RFe_N_P80T - RFe_9b_T72I_N_P80T",]
+# recalculate p.adj if only interested in this set of comparisons
+f.bat.viralStats[, p.adj := p.adjust(p.value, method='BH')]
+bat.viralStats[,'p.adj < 0.05' := ifelse(p.value < 0.05, 'yes', 'no')]
+
+
+g <- ggplot(f.bat.viralStats[splice.name != 'orf9b',], aes(y=reorder(splice.name, -splice.name), x=log2FC, fill=timepoint, color=`p.adj < 0.05`)) +
+  geom_bar(position='dodge', stat='Identity') +
+  #geom_errorbar(aes(ymin=-SE, ymax=SE), position = position_dodge()) +
+  xlab('log2FC (sgRNA/genomic)') +
+  ggtitle('Comparisons of viral transcript expression in RFe') +
+  ylab('') +
+  facet_grid(splice.name~comparison, scales='free_y') +
+  scale_color_manual(values=c('yes'='red')) +
+  scale_fill_brewer(type='seq', palette=1) +
+  guides('color'=FALSE) +
+  theme_bw() +
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.minor.ticks.y = element_blank())
+g
+BackupAsPDF(g, 'bat.viralsgRNA.compairsons.noORF9b.barplot', dimensions=c(5,6))
+
+fwrite(f.bat.viralStats[, .(splice.name, contrast, log2FC, SE, df, p.value, p.adj)], ScriptAndDatedFileName('bat.viralStats.filtered.csv'))
+```
+
+
+**Question**
+Lacking confidence intervals for the genes, see if we can adust the script to do this
+
+```{r}
+test<- counts.dt[splice.name == 'N' & host =='human' & timepoint %in% c('12h','24h'),]
+
+mod0 <- lm(log2_genomicNormCount ~ group, data=test)
+
+counts.dt
+
+# get the emm
+emm <- emmeans::emmeans(mod0, ~group)
+
+
+
+mod1 <- lm(log2_genomicNormCount ~ virus + timepoint, data=test)
+
+emmeans::emmeans(mod0, ~group)
+emmeans::emmeans(mod1, ~virus|timepoint)
+
+emmeans::eff_size(mod0, method='pairwise')
+
+emmeans::eff_size(pairs(emm), sigma(mod0), df.residual(mod0), method = "identity")
+
+pairs(emm)
+summary(emm)
+
+
+# -0.047217
+mean(c(3.006251,3.416384, 3.070263)) -mean(c(3.287610,3.199185,3.147754))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+Not used....
+
+produce the LFC plots for human and bat
+```{r}
+# read in the viral counts and plot and calculate fold change
+counts.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/083024_viralComparisons_data/2024_08_31_viral.subgenomicRNA.counts.csv', stringsAsFactors = F)
+counts.dt[, genomicNormalizedCount := count/count[splice.name == 'genomic'], by=.(sample)]
+counts.dt[, N_P80TNormalizedCount := genomicNormalizedCount/genomicNormalizedCount[virus == 'N_P80T'], by=.(splice.name, host,timepoint, rep)]
+counts.dt[, condition := gsub('_[0-9]{1,2}h.+$', '', sample)]
+counts.dt[, log2_genomicNormCount := log2(genomicNormCount)]
+
+counts.dt[splice.name == 'nonc_9b', splice.name := 'orf9b']
+
+# reorder factors
+counts.dt[, splice.name := factor(splice.name, levels=c('genomic', 'S', 'orf3', 'E', 'M', 'orf6', 'orf7', 'orf8', 'N', 'orf9b', 'Nstar'))]
+counts.dt[, virus := factor(virus, levels=c("WA","N_P80T","9b_T72I_N_P80T"))]
+counts.dt[, timepoint := factor(timepoint, levels=c("6h","12h","24h","48h"))]
+
+
+g <- ggplot(data=counts.dt[host == 'bat' & virus != 'WA' & !splice.name %in% c('Nstar', 'orf9b'), .(meanFC = mean(log2(N_P80TNormalizedCount), na.rm=T),stDev = sd(N_P80TNormalizedCount, na.rm=T)), by=.(splice.name, host,timepoint, virus)], 
+            aes(x=meanFC, y=virus, fill=virus)) + 
+  geom_bar(stat='Identity') +
+  geom_point(data=counts.dt[host == 'bat' & !virus %in% c('WA', 'N_P80T') & !splice.name %in% c('Nstar', 'genomic', 'orf9b'),], aes(x=log2(N_P80TNormalizedCount), y=virus, fill=virus), shape=21) +
+  geom_vline(xintercept=0) +
+  geom_vline(xintercept=0) +
+  ggtitle('Bat SARS2 subgenomic regions FC vs N_P80T') +
+  xlab('log2 (sgRNA/Genomic)/N_P80T') +
+  ylab('Virus') +
+  scale_fill_brewer(type='seq') +
+  facet_grid2(timepoint~splice.name, scales='free') +
+  #xlim(c(-2,2)) +
+  theme_bw()
+g
+
+counts.dt[host == 'bat' &  timepoint == '6h' & virus == '9b_T72I_N_P80T' & splice.name == 'N',]
+counts.dt[host == 'bat' &  timepoint == '6h' & virus == 'N_P80T' & splice.name == 'N',]
+```
+summarise the counts table to mean and sd per group
+```{r}
+g <- ggplot(stats.dt[splice.name != 'orf9b',], aes(x=splice.name, fill=timepoint, y=statistic)) +
+  geom_bar(position="dodge", stat='Identity') +
+  facet_wrap(~contrast) +
+  coord_flip() +
+  theme_bw()
+g
+
+counts.dt[host =='human' & timepoint == '48h' & splice.name %in% c('N','genomic')]
+counts.dt[, condition := gsub('_[0-9]{1,2}h.+$', '', sample)]
+counts.dt[, log2_genomicNormCount := log2(genomicNormCount)]
+```
+Recalcualte the stats
+Retry this by first calculating log2
+
+```{r}
+counts.dt[, log2_genomicNormCount := log2(genomicNormCount)]
+
+counts.mat <- dcast(counts.dt[splice.name != 'genomic' & host == 'human'], interaction(host, timepoint,splice.name)~virus+rep, value.var='log2_genomicNormCount') %>% 
+  as.matrix(rownames=1)
+
+
+counts.mat %>%  dim()
+
+run_tTests <-  function(row_data) {
+  WA <- row_data[1:3]
+  N_P80T <- row_data[4:6]
+  orf9b_T72I_N_P80T <- row_data[7:9]
+  
+  
+  # Perform t-tests between group pairs
+  N_P80T_WA  <- t.test(N_P80T, WA, alternative='two.sided')
+  orf9b_T72I_N_P80T_WA <- t.test(orf9b_T72I_N_P80T, WA, alternative='two.sided')
+  orf9b_T72I_N_P80T_N_P80T <- t.test(orf9b_T72I_N_P80T, N_P80T, alternative='two.sided')
+  
+  # return as datatable
+  data.table(
+    N_P80T_WA.statistic = N_P80T_WA$statistic,
+    N_P80T_WA.p_value = N_P80T_WA$p.value,
+    N_P80T_WA.conf_int_lower = N_P80T_WA$conf.int[1],
+    N_P80T_WA.conf_int_upper = N_P80T_WA$conf.int[2],
+    N_P80T_WA.estimate = N_P80T_WA$estimate,
+    
+    orf9b_T72I_N_P80T_WA.statistic = orf9b_T72I_N_P80T_WA$statistic,
+    orf9b_T72I_N_P80T_WA.p_value = orf9b_T72I_N_P80T_WA$p.value,
+    orf9b_T72I_N_P80T_WA.conf_int_lower = orf9b_T72I_N_P80T_WA$conf.int[1],
+    orf9b_T72I_N_P80T_WA.conf_int_upper = orf9b_T72I_N_P80T_WA$conf.int[2],
+    orf9b_T72I_N_P80T_WA.estimate = orf9b_T72I_N_P80T_WA$estimate,
+    
+    orf9b_T72I_N_P80T_N_P80T.statistic = orf9b_T72I_N_P80T_N_P80T$statistic,
+    orf9b_T72I_N_P80T_N_P80T.p_value = orf9b_T72I_N_P80T_N_P80T$p.value,
+    orf9b_T72I_N_P80T_N_P80T.conf_int_lower = orf9b_T72I_N_P80T_N_P80T$conf.int[1],
+    orf9b_T72I_N_P80T_N_P80T.conf_int_upper = orf9b_T72I_N_P80T_N_P80T$conf.int[2],
+    orf9b_T72I_N_P80T_N_P80T.estimate = orf9b_T72I_N_P80T_N_P80T$estimate
+  )}
+
+ttest.out <- rbindlist(lapply(1:nrow(counts.mat), function(i) {
+  run_tTests(counts.mat[i, ])
+}))
+
+ttest.out
+```
+
+
+```{r}
+run_tTests <- function(row_data) {
+  WA <- row_data[1:3]
+  N_P80T <- row_data[4:6]
+  orf9b_T72I_N_P80T <- row_data[7:9]
+  
+  # Perform t-tests
+  N_P80T_WA  <- t.test(N_P80T, WA, alternative='two.sided')
+  orf9b_T72I_N_P80T_WA <- t.test(orf9b_T72I_N_P80T, WA, alternative='two.sided')
+  orf9b_T72I_N_P80T_N_P80T <- t.test(orf9b_T72I_N_P80T, N_P80T, alternative='two.sided')
+  
+  # Create data.table
+  result <- data.table(
+    N_P80T_WA_statistic = N_P80T_WA$statistic,
+    N_P80T_WA_p_value = N_P80T_WA$p.value,
+    N_P80T_WA_conf_int_lower = N_P80T_WA$conf.int[1],
+    N_P80T_WA_conf_int_upper = N_P80T_WA$conf.int[2],
+    N_P80T_WA_estimate = N_P80T_WA$estimate,
+    
+    orf9b_T72I_N_P80T_WA_statistic = orf9b_T72I_N_P80T_WA$statistic,
+    orf9b_T72I_N_P80T_WA_p_value = orf9b_T72I_N_P80T_WA$p.value,
+    orf9b_T72I_N_P80T_WA_conf_int_lower = orf9b_T72I_N_P80T_WA$conf.int[1],
+    orf9b_T72I_N_P80T_WA_conf_int_upper = orf9b_T72I_N_P80T_WA$conf.int[2],
+    orf9b_T72I_N_P80T_WA_estimate = orf9b_T72I_N_P80T_WA$estimate,
+    
+    orf9b_T72I_N_P80T_N_P80T_statistic = orf9b_T72I_N_P80T_N_P80T$statistic,
+    orf9b_T72I_N_P80T_N_P80T_p_value = orf9b_T72I_N_P80T_N_P80T$p.value,
+    orf9b_T72I_N_P80T_N_P80T_conf_int_lower = orf9b_T72I_N_P80T_N_P80T$conf.int[1],
+    orf9b_T72I_N_P80T_N_P80T_conf_int_upper = orf9b_T72I_N_P80T_N_P80T$conf.int[2],
+    orf9b_T72I_N_P80T_N_P80T_estimate = orf9b_T72I_N_P80T_N_P80T$estimate
+  )
+  
+  print(result)  # Add this line to see the output for each row
+  return(result)
+}
+
+
+rbindlist(lapply(1:nrow(counts.mat), function(i) {
+  run_tTests(counts.mat[i, ])
+}))
+```
+Take the humnan and bat proteins and run a linear model on the data
+
+```{r}
+# create a group column and do pw comparisons wthin one factor level
+counts.dt[, group := gsub('_[123]$','', sample)]
+
+emmeans.contrastOfContrasts <- function (l, factorFormula =  ~group){  
+  emm <- emmeans::emmeans(l, specs =  factorFormula) #estimate marginal means
+  #contrasts <- contrast(emm, method = "pairwise", adjust = "none")
+  contrast1 <- pairs(emm, reverse=TRUE) # set WA as baseline
+  return (as.data.table(summary(contrast1)))
+}
+
+lm.out <- linearModelsAllProteins(counts.dt[host =='human',], 
+                                  formulaList = list(BasicModel =  log2_genomicNormCount ~ group),
+                                  splitColumn = "splice.name", 
+                                  postProcessFunction = emmeans.contrastOfContrasts, cl = 6)
+
+contrasts.oi <- c(unique(grep('6h.+6h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('12h.+12h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('24h.+24h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('48h.+48h', lm.out$postProcess$contrast, value=T))
+                  )
+
+
+
+lm.out$postProcess
+human.lm.out <- lm.out$postProcess[splice.name != 'genomic' & contrast %in% contrasts.oi,]
+human.lm.out[, p.adj := p.adjust(p.value, method='BH')]
+```
+
+Now look at the counts and see if the contrasts make sense before plotting
+Looks good
+```{r}
+human.lm.out
+
+ # look at S protein for 12 and 24 hr two mutant contrast
+human.lm.out[1:2,]
+
+mean(c(-3.620565, -3.822912, -3.837755)) - mean(c(-3.978564,-4.349268, -4.197265))
+```
+
+```{r}
+fwrite(human.lm.out[, .(splice.name, contrast, log2FC=estimate, SE, df, p.value, p.adj)], ScriptAndDatedFileName('human.viralStats.csv'))
+
+hu.viralStats <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/091824_dataPreparationforJyoti_data/2024_09_20_human.viralStats.csv')
+hu.viralStats[, comparison := gsub('_[0-9]{1,2}h', '', contrast)]
+hu.viralStats[, timepoint := factor(str_extract(contrast, '[0-9]{1,2}h'), levels=c('6h', '12h', '24h', '48h'))]
+hu.viralStats[, splice.name := factor(splice.name, levels=c('genomic', 'S', 'orf3', 'E', 'M', 'orf6', 'orf7', 'orf8', 'N', 'orf9b', 'Nstar'))]
+
+hu.viralStats[,'p.adj < 0.05' := ifelse(p.adj < 0.05, 'yes', 'no')]
+
+col.pal <- randomcoloR::distinctColorPalette(k=3)
+
+hu.viralStats$comparison %>%  unique()
+
+g <- ggplot(hu.viralStats, aes(x=reorder(splice.name, -splice.name), y=log2FC, fill=timepoint, alpha=`p.adj < 0.05`)) +
+  geom_bar(position='dodge', stat='Identity') +
+  #geom_errorbar(aes(ymin=-SE, ymax=SE), position = position_dodge()) +
+  xlab('Viral Transcript') +
+  facet_wrap(~comparison) +
+  coord_flip() +
+  scale_alpha_manual(values=c('yes'=0.9, 'no'=0.5)) +
+  scale_fill_brewer(type='seq', palette=1) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'human.viralsgRNA.compairsons.barplot', dimensions=c(10,6))
+
+
+g <- ggplot(hu.viralStats[splice.name != 'orf9b',], aes(x=reorder(splice.name, -splice.name), y=log2FC, fill=timepoint, alpha=`p.adj < 0.05`)) +
+  geom_bar(position='dodge', stat='Identity') +
+  #geom_errorbar(aes(ymin=-SE, ymax=SE), position = position_dodge()) +
+  xlab('Viral Transcript') +
+  facet_wrap(~comparison) +
+  coord_flip() +
+  scale_alpha_manual(values=c('yes'=0.9, 'no'=0.5)) +
+  scale_fill_brewer(type='seq', palette=1) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'human.viralsgRNA.compairsons.noORF9b.barplot', dimensions=c(10,6))
+
+
+hu.viralStats
+
+g <- ggplot(hu.viralStats[comparison != "MRC5_WA - MRC5_9b_T72I_N_P80T" & splice.name != 'orf9b',], aes(y=reorder(splice.name, -splice.name), x=log2FC, fill=timepoint, color=`p.adj < 0.05`)) +
+  geom_bar(position='dodge', stat='Identity') +
+  #geom_errorbar(aes(ymin=-SE, ymax=SE), position = position_dodge()) +
+  xlab('log2FC (sgRNA/genomic)') +
+  ggtitle('Comparisons of viral transcript expression in MRC5') +
+  ylab('') +
+  geom_vline(xintercept=0, linetype=1, alpha=0.6) +
+  facet_grid(splice.name~comparison, scales='free_y') +
+ # coord_flip() +
+  scale_color_manual(values=c('yes'='red')) +
+  scale_fill_brewer(type='seq', palette=1) +
+  guides(color="colorbar") +
+  theme_bw() +
+  theme(axis.text.y=element_blank(),
+        axis.minor.ticks.y=element_blank(),
+        axis.ticks.y = element_blank())
+g
+BackupAsPDF(g, 'human.viralsgRNA.compairsons.noORF9b.barplot', dimensions=c(8,6))
+```
+repeat the analysis with bat
+```{r}
+
+counts.dt
+emmeans.contrastOfContrasts <- function (l, factorFormula =  ~group){  
+  emm <- emmeans::emmeans(l, specs =  factorFormula) #estimate marginal means
+  #contrasts <- contrast(emm, method = "pairwise", adjust = "none")
+  contrast1 <- pairs(emm, reverse=TRUE) # set WA as baseline
+  return (as.data.table(summary(contrast1)))
+}
+
+lm.out <- linearModelsAllProteins(counts.dt[host =='bat' & virus != 'WA',], 
+                                  formulaList = list(BasicModel =  log2_genomicNormCount ~ group),
+                                  splitColumn = "splice.name", 
+                                  postProcessFunction = emmeans.contrastOfContrasts, cl = 6)
+
+contrasts.oi <- c(unique(grep('6h.+6h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('12h.+12h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('24h.+24h', lm.out$postProcess$contrast, value=T)),
+                  unique(grep('48h.+48h', lm.out$postProcess$contrast, value=T))
+                  )
+```
+
+```{r}
+bat.lm.out <- lm.out$postProcess[splice.name != 'genomic' & contrast %in% contrasts.oi,]
+bat.lm.out[, p.adj := p.adjust(p.value, method='BH')]
+
+fwrite(bat.lm.out[, .(splice.name, contrast, log2FC=estimate, SE, df, p.value, p.adj)], ScriptAndDatedFileName('bat.viralStats.csv'))
+
+bat.viralStats <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/091824_dataPreparationforJyoti_data/2024_09_20_bat.viralStats.csv')
+bat.viralStats[, comparison := gsub('_[0-9]{1,2}h', '', contrast)]
+bat.viralStats[, timepoint := factor(str_extract(contrast, '[0-9]{1,2}h'), levels=c('6h', '12h', '24h', '48h'))]
+bat.viralStats[, splice.name := factor(splice.name, levels=c('genomic', 'S', 'orf3', 'E', 'M', 'orf6', 'orf7', 'orf8', 'N', 'orf9b', 'Nstar'))]
+
+bat.viralStats[,'p.adj < 0.05' := ifelse(p.adj < 0.05, 'yes', 'no')]
+
+f.bat.viralStats <- bat.viralStats[comparison == "RFe_N_P80T - RFe_9b_T72I_N_P80T",]
+
+g <- ggplot(f.bat.viralStats[splice.name != 'orf9b',], aes(y=reorder(splice.name, -splice.name), x=log2FC, fill=timepoint, alpha=`p.adj < 0.05`)) +
+  geom_bar(position='dodge', stat='Identity') +
+  #geom_errorbar(aes(ymin=-SE, ymax=SE), position = position_dodge()) +
+  xlab('log2FC (sgRNA/genomic)') +
+  ggtitle('Comparisons of viral transcript expression in RFe') +
+  ylab('') +
+  scale_alpha_manual(values=c('yes'=0.99, 'no'=0.6)) +
+  scale_fill_brewer(type='seq', palette=1) +
+  theme_bw() #+
+  #theme(axis.text.y=element_blank(),
+  #      axis.ticks.x = element_blank())
+g
+BackupAsPDF(g, 'bat.viralsgRNA.compairsons.noORF9b.barplot', dimensions=c(5,6))
+
+fwrite(f.bat.viralStats[, .(splice.name, contrast, log2FC, SE, df, p.value, p.adj)], ScriptAndDatedFileName('bat.viralStats.filtered.csv'))
+```
+
+```{r}
+
+```
+
+
+
+ttest.out
+counts.mat[rownames(counts.mat) == 'human.48h.N',]
+
+ttest.dt <- do.call(rbind, ttest.out)
+ttest.dt
+
+
+
+ttest.dt <- cbind(rownames(counts.mat),ttest.dt)
+
+ttest.dt[V1 =='human.48h.N',]
+
+
+N_P80T.vsWA <- counts.dt[host =='human' & splice.name != 'genomic' & !is.na(log2_genomicNormCount), t.test(x=log2_genomicNormCount[condition == 'MRC5_N_P80T'], y=log2_genomicNormCount[condition == 'MRC5_WA'], alternative='two.sided', var.equal=F), by=.(splice.name, timepoint)] %>%
+  .[, .(splice.name, contrast='MRC5_N_P80T vs MRC5_WA',timepoint, FC=estimate, statistic, df=parameter, p.value, stderr, method, alternative)] %>%  unique()
+
+dblMut.vsWA <- counts.dt[host =='human' & splice.name != 'genomic' & !is.na(log2_genomicNormCount), t.test(x=log2_genomicNormCount[condition == 'MRC5_9b_T72I_N_P80T'], y=log2_genomicNormCount[condition == 'MRC5_WA'], alternative='two.sided', var.equal=F), by=.(splice.name, timepoint)] %>%
+  .[, .(splice.name, contrast='MRC5_9b_T72I_N_P80T vs MRC5_WA',timepoint, FC=estimate, statistic, df=parameter, p.value, stderr, method, alternative)] %>%  unique()
+
+dblMut.vsN_P08T <- counts.dt[host =='human' & splice.name != 'genomic' & !is.na(log2_genomicNormCount), t.test(x=log2_genomicNormCount[condition == 'MRC5_9b_T72I_N_P80T'], y=log2_genomicNormCount[condition == 'MRC5_N_P80T'], alternative='two.sided', var.equal=F), by=.(splice.name, timepoint)] %>%
+  .[, .(splice.name, contrast='MRC5_9b_T72I_N_P80T vs MRC5_N_P80T',timepoint, FC=estimate, statistic, df=parameter, p.value, stderr, method, alternative)] %>%  unique()
+
+stats.dt <- rbind(N_P80T.vsWA, dblMut.vsWA, dblMut.vsN_P08T)
+
+dblMut.vsN_P08T
+
+fwrite(stats.dt, ScriptAndDatedFileName('human.viral.sgRNA.t.tests.corrected.csv'))
+
+
+hu.stats.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/091824_dataPreparationforJyoti_data/2024_09_19_human.viral.sgRNA.t.tests.corrected.csv')
+hu.stats.dt[V1 == 'human.48h.N',]
+
+
+counts.dt[splice.name == 'N' & timepoint == '48h']
+
+
+
+counts.dt[host =='human' & splice.name != 'genomic' & !is.na(genomicNormCount), t.test(x=log2(genomicNormCount[condition == 'MRC5_N_P80T']), y=log2(genomicNormCount[condition == 'MRC5_WA']), alternative='two.sided', var.equal=F), by=.(splice.name, timepoint)] 
+```
+```{r}
+library(data.table)
+
+# Your function to run t-tests
+run_tTests <- function(row_data) {
+  WA <- row_data[1:3]
+  N_P80T <- row_data[4:6]
+  orf9b_T72I_N_P80T <- row_data[7:9]
+  
+  # Perform t-tests between group pairs
+  N_P80T_WA  <- t.test(N_P80T, WA, alternative='two.sided')
+  orf9b_T72I_N_P80T_WA <- t.test(orf9b_T72I_N_P80T, WA, alternative='two.sided')
+  orf9b_T72I_N_P80T_N_P80T <- t.test(orf9b_T72I_N_P80T, N_P80T, alternative='two.sided)
+  
+  # Return results as a data.table
+  data.table(
+    N_P80T_WA_statistic = N_P80T_WA$statistic,
+    N_P80T_WA_p_value = N_P80T_WA$p.value,
+    N_P80T_WA_conf_int_lower = N_P80T_WA$conf.int[1],
+    N_P80T_WA_conf_int_upper = N_P80T_WA$conf.int[2],
+    N_P80T_WA_estimate = N_P80T_WA$estimate,
+    
+    orf9b_T72I_N_P80T_WA_statistic = orf9b_T72I_N_P80T_WA$statistic,
+    orf9b_T72I_N_P80T_WA_p_value = orf9b_T72I_N_P80T_WA$p.value,
+    orf9b_T72I_N_P80T_WA_conf_int_lower = orf9b_T72I_N_P80T_WA$conf.int[1],
+    orf9b_T72I_N_P80T_WA_conf_int_upper = orf9b_T72I_N_P80T_WA$conf.int[2],
+    orf9b_T72I_N_P80T_WA_estimate = orf9b_T72I_N_P80T_WA$estimate,
+    
+    orf9b_T72I_N_P80T_N_P80T_statistic = orf9b_T72I_N_P80T_N_P80T$statistic,
+    orf9b_T72I_N_P80T_N_P80T_p_value = orf9b_T72I_N_P80T_N_P80T$p.value,
+    orf9b_T72I_N_P80T_N_P80T_conf_int_lower = orf9b_T72I_N_P80T_N_P80T$conf.int[1],
+    orf9b_T72I_N_P80T_N_P80T_conf_int_upper = orf9b_T72I_N_P80T_N_P80T$conf.int[2],
+    orf9b_T72I_N_P80T_N_P80T_estimate = orf9b_T72I_N_P80T_N_P80T$estimate
+  )
+}
+
+# Simulated example data
+set.seed(123)
+counts.mat <- matrix(rnorm(27), nrow=9, ncol=3)  # 9 rows, 3 columns
+counts.mat <- cbind(counts.mat, matrix(rnorm(27), nrow=9, ncol=3), matrix(rnorm(27), nrow=9, ncol=3))
+
+# Apply the t-test function row-wise to the matrix and combine results
+ttest.out <- rbindlist(lapply(1:nrow(counts.mat), function(i) {
+  run_tTests(counts.mat[i, ])
+}))
+
+# View the results
+print(ttest.out)
+
+```
+
+
+```{r}
+library(limma)
+
+design <- model.matrix(~ 0 + condition + timepoint, data = counts.dt)
+
+```
+
+
+Better idea; use the stats.dt for this plot; dont think it makes sense to use the 
+
+```{r}
+help(t.test)
+t.test(x=c(9.218591, 8.448407, 7.754303), y=c(9.764934, 9.184396, 8.862749), alternative='two.sided', var.equal=F) 
+counts.dt[host =='human' & splice.name == 'N' & timepoint == '12h' & condition %in% c('MRC5_N_P80T', 'MRC5_9b_T72I_N_P80T'),]
+
+summary.wide
+
+hu.stats.dt <- fread('./083024_viralComparisons_data/2024_08_31_human.viral.sgRNA.t.tests.csv')
+bat.stats.dt <- fread('./083024_viralComparisons_data/2024_08_31_bat.viral.sgRNA.t.tests.csv')
+
+
+hu.stats.dt[,adj.pvalue := p.adjust(p.value, method='BH')]
+
+
+log2(9.036876/9.270693)
+```
+
+summarise the counts for 
+```{r}
+summary.dt <- counts.dt[, .(mean.genomicNormCount = mean(genomicNormCount, na.rm=T), sd.genomicNormCount=sd(genomicNormCount, na.rm=T)), 
+                        by=.(host, virus, timepoint, splice.name)]
+
+summary.dt[host == 'human' & virus == 'WA' & timepoint == '12h' & splice.name == 'N']
+
+fwrite(summary.dt, ScriptAndDatedFileName('viralCounts.summarised.csv'))
+
+summary.wide <- dcast(summary.dt, splice.name+host+timepoint~virus, value.var = 'mean.genomicNormCount')
+
+summary.wide[, `:=`('N_P80T vs WA' = log2(N_P80T/WA),
+                     '9b_T72I_N_P80T vs WA' = log2(`9b_T72I_N_P80T`/WA),
+                     '9b_T72I_N_P80T vs N_P80T' = log2(`9b_T72I_N_P80T`/N_P80T)) ]
+
+
+summary.wide[splice.name == 'N' & host == 'human' & timepoint =='12h',]
+
+summary.wide
+```
+
+
+
+```{r}
+
+2.026757e+01
+
+g <- ggplot(hu.stats.dt[!splice.name %in% c('Nstar', 'orf9b'),], aes(x=contrast, y=statistic, fill=contrast)) +
+  geom_bar(stat='Identity') +
+  coord_flip() +
+  geom_hline(yintercept = 0) +
+  facet_grid2(timepoint~splice.name, scales='free')
+g
+
+hu.stats.dt
+```
+
+
+```{r}
+counts.dt[host =='human' & virus == 'WA'& timepoint == '12h' & splice.name == 'N',]
+
+
+mean(c(8.034739, 10.676625, 8.399265))
+
+
+
+
+counts.dt$condition %>%  unique()
+
+ggdotchart(ToothGrowth,
+ x = "dose", 
+ y = "len",
+ fill = "dose", 
+ palette = "Dark2")+
+ stat_compare_means(label = "p.format",
+ comparisons = my_comp,
+ method = "t.test",
+ symnum.args = list(cutpoints = c(0, 0.001, 1), 
+ symbols = "p < 0.001"))
+
+```
+```{r}
+library(ggpubr)
+
+my_comparisons <- list( c("MRC5_N_P80T", "MRC5_WA"), c("MRC5_9b_T72I_N_P80T", "MRC5_WA"), c("MRC5_9b_T72I_N_P80T", "MRC5_N_P80T") )
+```
+
+
+
+Plot the fold changes for each of the groups
+
+stats.dt <- fread('./083024_viralComparisons_data/2024_08_31_human.viral.sgRNA.t.tests.csv')
+

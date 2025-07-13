@@ -1,0 +1,1291 @@
+---
+title: "040825_preparePCPInput"
+author: "Martin Gordon"
+date: "2025-04-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# single file HIV infected cells
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+Find the SEC-MS proteins
+```{r}
+sec.input <- fread('./data/HIV_Infection_CD4T_cells/Donor-1-032625/PCprophet/CD4_Infected_032825_D1.csv', header = T)
+sec.input[PG.Organisms == 'Human immunodeficiency virus type 1', PG.Genes]
+
+# check to ensure the colnames are in order
+all(colnames(sec.input)[6:ncol(sec.input)] == as.character(seq(1,72,1)))
+
+# write out matrix for PCprophet input
+sec.input[,]
+```
+
+make seclong dt
+clearly two problematic fractions in control... do something with these
+```{r}
+cols.noi <- c('PG.MolecularWeight', 'PG.ProteinDescriptions', 'PG.Organisms')
+sec.input <- sec.input[, c(cols.noi) := NULL]
+
+setnames(sec.input, old=c('PG.ProteinAccessions', 'PG.Genes'), new=c('ID', 'GN'))
+
+col.order <- c('GN', 'ID', as.character(seq(1,72)))
+sec.input[,..col.order]
+
+long.dt <- setDT(reshape2::melt(sec.input, id.vars=c('PG.ProteinAccessions','PG.Genes','PG.Organisms')))
+long.dt <- long.dt[, .(protein=PG.ProteinAccessions, gene=PG.Genes, org=PG.Organisms, fraction=variable, intensity=value)]
+long.dt[, sample := 'CD4_infected_1']
+
+sec.long <- long.dt
+
+#fwrite(sec.long, ScriptAndDatedFileName('cd4.secms.csv'))
+sec.long <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_09_cd4.secms.csv')
+```
+
+```{r}
+qc.dt <- qcSummaryTable(sec.long)
+qcPlotProteinCount(qc.dt)
+# number of protiens eluting looks good
+BackupAsPDF(qcPlotProteinCount(qc.dt), 'Nproteins.linechart')
+```
+
+The first four fractions look problematic.. what are the proteins in the first 4 fractions?
+```{r}
+qcPlotMedianInt(qc.dt)
+BackupAsPDF(qcPlotMedianInt(qc.dt), 'medianPolish.linechart')
+
+sec.long[fraction %in% c(1,2,3,4) & intensity != 0,.N, by=.(fraction)]
+```
+plot heatmap; row-wise scaling to 1
+
+```{r}
+missing.prots <- sec.long[,sum(intensity), by=protein][V1 == 0, unique(protein)]
+viral.prots <- sec.long[org != 'Homo sapiens', unique(protein)]
+
+intMats <- scaledIntensityMatrices(sec.long)
+BackupAsPDF(intensityHeatmaps(intMats), 'filtered.prots.heatmap')
+# 8.5 k but over 1.5k are empty
+```
+Write out the missing prots
+
+```{r}
+col.order <- c('GN', 'ID', as.character(seq(1,72)))
+sec.input[ID %in% viral.prots]
+
+fwrite(sec.input[!ID %in% missing.prots, ..col.order], sep='\t', ScriptAndDatedFileName('CD4_Inf_1.pcp.in.txt'))
+```
+
+
+1217 proteins are missing fromt he data, remove before processing
+
+Also, think it might be worth dropping the first 4 fractions as these could be misconstrued as a peak
+```{r}
+filtered.dt <- sec.long[!protein %in% missing.prots]
+
+qc.dt <- qcSummaryTable(filtered.dt)
+
+# number of protiens eluting looks good
+BackupAsPDF(qcPlotProteinCount(qc.dt), 'filtered.Nproteins.linechart')
+BackupAsPDF(qcPlotMedianInt(qc.dt), 'filtered.medianPolish.linechart')
+```
+plot the filtered heatmap
+Seems to be a large smear of proteins at the top of the heatmap.. not very helpful for peak picking
+Looks like the env viral protein might fall in this site
+
+```{r}
+intMats <- scaledIntensityMatrices(filtered.dt)
+BackupAsPDF(intensityHeatmaps(intMats), 'filtered.prots.heatmap')
+intensityHeatmaps(intMats)
+```
+Save the filtered dt to file
+
+```{r}
+fwrite(filtered.dt, ScriptAndDatedFileName('cd4.inf.1.secms.filtered.csv.gz'))
+```
+
+
+I think we want to start looking from fraction 7.. first see if any virla prots are identifed in earlier peaks
+plot the scaled intensity of the viral proteins
+```{r}
+g <- ggplot(filtered.dt[protein %in% viral.prots,], aes(x=fraction, y=intensity_totalScaled, group=protein, color=gene)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  scale_color_brewer(type='qual', palette=1) +
+  labs(title='HIV protein profiles')
+g
+BackupAsPDF(g, 'viralProteinProfiles.scaledInts.linechart')
+```
+## Normalize data
+Fit a local cubic to the data; drop fractions outside the expected range
+Im not sure what is in the first few fractions; for now normalize and continue
+
+*todo* look at the first few proteins and enrich, then continue
+
+```{r}
+allFits <- fitLocalCubics(qc.dt, window = 15, sampleTerm = "singleSample")
+
+labelOutliers(qc.dt , allFits, threshold = 2) 
+
+p <-plotNormAndOutlierFits(qc.dt , allFits)
+BackupAsPDF(p, 'localRegression.window15.linechart')
+```
+
+```{r}
+normalizeByResiduals(filtered.dt, qc.dt)
+```
+replot the normalized heatmap.. inspect tomorrow
+
+```{r}
+names(intMats) <- 'raw_CD4_infected_1'
+names(normMatrices) <- 'norm_CD4_infected_1'
+
+filtered.dt[intensity != originalIntensity]
+
+# this scales the normalized intensity values
+normMatrices <- scaledIntensityMatrices(filtered.dt)
+hm <- intensityHeatmaps(intMats) + intensityHeatmaps(normMatrices)
+
+BackupAsPDF(hm, 'RawVsNorm.mat.heatmap')
+```
+peak detection algorithm
+```{r}
+peakTables <- lapply (normMatrices, goodPeaksTableFromIntensityMatrix, minCV=-Inf)
+
+allPeaks <- rbindlist(peakTables, idcol='sample')
+```
+plot the number of peaks per fraction
+
+```{r}
+# gives proportions of good peaks int he data
+p <- ggplot(filteredPeaks, aes(x= peakLocation, fill = goodPeak)) + 
+  geom_bar() + 
+  facet_grid(sample~.) +
+  theme_bw()
+
+p
+BackupAsPDF(p, "PeakCountsPerFraction.histogram")
+```
+Get id mappings for the proteins
+
+```{r}
+# id mapper
+idmapper <- sec.long[protein %in% viral.prots, .(protein, gene)] %>% 
+  unique()
+
+allPeaks <- merge(allPeaks, idmapper, by=c('protein'), all.x=T)
+
+# get gene names for the others
+allPeaks[!protein %in% viral.prots, gene := multiUniprots2multiGenes(protein, species='HUMAN')]
+#fwrite(allPeaks, ScriptAndDatedFileName('detectedPeaks.csv.gz'))
+allPeaks <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_10_detectedPeaks.csv.gz')
+```
+
+Check protein elution agrees with our mw standards
+Idea is we seperate based on size, so can predict the mw of proteins at the eluted fraction
+```{r}
+mw.standards <- fread('./data/HIV_Infection_CD4T_cells/Donor-1-032625/PCprophet/cal_SRT.txt')
+setnames(mw.standards, new=c('fraction', 'mw'))
+
+
+mw.standards
+# want the standards in daltons (right?)
+mw.standards[, mw := mw*1000]
+mc <- calculateFractionMassConverters(mw.standards)
+```
+
+Read in the table of protein molecular weight;
+```{r}
+# created my own uniprot id
+mw.dt <- fread('./data/idmapping_2025_04_10.tsv.gz')
+mw.dt <- mw.dt[, .(protein=From, mw=Mass)]
+#mw.dt[, gene := multiUniprots2multiGenes(protein, species='HUMAN')]
+setkey(mw.dt, protein)
+mw.dt <- mw.dt[, .(protein, mw)]
+
+# label fractions by mass, and fraction/proteins by mass ratio, aka log2MassNumber
+filtered.dt[, fractionMass := mc$fraction2Mass(fraction)] # get predicted mw for a protein eluting at a given fraction
+filtered.dt[, log2MassNumber := log2(fractionMass/mw.dt[protein, .(mw), on = "protein"])] # dividing fraction mass by mw of the protein
+
+
+
+#fwrite(filtered.dt, ScriptAndDatedFileName("Monita_SEC_NormalizedEtc.csv"))
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_10_Monita_SEC_NormalizedEtc.csv')
+```
+
+look at removing peaks < 120% mass
+I think ignore for now until I have a good way to visualize/inspect. move on
+```{r}
+#  
+# this is the calcualtion for finding peak center of mass; im not really sure on this
+#sum(intMat[protein, fractionNames ] * fractions/sum(intMat[protein, fractionNames ]))
+
+scorePeakByMassShift <- function(peak.dt, mw){
+  # the 150% fraction
+  peak.dt[mw.dt, fiftyPCFraction := mc$mass2Fraction(1.2 * mw), on = "protein"]
+  peak.dt[!is.na(fiftyPCFraction), goodPeak := goodPeak & cofmN < fiftyPCFraction]
+  peak.dt
+}
+purrr::walk(peakTables, scorePeakByMassShift, mw)
+
+filteredPeaks <- peakTables$norm_CD4_infected_1
+
+filteredPeaks[,.N, by=goodPeak]
+allPeaks[,.N, by=goodPeak]
+24 + (-2:2) # createsa  window
+```
+plot the set of filtered peaks
+```{r}
+filteredPeaks[, sample := 'norm_CD4_infected_1']
+
+# gives proportions of good peaks int he data
+q <- ggplot(filteredPeaks, aes(x= peakLocation, fill = goodPeak)) + 
+  geom_bar() + 
+  facet_grid(sample~.) +
+  theme_bw()
+
+BackupAsPDF(p/q, "allAndFiltered.PeakCountsPerFraction.histogram")
+```
+Sanity check the peak selection using mw
+V interesting and useful plot; 
+clear in fraction 35 we are recovering a lot of complexes (eluted proteins much smaller MW than the MW standards)
+looks to me like at fraction 49 most elutions are single proteins
+What about 51? the MW standard is smaller than most eluting proteins?
+
+Am I correctly reading this plot?
+```{r}
+# merge the mw info to the table
+allPeaks[mw.dt, proteinMW := i.mw, on = "protein"]
+
+g <- ggplot (allPeaks[ , .SD[which.max(peakHeight)], by = .(protein, sample)  ], aes( x  = as.factor(sprintf("%02d", as.integer(peakLocation))), y = proteinMW, color = log10(proteinMW))) + 
+  #geom_density_2d() + 
+  scale_y_log10() +
+  geom_boxplot(outlier.shape = NA) + 
+  ggforce::geom_sina(shape = ".",scale = "area")+
+  geom_point(data = mw.standards[, .(peakLocation = fraction, proteinMW = mw)], color = "red") + 
+  rotate.x.axis.text +
+  scale_color_viridis_c() + 
+  facet_wrap(~sample, ncol = 2) + 
+  ggtitle("Protein Peaks")
+g
+BackupAsPDF(g, 'proteinPeaksVsMWstandards.boxplots')
+```
+plot the filtered set 
+
+```{r}
+filteredPeaks[mw.dt, proteinMW := i.mw, on = "protein"]
+
+g <- ggplot (filteredPeaks[ , .SD[which.max(peakHeight)], by = .(protein, sample)  ], aes( x  = as.factor(sprintf("%02d", as.integer(peakLocation))), y = proteinMW, color = log10(proteinMW))) + 
+  #geom_density_2d() + 
+  scale_y_log10() +
+  geom_boxplot(outlier.shape = NA) + 
+  ggforce::geom_sina(shape = ".",scale = "area")+
+  geom_point(data = mw.standards[, .(peakLocation = fraction, proteinMW = mw)], color = "red") + 
+  rotate.x.axis.text +
+  scale_color_viridis_c() + 
+  facet_wrap(~sample, ncol = 2) + 
+  ggtitle("Protein Peaks")
+g
+BackupAsPDF(g, 'filtered.proteinPeaksVsMWstandards.boxplots')
+
+```
+```{r}
+allPeaks[,.N,by=goodPeak]
+filteredPeaks[,.N,by=goodPeak] 
+
+#fwrite(filteredPeaks, ScriptAndDatedFileName('detectedPeaks.filteredMonomers.csv.gz'))
+filteredPeaks <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_10_detectedPeaks.filteredMonomers.csv.gz')
+allPeaks <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_10_detectedPeaks.csv.gz')
+```
+
+## peak-peak correlations
+Before we perform the pw correlation analysis, we need to identify a GS and decoy set to assess performance
+
+Get string ids for the hu and hiv proteins 
+Set up human stringDB
+
+```{r}
+hu.string.dt <- fread('~/Documents/utils/mg_utils/data/stringDB/9606.protein.aliases.v12.0.txt.gz')
+hu.string.dt[source == 'Ensembl_UniProt' & alias == 'P60484'] # check for uniprot id
+huString.mapper <- hu.string.dt[source == 'Ensembl_UniProt', .(protein=alias, stringID=`#string_protein_id`)]
+huString.mapper[protein %in% filtered.dt$protein, unique(stringID)]
+
+# take our interactors passing mist and see if these overlap 
+hiv.hu.mist <- fread('/Users/martingordon/Documents/projects/112024_RKakke_AF2_HIV_hitsInvestigation/201124_AFInteractiorsIntegration_data/2024_11_20_af_interactors_mistScores.csv')
+# REV, VPR,  
+# GAG-POL are there but seperate entities
+# ENV is either GP120 or GP160
+
+# just take those with score > 0.75 in either set
+# add this to the gold standard set
+highConf.interactors <- hiv.hu.mist[Bait %in% c('REV', 'VPR') & (HEK_MiST_score > 0.75 | Jurkat_MiST_score > 0.75), .(protein1=Bait, protein2=Protein_1, source='HIV-HU_MIST')]
+
+
+# also, read int he 
+hiv.nodes <- fread('~/Documents/utils/mg_utils/data/stringDB/11676.protein.aliases.v10.5.txt.gz')
+setnames(hiv.nodes, new=c('stringID', 'gene', 'db'))
+hiv.nodes[, gene := toupper(gene)]
+hiv.nodes$stringID %>% unique()
+# a datatable merge ; the on argument  in quotes is the col in i..
+highConf.interactors[huString.mapper, stringID2 := i.stringID, on=c(protein2='protein')]
+# now merge the viral prot IDs
+highConf.interactors[hiv.nodes, stringID1 := i.stringID, on=c(protein1='gene')]
+hu.hiv.gs <- highConf.interactors[, .(gene1=stringID1, gene2=stringID2, source='Jager et al')]
+```
+decoy set and truth set
+```{r}
+gs.interactors <- goldStandardPairs(huString.mapper[protein %in% filtered.dt$protein, unique(stringID)], 
+                                    corum.path = NULL,
+                                    string.links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                                    string.info.path =  NULL,
+                                    stringCombinedScoreThreshold = 250)
+
+gs.decoys <- decoysFromString(huString.mapper[protein %in% filtered.dt$protein, unique(stringID)], 
+                              links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                              info.path =  NULL)
+
+gs.comb.interactors <- rbind(gs.interactors, hu.hiv.gs)
+```
+
+
+# peak-peak correlations
+```{r}
+#peakMatrices <- goodPeaksMatFromPeaksTable(normMatrices$norm_CD4_infected_1, allPeaks = allPeaks)
+# reran with filtered due to better sepreration of TP/FP set
+peakMatrices <- goodPeaksMatFromPeaksTable(normMatrices$norm_CD4_infected_1, allPeaks = filteredPeaks)
+corPeaks6 <- windowedCorrelation(normMatrices$norm_CD4_infected_1, peakMatrices, outerRadius = 6)
+
+allPeakCorrs <- corPeaks6$cor
+```
+
+Add annotations to the peak correlations
+```{r}
+# viral only 5 in our set so easy to add by hand
+# taking gag pol as p6 gag
+hiv.mapper <- data.table(protein=c("Q8ADQ4", "Q8ADQ5", "Q8ADQ7", "Q8ADQ9", "Q8ADR1"),
+                         stringID = c("11676.NEF_HV1H2", "11676.PRO_0000239240", "11676.REV_HV1H2", "11676.VPR_HV1H2", "11676.PRO_0000038598"),
+                         gene=c("NEF", "ENV", "REV", "VPR", "GAG-POL"))
+
+comb.mapper <- rbind(huString.mapper,hiv.mapper)
+
+
+# add string ID to the set (also genes?)
+allPeakCorrs[comb.mapper, gene1 := i.stringID, on = c(protein1 = "protein")]
+allPeakCorrs[comb.mapper, gene2 := i.stringID, on = c(protein2 = "protein")]
+allPeakCorrs[comb.mapper, alias1 := i.gene, on = c(protein1 = "protein")]
+allPeakCorrs[comb.mapper, alias2 := i.gene, on = c(protein2 = "protein")]
+
+# for now use protein as gene for the NA gene
+allPeakCorrs[is.na(gene1), gene1 := protein1]
+allPeakCorrs[is.na(gene2), gene2 := protein2]
+
+allPeakCorrs[, sample := 'CD4_infected_1']
+
+#fwrite(allPeakCorrs, ScriptAndDatedFileName('allbyallPeakCorrelations.csv.gz'))
+#allPeakCorrs <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_10_allbyallPeakCorrelations.csv.gz')
+
+
+# the filtered peak set
+#fwrite(allPeakCorrs, ScriptAndDatedFileName('allbyallPeakCorrelations.filteredPeakSet.csv.gz'))
+allPeakCorrs <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_10_allbyallPeakCorrelations.filteredPeakSet.csv.gz')
+```
+
+label by gold standards
+```{r}
+allPeakCorrs[, gs := "unknown"]
+allPeakCorrs[gs.interactors ,gs := "interactor" , on = c("gene1", "gene2")]
+allPeakCorrs[gs.decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+```
+
+```{r}
+g <- ggplot(allPeakCorrs[gene1 < gene2], aes(x = sample, fill = gs)) +
+  geom_bar() + 
+  labs(title='Breakdown of detected interactors') +
+  theme_bw() + 
+  scale_fill_brewer(type = "qual", palette = "Set2")
+
+BackupAsPDF(g, 'breakdownOfInteractors.barplot')
+
+g <- ggplot(allPeakCorrs[gene1 < gene2 & gs != 'unknown'], aes(x = sample, fill = gs)) +
+  geom_bar() + 
+  labs(title='Breakdown of detected interactors') +
+  theme_bw() + 
+  scale_fill_brewer(type = "qual", palette = "Set2")
+g
+BackupAsPDF(g, 'breakdownOfInteractors.known.sets.barplot')
+```
+
+```{r}
+allGenes <- comb.mapper$stringID %>% 
+  unique()
+denomInteractor <- nrow(gs.interactors[gene1 %in% allGenes & gene2 %in% allGenes])
+denomDecoy <- nrow(gs.decoys[gene1 %in% allGenes & gene2 %in% allGenes])
+```
+
+
+```{r}
+scoreByGS(allPeakCorrs, denomDecoy, denomInteractor, column = "corScore", groupByVariable = c("sample", "start"))
+```
+
+example log likelihood plot; 
+plot these for all windows
+
+```{r}
+# an example LL plot
+startOI = 31
+sampleOI <- unique(allPeakCorrs$sample)
+
+corScoreLabels <- function(corScore){
+  1- signif(10^(-corScore), 2)
+}
+
+allwindows <- allPeakCorrs$start %>%
+  unique() %>% 
+  sort()
+
+outDir <- '../040825_preparePCProphetInput_data/pdfs/logliklihood_plots/'
+
+for (i in allwindows){
+  
+  p <- ggplot(allPeakCorrs[start == i & sample == sampleOI], aes(x = corScore)) +
+    geom_line(aes(y = log10IntRate, color = "interactor")) +
+    #geom_segment(aes(y =   log10IntRate-log10RateRatioID, yend = log10IntRate,color = "ratio", xend = corScore)) + 
+    geom_line(aes(y = log10DecoyRate, color = "decoy")) +
+    scale_color_manual(values = c(decoy = "grey", interactor = "red", ratio = "purple")) +
+    ggtitle(label= paste0(sampleOI, " fraction ", i)) + 
+    scale_x_continuous(labels = corScoreLabels, name = "Pearson's R") + 
+    scale_y_continuous(name = "Log Likelihood (i.e. what portion passes threshold)") + 
+    theme_bw()
+  
+  BackupAsPDF(p, paste0('logliklihood_plots/',i,'.decoyTruthRatio.linechart'))
+}
+```
+
+looks like we have good discriminatory power for fraction 30 approx to discriminate false and true sets of things
+```{r}
+p <-  ggplot (allPeakCorrs, aes(x = corScore, y = log10RateRatioID, color = start)) + geom_hline(yintercept = 0.0, lty = "dotted") +  geom_line(aes(group = start)) + facet_wrap(~sample) + scale_color_viridis_c(option = "H", name = "fraction") + theme_bw()
+BackupAsPDF(p, 'llratios.linechart')
+
+```
+# summarization peak sim to protein sim
+# summarize to protein pair
+
+```{r}
+stoichDevThreshold <- log2(1 + 0.2)
+
+setorder(allPeakCorrs, sample, -log10RateRatioID )
+
+summary <- allPeakCorrs[, .SD[1], by= .(sample, protein1, protein2, gene1, gene2, alias1=gsub('[.].+','',alias1), alias2=sub('[.].+','',alias2), prot1Peak, prot2Peak, gs) # best correlation per pair of peaks
+                          ][, .(sumLLRatio = sum(log10RateRatioID[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]), # only sum peaks that are within 20% of the first
+                                numPeaks = .N,
+                                numSameStoichPeaks  = sum (abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold)),
+                            by = .(sample, protein1, protein2, gene1, gene2, alias1, alias2, gs)
+                            ]
+setorder(summary, sample, -sumLLRatio)
+fwrite (summary[gene1 < gene2], ScriptAndDatedFileName("PeakSimilarityScores.csv.gz"))
+#summary <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_10_PeakSimilarityScores.csv.gz')
+summary <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_12_PeakSimilarityScores.csv.gz')
+```
+None of our detected peaks are found... maybe we need to rerun with the full set tomorrow..
+```{r}
+allPeakCorrs[protein1 %in% viral.prots| protein2 %in% viral.prots,]
+```
+
+# cosine similarity
+
+```{r}
+# goodProteins <- sec.dt[!is.na(intensity), .N, by = .(protein, sample)][N > 36, unique(protein)]
+# normIntMats <-  scaledIntensityMatrices(sec.dt[protein %in% goodProteins])
+cosMats <- pbapply::pblapply(normMatrices, cosineMatrix)
+p <- plot(density(cosMats[[1]],  na.rm = TRUE), col='firebrick')
+BackupAsPDF(p, 'cosineScoresForSample.density')
+```
+```{r}
+
+cosineMat2Table <- function(mat, threshold = 0.9){
+  idx <- which(mat > threshold , arr.ind = TRUE)
+  
+  dt <- as.data.table(idx,
+                    keep.rownames = TRUE)
+  setnames(dt, "rn", "protein1")
+  dt[, protein2 := colnames(mat)[col]]
+  dt[, cosSim := mat[idx]]
+  dt[, c("row", "col") := NULL ]
+  return (dt[protein1 != protein2,])
+}
+
+cosSim.dt <- pbapply::pblapply(cosMats, cosineMat2Table, threshold = -1) %>% 
+  rbindlist(idcol = "sample")
+cosSim.dt[, gene1 := protein1]
+cosSim.dt[, gene2 := protein2]
+
+# get stringIDs where I have them...
+cosSim.dt[comb.mapper, gene1 := stringID, on = c(protein1 = "protein")]
+cosSim.dt[comb.mapper, gene2 := stringID, on = c(protein2 = "protein")]
+cosSim.dt[comb.mapper, alias1 := gene, on = c(protein1 = "protein")]
+cosSim.dt[comb.mapper, alias2 := gene, on = c(protein2 = "protein")]
+
+cosSim.dt[, gs := "unknown"]
+cosSim.dt[gene1 > gene2, gs := "reverse"]
+cosSim.dt[gs.interactors ,gs := "interactor" , on = c("gene1", "gene2")]
+cosSim.dt[gs.decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+
+# make a ridge plot of the correlation scores from the matrix; split out the interactor, decoy and the other sets
+```
+Distribution of the cosine similarity of the data; doesnt look good, not freat seperation of the two sets
+```{r}
+g <- ggplot(cosSim.dt[gs %in% c("decoy", "interactor")], aes (x = cosSim, fill=gs)) + 
+  geom_histogram(boundary = 1.0, binwidth = 0.003) +
+  scale_fill_manual(values=c('gold', 'grey70')) +
+  facet_grid(gs~sample, scales = "free_y") +
+  theme_bw()
+g
+BackupAsPDF(g, 'cosineSimilarity.decoyVsinteractor.histogram')
+```
+## smaller set to save GBs of RAM
+```{r}
+# cosSim.dt <- pbapply::pblapply(cosMats, cosineMat2Table, threshold = 0.75) |> rbindlist(idcol = "sample")
+# 
+# cosSim.dt[, gene1 := multiUniprots2multiGenes(protein1)]
+# cosSim.dt[, gene2 := multiUniprots2multiGenes(protein2)]
+# 
+# cosSim.dt[, gs := "unknown"]
+# cosSim.dt[gene1 > gene2, gs := "reverse"]
+# cosSim.dt[gs ,gs := "interactor" , on = c("gene1", "gene2")]
+# #allPeakCorrs[falsePairs,gs := "decoy" , on = c("gene1", "gene2")]
+# cosSim.dt[decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+
+cosSim.dt <- cosSim.dt[cosSim > 0.8][gene1 < gene2]
+#fwrite(cosSim.dt, ScriptAndDatedFileName('cosineSimilarity.highScores.csv.gz'))
+cosSim.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_10_cosineSimilarity.highScores.csv.gz')
+```
+
+score the 
+
+```{r}
+scoreByGS(cosSim.dt, denomDecoy, denomInteractor, column = "cosSim", groupByVariable = c("sample" ))
+cosSim.dt
+```
+```{r}
+
+help(signif) # rounding 
+sub.dt <- unique(cosSim.dt[, .(sample, cosSim = round (cosSim, 4), log10RateRatioID =  signif(log10RateRatioID,3), interactorCount)])
+
+ggplot (sub.dt, aes(x = -log10(1-cosSim), y = log10RateRatioID, color = sample)) + geom_line()
+```
+combine cosine and peak similarity measurements
+
+```{r}
+summary[gene1 < gene2]
+
+allScores <- merge (summary[gene1 < gene2][, .(sample, protein1, protein2, peakLLRatio = sumLLRatio, numPeaksScored = numSameStoichPeaks)],
+                    cosSim.dt[, .(sample, protein1, protein2, cosLLRatio = log10RateRatioID )],
+                    by = c("sample", "protein1", "protein2"),
+                    all = TRUE)
+
+allScores[, gene1 := protein1]
+allScores[, gene2 := protein2]
+
+#fwrite(comb.mapper, ScriptAndDatedFileName('StringGeneProtein.idMapper.csv.gz'))
+comb.mapper <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_StringGeneProtein.idMapper.csv.gz')
+comb.mapper
+
+# get stringIDs where I have them...
+allScores[comb.mapper[!is.na(stringID)], gene1 := stringID, on = c(protein1 = "protein")]
+allScores[comb.mapper[!is.na(stringID)], gene2 := stringID, on = c(protein2 = "protein")]
+allScores[comb.mapper[!is.na(gene)], alias1 := gene, on = c(protein1 = "protein")]
+allScores[comb.mapper[!is.na(gene)], alias2 := gene, on = c(protein2 = "protein")]
+
+
+allScores[is.na(peakLLRatio), peakLLRatio := 0]
+allScores[is.na(cosLLRatio), cosLLRatio := 0]
+allScores[, bestLLRatio := ifelse(peakLLRatio > cosLLRatio, peakLLRatio, cosLLRatio)]
+setorder(allScores, -bestLLRatio)
+```
+
+Annotate the scores with the gene set results  and save the results; we will use this for the downstream plotting
+
+```{r}
+allScores[, gs := "unknown"]
+allScores[gene1 > gene2, gs := "reverse"]
+
+# very useful merges and col assignment, basically matching rows based on two columns in a second datatable
+allScores[gs.interactors ,gs := "interactor" , on = c("gene1", "gene2")]
+allScores[gs.decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+
+#fwrite(allScores[gene1 < gene2], ScriptAndDatedFileName("PeakPlusCosSim.csv.gz"))
+```
+
+For now produce the plots expected for Bens pipeline
+
+Lets plot our scores from the BP pipeline against the MIST scores for HIV
+Pull out interactors with MIST scores > .7 fromt he Yager paper
+```{r}
+# get the interqactors for this set of 5
+# leaving out gag pol 
+yager.ints <- hiv.hu.mist[Bait %in% c('REV', 'VPR', 'ENV', 'NEF'), .(gene1=Bait, protein2=Protein_1, source='HIV-HU_MIST', ipTM_mean, ipTM_std, pdockq_mean, HEK_MiST_score, Jurkat_MiST_score)]
+
+# get the best mist score
+yager.ints[is.na(HEK_MiST_score), HEK_MiST_score := 0]
+yager.ints[is.na(Jurkat_MiST_score), Jurkat_MiST_score := 0]
+yager.ints[, bestMistScore := ifelse(HEK_MiST_score > Jurkat_MiST_score, HEK_MiST_score, Jurkat_MiST_score)]
+yager.ints[Jurkat_MiST_score == 0, Jurkat_MiST_score := NA]
+yager.ints[HEK_MiST_score == 0, HEK_MiST_score := NA]
+
+
+# label as a member of best set if the scores are > .7 in either cell line 
+yager.ints[, significantInts := ifelse(bestMistScore > .7, 'yes', 'no')]
+#yager.ints <- yager.ints[bestMistScore != 0]
+# add the annotation 
+yager.ints[comb.mapper, gene2 := i.gene, on=c(protein2='protein')]
+yager.ints[comb.mapper, protein1 := i.protein, on=c(gene1='gene')]
+
+
+# subset to 
+#fwrite(yager.ints[bestMistScore != 0,.(protein1, gene1, protein2, gene2, ipTM_mean, ipTM_std, pdockq_mean, bestMistScore, significantInts)], ScriptAndDatedFileName('yager.ints.toCompare.csv.gz'))
+apms.int <-  fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_yager.ints.toCompare.csv.gz')
+
+```
+plot correlations between the mistscores and the pw peaks analysis
+
+scatterplot of our peak-wise correlations and the apms output
+```{r}
+ # viral prots only in protein1 for both; safe to merge
+apms.int[protein2 %in% viral.prots]
+allScores[protein2 %in% viral.prots]
+
+comb.dt <- merge(allScores, apms.int[,.(protein1, protein2, ipTM_mean, ipTM_std, pdockq_mean, bestMistScore, significantInts)], by.x=c('protein1', 'protein2'), by.y=c('protein1', 'protein2'), all.x=T)
+
+#fwrite(comb.dt, ScriptAndDatedFileName('combined.scores.wYager.csv.gz'))
+comb.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_combined.scores.wYager.csv.gz')
+```
+plot the scatterlpot of scores
+overlaps between the scores look pretty poor but then none of these overlapping interactions score well in our data.
+```{r}
+library(tidymodels)
+comb.dt[, tidygene1 := gsub('[.].+','', alias1)]
+comb.dt[, tidygene2 := gsub('[.].+','', alias2)]
+
+g <-  ggplot(comb.dt[!is.na(bestMistScore),], aes(x = bestMistScore, y = bestLLRatio, label=paste0(tidygene1,'_', tidygene2))) + 
+  geom_point(aes(color=significantInts), size=2) +
+  geom_density_2d() +
+  ggrepel::geom_text_repel() +
+  scale_color_manual(values=c('grey80', 'gold')) +
+  theme_bw() +
+  guides(color=guide_legend('Significant\nMiST Interactors\n(MisT > .7)')) 
+g
+BackupAsPDF(g, 'mistVspeakScore.scatterplots')
+# look at the predicted weights of the eluting proteins; are they 
+
+mist.viralHost.interactors <- comb.dt[bestMistScore >=0.7 & significantInts == 'yes', unique(c(protein1, protein2))]
+```
+
+Fish out the elution profiles of the individual pairs; do any of these loook good by eye
+
+```{r}
+normInts.long <- reshape2::melt(normMatrices$norm_CD4_infected_1) %>% 
+  as.data.table()
+setnames(normInts.long, new=c('protein', 'fraction', 'normalizedScaledIntensity'))
+
+# remove redundant stringIDs
+normInts.long <- merge(normInts.long, unique(comb.mapper[, .(protein,gene)]), by='protein', all.x=T, all.y=F)
+```
+
+plot the elution profiles of the hiv proteins
+```{r}
+g <- ggplot(normInts.long[protein %in% viral.prots,], aes(x=fraction, y=normalizedScaledIntensity, color=gene)) +
+  geom_line() +
+  labs(title='elution profiles of HIV proteins',y='normalized scaled intensity') +
+  scale_color_brewer(type='qual', palette=3) +
+  theme_bw()
+
+BackupAsPDF(g, 'hiv.proteins.elutionProfiles.normalizedAndScaled.linechart')
+```
+
+plot of the elution profiles of the peaks from SEC-MS; some of these look ok, wonder if I have thrown them out with my peak filtering?? Need to investigate..
+```{r}
+
+comb.dt[significantInts == 'yes', .(protein1, protein2, gene1, gene2,alias1, alias2)]
+
+# add the mist annotation 
+g <- ggplot(normInts.long[protein %in% c(comb.dt[significantInts == 'yes' & protein1 == 'Q8ADQ9', unique(protein2)])], aes(x=fraction, y=normalizedScaledIntensity, group=protein, color=simplifiedGene)) +
+  geom_line(alpha=0.5) +
+  geom_line(data=normInts.long[protein == 'Q8ADQ9',], color='black', width=3) +
+  labs(title='VPR significant MiST interactors') +
+  scale_color_brewer(type='qual', palette=3) +
+  theme_bw()
+g
+BackupAsPDF(g, 'VPR.sigMIST.interactors.elutionProfile')
+
+# add the mist annotation 
+g <- ggplot(normInts.long[protein %in% c(comb.dt[significantInts == 'yes' & protein1 == 'Q8ADQ4', unique(protein2)])], aes(x=fraction, y=normalizedScaledIntensity, group=protein, color=simplifiedGene)) +
+  geom_line(alpha=0.8) +
+  geom_line(data=normInts.long[protein == 'Q8ADQ4',], color='black', width=3) +
+  labs(title='VPR significant MiST interactors') +
+  scale_color_brewer(type='qual') +
+  theme_bw()
+g
+BackupAsPDF(g, 'NEF.sigMIST.interactors')
+
+# add the mist annotation 
+g <- ggplot(normInts.long[protein %in% c(comb.dt[significantInts == 'yes' & protein1 == 'Q8ADQ7', unique(protein2)])], aes(x=fraction, y=normalizedScaledIntensity, group=protein, color=simplifiedGene)) +
+  geom_line(alpha=0.8) +
+  geom_line(data=normInts.long[protein == 'Q8ADQ7',], color='black', width=3) +
+  labs(title='REV significant MiST interactors') +
+  scale_color_brewer(type='qual') +
+  theme_bw()
+g
+BackupAsPDF(g, 'REV.sigMIST.interactors')
+```
+create job division plot of these interactors, and also the set of interactors we detect
+log2Mass ratio: predictedMassOfAprotein/MWofProtein (when less than 0 )
+Basically things arriving early high ratio eluting much sooner than singletons of expected MW, so likely in complex... what does eluting below its MW mean
+
+Issue is the mass of the two co-eluting proteins NEF and PCMT1 are v similar sizes/MW, cant say if they are truly interacting or if just co-eluting monomers 
+If we had non-infected data and saw a shift this would be very interesting, but dont have this info
+```{r}
+p <- ggplot (filtered.dt[protein %in% c('Q8ADQ7', comb.dt[significantInts == 'yes' & protein1 == 'Q8ADQ7', unique(protein2)])], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='REV host interactors (significant MiST set)') +
+  theme_bw()
+p
+BackupAsPDF(p, 'REV.host.SigMistInteractors.ridgeplots')
+
+p <- ggplot (filtered.dt[protein %in% c('Q8ADQ4', comb.dt[significantInts == 'yes' & protein1 == 'Q8ADQ4', unique(protein2)])], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='NEF host interactors (significant MiST set)') +
+  theme_bw()
+p
+BackupAsPDF(p, 'NEF.host.SigMistInteractors.ridgeplots')
+
+p <- ggplot (filtered.dt[protein %in% c('Q8ADQ9', comb.dt[significantInts == 'yes' & protein1 == 'Q8ADQ9', unique(protein2)])], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='VPR host interactors (significant MiST set)') +
+  theme_bw()
+p
+BackupAsPDF(p, 'VPR.host.SigMistInteractors.ridgeplots')
+```
+Look at the elutions we detect that pass instead
+*Postive control*
+First pull out the ribosomal proteins we detect
+
+pull out ribosomal proteins we can show as gold standard
+```{r}
+gmt.go <- loadGmtFromBioconductor(ontology = 'ALL', keyType = 'SYMBOL')
+proteomsome.set <- gmt.go[grep('^PSM[ABCD]', gene), unique(gene)]
+
+p <- ggplot (filtered.dt[gene %in% proteomsome.set], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='Proteosome elution profiles') +
+  theme_bw()
+p
+BackupAsPDF(p, 'proteomsome.elution.profiles')
+
+gmt.go <- loadGmtFromBioconductor(ontology = 'ALL', keyType = 'SYMBOL')
+ribo.set <- gmt.go[grep('^RPL', gene), unique(gene)]
+
+p <- ggplot (filtered.dt[gene %in% proteomsome.set, ], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='Ribosome elution profiles') +
+  theme_bw()
+p
+BackupAsPDF(p, 'ribosome.elution.profiles')
+```
+
+VPR & RPA123
+
+
+```{r}
+p <- ggplot (filtered.dt[gene %in% c('VPR', 'CCDC25', 'RPA1','RPA2','RPA3')], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='Proteosome elution profiles') +
+  theme_bw()
+p
+```
+
+```{r}
+info.set <- gmt.go[grep('CXCD4|CXCR4', gene), unique(gene)]
+
+p <- ggplot (filtered.dt[gene %in% c('CD4', 'CXCR4')| protein %in% viral.prots], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='elution profiles') +
+  theme_bw()
+BackupAsPDF(p, 'cd4.cxcr4.viralprot.elutions.ridge')
+
+ap2.set <- c('AP2A2','AP2A1', 'AP2B1','AP2M1','AP2S1')
+
+
+info.set <- gmt.go[grep('ANAP', gene), unique(gene)]
+info.set
+# ap2 part of how the virus internalises
+p <- ggplot (filtered.dt[gene %in% c(info.set),], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='elution profiles') +
+  theme_bw()
+
+p
+BackupAsPDF(p, 'anap.elutions.ridge')
+```
+Elution plots of human complexes & also complexHeatmap
+
+```{r}
+nucpore <-c('P49790','Q5SRE5','Q8TEM1','O15504', 'Q9UKX7', 'O75694', 'Q92621', 
+             'Q8NFH5', 'Q8N1F7', 'P57740', 'Q8WUM0','Q12769','Q8NFH4','Q8NFH3','Q9BW27',
+             'P52948','P35658','Q99567','Q7Z3B4','Q9BVL2','P37198')
+```
+
+elution profile
+```{r}
+p <- ggplot (filtered.dt[protein %in% c(nucpore),], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  theme_bw()
+p
+BackupAsPDF(p, 'nucpore.complex.elution', dimensions=c(8,8))
+```
+heatmap of nuc pore
+
+```{r}
+comb.mapper[, simplifiedGene := gsub('[.].+', '', gene)]
+
+# custom mod f Bens function to generate a heatmap 
+customintensityHeatmaps <- function(intMats, intensityName = "Relative Protein Intensity", sample='norm_CD4_infected_1', proteinsOI, topOfColorRange = 0.45,...){
+  denom = 50 / topOfColorRange
+  colorFun <- circlize::colorRamp2(breaks = (0:50)/denom, colors = viridis(51,direction = 1))
+  
+  subMat <- intMats[rownames(intMats) %in% proteinsOI,]
+  # convert names to subset we want
+  #print(rownames(subMat))
+  rownames(subMat) <- comb.mapper[match(gsub('[;].+', '', rownames(subMat)), comb.mapper$protein), simplifiedGene]
+  
+  hml <- Heatmap (subMat,
+                  name = intensityName,
+                  cluster_rows = TRUE,
+                  border=T,
+                  row_dend_reorder = FALSE,
+                  cluster_columns = FALSE,
+                  col = colorFun,
+                  show_row_names = ifelse(nrow(subMat) > 100, FALSE, TRUE),
+                  row_names_side = "left",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_labels = ifelse(as.integer(colnames(subMat)) %% 5 == 0, colnames(subMat), ""),
+                  column_title = sample,
+                  #first only:
+                  show_heatmap_legend = TRUE, 
+                 # row_title = sprintf ("%d Proteins", nrow(subMat)),
+                  ...
+  )
+  return(hml)
+}
+```
+plot the heatmap
+
+Change our heatmap scaling to relative abundance to max per row rather than total
+
+```{r}
+#hm <- customintensityHeatmaps(normMat, proteinsOI = firstSet, sample='Nuclear pore complex proteins')
+#BackupAsPDF(hm, 'nucpore.proteins.heatmap')
+
+normMat.max <- scaledIntensityMatrices(filtered.dt, scaleDenom = 'max')$CD4_infected_1
+
+hm <- customintensityHeatmaps(normMat.max, proteinsOI = nucpore, sample='Nuclear pore complex proteins')
+BackupAsPDF(hm, 'nucpore.protein.heatmaps')
+```
+plot the proteosome 
+
+```{r}
+proteomsome.set <- c('P25786','P25787','P25788','P25789','P28066','P60900','O14818','P20618','P40306','P49721','P49720',
+                     'P28070','P28074','P28072','Q99436', 'P28062', 'P28065', 'P62191', 'P35998', 'P17980', 'Q9P2W1', 
+                     'P43686','P62195', 'P62333','Q99460', 'O75832','O00231', 'O00232', 'Q9UNM6', 'O00487', 'Q13200', 
+                     'O43242', 'P55036','Q16401', 'Q15008', 'P51665', 'P48556', 'O00233', 'Q06323', 'Q9UL46', 'P61289',
+                     'Q9GZU8', 'Q14997', 'Q92530P', 'O95456', 'Q969U7', 'Q9BT73', 'Q5JS54')
+```
+
+proteosome complex
+```{r}
+p <- ggplot (filtered.dt[protein %in% c(proteomsome.set),], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='proteosome complex') +
+  theme_bw()
+p
+BackupAsPDF(p, 'proteosome.complex.elution', dimensions=c(8,8))
+
+hm <- customintensityHeatmaps(normMat.max, proteinsOI = proteomsome.set, sample='Proteomsome complexes')
+BackupAsPDF(hm, 'proteosome.protein.heatmaps', dimensions = c(9,10))
+```
+now plot the ap2 complex
+
+```{r}
+ap2.complex <- c('AP2A1', 'AP2A2', 'AP2B1', 'AP2M1', 'AP2S1')
+ap2.complex.wNEF <- c('AP2A1', 'AP2A2', 'AP2B1', 'AP2M1', 'AP2S1', 'NEF')
+
+
+p <- ggplot (filtered.dt[gene %in% c('NEF', ap2.complex),], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='NEF & AP2 complex') +
+  theme_bw()
+p
+BackupAsPDF(p, 'ap2.nef.complex.elution')
+
+comb.mapper[simplifiedGene %in% ap2.complex, unique(protein)]
+
+# ap2 complex heatmap w nef
+hm <- customintensityHeatmaps(normMat.max, proteinsOI = comb.mapper[simplifiedGene %in% ap2.complex.wNEF, unique(protein)], sample='NEF & AP2 complex')
+hm
+BackupAsPDF(hm, 'nef.ap2.complex.heatmap')
+
+
+
+###  ap2 only
+p <- ggplot (filtered.dt[gene %in% c(ap2.complex),], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  labs(title='AP2 complex') +
+  theme_bw()
+p
+BackupAsPDF(p, 'ap2.complex.elution')
+
+hm <- customintensityHeatmaps(normMat.max, proteinsOI = comb.mapper[simplifiedGene %in% ap2.complex, unique(protein)], sample='NEF & AP2 complex')
+BackupAsPDF(hm, 'ap2.complex.heatmap')
+```
+
+
+
+
+HIV drug resistance db
+
+```{r}
+
+```
+
+
+*not used now...*
+pull out REV and VPR, add their interactors to the truth set
+
+```{r}
+# to match  mist set
+filtered.dt[protein %in% viral.prots, gene := toupper(gene)]
+
+# read in the hiv protein links to human
+hu.hiv.ints <- fread('~/Documents/utils/mg_utils/data/stringDB/11676.protein.links.detailed.v10.5.txt.gz')
+hu.hiv.ints[experimental > 400 & grepl('9606', protein2), .(protein1, protein2)]
+hu.hiv.ints[experimental >= 250,]
+
+hist(hu.hiv.ints$combined_score)
+
+# also, read int he 
+hiv.nodes <- fread('~/Documents/utils/mg_utils/data/stringDB/11676.protein.aliases.v10.5.txt.gz')
+setnames(hiv.nodes, new=c('stringID', 'gene', 'db'))
+hiv.interactors
+```
+
+*todo*
+Pull out the viral host interactions; share these plots with Monita
+Show a network of viral host interactions; how do the PCprophet and BP pipeline compare?
+
+Enrichment: thoughts are to break corum into pairwise interactions and then see what complexes are enriched in our data
+Issue here is we may detect complexes are enriched when we only detect subcomplexes (eg A-B-C found, so call A-B-C-D-E  enrihced)
+
+First (normalized) heatmap of the HIV proteins
+
+```{r}
+# plot the entire heatmap
+hm <- intensityHeatmaps(normMatrices, 
+                  intensityName = "Normalized\nScaled\nIntensity", 
+                  column_title_gp = gpar(fontsize = 12, fontface="bold"))
+
+BackupAsPDF(hm, 'scaledNorm.Ints.heatmap')
+
+# plot the viral proteins in this data
+
+viralProtMatrices <- lapply(normMatrices, function(x){
+  
+  return(x[rownames(x) %in% viral.prots,])
+  
+})
+
+# use gene names
+rownames(viralProtMatrices$norm_CD4_infected_1) <- comb.mapper$gene[match(rownames(viralProtMatrices$norm_CD4_infected_1), comb.mapper$protein)]
+
+hm <- intensityHeatmaps(viralProtMatrices, 
+                  intensityName = "Normalized\nScaled\nIntensity", 
+                  column_title_gp = gpar(fontsize = 12, fontface="bold"))
+hm
+BackupAsPDF(hm, 'scaledNorm.viralProteins.Ints.heatmap')
+```
+Convert the normalized matrix to long format and plot the viral protein elution profiles over the entire set
+```{r}
+normInts.long <- reshape2::melt(normMatrices$norm_CD4_infected_1) %>% 
+  as.data.table()
+setnames(normInts.long, new=c('protein', 'fraction', 'normalizedScaledIntensity'))
+
+# remove redundant stringIDs
+normInts.long <- merge(normInts.long, unique(comb.mapper[, .(protein,gene)]), by='protein', all.x=T, all.y=F)
+```
+
+plot the elution profiles of the hiv proteins
+```{r}
+g <- ggplot(normInts.long[protein %in% viral.prots,], aes(x=fraction, y=normalizedScaledIntensity, color=gene)) +
+  geom_line() +
+  labs(title='elution profiles of HIV proteins',y='normalized scaled intensity') +
+  scale_color_brewer(type='qual', palette=3) +
+  theme_bw()
+
+BackupAsPDF(g, 'hiv.proteins.elutionProfiles.normalizedAndScaled.linechart')
+```
+Show consistency of our method; in addition to barplot of the decoy-truth set, show the elution profiles of known complexes (eg ribosomal proteins)
+Use this to illustrate confidence in the method, then share hte host-viral stuff
+
+Compared to using cosine similarity; poor separation of the two groups; only good seperation at .99....
+```{r}
+g <- ggplot(cosSim.dt[cosSim > 0.9 & gs %in% c("decoy", "interactor")], aes (x = cosSim, fill=gs)) + 
+  geom_histogram(boundary = 1.0, binwidth = 0.003) + 
+  scale_fill_manual(values=c('grey80', 'gold')) +
+  labs(title='Interactor and decoy set scores', subtitle = 'cosine similarity >= 0.9') +
+  facet_grid(gs~sample, scales = "free_y") +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'cosineSim.interactorVsDecoy.threshold9.histogram')
+```
+Maybe plot a roc to show our method performs better?
+
+```{r}
+
+```
+
+
+
+**Note used**
+Need to identify what the different columns mean
+
+```{r}
+
+uniprot.expanded <- unique(filtered.dt[, .(protein)]) %>% 
+  .[, lapply(protein, function(x){ unlist(tstrsplit(x, ';'))}), by=.I]
+
+uniprot.expanded
+uniprot.id <- filtered.dt[,protein)] %>% 
+  unique()
+
+uniprot.id
+
+fwrite(uniprot.id, ScriptAndDatedFileName('uniprot.ids.txt'))
+
+fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_10_uniprot.ids.txt', sep='\t')
+```
+```{r}
+uniprot.id[14]
+```
+
+
+Maybe remove these earlier fractions or leave as is? 
+As we are only interested in HIV-host interactors, I think we can leave as is for now as none of the HIV proteins elute in these fractions
+Perform peak selection, plot number of peaks per fraction/n proteins per fraction to identify informative fractions; if we find a lot of peaks/protein ratio in fraction 1-7 remove
+```{r}
+subset.dt <- filtered.dt[, ]
+```
+
+```{r}
+intMats <- scaledIntensityMatrices(sec.long)
+intensityHeatmaps(intMats) |> BackupAsPDF()
+```
+
+
+```{r}
+qc.dt[,c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+allFits <- fitLocalCubics(qc.dt, window = 10, sampleTerm = "interaction") #|> suppressWarnings()
+
+# identifies outliers based on some median residual threshold to the curves.
+p <-plotNormAndOutlierFits (qc.dt , allFits)
+print(p)
+```
+
+```{r}
+qc.dt[isOutlier == T, .(sample, fraction)]
+normalizeByResiduals(sec.long, qc.dt)
+
+normIntMats <-  scaledIntensityMatrices(sec.long)
+intensityHeatmaps(normIntMats, intensityName = "Normalized\nScaled\nIntensity") |> BackupAsPDF()
+```
+find the outlier runs, interpolate, upload and rerun
+
+```{r}
+sec.list[['ctrl']][, rn := paste0(GN,'__',ID)][,c('ID', 'GN') := NULL]
+ctrl.mat <- as.matrix(sec.list[['ctrl']], rownames='rn')
+
+
+ctrl.mat %>% Heatmap(., 
+                     cluster_rows = F,
+                     cluster_columns = F,
+                     show_row_names = F
+                    )
+
+#ctrl.mat[,2] <- rowSums(ctrl.mat[, c(1, 3)])/2
+#ctrl.mat[,4] <- rowSums(ctrl.mat[, c(3, 5)])/2
+ctrl.mat[,46] <- rowSums(ctrl.mat[, c(45, 47)])/2
+ctrl.mat[,50] <- rowSums(ctrl.mat[, c(49, 51)])/2
+
+ctrl.mat %>% Heatmap(., 
+                     cluster_rows = F,
+                     cluster_columns = F,
+                     show_row_names = F
+                    )
+
+
+ctrl.mat <- as.data.table(ctrl.mat, keep.rownames = T)[, c('GN','ID') := tstrsplit(rn, '__', keep=c(1,2))] %>% 
+  .[, rn := NULL]
+
+cols.oi <- c('GN', 'ID', grep('PG.Quantity', colnames(ctrl.mat), value=T))
+ctrl.mat <- ctrl.mat[, ..cols.oi]
+```
+
+Looks much better with the 
+```{r}
+test <- setDT(reshape2::melt(ctrl.mat))
+test <- test[, .(sample='ctrl_1', treatment='ctrl', replicate=1, protein=ID, fraction=as.numeric(gsub('_F', '', str_extract(variable, '_F[0-9]{1,2}'))), intensity=value)]
+
+qcPlotMedianInt(qcSummaryTable(test))
+```
+Map the human to mouse set
+# get the ensembl datasets (write script to automatically pull homologs)
+Retry Tomorrow, cant access biomart right now
+```{r}
+huMapping.id <- fread('https://ftp.ebi.ac.uk/pub/ensemblorganisms/Homo_sapiens/GCA_000001405.29/ensembl/homology/2023_03/Homo_sapiens-GCA_000001405.29-2023_03-homology.tsv.gz')
+huMapping.id <- huMapping.id[ref_assembly == 'GRCm39', .(mmAssembly=ref_assembly, mmGene=ref_gene_name, hsAssembly=query_assembly, hsGene=query_gene_name,query_perc_id, query_perc_cov)]
+
+# thinking maybe a quick first pass, take the ortholog with highest avg seq similarity and cov
+topHit.dt <- huMapping.id[, .SD[which.max((query_perc_id+query_perc_cov)/2)], by=.(mmGene)]
+```
+
+ now need to map gene names to uniprot using the uniprot ID mapping utility
+```{r}
+
+as.data.table(c(anno.list[[1]]$GN, anno.list[[2]]$GN) %>%  unique()) %>% 
+  .[V1 != ''] %>% 
+  fwrite(., './docs/huIDsForUniprotMapping.txt', col.names = F)
+
+
+# uniprot id mapping.. need better way to programatically acess this
+uniprot.mapping <- fread('./docs/idmapping_2025_03_14.tsv.gz')
+uniprot.mapping <- uniprot.mapping[, head(.SD,1), by=.(From)] # just get one unique mapping...
+
+# looks fine most hits in top right quadrant
+ggplot(topHit.dt, aes(x=query_perc_cov, y=query_perc_id)) +
+  geom_point() +
+  geom_density2d()
+```
+# replace the old mat with the corrected data and convert IDs
+```{r}
+sec.list[['ctrl']] <- ctrl.mat
+
+anno.list <- lapply(sec.list, function(mat){
+  
+  anno.mat <- merge(x=mat, y=topHit.dt[,.(GN=mmGene, hsGene)], by='GN', all.x=T, all.y=F)
+  anno.mat[, GN := hsGene]
+  anno.mat[, hsGene := NULL]
+  
+  new.mat <- merge(x=anno.mat, y=uniprot.mapping[,.(gene=From, Entry)], by.x='GN', by.y='gene', all.x=T)
+  new.mat[, ID := ifelse(!is.na(Entry), Entry, GN)]
+  new.mat[, Entry := NULL]
+  return(new.mat[!is.na(GN) & GN != '',])
+})
+
+# looks good
+lapply(anno.list, colnames)
+
+lapply(names(anno.list), function(x){
+  fwrite(anno.list[[x]], sep='\t', ScriptAndDatedFileName(paste0(x,'.huIDs.pcpin.mat.txt')))
+})
+```
+
+# fix the problematic runs, but reuse the mouse mat as input 
+
+```{r}
+sec.list <- list(ctrl=fread('./030725_preparePCprophetInput_data/2025_03_10_ctrl.mito.pcp.in.mat.txt'),
+                 test=fread('./030725_preparePCprophetInput_data/2025_03_10_test.mito.pcp.in.mat.txt'))
+
+# check to ensure the order matches expected
+lapply(sec.list, function(x){
+  
+  fractOrder <- sapply(strsplit(colnames(x)[5:ncol(x)], '[._]'), function(y) y[3])
+
+  all(fractOrder == paste0('F', seq(1,ncol(x)-4))) == TRUE
+  print(colnames(x))
+  
+})
+```
+interpolate values for troublesome runs 
+```{r}
+ctrl.mat <- sec.list[['ctrl']]
+ctrl.mat[,id := paste0(GN,'__',ID)]
+
+ctrl.mat <- as.matrix(ctrl.mat[, c('GN','ID') := NULL] , rownames='id')
+
+# spot runs with issues
+plot(apply(ctrl.mat, 2, sum))
+
+ctrl.mat[,46] <- rowSums(ctrl.mat[, c(45, 47)])/2
+ctrl.mat[,50] <- rowSums(ctrl.mat[, c(49, 51)])/2
+
+
+# fixed issue runs 
+plot(apply(ctrl.mat, 2, sum))
+
+ctrl.mat <- as.data.table(ctrl.mat, keep.rownames = T)
+ctrl.mat[, c('GN', 'ID') := tstrsplit(rn, '__', keep=c(1,2))]
+ctrl.mat[, rn := NULL]
+
+col.oi <- c('GN', 'ID', colnames(ctrl.mat)[1:(length(colnames(ctrl.mat))-2)])
+ctrl.mat <- ctrl.mat[, ..col.oi]
+
+
+sec.list[['ctrl']] <- ctrl.mat
+
+
+lapply(names(sec.list), function(x){
+  fwrite(sec.list[[x]], sep='\t', ScriptAndDatedFileName(paste0(x,'.fixProbRuns.pcpIn.mat.txt')))
+})
+```
+
+

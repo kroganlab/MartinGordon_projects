@@ -1,0 +1,338 @@
+---
+title: "060225_differentialAnalysisSeperateDonors"
+author: "Martin Gordon"
+date: "2025-06-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+As requested by Robyn, run differential analysis of each of the donors seperately. When this is complete, upload to the SEC-MS folder for Ben to take a look and share with the group tomorrow morning if there are no issues
+
+```{r packages}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+library(RColorBrewer)
+library(eulerr)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+#source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+
+customTheme <- theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+brewer.pal.info
+col.pal <- brewer.pal(n=8, name='Set1')
+cond.pal <- c("infected_uninfected_1" =  "#377EB8", "challenged_infected_1" = "#E41A1C",  "challenged_uninfected_1"="#4DAF4A","infected_uninfected_2" ="#377EB8",  "challenged_infected_2"="#E41A1C",  "challenged_uninfected_2"="#4DAF4A" )
+```
+
+
+# read input files for the analysis; we will use the version with the imputed values, split on Donor and then run all the pairwise contrasts so we can tell which is which
+
+## Differential peak analysis
+
+```{r}
+# all filtered peaks 
+allPeaks <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_allPeaks.donor1donor2.monomerMassLabelled.csv.gz')
+allPeaks[, unfilteredPeaks := goodPeak]
+allPeaks[, goodPeak := filtteredGoodPeak]
+
+# with standardised fractions
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_hiv.donor1donor2.sec.ms.wStandardisedFractions.csv.gz') 
+sec.long[, treatment := status] # I think we use status?
+sec.long[, replicate := donor]
+```
+
+Now, we want to split the datasets into two donors, run seperately and run each group pairwise. Inspect the results in the app
+```{r}
+allTreatments <- sec.long$treatment %>% 
+  unique()
+
+
+allByAll <- function(items){
+  data.table(x = items)[, .(y = items), by = x][]
+}
+
+pair.mat <- allByAll(allTreatments)[x < y] %>% 
+  as.matrix()
+
+allPeaks[,treatment := tstrsplit(sample, "_")[[2]]]
+
+
+contrastTreatmentSubset <- function (treatments, sec.dt, allPeaks){
+  print (treatments)
+  allPeaks <- allPeaks[treatment %in% treatments]
+  allPeaks[, proteinPeakCluster := NULL]
+  # per protein, join peaks across runs into clusters
+  allPeaks[goodPeak == TRUE, proteinPeakCluster := clusterPeaks(cofmN.standardized, maxDistance = 2.5), by = protein]
+
+  # per peak cluster (per protein), summarize to a center (and height etc, but most important is center)
+  peakClusters <- allPeaks[!is.na(proteinPeakCluster), 
+                           .(.N, meanPeakHeight  = mean(peakHeight), center = mean(cofmN.standardized)),
+                           keyby = .(protein, proteinPeakCluster)]
+  
+  # split data into single-protein chunks
+  # peaks in the protein
+  peakClusters.subTables <- split(peakClusters, by = "protein")
+  # sec data per protein (only those in above table)
+  allProteins <- names(peakClusters.subTables)
+  sec.subTables <- split(sec.dt[treatment %in% treatments][protein %in% allProteins], by = "protein" )
+  
+  # iterate over proteins
+  names(allProteins) <- allProteins
+  anova.ls <- pbapply::pblapply(allProteins, function(proteinOI) anovaPeaksInOneProtein(sec.subTables[[proteinOI]], peakClusters.subTables[[proteinOI]], radius = 5))
+  
+  # format output
+  anova.dt <- rbindlist(anova.ls, use.names = TRUE, fill = TRUE, idcol = "protein")
+  print(anova.dt)
+  # friendly names
+  setnames(anova.dt,
+           old = c( "rn",        "Sum.Sq",     "Mean.Sq",    "F.value", "Pr..F."),
+           new = c( "modelTerm", "SumSquares", "MeanSquare", "F",       "p.F"))
+  
+  
+  peakClusters[anova.dt[modelTerm == "poly(standardFraction, 4):treatment"], treatmentDiff.p := i.p.F]
+  peakClusters[anova.dt[modelTerm == "treatment"], treatmentIntensity.p := i.p.F]
+
+  setorder(peakClusters, treatmentDiff.p, na.last = TRUE)
+  
+  peakClusters[, gene := multiUniprots2multiGenes(protein)]
+  setcolorder(peakClusters, c("protein", "gene"))
+  
+  return (peakClusters)
+}
+```
+Run the analysis for donor1 and donor2
+```{r}
+d1_pairwiseContrasts <- apply(pair.mat, 1, contrastTreatmentSubset, sec.long[donor == 1,], allPeaks[peakHeight > 0.01])
+d2_pairwiseContrasts <- apply(pair.mat, 1, contrastTreatmentSubset, sec.long[donor == 2,], allPeaks[peakHeight > 0.01])
+names(d1_pairwiseContrasts) <- apply(pair.mat, 1, function(x) paste0(paste0(x, collapse = "_"), '_1'))
+names(d2_pairwiseContrasts) <- apply(pair.mat, 1, function(x) paste0(paste0(x, collapse = "_"), '_2'))
+names(d2_pairwiseContrasts)
+
+allContrasts <- rbindlist(c(d1_pairwiseContrasts, d2_pairwiseContrasts),idcol = "contrast")
+
+allContrasts[, donor := gsub('_', '', str_extract(contrast, '_[12]$'))]
+allContrasts[, treatmentDiff.adjP := p.adjust(treatmentDiff.p, method='BH'), by=contrast]
+allContrasts[, treatmentIntensity.adjP := p.adjust(treatmentIntensity.p, method='BH'), by=contrast]
+
+# save the output of the pw contrasts 
+fwrite(allContrasts, ScriptAndDatedFileName('HIV.donor1donor2.allPWcontrasts.csv.gz'))
+allContrasts[gene == 'GCN1' & contrast == 'infected_uninfected_1',]
+```
+
+
+```{r}
+allContrasts <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/060225_differentialAnalysisSeperateDonors_data/2025_06_02_HIV.donor1donor2.allPWcontrasts.csv.gz')
+
+# about 2k differential proteins per contrast
+allContrasts[treatmentDiff.adjP < 0.05, length(unique(protein)), by=contrast]
+```
+
+Couple of very quick plots; number of de genes in each contrast, and overlap between the contrasts
+
+```{r}
+allContrasts$contrast %>% unique()
+allContrasts[, length(unique(protein)), by=.(contrast)]
+
+g <-  ggplot(allContrasts[treatmentDiff.adjP < 0.05, length(unique(protein)), by=.(contrast)], aes(x=contrast, y=V1, fill=contrast)) +
+  geom_bar(stat='identity') +
+  labs(title='pairwise differential peak analysis', y='N proteins (padj < 0.05)') +
+  scale_fill_manual(values=cond.pal) +
+  customTheme
+g
+BackupAsPDF(g, 'ndiffProteins.barplot')
+```
+
+now a venn diagram of each of the different hits
+
+```{r}
+allContrasts[, unlist(gene), by=sample]
+sigHits <- allContrasts[treatmentDiff.adjP < 0.05][,.(contrast, gene)] %>% 
+  split(., by='contrast')
+
+sigHits <- lapply(sigHits, function(x) unique(x$gene))
+lapply(sigHits, length) # looks good
+names(sigHits)
+
+# now look at the overlap in the different groups
+g <- plot(euler(sigHits[grepl('infected_uninfected', names(sigHits))]),
+     labels = list(font = 4),
+     alpha=0.7,
+     fill=col.pal[1:2],
+     quantities = TRUE)
+
+g
+BackupAsPDF(g, 'sighits.infectedVsuninfected.overlap.euler')
+
+g <- plot(euler(sigHits[grepl('challenged_infected', names(sigHits))]),
+     labels = list(font = 4),
+     alpha=0.7,
+     fill=col.pal[1:2],
+     quantities = TRUE)
+g
+BackupAsPDF(g, 'sighits.challengedVinfected.overlap.euler')
+
+
+g <- plot(euler(sigHits[grepl('challenged_uninfected', names(sigHits))]),
+     labels = list(font = 4),
+     alpha=0.7,
+     fill=col.pal[1:2],
+     quantities = TRUE)
+g
+BackupAsPDF(g, 'sighits.challengedVsuninfected.overlap.euler')
+```
+```{r}
+# save a file as results to share so users can investigate theri results on shiny
+
+setorder(allContrasts, treatmentDiff.p, na.last = TRUE)
+fwrite(allContrasts[, .(contrast, donor, protein, gene, proteinPeakCluster, N, meanPeakHeight, center, treatmentDiff.p, treatmentIntensity.p, treatmentDiff.adjP, treatmentIntensity.adjP)], ScriptAndDatedFileName('allPWcontrasts.anova.toShare.csv.gz'))
+
+
+```
+
+
+
+Not so sure of these results... lets read in the results from the first set of donor contrasts and see if the numbers of sig hits are similiar and if the overlaps are similiar
+
+```{r}
+peakClusters <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_14_anova.results.csv.gz')
+
+# only 1.4 k different here... at least want to check all these proteins are different in the PW level ANOVA?
+# also,run the PW level ANOVA and confirm thewse two are similair
+firstPassHits<- peakClusters[treatmentDiff.padj < 0.05, unique(protein)]
+firstPassHits %>% 
+  length()
+
+allContrasts[, donor := gsub('_', '', str_extract(contrast, '_[12]$'))]
+
+# 3k compared to 5k... dont know why it is so inflated doing the pw analysis.... try all 3 anova and see how it is impacted
+allContrasts[treatmentDiff.p < 0.05, length(unique(protein)), by=donor]
+peakClusters[treatmentDiff.p < 0.05, length(unique(protein)),]
+```
+Also remember for the second dataset we dont filter out 'good peaks'
+Try ANOVA with all 3 reps just subset the datatables to donor one and call test
+
+```{r}
+testPeaks <- allPeaks[grepl('_1$', sample)]
+# per protein, join peaks across runs into clusters
+testPeaks[goodPeak == TRUE, proteinPeakCluster := clusterPeaks(cofmN.standardized, maxDistance = 2.5), by = protein]
+
+# per peak cluster (per protein), summarize to a center (and height etc, but most important is center)
+peakClusters <- testPeaks[!is.na(proteinPeakCluster), 
+                         .(.N, meanPeakHeight  = mean(peakHeight), center = mean(cofmN.standardized)),
+                          keyby = .(protein, proteinPeakCluster)]
+
+# split data into single-protein chunks
+# peaks in the protein
+peakClusters.subTables <- split(peakClusters, by = "protein")
+
+# sec data per protein (only those in above table)
+allProteins <- names(peakClusters.subTables)
+sec.subTables <- split(sec.long[protein %in% allProteins & donor == 1,], by = "protein" )
+
+# iterate over proteins
+names(allProteins) <- allProteins
+anova.ls <- pbapply::pblapply(allProteins, function(proteinOI) anovaPeaksInOneProtein(sec.subTables[[proteinOI]], peakClusters.subTables[[proteinOI]], radius = 5))
+# format output
+anova.dt <- rbindlist(anova.ls, use.names = TRUE, fill = TRUE, idcol = "protein")
+
+# friendly names
+setnames(anova.dt,
+         old = c( "rn",        "Sum.Sq",     "Mean.Sq",    "F.value", "Pr..F."), # anova col names to change
+         #old = c( "rn",        "Sum Sq",     "Mean Sq",    "F value", "Pr(>F)"),
+         new = c( "modelTerm", "SumSquares", "MeanSquare", "F",       "p.F"))
+
+
+peakClusters[anova.dt[modelTerm == "poly(standardFraction, 4):treatment"], treatmentDiff.p := i.p.F]
+peakClusters[anova.dt[modelTerm == "treatment"], treatmentIntensity.p := i.p.F]
+
+# term we are interested in: what peak profiles change in response to treatment?
+anova.dt
+
+setorder(peakClusters, treatmentDiff.p, na.last = T)
+peakClusters[, gene := multiUniprots2multiGenes(protein)]
+peakClusters[treatmentDiff.p < 0.05, length(unique(protein)),]
+
+
+fwrite(peakClusters, ScriptAndDatedFileName('donor1.allconditions.anova.results.csv.gz'))
+```
+
+run the same for donor 2 and save 
+
+```{r}
+
+testPeaks <- allPeaks[grepl('_2$', sample)]
+# per protein, join peaks across runs into clusters
+testPeaks[goodPeak == TRUE, proteinPeakCluster := clusterPeaks(cofmN.standardized, maxDistance = 2.5), by = protein]
+
+# per peak cluster (per protein), summarize to a center (and height etc, but most important is center)
+peakClusters <- testPeaks[!is.na(proteinPeakCluster), 
+                         .(.N, meanPeakHeight  = mean(peakHeight), center = mean(cofmN.standardized)),
+                          keyby = .(protein, proteinPeakCluster)]
+
+# split data into single-protein chunks
+# peaks in the protein
+peakClusters.subTables <- split(peakClusters, by = "protein")
+
+# sec data per protein (only those in above table)
+allProteins <- names(peakClusters.subTables)
+sec.subTables <- split(sec.long[protein %in% allProteins & donor == 2,], by = "protein" )
+
+# iterate over proteins
+names(allProteins) <- allProteins
+anova.ls <- pbapply::pblapply(allProteins, function(proteinOI) anovaPeaksInOneProtein(sec.subTables[[proteinOI]], peakClusters.subTables[[proteinOI]], radius = 5))
+# format output
+anova.dt <- rbindlist(anova.ls, use.names = TRUE, fill = TRUE, idcol = "protein")
+
+# friendly names
+setnames(anova.dt,
+         old = c( "rn",        "Sum.Sq",     "Mean.Sq",    "F.value", "Pr..F."), # anova col names to change
+         #old = c( "rn",        "Sum Sq",     "Mean Sq",    "F value", "Pr(>F)"),
+         new = c( "modelTerm", "SumSquares", "MeanSquare", "F",       "p.F"))
+
+
+peakClusters[anova.dt[modelTerm == "poly(standardFraction, 4):treatment"], treatmentDiff.p := i.p.F]
+peakClusters[anova.dt[modelTerm == "treatment"], treatmentIntensity.p := i.p.F]
+
+# term we are interested in: what peak profiles change in response to treatment?
+anova.dt
+
+setorder(peakClusters, treatmentDiff.p, na.last = T)
+peakClusters[, gene := multiUniprots2multiGenes(protein)]
+peakClusters[treatmentDiff.p < 0.05, length(unique(protein)),]
+
+fwrite(peakClusters, ScriptAndDatedFileName('donor2.allconditions.anova.results.csv.gz'))
+```
+
+For the ones that pass in this dataset, why were they missing in the initial analysis? Did they fall just below threshold? Investigate... Also I am suspicious that a similar number of DE proteins are found in each set...
+1 k more hits in the second dataset when we run the anova on all... 4k vs 3k.. remember its researched, different nomralization, not filtering peaks using MW as we dont have standard for run2 etc... I think good enough is good enough in this case we see clear enrichment in the histgram above.. we just want to find the number of proteins different between each group
+Maybe speak to Ben, but leave as is for now
+```{r}
+peakClusters
+peakClusters[treatmentDiff.padj < 0.05, .(length(unique(protein)),.N),]
+
+# nearly 3 times as many proteins... this is way off our initial estimate of DE hits... what is going on?
+# look at the DE distributions of these proteins
+newHits <- allContrasts[grepl('_1', contrast) & treatmentDiff.adjP < 0.05 & !protein %in% firstPassHits, unique(protein)]
+
+peakClusters[treatmentDiff.padj < 0.05 & protein %in% newHits]
+hist(peakClusters[ protein %in% newHits, treatmentDiff.p], breaks = 100) +
+```
+

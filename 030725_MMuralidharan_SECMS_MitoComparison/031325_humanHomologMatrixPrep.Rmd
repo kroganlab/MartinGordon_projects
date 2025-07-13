@@ -1,0 +1,228 @@
+---
+title: "031325_humanHomologMatrixPrep"
+author: "Martin Gordon"
+date: "2025-03-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+```
+
+
+Quick QC check of the data; 
+read in the processed data
+
+```{r}
+sec.list <- list(ctrl=fread('./030725_preparePCprophetInput_data/2025_03_10_ctrl.mito.pcp.in.mat.txt'),
+                 test=fread('./030725_preparePCprophetInput_data/2025_03_10_test.mito.pcp.in.mat.txt'))
+
+# check to ensure the order matches expected
+lapply(sec.list, function(x){
+  
+  fractOrder <- sapply(strsplit(colnames(x)[5:ncol(x)], '[._]'), function(y) y[3])
+  all(fractOrder == paste0('F', seq(1,ncol(x)-4))) == TRUE
+  
+})
+rbindlist(sec.list)
+```
+make seclong dt
+clearly two problematic fractions in control... do something with these
+```{r}
+sec.long <- lapply(sec.list, function(x){
+
+ long.dt <-  setDT(reshape2::melt(x))
+ long.dt[, .(protein=ID, fraction=as.numeric(gsub('_F', '', str_extract(variable, '_F[0-9]{1,2}'))), intensity=value)]
+}) %>% rbindlist(idcol = 'sample')
+
+# fix to confrom with 
+sec.long[, sample := paste0(sample, '_1')]
+
+qc.dt <- qcSummaryTable(sec.long)
+
+BackupAsPDF(qcPlotProteinCount(qc.dt), 'Nproteins.linechart')
+```
+Looks like these two fractions will need to be dropped
+Interesting that the median polish seems to 
+```{r}
+qcPlotMedianInt(qc.dt)
+```
+```{r}
+intMats <- scaledIntensityMatrices(sec.long)
+intensityHeatmaps(intMats) |> BackupAsPDF()
+```
+```{r}
+qc.dt[,c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+allFits <- fitLocalCubics(qc.dt, window = 10, sampleTerm = "interaction") #|> suppressWarnings()
+
+# identifies outliers based on some median residual threshold to the curves.
+p <-plotNormAndOutlierFits (qc.dt , allFits)
+print(p)
+```
+
+```{r}
+qc.dt[isOutlier == T, .(sample, fraction)]
+normalizeByResiduals(sec.long, qc.dt)
+
+normIntMats <-  scaledIntensityMatrices(sec.long)
+intensityHeatmaps(normIntMats, intensityName = "Normalized\nScaled\nIntensity") |> BackupAsPDF()
+```
+find the outlier runs, interpolate, upload and rerun
+
+```{r}
+sec.list[['ctrl']][, rn := paste0(GN,'__',ID)][,c('ID', 'GN') := NULL]
+ctrl.mat <- as.matrix(sec.list[['ctrl']], rownames='rn')
+
+
+ctrl.mat %>% Heatmap(., 
+                     cluster_rows = F,
+                     cluster_columns = F,
+                     show_row_names = F
+                    )
+
+#ctrl.mat[,2] <- rowSums(ctrl.mat[, c(1, 3)])/2
+#ctrl.mat[,4] <- rowSums(ctrl.mat[, c(3, 5)])/2
+ctrl.mat[,46] <- rowSums(ctrl.mat[, c(45, 47)])/2
+ctrl.mat[,50] <- rowSums(ctrl.mat[, c(49, 51)])/2
+
+ctrl.mat %>% Heatmap(., 
+                     cluster_rows = F,
+                     cluster_columns = F,
+                     show_row_names = F
+                    )
+
+
+ctrl.mat <- as.data.table(ctrl.mat, keep.rownames = T)[, c('GN','ID') := tstrsplit(rn, '__', keep=c(1,2))] %>% 
+  .[, rn := NULL]
+
+cols.oi <- c('GN', 'ID', grep('PG.Quantity', colnames(ctrl.mat), value=T))
+ctrl.mat <- ctrl.mat[, ..cols.oi]
+```
+
+Looks much better with the 
+```{r}
+test <- setDT(reshape2::melt(ctrl.mat))
+test <- test[, .(sample='ctrl_1', treatment='ctrl', replicate=1, protein=ID, fraction=as.numeric(gsub('_F', '', str_extract(variable, '_F[0-9]{1,2}'))), intensity=value)]
+
+qcPlotMedianInt(qcSummaryTable(test))
+```
+Map the human to mouse set
+# get the ensembl datasets (write script to automatically pull homologs)
+Retry Tomorrow, cant access biomart right now
+```{r}
+huMapping.id <- fread('https://ftp.ebi.ac.uk/pub/ensemblorganisms/Homo_sapiens/GCA_000001405.29/ensembl/homology/2023_03/Homo_sapiens-GCA_000001405.29-2023_03-homology.tsv.gz')
+huMapping.id <- huMapping.id[ref_assembly == 'GRCm39', .(mmAssembly=ref_assembly, mmGene=ref_gene_name, hsAssembly=query_assembly, hsGene=query_gene_name,query_perc_id, query_perc_cov)]
+
+# thinking maybe a quick first pass, take the ortholog with highest avg seq similarity and cov
+topHit.dt <- huMapping.id[, .SD[which.max((query_perc_id+query_perc_cov)/2)], by=.(mmGene)]
+```
+
+ now need to map gene names to uniprot using the uniprot ID mapping utility
+```{r}
+
+as.data.table(c(anno.list[[1]]$GN, anno.list[[2]]$GN) %>%  unique()) %>% 
+  .[V1 != ''] %>% 
+  fwrite(., './docs/huIDsForUniprotMapping.txt', col.names = F)
+
+
+# uniprot id mapping.. need better way to programatically acess this
+uniprot.mapping <- fread('./docs/idmapping_2025_03_14.tsv.gz')
+uniprot.mapping <- uniprot.mapping[, head(.SD,1), by=.(From)] # just get one unique mapping...
+
+# looks fine most hits in top right quadrant
+ggplot(topHit.dt, aes(x=query_perc_cov, y=query_perc_id)) +
+  geom_point() +
+  geom_density2d()
+```
+# replace the old mat with the corrected data and convert IDs
+```{r}
+sec.list[['ctrl']] <- ctrl.mat
+
+anno.list <- lapply(sec.list, function(mat){
+  
+  anno.mat <- merge(x=mat, y=topHit.dt[,.(GN=mmGene, hsGene)], by='GN', all.x=T, all.y=F)
+  anno.mat[, GN := hsGene]
+  anno.mat[, hsGene := NULL]
+  
+  new.mat <- merge(x=anno.mat, y=uniprot.mapping[,.(gene=From, Entry)], by.x='GN', by.y='gene', all.x=T)
+  new.mat[, ID := ifelse(!is.na(Entry), Entry, GN)]
+  new.mat[, Entry := NULL]
+  return(new.mat[!is.na(GN) & GN != '',])
+})
+
+# looks good
+lapply(anno.list, colnames)
+
+lapply(names(anno.list), function(x){
+  fwrite(anno.list[[x]], sep='\t', ScriptAndDatedFileName(paste0(x,'.huIDs.pcpin.mat.txt')))
+})
+```
+
+# fix the problematic runs, but reuse the mouse mat as input 
+
+```{r}
+sec.list <- list(ctrl=fread('./030725_preparePCprophetInput_data/2025_03_10_ctrl.mito.pcp.in.mat.txt'),
+                 test=fread('./030725_preparePCprophetInput_data/2025_03_10_test.mito.pcp.in.mat.txt'))
+
+# check to ensure the order matches expected
+lapply(sec.list, function(x){
+  
+  fractOrder <- sapply(strsplit(colnames(x)[5:ncol(x)], '[._]'), function(y) y[3])
+
+  all(fractOrder == paste0('F', seq(1,ncol(x)-4))) == TRUE
+  print(colnames(x))
+  
+})
+```
+interpolate values for troublesome runs 
+```{r}
+ctrl.mat <- sec.list[['ctrl']]
+ctrl.mat[,id := paste0(GN,'__',ID)]
+
+ctrl.mat <- as.matrix(ctrl.mat[, c('GN','ID') := NULL] , rownames='id')
+
+# spot runs with issues
+plot(apply(ctrl.mat, 2, sum))
+
+ctrl.mat[,46] <- rowSums(ctrl.mat[, c(45, 47)])/2
+ctrl.mat[,50] <- rowSums(ctrl.mat[, c(49, 51)])/2
+
+
+# fixed issue runs 
+plot(apply(ctrl.mat, 2, sum))
+
+ctrl.mat <- as.data.table(ctrl.mat, keep.rownames = T)
+ctrl.mat[, c('GN', 'ID') := tstrsplit(rn, '__', keep=c(1,2))]
+ctrl.mat[, rn := NULL]
+
+col.oi <- c('GN', 'ID', colnames(ctrl.mat)[1:(length(colnames(ctrl.mat))-2)])
+ctrl.mat <- ctrl.mat[, ..col.oi]
+
+
+sec.list[['ctrl']] <- ctrl.mat
+
+
+lapply(names(sec.list), function(x){
+  fwrite(sec.list[[x]], sep='\t', ScriptAndDatedFileName(paste0(x,'.fixProbRuns.pcpIn.mat.txt')))
+})
+```
+
+
+```{r}
+
+```
+

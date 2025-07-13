@@ -1,0 +1,122 @@
+---
+title: "061425_D3_dataInspection"
+author: "Martin Gordon"
+date: "2025-06-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview 
+
+Look at the agreement between donor3 prot quant and peptide/msstats quant and let Monita know if it looks ok 
+
+```{r packages}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+library(RColorBrewer)
+library(eulerr)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+
+customTheme <- theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+brewer.pal.info
+col.pal <- brewer.pal(n=8, name='Set1')
+cond.pal <- c("infected_uninfected_1" =  "#377EB8", "challenged_infected_1" = "#E41A1C",  "challenged_uninfected_1"="#4DAF4A","infected_uninfected_2" ="#377EB8",  "challenged_infected_2"="#E41A1C",  "challenged_uninfected_2"="#4DAF4A" )
+```
+
+Read in the prot quant and the other quant files and see how they loook
+
+```{r}
+allFiles <- dir('./data/HIV_Infection_CD4T_cells/Donor-3-061125/D3_Stringent_Spectronaut_Parameters_061225/', full.names = T, include.dirs = T, recursive = T)
+
+grep('MSStats', allFiles, value=T)
+# read in the different files types
+pep.ls <- lapply(grep('Peptide', allFiles, value=T), fread)
+prot.ls <- lapply(grep('Protein', allFiles, value=T), fread)
+```
+
+Quick look at the pep
+```{r}
+names(pep.ls) <- sapply(grep('Peptide', allFiles, value=T), function(x) unlist(strsplit(x, '[/]'))[7])
+names(prot.ls) <- sapply(grep('Protein', allFiles, value=T), function(x) unlist(strsplit(x, '[/]'))[7]) 
+
+pep.dt <- rbindlist(pep.ls, idcol='sample')
+prot.dt <- rbindlist(prot.ls, idcol='sample')
+
+prot.dt[grepl('IFIT1', PG.Genes), colnames(prot.dt)]
+
+prot.dt[,.N, by=sample] # 28 k rows in each protein mat... what are all these?
+prot.dt[grepl('IFIT1', PG.Genes),]
+
+cols.oi <- c('sample','EG.PrecursorId', grep('TargetQuantity', colnames(pep.dt), value=T))
+
+pep.dt[grepl('IFIT1', PG.Genes),.N, by=sample] # 49 rows per sample... same peptides in each sample?
+
+# same number of rows in each sample
+pep.dt[,.N, by=sample]
+
+prot.dt
+
+pep.mat <- pep.dt[grepl('IFIT1', PG.Genes),..cols.oi][, pepid := paste0(sample, '.', EG.PrecursorId)]
+pep.mat[, c('sample', 'EG.PrecursorId') := NULL]
+pep.mat <- as.matrix(pep.mat, rownames='pepid')
+
+plot(sort(apply(pep.mat, 1, function(x)sum(is.na(x)))))
+
+
+Heatmap(pep.mat, 
+        row_split=str_extract(rownames(pep.mat),'Challenged_Infected|Challenged_Uninfected|D3-Uninfected'),
+        show_row_names = F,
+        cluster_rows = F, 
+        cluster_columns = F)
+```
+Look at the entire matrix 
+```{r}
+pep.mat <- pep.dt[,..cols.oi][, pepid := paste0(sample, '.', EG.PrecursorId)]
+pep.mat[, c('sample', 'EG.PrecursorId') := NULL]
+pep.mat <- as.matrix(pep.mat, rownames='pepid')
+# count the number of petected
+apply(pep.mat, 2, function(x)sum(!is.na(x)))
+
+# n detected peptides per run
+detectedPepPerRun <- apply(pep.mat, 2, function(x)sum(!is.na(x)))
+plot(detectedPepPerRun)
+```
+
+```{r}
+prot.cols <- c('sample', 'PG.ProteinAccessions',grep('TargetQuantity', colnames(prot.dt), value=T))
+
+prot.mat <- prot.dt[,..prot.cols][, protid := paste0(sample, '.', PG.ProteinAccessions)]
+prot.mat[, c('sample', 'PG.ProteinAccessions') := NULL]
+prot.mat <- as.matrix(prot.mat, rownames='protid')
+
+
+# look like the n detected proteins and N detected peptides are the same?
+detectedProtPerRun <- apply(prot.mat, 2, function(x)sum(!is.na(x)))
+plot(detectedProtPerRun)
+
+# same number of detections... looks incorrect to me
+all(detectedProtPerRun == detectedPepPerRun)
+```
+```{r}
+prot.dt[grepl('IFIT1', PG.Genes),]
+pep.dt[grepl('IFIT1', PG.Genes),]
+
+```
+

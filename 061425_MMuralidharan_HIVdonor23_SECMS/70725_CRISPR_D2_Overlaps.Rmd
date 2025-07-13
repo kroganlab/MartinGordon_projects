@@ -1,0 +1,126 @@
+---
+title: "070725_CRISPR_D2_Overlaps"
+author: "Martin Gordon"
+date: "2025-07-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Look at the overlap to CRISPR hits from Ujwals study with the donor2 samples
+Big probelm the differential results are very different across both analysis... not sure what to do here... reanalyze all together? repeat with the MSstats format?
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(viridis)
+library(pracma)
+library(magick)
+library(eulerr)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+Read in the significant CRISPR results
+```{r}
+crispr.ko <- setDT(readxl::read_xlsx('~/Library/CloudStorage/Box-Box/HIV_Infection_CD4T_cells/CRISPR/CRISPRko_significant_genes.xlsx'))
+crispr.act <- setDT(readxl::read_xlsx('~/Library/CloudStorage/Box-Box/HIV_Infection_CD4T_cells/CRISPR/CRISPRact_significant_genes.xlsx'))
+
+
+colnames(crispr.ko) <- gsub('\\"', '', colnames(crispr.ko))
+colnames(crispr.act) <- gsub('\\"', '', colnames(crispr.act))
+
+crispr.act[, assay := 'CRISPR_act' ]
+crispr.ko[, assay := 'CRISPR_ko' ]
+
+crispr.dt <- rbind(crispr.act, crispr.ko) %>% 
+  .[, .(assay, gene=id, num_guides=num, neg.p.value, neg.fdr, neg.lfc, neg.goodsgrna, pos.p.value, pos.fdr, pos.lfc, pos.goodsgrna)]
+```
+What do these scores mean? CRISPR activation overexpress a gene
+A negative fold change is a reduction in numerator so negatively impacts growth
+A positive fold change increases growth
+
+CRISPR ko we knockout a gene and pos lfc is increased growth, negative lfc is impacted growth
+
+```{r}
+#fwrite(crispr.dt,  ScriptAndDatedFileName('hiv.crispr.scores.csv.gz'))
+```
+
+
+Read in the donor 2 data and see if any of these scores overlap 
+
+```{r}
+old.pw <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/060225_differentialAnalysisSeperateDonors_data/2025_06_02_allPWcontrasts.anova.toShare.csv.gz')
+
+pw.contrasts <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.pwContrasts.csv.gz')
+
+pw.contrasts <- pw.contrasts[grepl('_2$', contrast)]
+
+# get the best score per protein
+pw.contrasts <- pw.contrasts[, .SD[which.min(treatmentDiff.p)], by=.(contrast,gene,protein)]
+
+pw.contrasts[, sig := 'not']
+pw.contrasts[treatmentDiff.padj < 0.01, sig := 'yes']
+
+pw.contrasts[,.N, by=.(contrast, sig)]
+```
+
+
+```{r}
+crispr.dt[,.N, by=gene][N > 1]
+
+# get the best score per protein
+old.pw <- old.pw[grepl('_2$', contrast)]
+old.pw <- old.pw[, .SD[which.min(treatmentDiff.p)], by=.(contrast,gene,protein)]
+
+old.pw[, sig := 'not']
+old.pw[treatmentIntensity.adjP < 0.01, sig := 'yes']
+
+pw.contrasts[,.N, by=.(contrast, sig)]
+old.pw[,.N, by=.(contrast, sig)]
+```
+The reuslts are completely different between the two searches.... what to look at overlap in?
+Try both, new first
+```{r}
+old.pw$gene %>% unique() %>% length()
+pw.contrasts$gene %>% unique() %>% length()
+
+
+intersect(old.pw[contrast == 'infected_uninfected_2' & sig != 'not', gene], 
+          pw.contrasts[contrast == 'Infected_Uninfected_2' & sig != 'not', gene]
+          )
+ 
+
+pw.contrasts[contrast == 'Infected_Uninfected_2' & sig != 'not', protein]
+
+
+pw.contrasts.wCRISPR <- merge(pw.contrasts, dcast(crispr.dt, gene~assay, value.var = c('neg.p.value', 'neg.fdr', 'neg.lfc', 'pos.p.value', 'pos.fdr', 'pos.lfc')), by='gene')
+pw.contrasts.wCRISPR
+fwrite(pw.contrasts.wCRISPR, ScriptAndDatedFileName('hiv.d2.pw.contrasts.CRISPRsetScores.csv.gz'))
+
+
+old.pw.wCRISPR <- merge(old.pw, dcast(crispr.dt, gene~assay, value.var = c('neg.p.value', 'neg.fdr', 'neg.lfc', 'pos.p.value', 'pos.fdr', 'pos.lfc')), by='gene')
+old.pw.wCRISPR[ sig != 'not',]
+```
+
+```{r}
+pw.contrasts.wCRISPR[sig != 'not']
+```
+

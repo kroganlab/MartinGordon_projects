@@ -1,0 +1,597 @@
+---
+title: "050625_makePlots"
+author: "Martin Gordon"
+date: "2025-05-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Plots to generate to visualize as part of the HARC meeting thursday
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+library(RColorBrewer)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# flag consec proteins
+source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+
+
+source('~/Documents/utils/mg_utils/r_utils/plottingHelperFunctions.R')
+
+
+de.pal <- c("dodgerblue2", "white","#E31A1C")
+```
+
+Read in the normalized SEC_MS data 
+```{r}
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.donor1donor2.normalized.interpolated.scaled.csv.gz')
+apms.int <-  fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_yager.ints.toCompare.csv.gz') # Yager paper data
+
+yager.hits <- apms.int[bestMistScore > .75, .(protein1, protein2, gene1, gene2)]
+
+viral.prots <- sec.long[org != 'Homo sapiens', unique(protein)]
+
+robyn.complexes <- setDT(readxl::read_xlsx('./docs/Complexes_Database_RMK_20250506.xlsx'))
+#filter to just described complexes 
+robyn.complexes <- robyn.complexes[, (.SD), .SDcols = !patterns('[.]PG[.]Quantity')]
+ro
+# differential peaks
+peakClusters <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_donor1donor2.de.anova.results.csv.gz')
+
+peakClusters[treatmentDiff.p < 0.05 & protein %in% viral]
+
+
+
+getQualitati
+```
+color palette 
+```{r, col}
+donor.col <- brewer.pal(n=2,name='Pastel2')
+
+ 
+status.col <- brewer.pal(n=3,name='Pastel1')
+names(status.col) <- c('infected', 'uninfected', 'challenged')
+
+ 
+status.col <-  c("#E41A1C","#377EB8","#4DAF4A")
+names(status.col) <-  c('infected', 'uninfected', 'challenged')
+```
+
+tidy the complex info
+
+```{r}
+robyn.complexes <- robyn.complexes[, .(protein=PG.ProteinAccessions, gene=PG.Genes, org=PG.Organisms, 
+                    complexID=`Complex ID...84`, subcomplexID=`SubComplex ID...85`)]
+
+complexes.oi <- unique(robyn.complexes$complexID)
+robyn.complexes <- robyn.complexes[complexID %in% complexes.oi & !is.na(complexID)]
+```
+
+create the plot data 
+```{r}
+plot.dt <- merge(sec.long[, .(sample, protein, gene, org, mw, fraction, status, donor,intensity_totalScaled)], robyn.complexes, by=c('protein', 'gene', 'org'), all.x=T)
+plot.dt[, donor := as.character(donor)]
+plot.dt[, status := factor(status, levels=c('uninfected', 'challenged', 'infected'))]
+```
+
+Get our functions organised to plot these different complexes
+```{r}
+customintensityHeatmaps <- function(intMats, 
+                                    intensityName = "Relative Protein Intensity", 
+                                    sample='norm_CD4_infected_1', 
+                                    proteinsOI, 
+                                    split_rows=FALSE,
+                                    topOfColorRange = 0.45,...){
+  denom = 50 / topOfColorRange
+  colorFun <- circlize::colorRamp2(breaks = (0:50)/denom, colors = viridis(51,direction = 1))
+  
+  subMat <- intMats[rownames(intMats) %in% proteinsOI$protein,]
+  print(rownames(subMat))
+  
+  rowgrp <- proteinsOI[match(rownames(subMat), protein), info]
+  # convert names to subset we want
+  #print(rownames(subMat))
+  rownames(subMat) <- comb.mapper[match(gsub('[;].+', '', rownames(subMat)), comb.mapper$protein), simplifiedGene]
+  subMat <- subMat[!is.na(rownames(subMat)),]
+  
+  hml <- Heatmap (subMat,
+                  name = intensityName,
+                  cluster_rows = TRUE,
+                  #row_split = rowgrp,
+                  border=T,
+                  row_dend_reorder = FALSE,
+                  cluster_columns = FALSE,
+                  col = colorFun,
+                  show_row_names = ifelse(nrow(subMat) > 100, FALSE, TRUE),
+                  row_names_side = "left",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_labels = ifelse(as.integer(colnames(subMat)) %% 5 == 0, colnames(subMat), ""),
+                  column_title = sample,
+                  #first only:
+                  show_heatmap_legend = TRUE, 
+                 # row_title = sprintf ("%d Proteins", nrow(subMat)),
+                  ...
+  )
+  return(hml)
+}
+```
+
+ridgeline plots
+
+```{r, fig.width=10,fig.height=6}
+
+# plot the donors on top of each other... color by group maybe? use lines to distinguish groups
+p <- ggplot(plot.dt[complexID == 'CCC/WASH'], aes(x = fraction, y=gene, color=status)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.3, fill='white', scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=3, aes(color='maroon')) +
+    #scale_fill(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_color_manual(values=status.col) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) +
+    facet_grid(subcomplexID~donor, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  guides(linetype=guide_legend('donor'))
+p
+BackupAsPDF(p, 'test.ridgeplot')
+```
+Now try the same plot with fill
+```{r, fig.width=10,fig.height=6}
+
+# plot the donors on top of each other... color by group maybe? use lines to distinguish groups
+p <- ggplot(plot.dt[complexID == 'CCC/WASH'], aes(x = fraction, y=gene, fill=status)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.4,  scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=3, aes(color='maroon')) +
+    #scale_fill(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_manual(values=status.col) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) +
+    facet_grid(subcomplexID~donor, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  guides(linetype=guide_legend('donor'))
+p
+BackupAsPDF(p, 'test.ridgeplot.fill')
+```
+Plot the viral complex for all things
+
+```{r, fig.width=10,fig.height=6}
+# plot the donors on top of each other... color by group maybe? use lines to distinguish groups
+p <- ggplot(plot.dt[protein %in% viral.prots,], aes(x = fraction, y=gene, fill=status)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.4,  scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=3, aes(color='maroon')) +
+    #scale_fill(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_manual(values=status.col) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) +
+    facet_grid(subcomplexID~donor, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  guides(linetype=guide_legend('donor'))
+p
+
+BackupAsPDF(p, 'viralprots.ridgeplot.fill')
+```
+plot the linechart for the 
+
+```{r, fig.width=10,fig.height=6}
+# plot the donors on top of each other... color by group maybe? use lines to distinguish groups
+p <- ggplot(plot.dt[protein %in% viral.prots,], aes(x = fraction, y=gene, color=status)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.4, fill='white', scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=3, aes(color='maroon')) +
+    #scale_fill(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_color_manual(values=status.col) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) +
+    facet_grid(subcomplexID~donor, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  guides(linetype=guide_legend('donor'))
+p
+BackupAsPDF(p, 'viralprots.ridgeplot.line')
+```
+
+Read in the new complex info; iterate over the complexes to plot
+
+```{r}
+robyn.complexes <- setDT(readxl::read_xlsx('./docs/Complexes_Database_RMK_20250506.xlsx'))
+
+robyn.complexes <- robyn.complexes[, .(protein=PG.ProteinAccessions, gene=PG.Genes, org=PG.Organisms, 
+                    complexID=`Complex ID...84`, subcomplexID=`SubComplex ID...85`)]
+
+complexes.oi <- unique(robyn.complexes$complexID)
+robyn.complexes <- robyn.complexes[complexID %in% complexes.oi & !is.na(complexID)]
+```
+
+create the plot data 
+```{r}
+plot.dt <- merge(sec.long[, .(sample, protein, gene, org, mw, fraction, status, donor,intensity_totalScaled)], robyn.complexes, by=c('protein', 'gene', 'org'), all.x=T)
+plot.dt[, donor := as.character(donor)]
+plot.dt[, status := factor(status, levels=c('uninfected', 'challenged', 'infected'))]
+```
+## 05-06-25 
+New set of complexes  and use BPs sec long set so we can look at visualizations
+```{r}
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/docs/2025_05_07_OutlierFractionsRemoved_interpNorm_sec.csv.gz')
+complexes.oi <- unique(robyn.complexes$complexID)
+robyn.complexes <- robyn.complexes[complexID %in% complexes.oi & !is.na(complexID)]
+
+plot.dt <- merge(sec.long[, .(sample, protein, gene, org, mw, fraction, status, donor, normInts, intensity_totalScaled)], robyn.complexes, by=c('protein', 'gene', 'org'), all.x=T)
+plot.dt[, donor := as.character(donor)]
+plot.dt[, status := factor(status, levels=c('uninfected', 'challenged', 'infected'))]
+```
+
+iterate over the list of protein complexes; split by subcomplex id and plot both
+
+```{r, elution-plots, fig.width=10,fig.height=6}
+plot.dt[is.na(subcomplexID), subcomplexID := '']
+
+lapply(complexes.oi, function(comp){
+  
+  fname <- gsub(' |[/]', '_', comp)
+  # plot the donors on top of each other... color by group maybe? use lines to distinguish groups
+  p <- ggplot(plot.dt[complexID == comp,], aes(x = fraction, y=gene, fill=status)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.4,  scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=2, aes(color='maroon'), alpha=0.4) +
+    scale_fill_manual(values=status.col) +
+    labs(title=paste0(comp)) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) + # to reorder colnames
+    facet_grid(subcomplexID~donor, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  guides(linetype=guide_legend('donor'))
+  p
+  print(paste0(fname, '.complexSubunits.ridgeline'))
+  BackupAsPDF(p, paste0(fname, '.complexSubunits.ridgeline'))
+})
+```
+
+```{r, elution-plots, fig.width=10,fig.height=12}
+replotComplexes <- c('CRL', 'Proteasome', 'NPC', 'Dynactin', 'RNAPII')
+
+lapply(complexes.oi, function(comp){
+  
+  fname <- gsub(' |[/]', '_', comp)
+  # plot the donors on top of each other... color by group maybe? use lines to distinguish groups
+  p <- ggplot(plot.dt[complexID == comp,], aes(x = fraction, y=gene, fill=status)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.4,  scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=2, aes(color='maroon'), alpha=0.4) +
+    scale_fill_manual(values=status.col) +
+    labs(title=paste0(comp)) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) + # to reorder colnames
+    facet_grid(subcomplexID~donor, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  guides(linetype=guide_legend('donor'))
+  print(p)
+  #print(paste0(fname, '.complexSubunits.ridgeline'))
+  #BackupAsPDF(p, paste0(fname, '.complexSubunits.ridgeline'))
+})
+```
+
+To tidy  (just make longer for now )
+- RNAp11 complex
+- Proteasome
+- NPC complex
+- Dynactin complex
+- CRL complex
+
+heatmaps of absolute intensity
+color the complexes by intensity and replot; wont be able to ovelay; for now use donor 1
+elution profiles of the Yager interactors with our data
+```{r, ridgeline-ints, fig.width=11,fig.height=6}
+#
+plot.dt[, totalInts := sum(normInts, na.rm=T), by=.(protein, sample)]
+plot.dt[is.na(subcomplexID), subcomplexID := complexID]
+
+lapply('BLOC1', function(comp){
+  
+  fname <- gsub(' |[/]', '_', comp)
+  # plot the donors on top of each other... color by group maybe? use lines to distinguish groups
+  p <- ggplot(plot.dt[complexID == comp & donor == '1',], aes(x = fraction, y=gene, fill=intensity)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=2, aes(color='maroon'), alpha=0.4) +
+    scale_fill_viridis_c(name = "log2 total normalized intensity", option = "C") +
+    labs(title=paste0(comp)) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) + # to reorder colnames
+    facet_grid(subcomplexID~status, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text=element_text(color='white', size=9),
+          strip.background = element_rect(colour = "white", fill = "grey80"))
+ 
+  print(p)
+  #print(paste0(fname, '.complexSubunits.ridgeline'))
+  #BackupAsPDF(p, paste0(fname, '.complexSubunits.ridgeline.totalInts'))
+})
+```
+
+## 05-07-25 Evening 
+Plot the remaining HIV complexes reported by the group
+Read in Robyns latest data file and plot
+
+```{r}
+
+```
+
+
+
+
+
+
+
+add Yager interactors group to our data
+plot both the overlap per donor and also the total intensity color
+```{r, ridgeline-ints, fig.width=11,fig.height=6}
+# only 7 viral proteins?? REV is filtered out at some step of the filtering... check if it only had one REV
+# REV seems to have been filtered out at the peptide filtering s
+sec.long[org != 'Homo sapiens', unique(gene)]
+sec.ori[org != 'Homo sapiens', unique(gene)]
+
+
+robyn.complexes[gene == 'rev']
+
+sec.ori <- fread('050625_HIV_CD4T_TwoDonors_data/2025_05_06_msstats.input.singleProtein.filtered.csv.gz')
+sec.ori[ProteinName %in% viral.prots,]
+
+sec.ori
+sec.ori[ProteinName == 'Q8ADQ7',]
+
+for (i in unique(yager.hits$gene1)){
+  
+  sig.interactors <- yager.hits[gene1 == i, protein2]
+  prot.oi <- rbind(plot.dt[protein %in% sig.interactors,],
+                   plot.dt[gene == tolower(i),])
+  
+  p <- ggplot (plot.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled, fill=status),alpha=0.4, scale = 8) +
+    labs(title=paste0(i, ' interactors (Jäger et al. 2011)')) +
+    facet_grid(.~donor) +
+    scale_fill_manual(values=status.col) +
+    theme_bw() +
+    theme(strip.text.y = element_text(size = 5.5))
+  
+   print(p)
+   BackupAsPDF(p, paste0(i, '.jagerinteractors.ridgeline.'))
+}
+```
+
+Investigate why some complexes dont plot
+```{r}
+# dont know why RNAp is changing; like a protein has two summarized 
+subdt <- plot.dt[donor == 1 & complexID == 'RNAPII',]
+subdt[is.na(intensity_totalScaled), intensity_totalScaled := 0]
+subdt %>% str()
+
+ ggplot(subdt, aes(x = fraction, y=gene, fill=log2(totalInts))) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled)) +
+    #geom_vline(xintercept=c(10,20,30,40,50,60), linetype=2, aes(color='maroon'), alpha=0.4) +
+    #scale_fill_viridis_c(name = "log2 total normalized intensity", option = "C") +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) + # to reorder colnames
+    #facet_grid(subcomplexID~status, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80"))
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+
+p <- ggplot (plot.dt[complexID == 'CRL' & donor == 1,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill =  log2(totalInts+1)), scale = 10) +
+  #scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", name = "norm Ints")+
+  scale_fill_viridis_c(name = "log2 normalized intensity", option = "C") +
+  scale_y_discrete(name = "protein") +
+  facet_grid(.~status) +
+  theme_bw()
+p
+```
+
+Work on a heatmap function to plot the heatmap list of the different complexes; use the scaledheatmap 
+```{r}
+sec.long$intensity_totalScaled <- NULL
+# this is total scaled
+intMats <- scaledIntensityMatrices(sec.long, scaleDenom = 'max')
+
+sec.long$intensity_totalScaled <- NULL
+donor1_intMats <- scaledIntensityMatrices(secLong.dt = sec.long[donor == 1])
+```
+
+adjust these heatmap plots 
+```{r}
+# denom to make 50 different color scales
+complexIntensityHeatmaps <- function(intMats, complexDT, complexOI,  intensityName = "Relative Protein Intensity", topOfColorRange = 0.45,...){
+  denom = 50 / topOfColorRange
+  colorFun <- circlize::colorRamp2(breaks = (0:50)/denom, colors = viridis(51,direction = 1))
+  # get the individual sample lists
+  samples <- names(intMats)
+  
+  sample <- samples[1]
+  
+  mapping.dt <- complexDT[complexID == complexOI,]
+  mapping.dt[is.na(subcomplexID), subcomplexID:= complexID]
+  subMat <- intMats[[sample]][rownames(intMats[[sample]]) %in% mapping.dt$protein,]
+  
+  rowgrp <- mapping.dt[match(rownames(subMat), protein), subcomplexID]
+  
+  rowOrder <-  mapping.dt[, gene]
+  
+  # convert names to subset we want
+  #print(rownames(subMat))
+  rownames(subMat) <- mapping.dt[match(gsub('[;].+', '', rownames(subMat)), protein), gene]
+  
+  hml <- Heatmap (subMat,
+                  name = intensityName,
+                  cluster_rows = FALSE,
+                  row_order = rowOrder, # enforce roworder here, later heatmaps will follow this clustering
+                  show_row_dend = F,
+                  row_split = rowgrp, 
+                  cluster_columns = FALSE,
+                  col = colorFun ,
+                  show_row_names = TRUE,
+                  row_names_side = "left",
+                  row_names_gp = gpar(fontsize = 8),
+                  row_title_rot = 0,
+                  column_names_gp = gpar(fontsize = 5),
+                 # column_labels = ifelse(as.integer(colnames(intMats[[sample]])) %% 5 == 0, colnames(intMats[[sample]]), ""),
+                  column_title = sample,
+                  column_title_gp = gpar(fontsize=12, fontface='bold'),
+                  #first only:
+                  show_heatmap_legend = TRUE, 
+                  #row_title = sprintf ("%d Proteins", nrow(subMat)),
+                  ...
+  )
+  
+  # first one gets row title, also gets a legend
+  
+  if (length(intMats) > 1){
+    for (sample in samples[2:length(samples)]){
+      hml <- hml + Heatmap (intMats[[sample]][rownames(intMats[[sample]]) %in% mapping.dt$protein,],
+                            name = intensityName,
+                            cluster_rows = FALSE,
+                            row_dend_reorder = FALSE,
+                            cluster_columns = FALSE,
+                            col = colorFun ,
+                            show_row_names = FALSE, 
+                            column_names_gp = gpar(fontsize = 5),
+                            #column_labels = ifelse(as.integer(colnames(intMats[[sample]])) %% 5 == 0, colnames(intMats[[sample]]), ""),
+                            column_title = sample,
+                            column_title_gp = gpar(fontsize=12, fontface='bold'),
+                            # 
+                            show_heatmap_legend = FALSE,
+                            ...)      
+    }
+  }
+  return (hml)
+}
+```
+
+```{r}
+fwrite(robyn.complexes,  ScriptAndDatedFileName('robynComplexes.formattd.csv.gz'))
+```
+Heatmap of all samples
+```{r, test-heatmap, fig.height=6, fig.width=12}
+robyn.complexes[complexID == 'AP1 complex']
+
+hm <- complexIntensityHeatmaps(intMats = donor1_intMats, 
+                         complexDT = robyn.complexes,
+                         complexOI = 'AP1 complex', 
+                         border=T)
+
+BackupAsPDF(hm, 'testheatmap')
+```
+
+Example ridgeline plot
+```{r}
+# overlay the infected vs uninfected 
+p <- ggplot(plot.dt[!grepl('challenged', sample),], aes(x = fraction, y=gene, fill=sample)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.8, scale = 8) +
+    #scale_fill(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_brewer(type='qual', palette=4) +
+    scale_y_discrete(name = "protein", limits=rev(new.complexes$gene)) +
+    #facet_grid(.~sample, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10))
+p
+BackupAsPDF(p, 'geneSet.infectedVsuninfected.overlap.elution')
+```
+**todo**
+Create plots of normalized intensity matrices (log2 transform)
+
+```{r}
+View(scaledIntensityMatrices)
+```
+
+
+I think for the matrices, we can plan to plot either the CD4 infected, or plot all the heatmaps beside each other I think the best way is to look at the IntensityHeatmap function and ape that..
+```{r, fig.height=8, fig.width=10}
+plot.dt <- merge(sec.long[, .(sample, protein, gene, org, mw, fraction, status, donor,intensity_totalScaled)], robyn.complexes, by=c('protein', 'gene', 'org'), all.x=T)
+plot.dt[, donor := as.character(donor)]
+plot.dt[, status := factor(status, levels=c('uninfected', 'challenged', 'infected'))]
+
+
+# for first pass, lets plot the 
+plot.dt$complexID %>% unique()
+plot.dt[complexID == 'proteomsome']
+
+library(RColorBrewer)
+
+# plot the donors on top of each other... color by group maybe? use lines to distinguish groups
+p <- ggplot(plot.dt[complexID == 'CCC/WASH'], aes(x = fraction, y=gene, fill=donor, linetype=as.character(donor))) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.6, scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=3, aes(color='maroon'), alpha=0.6) +
+    #scale_fill(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_manual(values=donor.col) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) +
+    facet_grid(subcomplexID~status, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.background=element_rect()) +
+  guides(linetype=guide_legend('donor'))
+p
+BackupAsPDF(p ,'ccc.wash.treatmentOverlap.ridgeline.test')
+
+
+# plot the donors on top of each other... color by group maybe? use lines to distinguish groups
+p <- ggplot(plot.dt[complexID == 'CCC/WASH'], aes(x = fraction, y=gene, fill=status, linetype=as.character(donor))) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.6, scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=3, aes(color='maroon'), alpha=0.6) +
+    #scale_fill(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_manual(values=status.col) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) +
+    facet_grid(subcomplexID~donor, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.background = element_rect(colour = "black", fill = "white")) +
+  guides(linetype=guide_legend('donor'))
+p
+BackupAsPDF(p ,'ccc.wash.donorOverlap.ridgeline.test')
+```
+
+```{r}
+p <- ggplot(plot.dt[complexID == 'CCC/WASH'], aes(x = fraction, y=gene, color=donor, linetype=as.character(donor))) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.6, scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=3, aes(color='maroon'), alpha=0.6) +
+    #scale_fill(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_manual(values=donor.col) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) +
+    facet_grid(subcomplexID~status, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.background=element_rect()) +
+  guides(linetype=guide_legend('donor'))
+p
+```
+
+

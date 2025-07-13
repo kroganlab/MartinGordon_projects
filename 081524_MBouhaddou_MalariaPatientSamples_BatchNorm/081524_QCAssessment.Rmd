@@ -1,0 +1,1327 @@
+---
+title: "081524_QCAssessment"
+author: "Martin Gordon"
+date: "2024-08-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## libraries 
+
+```{r}
+library(data.table)
+library(magrittr)
+library(MSstats)
+library(ggplot2)
+library(stringr)
+library(ggh4x)
+library(MSstats)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+Questions? 
+Preprocessing?: some spec with 0 counts, columns with all NA vals
+RunOrder col: why do some columns have 
+Why is there only 29 rather than 30 bioreps?
+Any filtering performed?
+Is region something we want to test or control for?
+
+One of the issues is patient and batch is partially confounded... most patients were sequenced togehter in one batch
+ 
+Only 900 proteins after summarisation (and probably want to filter out those with only 1 featureID still..)
+After only keeping complete cases we have 163
+
+Is region something we are interested in keeping, or something else to control for?
+ 
+# read in files 
+```{r}
+
+contrasts <- fread('./data/contrasts.txt', header=F)
+keys <- fread('./data/keys.txt')
+patient.batches <- fread('./data/Patient_batches.txt')
+
+spec <- fread('./data/evidence_new.txt')
+
+# so this format contains no NA but some 0 intensity? what is a zero intensity
+# fitler out uninteresting columns
+spec <- spec[,.(Protein, Genes, Run, Condition, BioReplicate, IsotopeLabelType, Intensity, PeptideSequence=Stripped.Sequence, ModPeptideSequence=Modified.Sequence, Precursor.Charge)]
+spec[, noModPeptideSequence := PeptideSequence]
+spec[, PeptideSequence := ModPeptideSequence]
+spec[, runNumber := as.numeric(gsub('[.]d', '', str_extract(Run, "[0-9]+[.]d$")))]
+
+# some 0 values in the output
+spec <- spec[Intensity != 0,]
+```
+
+
+# merge the files
+
+```{r}
+# some mismathcing IDs
+spec[!Run %in% unique(patient.batches$RawFile), unique(Run)]
+# fix names; place a _ befroe the first D symvol
+spec[!Run %in% unique(patient.batches$RawFile), Run := sub('D', '_D', Run)]
+
+spec <- merge(x=spec[,-c('BioReplicate')], y=keys[,.(RawFile, Condition, BioReplicate, RunOrder=Run, Batch)], by.x=c('Run','Condition'), by.y=c('RawFile','Condition'))
+```
+
+
+some basic QC plots
+Intensity distributions bradly similar; no obvious issues but seems to be prefiltered?
+
+```{r}
+g <- ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram(boundary=0) 
+g
+BackupAsPDF(g, 'featureINts.Histogram')
+```
+
+Is this data already summarised? Count number of Protein Ids per Run
+No still at the peptide level
+
+Count number of features per run
+```{r}
+# no features detected more than once
+any(spec[,.N, by=.(ModPeptideSequence,Precursor.Charge,Run)]$N > 1)
+```
+
+N peptides per run
+
+```{r}
+g <- ggplot(spec[, .( NFeatures=.N), by=.(Run,runNumber,Condition,BioReplicate,Batch)], aes(x=reorder(Run,runNumber), y=NFeatures)) +
+  geom_bar(stat='Identity') +
+  facet_grid2(Batch~Condition, scales='free', independent = T) +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+
+#BackupAsPDF(g, 'nFeaturesPerFun.barplot')
+```
+```{r}
+g <- ggplot(spec[, .( NFeatures=.N), by=.(Run,runNumber,Condition,BioReplicate,Batch)], aes(x=reorder(Run,runNumber), y=NFeatures, fill=Batch)) +
+  geom_bar(stat='Identity') +
+  scale_fill_brewer(type='qual') +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'nFeaturesPerFun.batchCol.barplot')
+
+g <- ggplot(spec[, .( NFeatures=.N), by=.(Run,runNumber,RunOrder,Condition,BioReplicate,Batch)], aes(x=reorder(Run,RunOrder), y=NFeatures, fill=Batch)) +
+  geom_bar(stat='Identity') +
+  scale_fill_brewer(type='qual') +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'nFeaturesPerFun.batchCol.runOrder.barplot')
+
+```
+PCA and sample clustering
+Why is there a huge drop in sample completeness? I think this couold be just poorer coverage in the batch2 samples
+
+```{r}
+featureMat <- dcast(spec,
+                     paste0(ModPeptideSequence, Precursor.Charge)~interaction(Condition,BioReplicate), value.var = "Intensity") |> as.matrix(rownames = "ModPeptideSequence")
+
+# over 8k features detected in total
+featureMat %>%  dim()
+
+completeness.dt <- apply(featureMat, 1, function(x) sum(!is.na(x))/length(x)) %>% 
+  data.table(seqID=names(.),
+             completeness=.)
+
+g <- ggplot(completeness.dt, aes(x=completeness)) +
+  geom_histogram(boundary=0,bins=50) +
+  ylab('NFeatures') +
+  theme_bw()
+
+BackupAsPDF(g, 'featureMissingness.histogram')
+```
+For now lets check out the heatmpa
+
+```{r}
+submat <- log2(featureMat)
+
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T), '-')
+submat <- submat[sample(rownames(submat), 3000),]
+
+ann <- spec[,.N, by=.( Group=paste0(Condition, '.', BioReplicate),Condition,Patient=as.factor(BioReplicate),Batch)][, N := NULL]
+# match the anno dt rows to order of the heatmap vector
+ann <- ann[match(colnames(featureMat), Group),]
+
+
+col.pal <- randomcoloR::distinctColorPalette(k=29)
+names(col.pal) <- unique(ann$Patient)
+
+
+colours <- list('Batch' = c('B1' = 'lightpink', 'B2'="slategrey"),
+                'Condition' = c('HMT_D0'='azure','HMT_D7' = '#66CCEE','HMT_D21' = '#4477AA','LMT_D0'="#CCBB44", 'LMT_D7'='orange','LMT_D21'='#EE6677'),
+                'Patient' = col.pal
+                )
+
+colAnn <- HeatmapAnnotation(df = ann[,.(Condition,Batch,Patient)], col = colours)
+
+
+hm <- Heatmap(submat, 
+        top_annotation = colAnn,
+        name='Ints./Median',
+        cluster_rows = clusterWNA(mat=submat),
+        column_names_gp=gpar(fontsize=3),
+        show_row_names = F)
+
+BackupAsPDF(hm, 'features.medianScaled.heatmap', dimensions = c(12,6))
+```
+Just a lot more missingness in batch 1, but I think we should summarise before worrying about this
+
+```{r}
+submat <- log2(featureMat)
+
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T), '-')
+submat <- submat[complete.cases(submat),]
+
+
+colours <- list('Batch' = c('B1' = 'lightpink', 'B2'="slategrey"),
+                'Condition' = c('HMT_D0'='lightblue2','HMT_D7' = '#66CCEE','HMT_D21' = '#4477AA','LMT_D0'="#CCBB44", 'LMT_D7'='orange','LMT_D21'='#EE6677'),
+                'Patient' = col.pal
+                )
+
+colAnn <- HeatmapAnnotation(df = ann[,.(Condition,Batch,Patient)], col = colours)
+
+
+hm <- Heatmap(submat, 
+        top_annotation = colAnn,
+        name='Ints./Median',
+        row_title =sprintf('%s complete features', nrow(submat)),
+        cluster_rows = clusterWNA(mat=submat),
+        column_names_gp=gpar(fontsize=3),
+        show_row_names = F)
+
+hm
+BackupAsPDF(hm, 'features.medianScaled.completeCases.heatmap', dimensions = c(12,6))
+
+
+hm <- Heatmap(submat, 
+        top_annotation = colAnn,
+        name='Ints./Median',
+        column_split=ann$Condition,
+        row_title =sprintf('%s complete features', nrow(submat)),
+        cluster_rows = clusterWNA(mat=submat),
+        border = T,
+        column_names_gp=gpar(fontsize=3),
+        show_row_names = F)
+
+BackupAsPDF(hm, 'features.medianScaled.condSplit.completeCases.heatmap', dimensions = c(12,6))
+
+
+hm <- Heatmap(submat, 
+        top_annotation = colAnn,
+        name='Ints./Median',
+        column_split=ann$Batch,
+        row_title =sprintf('%s complete features', nrow(submat)),
+        cluster_rows = clusterWNA(mat=submat),
+        border = T,
+        column_names_gp=gpar(fontsize=3),
+        show_row_names = F)
+hm
+BackupAsPDF(hm, 'features.medianScaled.batchSplit.completeCases.heatmap', dimensions = c(12,6))
+```
+PCA 
+PC1 clearly driven by batch 
+PC2,4 clusters by region which is promising but not much variance explained
+Hopefully becomes clearer after summarising
+
+```{r}
+submat <- log2(featureMat)
+submat <- submat[complete.cases(submat),]
+
+pcaOut <- prcomp(t(submat))
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, ann, by.x = "rn", by.y = "Group", all.x = TRUE)
+pcaDT[, region := ifelse(Condition %like% 'HMT', 'High', 'Low')]
+pcaDT[, timepoint := tstrsplit(Condition, '_', keep=2)]
+pcaDT[, .(Condition, rn,timepoint, region,Patient)]
+
+g <- ggplot(data.table(PC=seq(1,length(pcaPercentVar), by=1), var=pcaPercentVar)[PC <= 10,], aes(x=as.factor(PC), y=var)) +
+  geom_bar(stat='Identity') +
+  xlab('PC') +
+  ylab('variance explained')
+BackupAsPDF(g,'feature.pca.varExplained.barplot')
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, fill = Condition, shape=Batch)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ylab (sprintf ("PC4, %.1f%%", pcaPercentVar[4])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+ # scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:22) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "feature.pca.pc24.regionCol")
+```
+Summarise to protein and replot
+
+```{r}
+mssInput <- spec[, .(ProteinName = Protein, 
+         PeptideModifiedSequence = PeptideSequence,
+         PeptideSequence = noModPeptideSequence,
+         Run,
+         Condition,
+         BioReplicate,
+         Intensity,
+         PrecursorCharge = Precursor.Charge,
+         IsotopeLabelType,
+         ProductCharge = NA,
+         FragmentIon = NA)]
+
+dp.out <- dataProcess(mssInput, 
+                      MBimpute =  FALSE, 
+                      summaryMethod = 'TMP',
+                      featureSubset = "all")
+```
+
+Plot the standard QC at the protein level
+
+
+```{r}
+saveRDS(dp.out, ScriptAndDatedFileName('dp.out.rds'))
+
+#fwrite(setDT(dp.out$ProteinLevelData), ScriptAndDatedFileName('proteinLvl.quant.csv'))
+#fwrite(setDT(dp.out$FeatureLevelData), ScriptAndDatedFileName('featureLvl.quant.csv'))
+```
+
+```{r}
+p.quant <- fread('~/Documents/projects/081524_MBouhaddou_MalariaPatientSamples_BatchNorm/081524_QCAssessment_data/2024_08_16_proteinLvl.quant.csv')
+```
+
+QC heatmaps & PCA
+```{r}
+p.mat <- dcast(p.quant,Protein~paste0(GROUP,'.', SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T), '-')
+
+
+colours <- list('Batch' = c('B1' = 'lightpink', 'B2'="slategrey"),
+                'Condition' = c('HMT_D0'='lightblue2','HMT_D7' = '#66CCEE','HMT_D21' = '#4477AA','LMT_D0'="#CCBB44", 'LMT_D7'='orange','LMT_D21'='#EE6677'),
+                'Patient' = col.pal
+                )
+
+colAnn <- HeatmapAnnotation(df = ann[,.(Batch)], col = colours)
+
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        show_row_names = F,
+        column_names_gp = gpar(fontsize=4),
+        row_title = sprintf('%s Proteins', nrow(submat)),
+        column_split = ann$Condition,
+        name='log2 Ints./Median',
+        cluster_rows = clusterWNA(submat))
+
+BackupAsPDF(hm, 'protens.medianScale.heatmap', dimensions = c(10,6))
+
+
+# plot a complete cases heatmap
+hm <- Heatmap(submat[complete.cases(submat),],
+        top_annotation = colAnn,
+        show_row_names = F,
+        column_names_gp = gpar(fontsize=4),
+        row_title = sprintf('%s Proteins (no missing)', nrow(submat[complete.cases(submat),])),
+        column_km = 2,
+        name='log2 Ints./Median',
+        cluster_rows = clusterWNA(submat[complete.cases(submat),]))
+hm
+
+BackupAsPDF(hm, 'protens.medianScale.completecases.heatmap', dimensions = c(10,6))
+```
+Look at PCA at the protein level 
+Only 163 features going into the dataset so worth keeping in mind
+
+```{r}
+submat <- p.mat[complete.cases(p.mat),]
+
+pcaOut <- prcomp(t(submat))
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, ann, by.x = "rn", by.y = "Group", all.x = TRUE)
+pcaDT[, region := ifelse(Condition %like% 'HMT', 'High', 'Low')]
+pcaDT[, timepoint := tstrsplit(Condition, '_', keep=2)]
+pcaDT[, .(Condition, rn,timepoint, region,Patient)]
+
+g <- ggplot(data.table(PC=seq(1,length(pcaPercentVar), by=1), var=pcaPercentVar)[PC <= 10,], aes(x=as.factor(PC), y=var)) +
+  geom_bar(stat='Identity') +
+  xlab('PC') +
+  ylab('variance explained')
+BackupAsPDF(g,'protein.pca.varExplained.barplot')
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC3, y=PC4, fill = timepoint, shape=Batch)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+ # scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:22) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "protein.pca.pc12.regionCol")
+```
+Ok, so now want to try combat workflow
+First, get an estimate of missingness at the Protein level
+
+
+Lets be less stringent; if > 50% completeness, i
+
+```{r}
+completeness.dt <- apply(p.mat, 1, function(x) sum(!is.na(x))/length(x)) %>% 
+  data.table(Protein = names(.),
+             completeness = .)
+
+ggplot(completeness.dt, aes(x=completeness)) +
+  geom_histogram(binwidth = 0.025) +
+  geom_vline(xintercept = 0.75)
+
+p.mat[rownames(p.mat) %in% completeness.dt[completeness < .25,]$Protein,]
+```
+Lets generate metadata and model matrix
+batch and patient seem completely confounded, so cant estimate batch covariate at patient level
+
+Edit our p.quant output to reflect the conditions
+```{r}
+p.quant[,Region := str_extract(GROUP, 'HMT|LMT')]
+p.quant[,Patient := SUBJECT]
+p.quant[Region == 'HMT' , Patient := as.character(Patient + 29)]
+p.quant[, sample := paste0(GROUP,'.', Patient)]
+
+p.mat <- dcast(p.quant, Protein~paste0(GROUP,'.',Patient), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+```
+
+```{r}
+ann <- spec[,.N, by=.( Group=paste0(Condition, '.', BioReplicate),Condition,Patient=BioReplicate,Batch)][, N := NULL]
+
+ann[, c('Region', 'Timepoint') := tstrsplit(Condition, '_', keep=c(1,2))]
+ann[, max(Patient), by=Region]
+ann[Region == 'HMT' ,Patient := as.character(Patient + 29)]
+ann[, c('Condition', 'Patient', 'Timepoint','Batch', 'Region') := lapply(.SD, as.factor), .SDcols = c('Condition', 'Patient', 'Timepoint','Batch', 'Region')]
+
+# create a new group ID
+ann[,Group := as.factor(paste0(Condition,'.', Patient))]
+
+# match order of our expression matrix
+ann <- ann[match(colnames(p.mat), Group),]
+
+batch <- as.factor(ann$Batch)
+
+# batch and patient are confounded so dont use in model
+table(ann$Batch, ann$Patient)
+
+
+# a2 factor model; these are the variables of interest
+mod <- model.matrix(~Region+Timepoint, data=ann)
+rownames(mod) <- ann$Group
+```
+
+
+
+
+```{r}
+clean.mat <- limma::removeBatchEffect(p.mat, batch, design=mod)
+
+submat <- sweep(clean.mat, 1, apply(clean.mat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat,
+        cluster_rows = clusterWNA(submat),
+       # column_km=2,
+        row_title= sprintf('%s complete proteins', nrow(submat)),
+        show_row_names = F,
+        column_names_gp = gpar(fontsize=4),
+        top_annotation = colAnn)
+
+hm
+BackupAsPDF(hm, 'cleanedMat.medianScaled.heatmap')
+```
+Look at PCA
+
+```{r}
+submat <- clean.mat[complete.cases(clean.mat),]
+
+
+pcaOut <- prcomp(t(submat))
+
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, ann, by.x = "rn", by.y = "Group", all.x = TRUE)
+pcaDT[, region := ifelse(Condition %like% 'HMT', 'High', 'Low')]
+pcaDT[, timepoint := tstrsplit(Condition, '_', keep=2)]
+
+g <- ggplot(data.table(PC=seq(1,length(pcaPercentVar), by=1), var=pcaPercentVar)[PC <= 10,], aes(x=as.factor(PC), y=var)) +
+  geom_bar(stat='Identity') +
+  xlab('PC') +
+  ylab('variance explained')
+BackupAsPDF(g,'protein.pca.varExplained.cleaned.barplot')
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, fill = Batch, shape=Batch)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+ # scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:22) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'protein.clean.pca.PC12.batchCol')
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, fill = Condition, shape=Batch)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+ # scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:22) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'protein.clean.pca.PC12.conditionCol')
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, fill = Timepoint, shape=Batch)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+ # scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:22) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'protein.clean.pca.PC12.conditionCol')
+
+```
+
+Looks better; add the intensity vals back to the p.quant 
+
+```{r}
+clean.dt <- reshape2::melt(clean.mat)
+setnames(clean.dt, new=c('Protein', 'sample', 'adjLogIntensities'))
+
+p.quant <- merge(x=p.quant, y=clean.dt, by=c('Protein','sample'))
+
+p.quant[, oldLogIntensities := LogIntensities]
+p.quant[, LogIntensities := adjLogIntensities]
+
+fwrite(p.quant, ScriptAndDatedFileName('proteinLvl.quant.adjusted.csv'))
+```
+
+Lets quickly test and look for DEGs; 
+No need to model batch, subject etc.
+
+```{r}
+contrasts <- contrasts[, c('numerator', 'denominator') := tstrsplit(V1, '-')][, .(numerator,denominator)]
+contrasts.list <- split(contrasts, seq(nrow(contrasts)))
+
+names(contrasts.list) <- apply(contrasts, 1, function(x){ paste(x[1], x[2], sep='-') }) 
+
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(dp.out$ProteinLevelData$GROUP),
+                               labels = names(contrasts.list))
+
+# may need to change this
+f.quant <- setDT(dp.out$FeatureLevelData)
+
+p.quant[, SUBJECT := interaction(GROUP,Patient)]
+
+dp.out$ProteinLevelData <- p.quant
+```
+
+```{r}
+# run msstats correcting for batch 
+mss <- groupComparison(contrast.matrix=contrasts.mat, data=dp.out)
+mss.dt <- setDT(mss$ComparisonResult)
+
+mss.dt[, padj := p.adjust(pvalue, method='BH')]
+mss.dt[, sig := 'not']
+mss.dt[padj < 0.1 & abs(log2FC) > 0.58, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+g <- ggplot(mss.dt[sig != 'not',.N, by=.(Label,sig)], aes(x=Label, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ylab('N sig hits (FC +/- 50% & p.adj < 0.05)') +
+  scale_fill_manual(values=c('up'='firebrick1', 'down'='steelblue2')) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'batchCorrection.NsigHits.barplot')
+```
+
+Check for overlap in the two sets
+All 6 are in the second set
+```{r}
+new.mss.dt[abs(log2FC) >0.58 & adj.pvalue < 0.05, unique(Protein)] %in%  mss.dt[abs(log2FC) >0.58 & padj < 0.05, unique(Protein)]
+```
+
+First, save the output and fix the gene names
+
+```{r}
+# tidy names and write the output
+mss.dt[, c('ProteinName', 'subRegionStart', 'subRegionEnd') := tstrsplit(Protein, '-', keep=c(1,2,3))]
+mss.dt[, subRegion := paste0(subRegionStart,'-', subRegionEnd)]
+mss.dt[, gene := multiUniprots2multiGenes(ProteinName, species='HUMAN')]
+mss.dt[subRegion != 'NA-NA', gene := paste0(gene,'_', subRegion)]
+mss.dt[, Label := factor(Label, levels=c("LMT_D0-HMT_D0","LMT_D7-HMT_D7","LMT_D21-HMT_D21"))]
+
+fwrite(mss.dt, ScriptAndDatedFileName('mssPWComparisons.batchCor.csv'))
+```
+
+
+```{r}
+mss.dt <- fread('~/Documents/projects/081524_MBouhaddou_MalariaPatientSamples_BatchNorm/081524_QCAssessment_data/2024_08_20_mssPWComparisons.batchCor.csv')
+
+sigProts <- mss.dt[sig != 'not', unique(Protein)]
+sigGenes <- mss.dt[sig != 'not', unique(gene)]
+
+
+
+g <- ggplot(mss.dt, aes(x=log2FC, y=-log10(adj.pvalue), color=sig, label=gene)) +
+  geom_point(size=1.5, alpha=0.9) +
+  geom_vline(xintercept=c(0.58,-0.58), linetype=2, alpha=0.7, color='grey') +
+  geom_hline(yintercept=-log10(0.05), linetype=2, alpha=0.7, color='grey') + 
+  ggrepel::geom_text_repel(data=mss.dt[sig != 'not'], size=1.5, max.overlaps = 20, color='black', alpha=0.6, segment.size	=0.1) +
+ # scale_color_manual(values = c('not'='grey', 'down'='steelblue3', 'up'='firebrick1')) +
+  scale_color_manual(values = c('not'='grey', 'down'='steelblue3', 'up'='firebrick1')) +
+  facet_wrap(~Label) +
+  ylab(expression(-log[10] ~ ' padj')) +
+  theme_bw() #+,
+       
+
+g
+BackupAsPDF(g, 'batchCor.padj0.1.FC0.5.volcanoplots', dimensions = c(12,5))
+```
+
+Take these proteins and look at the heatmap of DE between conditions
+```{r}
+dp.out$ProteinLevelData <- merge(x=dp.out$ProteinLevelData, y=unique(mss.dt[,.(gene,Protein)]), by='Protein')
+
+cleanMat <- dcast(dp.out$ProteinLevelData, gene~oldSubject, value.var = 'adjLogIntensities') %>% 
+  as.matrix(rownames='gene')
+
+submat <- cleanMat[rownames(cleanMat) %in% sigGenes,]
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+colAnn <- HeatmapAnnotation(df = ann[,.(Region)], col = colours)
+ann[, Timepoint := factor(Timepoint, levels=c("D0","D7", "D21"))]
+
+
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        row_title=sprintf('%s proteins (FC +/- 50%% & padj < 0.1)', nrow(submat)),
+        name='Ints/Median',
+        cluster_columns = F,
+        show_column_names=F,
+        border=T,
+        row_names_gp = gpar(fontsize=5),
+        cluster_rows = clusterWNA(submat),
+        column_split = list(ann$Timepoint,
+                            ann$Region),
+        column_title = "%s")
+
+hm
+
+BackupAsPDF(hm, 'sigProts.medianScaled.heatmap',dimensions=c(8,8))
+```
+Lets quickly run GO and KEGG enrichment on the sig hits
+Will need to tidy protein names
+
+# first tidy protein name 
+
+```{r}
+mss.dt[,oldGene := gene]
+mss.dt[, gene := tstrsplit(gene, '_', keep=1)]
+```
+
+
+```{r}
+gmt.hs.go.bp <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+gmt.hs.go.cc <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='CC', keyType='SYMBOL')
+gmt.hs.kegg <-  loadKegg(organism='hsa', keyType = 'kegg') # map to entrez ID
+
+
+# human kegg to symbol and can merge these tables and
+hsKeggMap.dt <- clusterProfiler:::bitr(gmt.hs.kegg$gene, fromType='ENTREZID', toType='SYMBOL', OrgDb='org.Hs.eg.db')
+gmt.hs.kegg <- merge(x=gmt.hs.kegg, y=hsKeggMap.dt, by.x="gene", by.y="ENTREZID", all.x=T)
+gmt.hs.kegg <- gmt.hs.kegg[, .(ont, gene = ifelse(SYMBOL == '', gene, SYMBOL), ont.id)]
+```
+
+
+```{r}
+fwrite(mss.dt[, .(Protein, gene=oldGene, Label, log2FC, SE, Tvalue, DF, pvalue, padj, adj.pvalue, issue, MissingPercentage)], ScriptAndDatedFileName('mssPWcomparisons.batchCor.csv'))
+
+fwrite(dp.out$ProteinLevelData[, .(Protein, gene, GROUP, SUBJECT = oldSubject, Patient, Batch, adjLogIntensities = adjLogIntensities, unadjLogIntensities=oldLogIntensities,TotalGroupMeasurements, NumMeasuredFeature, MissingPercentage, more50missing)],
+       ScriptAndDatedFileName('p.quant.batchControlled.csv'))
+```
+
+
+```{r}
+
+spec[, Proteinname := tstrsplit(Protein, '-', keep=1)]
+spec[, geneName := multiUniprots2multiGenes(Proteinname)]
+
+
+runEnrichment <- function(dt, ont, keepSp='human', title, isKEGG=F){
+  
+  sub.dt <-dt
+  print(sub.dt)
+  
+  # pull out bg
+  universe <-  unique(spec$geneName)
+  
+  # create enrichment groups
+  sub.dt[, enrich.grp := interaction(Label, sig)]
+  
+  # run GO enrichment on each group seperately
+  enrich.dt <- enricherOnGroups(sub.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = ont, 
+                              universe = universe)
+  
+  if (isKEGG) {
+    
+    return(list(
+              enrich=enrich.dt))
+    
+  } else {
+    simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                           gmt=ont, 
+                                                           groupColumn = 'enrich.grp',
+                                                           max_pAdjust = 0.1)
+    
+    return(list(
+              enrich=enrich.dt,
+              simpenrich=simp.enrich))
+  }
+}
+
+
+1 - mean(c(0.64453,0.77152,0.90248,0.84100,0.65059,0.89975,0.87886,0.82220,0.90324,0.90056,0.88657,0.86091,0.66978,0.63579,0.81815,0.90577))
+
+mean(c(0.86884,0.85508,0.87392,0.39732,0.87556,0.87291,0.69642,0.87083,0.79858,0.86588,0.86291,0.84178,0.45706,0.52835,0.85704,0.41526,0.83419))
+
+row3 <- c(0.96454,0.90841,0.97874,0.97979,0.97915,0.98254,0.98184,0.97898,0.86762,0.97782,0.97771,0.97899,0.97987,0.97788,0.97949,0.98074,0.97561)
+
+row4 <- c(0.78636,0.45168,0.64947,0.68432,0.89344,0.90091,0.90124,0.56938,0.89757,0.90204,0.90129,0.90190,0.80076,0.90097,0.90233,0.87599)
+row5 <- c(0.86884,0.85508,0.87392,0.39732,0.87556,0.87291,0.69642,0.87083,0.79858,0.86588,0.86291,0.84178,0.45706,0.52835,0.85704,0.41526,0.83419)
+row1 <- c(0.96454,0.90841,0.97874,0.97979,0.97915,0.98254,0.98184,0.97898,0.86762,0.97782,0.97771,0.97899,0.97987,0.97788,0.97949,0.98074,0.97561)
+
+exp(mean(log(row5)))
+
+mean(row4)
+```
+
+```{r}
+# 
+hm.bp <- runEnrichment(mss.dt, ont=gmt.hs.go.bp, keepSp='human', title='GO Biological Process', isKEGG=F)
+hm.cc <- runEnrichment(mss.dt, ont=gmt.hs.go.cc, keepSp='human', title='GO Cellular Component', isKEGG=F)
+hm.kegg <- runEnrichment(mss.dt, ont=gmt.hs.kegg, keepSp='human', title='GO KEGG Pathways', isKEGG = T) 
+
+
+fwrite(hm.bp$enrich, ScriptAndDatedFileName('human.GO.BP.enrichment.csv'))
+fwrite(hm.bp$simpenrich$simplified, ScriptAndDatedFileName('human.GO.BP.enrichment.simplified.csv'))
+fwrite(hm.cc$enrich, ScriptAndDatedFileName('human.GO.CC.enrichment.csv'))
+fwrite(hm.cc$simpenrich$simplified, ScriptAndDatedFileName('human.GO.CC.enrichment.simplified.csv'))
+fwrite(hm.kegg$enrich, ScriptAndDatedFileName('human.KEGG.enrichment.csv'))
+```
+Lets try plot the enrichment results
+Not finding sig hits unless we change our universe... 
+For now lets just plot proteins from the complement activation system 
+
+```{r}
+
+plotHeatmap <- function(dt, keepSp='human', pThresh=6, nTerms=4){
+  
+  subDT <- copy(dt) # create cp for modifying
+  
+  subDT[, enrich.grp := factor(enrich.grp, levels=c('LMT_D0-HMT_D0.up', 'LMT_D7-HMT_D7.up', 'LMT_D21-HMT_D21.up', 'LMT_D0-HMT_D0.down',  'LMT_D7-HMT_D7.down', 'LMT_D21-HMT_D21.down'))]  
+  
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = subDT,
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  #column_split=list(str_extract(levels(subDT$enrich.grp), 'D[0721]{1,2}')),
+                                  negCols=unique(grep('down', subDT$enrich.grp, value=T)),
+                                  topN=nTerms,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6), 
+                                  upperThreshold = pThresh)
+  
+  return(ht)
+}
+
+plotHeatmap(hm.kegg$enrich)
+```
+
+```{r}
+hm.bp$enrich[p.adjust < 0.05,]
+
+
+hm.bp$enrich[ID %like% ]
+
+mss.dt[gene == 'APOB',]
+```
+
+
+
+Can we improve our recovery?
+
+Lets try the WGCNA correction method; use a subset of samples to control for in both sets (lets try low transmisson D0 in both)
+
+```{r}
+
+hm.e
+
+ann$Condition == 'LMT_D0'
+ann$Group == colnames(p.mat)
+library(WGCNA)
+
+t.1 <- empiricalBayesLM(t.mat, 
+                 removedCovariates = ann$Batch,
+                 fitToSamples = ann$Condition == 'LMT_D0')
+
+t.1$
+
+dim(ProteinLevelDat)
+t.mat <- t(p.mat[complete.cases(p.mat),])
+t.mat[complete.cases(t.mat),]
+dim(t.mat)
+
+
+plotPCA(t.1$adjustedData.OLS, annotation = ann, main='test')
+```
+```{r}
+t.1$adjustedData
+
+submat <- clean.mat[complete.cases(clean.mat),]
+
+
+pcaOut <- prcomp(t(submat))
+
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, ann, by.x = "rn", by.y = "Group", all.x = TRUE)
+pcaDT[, region := ifelse(Condition %like% 'HMT', 'High', 'Low')]
+pcaDT[, timepoint := tstrsplit(Condition, '_', keep=2)]
+
+g <- ggplot(data.table(PC=seq(1,length(pcaPercentVar), by=1), var=pcaPercentVar)[PC <= 10,], aes(x=as.factor(PC), y=var)) +
+  geom_bar(stat='Identity') +
+  xlab('PC') +
+  ylab('variance explained')
+BackupAsPDF(g,'protein.pca.varExplained.cleaned.barplot')
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, fill = Batch, shape=Batch)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+ # scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:22) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+```
+
+
+```{r}
+
+nGenes = 1000;
+nSamples1 = 8;
+nSamples2 = 12;
+disEffect = 0.5;
+batchEffect = 0.4;
+set.seed(2);
+# Simulate first data set, genes in columns
+data1 = matrix(rnorm(nSamples1 * nGenes), nSamples1, nGenes)
+annotation1 = data.frame(
+      status = sample(c("Ctrl", "Disease1"), nSamples1, replace = TRUE));
+# Add a global effect of disaese
+dSamples1 = annotation1$status=="Disease1"
+data1[ dSamples1, ] = data1[ dSamples1, ] + 
+      disEffect * matrix(rnorm(nGenes), sum(dSamples1), nGenes, byrow = TRUE)
+# Simulate second data set
+data2 = matrix(rnorm(nSamples2 * nGenes), nSamples2, nGenes)
+annotation2 = data.frame(
+     status = sample(c("Ctrl", "Disease2"), nSamples2, replace = TRUE));
+# Add a global effect of disaese
+dSamples2 = annotation2$status=="Disease2";
+data2[ dSamples2, ] = data2[ dSamples2, ] + 
+      disEffect * matrix(rnorm(nGenes), sum(dSamples2), nGenes, byrow = TRUE)
+
+# Add a batch effect to second data set: shift each gene by a random amount
+data2 = data2 + batchEffect * matrix(rnorm(nGenes), nSamples2, nGenes, byrow = TRUE)
+
+```
+
+```{r}
+# Prepare a function to plot principal components since we will use it a few times
+plotPCA = function(data, annotation, ...)
+{
+  svd1 = svd(data, nu = 2, nv = 0);
+  status = annotation$Condition;
+  ctrlSamples = status=="LMT_D0"
+  status[ctrlSamples] = paste0(status[ctrlSamples], annotation$batch[ctrlSamples])
+  layout(matrix(c(1:2), 1, 2), widths = c(0.3, 1))
+  par(mar = c(3.2, 0, 0, 0));
+  plot(c(0, 1), type = "n", axes = FALSE, 
+       xlab = "", ylab = "");
+  legend("bottomright", legend = sort(unique(status)), 
+         pch = 20 + c(1:length(unique(status))), 
+         pt.bg = labels2colors(1:length(unique(status))), 
+         pt.cex = 2)
+  par(mar = c(3.2, 3.2, 2, 1))
+  par(mgp = c(2, 0.7, 0))
+  plot(svd1$u[, 1], svd1$u[, 2], 
+       xlab = "PC1", ylab = "PC2", 
+       pch = 20 + as.numeric(factor(status)), 
+       cex = 2.5, bg = labels2colors(status), cex.main = 1.0, ...)
+
+}
+```
+
+
+```{r}
+# Merge the two data sets
+data = rbind(data1, data2)
+# Include a batch variable in the combined sample annotation
+annotation = data.frame(
+    rbind(annotation1, annotation2), 
+    batch = c(rep(1, nSamples1), rep(2,nSamples2)))
+
+annotation
+```
+
+
+```{r}
+library(sva)
+
+
+grep('HMT_D[0-9]{1,2}[.]26', colnames(p.mat))
+
+
+p.mat[complete.cases(p.mat), grep('HMT_D[0-9]{1,2}[.]26',colnames(p.mat), invert=T)]
+
+# quick test on full columns
+test.out <- ComBat(dat=p.mat[complete.cases(p.mat), grep('HMT_D[0-9]{1,2}[.]26', colnames(p.mat), invert=T)], batch=batch, mod=mod, par.prior = T)
+
+colAnn <- HeatmapAnnotation(df = ann[,.(Batch, Condition)], col = colours)
+
+test.out <- sweep(test.out, 1, apply(test.out, 1, median, na.rm=T))
+
+hm <- Heatmap(test.out,
+        column_km = 2,
+        column_names_gp = gpar(fontsize=4),
+        row_title= sprintf('%s complete proteins', nrow(test.out)),
+        show_row_names = F,
+        top_annotation = colAnn)
+hm
+BackupAsPDF(hm, 'combat.fullModel.medSweep.heatmap',dimensions = c(10,7))
+```
+```{r}
+mod <- model.matrix(~Condition, data=ann)
+rownames(mod) <- ann$Group
+
+# quick test on full columns
+test.out <- ComBat(dat=p.mat[complete.cases(p.mat),], batch=batch, mod=mod, par.prior = T)
+test.out <- sweep(test.out, 1, apply(test.out, 1, median, na.rm=T))
+
+
+hm <- Heatmap(test.out,
+        column_km = 2,
+        row_title= sprintf('%s complete proteins', nrow(test.out)),
+        show_row_names = F,
+        column_names_gp = gpar(fontsize=4),
+        top_annotation = colAnn)
+
+hm
+BackupAsPDF(hm, 'combat.ConditionModel.medSweep.heatmap', dimensions = c(10,7))
+
+
+mod
+
+
+ann
+```
+Leaning towards using the full model to start with and model the random effects (patient) using lmm
+Need to also first impute values as
+ 
+ 
+lets try limma removeBatchEffects as doesnt require a complete matrix
+
+```{r}
+mod <- model.matrix(~Region+Timepoint+Patient, data=ann)
+mod
+rownames(mod) <- ann$Group
+
+test.mat <- limma::removeBatchEffect(p.mat, batch, design=mod)
+
+test.mat <- sweep(test.mat, 1, apply(test.mat, 1, median, na.rm=T))
+
+
+test.mat <- test.mat[complete.cases(test.mat),]
+
+
+
+hm <- Heatmap(test.mat,
+        cluster_rows = clusterWNA(test.mat),
+        #column_km=2,
+        row_title= sprintf('%s complete proteins', nrow(test.mat)),
+        show_row_names = F,
+        column_names_gp = gpar(fontsize=4),
+        top_annotation = colAnn)
+
+hm
+```
+This might be promising... lets try more complicated model..
+
+```{r}
+mod <- model.matrix(~Region+Timepoint, data=ann)
+rownames(mod) <- ann$Group
+
+test.mat <- limma::removeBatchEffect(p.mat, batch, design=mod)
+test.mat <- sweep(test.mat, 1, apply(test.mat, 1, median, na.rm=T))
+
+
+test.mat <- test.mat[complete.cases(test.mat),]
+hm <- Heatmap(test.mat,
+        cluster_rows = clusterWNA(test.mat),
+        row_title= sprintf('%s complete proteins', nrow(test.mat)),
+        show_row_names = F,
+        column_names_gp = gpar(fontsize=4),
+        top_annotation = colAnn)
+
+hm
+```
+Seems when we use the full model we do a worse job of seperating batches..
+Look for assoication in the categorical variables
+
+```{r}
+pheno.mat <- as.matrix(ann, rownames='Group')
+
+
+ann
+
+chisq.test(ann$Patient, ann$Region)
+
+
+mosaicplot(table(ann$Patient, ann$Batch), xlab('N samples'))
+g
+mosaicplot
+
+Heatmap(pheno.mat)
+
+
+ann[,.N, by=.(Patient,Batch)][order(Patient)]
+
+
+table(ann$Patient, ann$Batch)
+
+
+table(ann$Patient, ann$Batch)
+
+
+ggplot(ann[,.N, .(Patient, Region, Batch)], aes(x=Patient, y=N, fill=Region)) +
+  geom_bar(stat='Identity') +
+  theme_bw() +
+  scale_fill_brewer(type='seq', palette=2)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Not used...
+---
+
+
+
+Share this output msg with Ben; only 1 feature per peptide is that correct?
+```{r}
+INFO  [2024-08-16 12:07:11] ** Features with one or two measurements across runs are removed.
+INFO  [2024-08-16 12:07:11] ** Fractionation handled.
+INFO  [2024-08-16 12:07:11] ** Updated quantification data to make balanced design. Missing values are marked by NA
+INFO  [2024-08-16 12:07:13] ** Use all features that the dataset originally has.
+INFO  [2024-08-16 12:07:14] 
+ # proteins: 900
+ # peptides per protein: 1-378
+ # features per peptide: 1-1
+INFO  [2024-08-16 12:07:14] Some proteins have only one feature: 
+ A0A075B6I0,
+ A0A075B6J9,
+ A0A075B6K5,
+ A0A075B6P5-20-120,
+ A0A075B6Q5-21-118 ...
+INFO  [2024-08-16 12:07:14] 
+                    HMT_D0 HMT_D21 HMT_D7 LMT_D0 LMT_D21 LMT_D7
+             # runs     26      26     26     29      29     29
+    # bioreplicates     26      26     26     29      29     29
+ # tech. replicates      1       1      1      1       1      1
+INFO  [2024-08-16 12:07:14] Some features are completely missing in at least one condition:  
+ EIVMTQSPPTLSLSPGER_3_NA_NA,
+ IVM(UniMod:35)TQSPPTLSLSPGER_2_NA_NA,
+ (UniMod:28)QPVLTQPPSSSASPGESAR_2_NA_NA,
+ SGQAPVLVIYEDSKRPSGIPER_4_NA_NA,
+ ASGVPDRFSGSGSGTDFTLK_3_NA_NA ...
+INFO  [2024-08-16 12:07:14] The following runs have more than 75% missing values: 71
+INFO  [2024-08-16 12:07:14]  == Start the summarization per subplot...
+  |===========================================================================================================================================================================================| 100%
+INFO  [2024-08-16 12:07:18]  == Summarization is done.
+```
+
+
+```{r}
+# number of features matching to each group
+g <- ggplot(data=spec[,.N,.(Condition)], aes(x=Condition, y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  scale_fill_brewer(palette=2, type='qual') +
+  theme_bw()
+g
+BackupAsPDF(g, 'NfeaturesperGroup.barplot')
+```
+
+
+
+combine the spec data with keys/batch info
+
+```{r}
+# some mismathcing IDs
+spec[!Run %in% unique(patient.batches$RawFile), unique(Run)]
+# fix names; place a _ befroe the first D symvol
+spec[!Run %in% unique(patient.batches$RawFile), Run := sub('D', '_D', Run)]
+
+spec <- merge(x=spec, y=keys[,.(RawFile, Condition, BioReplicate, RunOrder=Run, Batch)], by.x=c('Run','Condition'), by.y=c('RawFile','Condition'))
+spec$BioReplicate.x <- NULL
+spec[, BioReplicate := BioReplicate.y]
+```
+
+```{r}
+g <-  ggplot(spec, aes(x=reorder(Run,runNumber), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  theme(axis.text.x=element_text(angle=90, size=3))
+g
+BackupAsPDF(g, 'pep.Ints.conditionCol.RunNumberMachineID.boxplot', dimensions=c(10,6))
+```
+PCA features 
+----
+```{r}
+featureMat <- dcast(spec,
+                     paste0(ModPeptideSequence, Precursor.Charge)~interaction(Condition,BioReplicate), value.var = "Intensity") |> as.matrix(rownames = "ModPeptideSequence")
+
+featureMat <- featureMat[complete.cases(featureMat), ]
+```
+
+High degree of missingness..
+Maybe we want to impute some values for genes > 80% present to run PCA?
+
+```{r}
+randomcoloR::distinctColorPalette(k=30)
+
+colnames(featureMat)
+pcaOut <- prcomp(t(log2(featureMat)))
+
+colInfo <- data.table(colname = colnames(featureMat))
+colInfo[,c("status","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+colInfo[, group := str_extract(status, 'HMT|LMT')]
+
+colInfo <- merge(x=colInfo, y=unique(spec[, .(sample=paste0(Condition, '.', BioReplicate), RunOrder, runNumber, Batch)]), 
+                 by.x='colname', by.y='sample',all.x=T)
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, fill = rep, shape=group)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+ # scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_manual(values=randomcoloR::distinctColorPalette(k=30)) +
+  scale_shape_manual(values = 21:22) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA_PC12_Complete_Features.conditionCol")
+
+
+spec[,.N, by=.(BioReplicate,Condition)]
+```
+
+
+Check for overlap in the two sets
+
+```{r}
+# convert to older set
+dp.out$ProteinLevelData[, LogIntensities := oldLogIntensities]
+dp.out$ProteinLevelData[, oldSubject := SUBJECT]
+
+dp.out$ProteinLevelData <- merge(x=dp.out$ProteinLevelData, y=ann[,.(Group, Batch)], by.x='SUBJECT', by.y='Group')
+
+# control for batch in the model
+dp.out$ProteinLevelData[, SUBJECT := paste0(GROUP,'.',Batch)]
+
+
+new.mss <- groupComparison(contrast.matrix=contrasts.mat, data=dp.out)
+new.mss.dt <- setDT(new.mss$ComparisonResult)
+
+
+new.mss.dt[, padj := p.adjust(pvalue, method='BH')]
+new.mss.dt[abs(log2FC) >0.58 & padj < 0.05, .N, by=Label]
+```
+
+Limma comparison to manual method
+
+```{r}
+# Load necessary library
+if (!requireNamespace("limma", quietly = TRUE)) {
+    install.packages("BiocManager")
+    BiocManager::install("limma")
+    library(limma)
+} else {
+    library(limma)
+}
+
+# Setting seed for reproducibility
+set.seed(123)
+
+# Parameters
+num_genes = 100
+num_samples = 12
+
+# Simulate some data: 100 genes and 12 samples
+# Base expression levels
+base_expression <- matrix(rnorm(num_genes * num_samples, mean=10, sd=3), nrow=num_genes, ncol=num_samples)
+rownames(base_expression) <- paste("Gene", 1:num_genes)
+colnames(base_expression) <- paste("Sample", 1:num_samples)
+
+# Create batch factors
+batch <- factor(rep(c("Batch1", "Batch2", "Batch3"), 4))
+
+# Create a biological factor (treatment)
+treatment <- factor(rep(c("Control", "Treatment"), 6))
+
+# Apply consistent batch effects
+batch_effects <- c(5, -4, 9)  # Different consistent effects for each batch
+batch_matrix <- matrix(batch_effects[as.integer(batch)], nrow=num_genes, ncol=num_samples, byrow=TRUE)
+
+# Apply consistent treatment effects
+treatment_effects <- c(0, 15)  # No effect for control, positive effect for treatment
+treatment_matrix <- matrix(treatment_effects[as.integer(treatment)], nrow=num_genes, ncol=num_samples, byrow=TRUE)
+
+expression <- base_expression + batch_matrix + treatment_matrix
+gene_expression <- expression[1,]
+
+# Manual adjustment using lm() preserving biological condition
+adjusted_expression_manual <- apply(expression, 1, function(gene_expression) {
+  full_model <- lm(gene_expression ~ batch + treatment)
+  reduced_model <- lm(gene_expression ~ treatment)
+  # isolate the component of the gene expression predictions that is due to the batch effect.
+  # Is the portion of gene expression that can be attributed solely to the batch, independent of the biological variable (treatment).
+  batch_effect <- full_model$fitted.values - reduced_model$fitted.values
+  adjusted_expression <- gene_expression - batch_effect # remove the batch effect
+  return(adjusted_expression)
+})
+
+
+# Convert adjusted expression to a matrix for easier handling
+adjusted_expression_matrix_manual <- matrix(unlist(adjusted_expression_manual), nrow=num_genes, byrow=TRUE)
+colnames(adjusted_expression_matrix_manual) <- colnames(expression)
+rownames(adjusted_expression_matrix_manual) <- rownames(expression)
+
+# Adjust using limma's removeBatchEffect while preserving biological effects
+design_matrix <- model.matrix(~ treatment)
+adjusted_expression_limma <- removeBatchEffect(expression, batch=batch, design = design_matrix)
+
+# Print the results
+print("Adjusted Expression Matrix (Manual):")
+print(head(adjusted_expression_matrix_manual))
+
+print("Adjusted Expression Matrix (limma):")
+print(head(adjusted_expression_limma))
+
+# Comparing the two approaches
+comparison <- adjusted_expression_matrix_manual - adjusted_expression_limma
+print("Difference between Manual and limma Approaches:")
+print(head(comparison)) # difference is essentially 0
+```
+c

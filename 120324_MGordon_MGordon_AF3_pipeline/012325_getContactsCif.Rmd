@@ -1,0 +1,219 @@
+---
+title: "012325_getContactsPAE"
+author: "Martin Gordon"
+date: "2025-01-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## this is a script to adjust the getContactsPAE from Bens af2.template script to automatically get the contacts in any multimer run
+Much of the functionality is taken from https://github.com/kroganlab/bp_utils/blob/master/af.template.dir/GetContactPAE.R
+```{r}
+library(data.table)
+library(magrittr)
+library(rjson)
+library(bio3d)
+```
+
+load an example cif file for processing; can also compare to a pdb to ensure we are getting the same results
+```{r}
+# need an if/else statment to check if it is pdb or cif
+
+
+model <- bio3d::read.cif('./output/dyrk1a__prkar1a_model.cif')
+
+loadPDBAtoms <- function(path){
+  
+  if (grep('[.]cif', path)) {
+    model = bio3d::read.cif(path) 
+  } else {
+    model = bio3d::read.pdb(path) 
+  } 
+  atoms <- setDT(model$atom)
+  atoms[, idx := .I]
+  return (atoms[])
+}
+
+test <- loadPDBAtoms('./output/dyrk1a__prkar1a_model.cif')
+test[,.(x,y,z)]
+
+interChainContacts <- function (pdbFile){
+  atoms <- loadPDBAtoms(pdbFile)
+
+  # all by all atom distance
+  message (sprintf("All by all atom distance for %d atoms", nrow(atoms)))
+  atomDistance <- as.matrix(dist(atoms[, .(x,y,z)]))
+  
+  # sweep out row and col radii
+  message (sprintf("Done with distance, now calculating contacts"))
+
+  # radii copied from Jason Nomburg, line 74 at
+  # https://github.com/jnoms/SAT/blob/main/sat/scripts/struc_detect_interaction.py
+  vdw.radii <- c(H =  1.2, C =  1.7, N =  1.55, O =  1.52, S =  1.8)
+  atomDistance <- sweep (atomDistance, 1, vdw.radii[atoms$elesy]) #this namevec[longvec] is v handy to assign values to all items in vecotr in brackets if matching names
+  atomDistance <- sweep (atomDistance, 2, vdw.radii[atoms$elesy])
+  
+  # if remaining distance is still less than 0.5, we declare it a contact 
+  contactIndeces <- which (atomDistance < 0.5, arr.ind = TRUE) |> as.data.table()
+  
+  # label with chains from idx in atoms table
+  contactIndeces[atoms, chainRow := i.chain , on =  c(row = "idx")]
+  contactIndeces[atoms, chainCol := i.chain , on =  c(col = "idx")]
+  
+  # make crosschain only, and only in one direction:
+  contactIndeces <- contactIndeces[chainRow < chainCol]
+  
+  # label with resno from atoms table
+  contactIndeces[atoms, resnoRow := i.resno, on = c(row = "idx")]
+  contactIndeces[atoms, resnoCol := i.resno, on = c(col = "idx")]
+  
+  # collapse from atoms to residues and sort
+  contactRes <- setorder(unique(contactIndeces[, .(chainRow, resnoRow, chainCol, resnoCol)]))
+  
+  # translate per-chain resno to the multimer resno based on chain lengths (max(resno)) for all prior chains
+  # assumptions!!!
+  cl <- atoms[, .(l = max(resno)), by = chain]
+  contactRes[, mmerResnoRow := resnoRow + sum(cl[chain < chainRow, sum(l)]), by = chainRow]
+  contactRes[, mmerResnoCol := resnoCol + sum(cl[chain < chainCol, sum(l)]), by = chainCol]
+  
+  return (contactRes[])  
+}
+
+
+# minB = lower bound of atoms to include in distance, from both ends of comparison.
+#         Assume plddt, where higher is better
+interChainResDistance <- function(atoms, minBStart = 0, minBStop = 25){
+  # all by all atom distance
+        atomDistance <- dist(atoms[, .(x,y,z)])
+  
+  # build pairwise table of distances between chains
+  # loop over chains, and compare all atoms to that chain, skipping those within that chain
+  .oneChain <- function(curChain){
+    curChain.idx <- which (atoms$chain == curChain & atoms$b > minBStop)
+    atomdist <- atoms[chain != curChain & b > minBStart, 
+                      .(chain, resno, eleno, b, otherChain = curChain, distance = min(usedist::dist_get(atomDistance, idx, curChain.idx))),
+                      by = .(idx)] 
+    residues <- atomdist[, .(distance = min(distance), bfactor = mean(b)), by = .(chain, resno, otherChain)]
+    residues[]
+    }
+  
+  resLong <- rbindlist(lapply(unique(atoms$chain), .oneChain))
+  resLong[]
+}
+
+
+pae <- jsonlite::fromJSON(paeJsonFile)
+
+contactRes <- interChainContacts(pdbFile)
+
+contactRes[, pae := pae[mmerResnoRow, mmerResnoCol], by = .(mmerResnoRow, mmerResnoCol)]
+```
+
+Testing these functions
+
+```{r}
+interchain.dt <- interChainResDistance(atoms=test)
+
+sName <- gsub('_model.cif', '', basename('./output/dyrk1a__prkar1a_model.cif'))
+sName
+testName <- 'fgudf__dshds__dkhds__uhs'
+
+
+chainNames <- toupper(unlist(strsplit(testName,'__')))
+chainIDmapper <- data.table(chainName=chainNames, chainID=LETTERS[1:length(chainNames)])
+
+message('mapping gene names to chainIDs...')
+
+interchain.dt[chainIDmapper, gene := i.chainName, on = c(chain = 'chainID')]
+interchain.dt[chainIDmapper, otherGene := i.chainName, on = c(otherChain = 'chainID')]
+
+
+p <- ggplot (interchain.dt, aes(x = resno, y = distance, color = bfactor)) + 
+    geom_line(lwd = 1, alpha = 0.5) +
+    geom_point(alpha = 1, stroke = NA) +
+  #coord_cartesian(xlim = c(0,400)) +
+  scale_y_log10(name = "distance (Angstroms)") +
+  #coord_cartesian(ylim = c(.1,20)) +
+  scale_y_continuous( ) +
+  geom_hline(yintercept = 4.0) + 
+  facet_grid(gene~otherGene, scales = "free", space = "free_x") +
+  scale_color_gradientn("plDDT", limits = c(0,100), colors = c(red = "#FE0012",
+                                                      orange = "#FFA42B",
+                                                      yellow = "#FFFD42","#FFFD42",
+                                                      palegreen = "palegreen2",
+                                                      blue = "lightblue","lightblue",#"#6097E8",
+                                                      darkBlue = "#001DF9"),
+                        values = c(0, .5, 0.7,0.75,0.8,0.85, 0.9, 1.0)) +
+  
+  theme_bw() +
+  scale_x_continuous(breaks = seq(0, max(interchain.dt$resno, na.rm = TRUE), by = 200)) +
+  ggrepel::geom_text_repel(aes(label = resno))
+
+p
+```
+
+
+```{r}
+
+cl
+test <- loadPDBAtoms('./output/dyrk1a__prkar1a_model.cif')
+test[,.(x,y,z)]
+
+
+vdw.radii[test$elesy]
+# all by all distance matrix of coordinates in 3d space
+atomDistance <- as.matrix(dist(test[, .(x,y,z)]))
+vdw.radii <- c(H =  1.2, C =  1.7, N =  1.55, O =  1.52, S =  1.8)
+
+# sweep out distances from the matrix
+atomDistance <- sweep(atomDistance, 1, vdw.radii[test$elesy])
+atomDistance <- sweep(atomDistance, 2, vdw.radii[test$elesy])
+
+# which cells in the matrix have a distance less than 0.5?
+contactIndeces <- which (atomDistance < 0.5, arr.ind = TRUE) %>% 
+  as.data.table()
+
+# label with chains from idx in atoms table
+# this is a datatable merge based on the index in the col and row of the matrix
+contactIndeces[test, chainRow := i.chain , on =  c(row = "idx")]
+contactIndeces[test, chainCol := i.chain , on =  c(col = "idx")]
+
+# make crosschain only, and only in one direction:
+# this should be resistqnt to multiple chains; is row != col would get opposite direction also
+contactIndeces <- contactIndeces[chainRow < chainCol]
+
+  # label with resno from atoms table
+contactIndeces[test, resnoRow := i.resno, on = c(row = "idx")]
+contactIndeces[test, resnoCol := i.resno, on = c(col = "idx")]
+
+# collapse from atoms to residues and sort
+# drop atom number to rm duplicate residue liness..
+contactRes <- setorder(unique(contactIndeces[, .(chainRow, resnoRow, chainCol, resnoCol)]))
+
+
+# translate per-chain resno to the multimer resno based on chain lengths (max(resno)) for all prior chains
+# assumptions!!!
+# getting length of each chain 
+cl <- test[, .(l = max(resno)), by = chain]
+
+# what we are basically doing here is adding the residue numer in the chain,I think I need to try understand this a little better
+# for A, its just going to be itself, for B etc. it will add 
+# assumes sequecnes are concatenated in A+B+C order? For example, if this was chain B-C contact but we had ABC, would it add full length of A and B?
+contactRes[, mmerResnoRow := resnoRow + sum(cl[chain < chainRow, sum(l)]), by = chainRow]
+contactRes[, mmerResnoCol := resnoCol + sum(cl[chain < chainCol, sum(l)]), by = chainCol]
+```
+Now we just want to add the PAE contacts to the file
+```{r}
+modelFile <- loadPDBAtoms('./output/dyrk1a__prkar1a_model.cif')
+modelFile
+
+contactRes <- interChainContacts('./output/dyrk1a__prkar1a_model.cif')
+
+# works great!
+contactRes[, pae := pae.mat[mmerResnoRow, mmerResnoCol], by = .(mmerResnoRow, mmerResnoCol)]
+fwrite (contactRes,file = contactResOutFile)
+```
+

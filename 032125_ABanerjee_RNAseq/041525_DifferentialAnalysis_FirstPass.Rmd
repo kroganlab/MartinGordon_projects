@@ -1,0 +1,1454 @@
+---
+title: "041524_DifferentialAnalysis_FirstPass"
+author: "Martin Gordon"
+date: "2025-04-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Focus on CARD9 impact on IDB
+CARD9 sensor; instigates different response pathway depending on the stimuli (bacterial vs yeast). Why it instigates different IM response pathway depending on pathogen isn't known
+CARD9 Interaction with USP7 (deubiquitinating enzyme; removes UB tags so stabilizes proteins and promotes pro-IM response I think?); possibly interacts physically with end terminal (C-terminal) of CARD9, as the removal of CARD9 C-terminal (protective mutant) reduces USP7 expression relative to WT
+USP7; not expected 
+*Data*
+
+Conditions: 2*3
+3 CARD9 variants (WT, dEX11 (protective), S12N (risk))
+2 stimulations LPS HKCA
+Comparisons we want; I think we may want a more complicated more than standard PW comparisons, as we want to see how reponse to stimulus changes depending on cell-line (CARD9 variant)
+
+*Todo*
+Differential analysis of the different conditions in Atoshi's data
+First pass; standard DESeq2 processing; construct a single GLM for the dataset and pull out the contrasts of interest
+Next step; enrichment for known GO processes etc.
+Visualizations; heatmaps, volcanoplots etc.
+Possible integration with the CRISPR data?
+
+*Request*
+Compare treatments across genotypes
+Compare treatments within genotypes
+Below in detail...
+- WT with mutants for both stimulants separately (cell-line comparisons within treatments - get cell-line effect)
+- dEX11 LPS vs dEX11 HKCA (treatment comparisons within cell-line - get treatment effect)
+Can do all these pairwise first, then add an interaction term to the model
+
+I think we want to test if the condition effect is different across genotypes
+
+Before that, let's do a quick QC of the output; how do. the different samples cluster and what is our coverage like
+```{r packages}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(DESeq2)
+library(tximport) # doubt this is needed if we just use the gene summarisation of the nf-core pipeline
+library(ggh4x) # additional functionality for ggplot2 obj; eg facet_grid allow x/y axis to vary
+library(scales) # axis and legend params
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(viridis)
+library(IHW) # independent hypothesis weighting for DESeq2; improved statistical power
+library(ggforce)
+library(eulerr)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+col.pal <- getQualitativePalette(n=6)
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+
+
+# for the different groups
+condition.col <- c('WT'="#1B9E77", 'dEX11'="#D95F02", 'S12N'="#7570B3")
+treatment.col <- c('LPS'= "#E6AB02",'HKCA'="#666666")
+#treatment.col <- c('LPS'= "#E6AB02", "#E7298A", "#A6761D", "#666666")
+
+
+# isgs for plotting; set passed around by Adrian
+isGenes <- fread('/Users/martingordon/Documents/projects/022624_AViDD_AB_PH_data/docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+
+```
+
+
+## Read in data
+```{r readcounts}
+counts.dt <- fread('./output/salmon.merged.gene_counts.tsv')
+#tpm.dt <- fread('./output/salmon.merged.gene_tpm.tsv') # normalized values for vi
+
+counts.dt[gene_name == gene_id] # all idnetical 
+counts.dt[, gene_id := NULL]
+
+counts.mat <- as.matrix(counts.dt, rownames='gene_name')
+```
+create a metadata table for the analysis
+```{r metadata}
+meta.dt <- data.table(sample=colnames(counts.dt))
+meta.dt[, `:=`(condition = gsub('[_].+', '', sample),
+               treatment = stringr::str_extract(sample, 'HKCA|LPS'),
+               rep = stringr::str_extract(sample, '[123]$'))]
+
+meta.dt <- meta.dt[, group := paste0(condition,'_', treatment)] %>% 
+  .[condition != 'gene']
+
+
+meta.dt$group %>% unique()
+# set factor levels; only natural referece is for condition
+meta.dt[, `:=`(condition = factor(condition, levels=c('WT', 'dEX11', 'S12N')),
+               treatment = factor(treatment, levels=c('LPS','HKCA')),
+               group = factor(group, levels=c("WT_LPS","WT_HKCA","dEX11_HKCA","dEX11_LPS","S12N_HKCA","S12N_LPS")))
+               ]
+
+meta.dt %>% str()
+meta.dt <- as.data.frame(meta.dt, row.names = meta.dt$sample)
+# sanity check
+all(rownames(meta.dt) == colnames(counts.mat)) == TRUE
+```
+Import the data into deseq2
+For our model, we want to consider genotype, treatment effect and their interaction
+
+Fromt he vignette
+The key point to remember about designs with interaction terms is that, unlike for a design ~genotype + condition, where the condition effect represents the overall effect controlling for differences due to genotype, by adding genotype:condition, the main condition effect only represents the effect of condition for the reference level of genotype (I, or whichever level was defined by the user as the reference level). The interaction terms genotypeII.conditionB and genotypeIII.conditionB give the difference between the condition effect for a given genotype and the condition effect for the reference genotype.
+
+This genotype-condition interaction example is examined in further detail in Example 3 in the help page for results, which can be found by typing ?results. In particular, we show how to test for differences in the condition effect across genotype, and we show how to obtain the condition effect for non-reference genotypes.
+
+Need to review this more closely
+```{r}
+# model the terms and their interaction; # we want to detect treatment-specific effects in the different conditions
+dds <- DESeqDataSetFromMatrix(round(counts.mat), # requires integers
+                              colData = meta.dt,  
+                              design =~treatment + condition + treatment:condition) 
+
+design(dds)
+```
+
+returning to filtering. I dont think this is stringent enough. Require at least 10 counts in 80% of samples (these are similar cell-lines)
+```{r}
+# filter low counts
+smallestGroupSize <- 3
+# 
+nrow(colData(dds)) * .8
+
+keep <- rowSums(counts(dds) >= 10) >= (nrow(colData(dds)) * .8)
+#keep <- rowSums(counts(dds) >= 10) >=   (nrow(colData(dds)) * .5)
+# retaining 18k seems fine; too many transcripts with near empty values; keep only values with at least 10 counts in 50% of groups
+sum(keep)
+dds <- dds[keep,]
+```
+
+
+```{r}
+dds <- DESeq(dds)
+#saveRDS(dds, ScriptAndDatedFileName('dds.CARD9variants.wInteractionTerm.rds'))
+```
+
+```{r}
+dds <- readRDS('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_15_dds.CARD9variants.wInteractionTerm.rds')
+
+keep <- rowSums(counts(dds) >= 10) >= (nrow(colData(dds)) * .8)
+#keep <- rowSums(counts(dds) >= 10) >=   (nrow(colData(dds)) * .5)
+# retaining 18k seems fine; too many transcripts with near empty values; keep only values with at least 10 counts in 50% of groups
+sum(keep)
+dds <- dds[keep,]
+```
+
+With interaction model terms are more difficult to interpret, but I do think we want to find genes that behave differently across genotypes
+```{r, eval=FALSE}
+resultsNames(dds)
+# means referenece model; 
+# Here WT is the reference condition 
+
+#[1] "Intercept"                
+# "treatment_HKCA_vs_LPS"  # treatment effect within WT reference (ie HKCA vs LPS)
+#"condition_dEX11_vs_WT" # gives us genotype effect for LPS treatment (ie deXLL vs WT)
+#"condition_S12N_vs_WT" # genotype effect for LPS (S12N vs WT)
+
+# these are the interaciton terms; add this to the main effect
+#"treatmentHKCA.conditiondEX11"  
+#"treatmentHKCA.conditionS12N" 
+
+# to compare the HKCA treatment effect in non-reference groups, we need to add the treatment term to the main effect
+#condition_dEX11_vs_WT, "treatmentHKCA.conditiondEX11"
+#"condition_S12N_vs_WT", "treatmentHKCA.conditionS12N" 
+
+# interaction term alone; answers is the genotype effect different across stimuli/treatment?
+#"treatmentHKCA.conditiondEX11"
+#"treatmentHKCA.conditionS12N" 
+```
+
+Pull out the different contrasts we want using the contrast function
+No LFC shrinkage; more relevant for visualization; think the stats are run on the unmpodified FCs..
+
+## model construction and contrasts
+
+I think this set-up is fine as we are interested in; we want to see how genotype impacts treatments; LPS comparison across genotypes
+*key point though, Im not sure if I can pull out treatment effect for non-reference levels..*
+The key point to remember about designs with interaction terms is that, unlike for a design ~genotype + condition, where the condition effect represents the overall effect controlling for differences due to genotype, by adding genotype:condition, the main condition effect only represents the effect of condition for the reference level of genotype
+ie. condition_dEX11_vs_WT only represents genotype effect for LPS reference level
+```{r}
+# sanity check these results are correct from the counts, but proceed as is for now
+res.interaction <- list('WT_HKCA-WT_LPS' =  as.data.table(results(dds, contrast=c('treatment', 'HKCA', 'LPS'), filterFun=ihw), keep.rownames=T), # treatment effect WT
+                        'dEX11_LPS-WT_LPS'= as.data.table(results(dds, contrast=c('condition', 'dEX11', 'WT'), filterFun=ihw),keep.rownames=T),# genotype effect dex11 vs WT (for LPS ref)
+                        'S12N_LPS-WT_LPS'= as.data.table(results(dds, contrast=c('condition', 'S12N', 'WT'), filterFun=ihw), keep.rownames=T), #genotype effect S12N vs WT (for LPS ref)
+                        # more difficult to extract the within genotpye contrasts... 
+                        'interaction.dEX11.WT'  = as.data.table(results(dds, name="treatmentHKCA.conditiondEX11",  filterFun=ihw),keep.rownames=T), # interaction: how is the genotpye different across treatments? (dEX11 & WT)
+                        'interaction.S12N.WT'  = as.data.table(results(dds, name="treatmentHKCA.conditionS12N",  filterFun=ihw), keep.rownames=T), # interaction: interaction: how is the genotpye different across treatments? (S12N & WT)
+                        'interaction.S12N.dEX11' = as.data.table(results(dds, contrast=list("treatmentHKCA.conditionS12N", "treatmentHKCA.conditiondEX11"),  filterFun=ihw), keep.rownames=T))  # interaction: interaction: how is the genotpye different across 
+res.interaction.dt <- rbindlist(res.interaction, idcol = 'contrast')
+
+fwrite(res.interaction.dt, ScriptAndDatedFileName('prelim.dea.wInteraciton.csv.gz'))
+res.interaction.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_16_prelim.dea.wInteraciton.csv.gz')
+```
+Now perform pairwise comparisons of groups
+Simplier approach and maybe no relevant as no obvious 'baseline' available for this data
+
+Reformat our design matrix
+```{r}
+dds.group <- dds
+design(dds.group) <- formula(~group) #just do simple pairwise with no interaction term
+dds.group <- DESeq(dds.group)
+```
+
+```{r}
+res.group <- list(# comparison to WT (per stimulant)
+                  'dEX11_LPS-WT_LPS'= as.data.table(results(dds.group, contrast=c('group', 'dEX11_LPS', 'WT_LPS'), filterFun=ihw), keep.rownames=T),
+                  'S12N_LPS-WT_LPS'= as.data.table(results(dds.group, contrast=c('group', 'S12N_LPS', 'WT_LPS'), filterFun=ihw), keep.rownames=T), 
+                  'dEX11_HKCA-WT_HKCA' = as.data.table(results(dds.group, contrast=c("group",'dEX11_HKCA', 'WT_HKCA'), filterFun=ihw), keep.rownames=T),
+                  'S12N_HKCA-WT_HKCA' = as.data.table(results(dds.group, contrast=c("group",'S12N_HKCA', 'WT_HKCA'), filterFun=ihw), keep.rownames=T),
+                  # within genotype stimulant comparison
+                  'dEX11_HKCA-dEX11_LPS' = as.data.table(results(dds.group, contrast=c("group",'dEX11_HKCA', 'dEX11_LPS'), filterFun=ihw), keep.rownames=T),
+                  'S12N_HKCA-S12N_LPS' = as.data.table(results(dds.group, contrast=c("group",'S12N_HKCA', 'S12N_LPS'), filterFun=ihw), keep.rownames=T),
+                  'WT_HKCA-WT_LPS' =  as.data.table(results(dds.group, contrast=c('group', 'WT_HKCA', 'WT_LPS'), filterFun=ihw), keep.rownames=T),
+                  # mutant comparison (per stimulant)
+                  'dEX11_LPS-S12N_LPS'= as.data.table(results(dds.group, contrast=c('group', 'dEX11_LPS', 'S12N_LPS'), filterFun=ihw),keep.rownames=T),
+                  'dEX11_HKCA-S12N_HKCA'= as.data.table(results(dds.group, contrast=c('group', 'dEX11_HKCA', 'S12N_HKCA'), filterFun=ihw),keep.rownames=T))
+
+res.group.dt <- rbindlist(res.group,idcol='contrast')
+#fwrite(res.group.dt, ScriptAndDatedFileName('prelim.dea.groupContrasts.csv.gz'))
+res.group.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_16_prelim.dea.groupContrasts.csv.gz')
+```
+
+**Sanity check**
+Sanity check our dea results and ensure FCs from contrasts (esp the interaction terms) match the observed counts
+Generate a normalized count matrix
+
+Validate our results are as expected using the summary datatable
+I think the interaction terms may be wrong..
+```{r}
+# get min pvals and compare
+res.interaction.dt[,.SD[which.min(pvalue)],, by=contrast]
+res.group.dt[,.SD[which.min(pvalue)],, by=contrast]
+```
+
+plot counts and check... all look good
+```{r}
+g <- plotCounts(dds, gene='CTSB', intgroup = "group", normalized = TRUE, returnData = T)
+ggplot(g, aes(x=reorder(group, group),y=log2(count))) +
+  geom_point() +
+  stat_summary(fun = "mean", colour = "red", size = 2, geom = "point")
+
+
+# WT_HKCA-WT_LPS looks good
+# dEX11_LPS-WT_LPS looks good 
+# S12N_LPS-WT_LPS looks good
+# interaction.dEX11.WT	looks good
+# interaction.S12N.WT looks good
+# interaction.S12N.dEX11 looks good
+# dEX11_HKCA-WT_HKCA  loos good
+# S12N_HKCA-S12N_LPS	looks good
+# dEX11_LPS-S12N_LPS	looks good
+# dEX11_HKCA-S12N_HKCA	looks good
+```
+
+## QC 
+look at distributions, clustering of subsample of genes and PCA...
+
+Gert counts matrix
+```{r}
+# kind of a log transformation good for visualizing 
+counts.mat <- assay(vst(dds, blind=T))
+counts.long <- data.table(reshape2::melt(counts.mat))
+
+setnames(counts.long, new=c('gene', 'sample', 'vstCounts'))
+counts.long[, `:=`(condition = gsub('[_].+', '', sample),
+                   treatment = stringr::str_extract(sample, 'HKCA|LPS'),
+                   rep = stringr::str_extract(sample, '[123]$'))]
+
+counts.long[, group := paste0(condition,'_', treatment)]
+#fwrite(counts.long, ScriptAndDatedFileName('norm.counts.csv.gz'))
+
+summary.mat <- dcast(counts.long, gene~group, value.var = 'vstCounts', fun.aggregate = mean,na.rm=T) %>% 
+  as.matrix(rownames='gene')
+```
+
+```{r, fig.height=5, fig.width=7}
+pcaOut <- prcomp(t(counts.mat))
+
+
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, meta.dt, by.x = "rn", by.y = "sample", all.x = TRUE)
+
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(pcaDT$condition)))
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = condition, shape = rep)) + 
+  geom_point(size=4) +
+  ggrepel::geom_text_repel(aes(label=gsub('[.]quant[.]sf', '', rn)), show.legend = FALSE, size = 2) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_fill_brewer(type = "qual", palette = 2) +
+  scale_shape_manual(values = 21:25) +
+ # scale_fill_manual(values=col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'groupCol.pca')
+```
+most variance explained by stimulus, rather than mutation status
+V small fold change in these proteins between the groups; we dont see this difference at the transcriptome level
+
+```{r}
+g <- plotCounts(dds, gene='CARD9', intgroup = c("group", "condition","treatment"), normalized = TRUE, returnData = T)
+
+p <- ggplot(g, aes(x=treatment, y=log2(count+1), group=condition)) +
+  geom_point(aes(color=condition)) +
+  stat_summary(fun = mean, geom="line", aes(color=condition)) +
+  labs(title='CARD9', x='Stimulus', y='vstCounts') +
+  scale_color_brewer(type = "qual", palette = 2) +
+  theme_bw() +
+  coord_cartesian(xlim=c(1.5,1.5)) # adjusting margins
+p
+BackupAsPDF(p, 'CARD9.counts.linechart')
+
+
+g <- plotCounts(dds, gene='USP7', intgroup = c("group", "condition","treatment"), normalized = TRUE, returnData = T)
+
+p <- ggplot(g, aes(x=treatment, y=log2(count+1), group=condition)) +
+  geom_point(aes(color=condition)) +
+  stat_summary(fun = mean, geom="line", aes(color=condition)) +
+  labs(title='USP7', x='Stimulus', y='vstCounts') +
+  scale_color_brewer(type = "qual", palette = 2) +
+  theme_bw() +
+  coord_cartesian(xlim=c(1.5,1.5)) # adjusting margins
+p
+BackupAsPDF(p, 'USP7.counts.linechart')
+
+# also generate simple dotplots
+g <- plotCounts(dds, gene='CARD9', intgroup = c("group", "condition","treatment"), normalized = TRUE, returnData = T)
+g$group <- factor(g$group, levels=c('WT_HKCA','WT_LPS','dEX11_HKCA', 'dEX11_LPS', 'S12N_HKCA', 'S12N_LPS'))
+
+p <- ggplot(g, aes(x=group, y=log2(count+1), group=condition)) +
+  geom_point(aes(color=condition)) +
+  stat_summary(fun = mean, geom="line", aes(color=condition)) +
+  labs(title='CARD9', x='Stimulus', y='vstCounts') +
+  scale_color_brewer(type = "qual", palette = 2) +
+  theme_bw() +
+  coord_cartesian() # adjusting margins
+p
+BackupAsPDF(p, 'card9.counts.groupOnX.linechart')
+
+g <- plotCounts(dds, gene='USP7', intgroup = c("group", "condition","treatment"), normalized = TRUE, returnData = T)
+g$group <- factor(g$group, levels=c('WT_HKCA','WT_LPS','dEX11_HKCA', 'dEX11_LPS', 'S12N_HKCA', 'S12N_LPS'))
+
+p <- ggplot(g, aes(x=group, y=log2(count+1), group=condition)) +
+  geom_point(aes(color=condition)) +
+  stat_summary(fun = mean, geom="line", aes(color=condition)) +
+  labs(title='USP7', x='Stimulus', y='vstCounts') +
+  scale_color_brewer(type = "qual", palette = 2) +
+  theme_bw() +
+  coord_cartesian() # adjusting margins
+p
+BackupAsPDF(p, 'usp7.counts.groupOnX.linechart')
+```
+
+Look at the heatmaps of genes
+Heatmaps
+---
+Heatmaps of random subsample of 2k genes in each set.
+Lets see how the sample clusters breakdown
+
+Samples all cluster as expected; but not a huge amount of variance in counts across conditions... might explain why we are seeing few DE genes..
+May need to drop FC thresholds to 50%??
+
+```{r, fig.height=6, fig.width=8}
+# median scale the rows to find submats
+submat <- sweep(counts.mat, 1, apply(counts.mat,1, median, na.rm=T), FUN='-')
+submat <- submat[sample(rownames(submat), 3000),]
+
+meta.dt <- setDT(meta.dt)
+colAnn <- HeatmapAnnotation(df = meta.dt[,.(group,condition, treatment, rep)])
+
+paste0(unlist(strsplit(colnames(submat), '_')), collapse='_')
+tstrsplit(colnames(submat), '_')
+
+hm <- Heatmap(submat,
+              column_split = list(tstrsplit(colnames(submat), '_', keep=1, '_'),
+                                  tstrsplit(colnames(submat), '_', keep=2, '_')),
+              column_title_gp = gpar(fontsize=10, fontface='bold'),
+              col = colorRamp2(colors=redbluColpal, breaks=c(4,2,0,-2,-4)),
+              column_names_gp = gpar(fontsize=7),
+              name='normCounts/median',
+              row_title = '3000 randomly sampled genes',
+              border=T,
+              show_row_names = F)
+hm
+BackupAsPDF(hm, 'randomSubset.medianScaled.heatmap')
+```
+
+
+boxplots of gene expressions; probably fine but good to check shape; weird to see this bottom out... what does the log transformed value look like?
+Weird that VST transformation imputes counts for 0; what is 0. equivalent to?
+Log2 scale for large counts, but do not trust low counts < 10
+```{r}
+# weird shape; looks like the bottom is 0
+# v weird shape
+ggplot(counts.long, aes(x=reorder(group, order=levels(colData(dds)$group)), y=vstCounts)) +
+  geom_violin()
+
+ori.counts.dt <- fread('./output/salmon.merged.gene_counts.tsv') %>% 
+  .[,gene_name := NULL]
+ori.mat <- as.matrix(ori.counts.dt, rownames='gene_id')
+
+counts.long[,.SD[range(vstCounts)], by=sample]
+counts.long[gene == 'AAAS' & sample == 'dEX11_HKCA_3']# 4.861745 is equivalent to 0... only reliable at higher counts
+```
+
+
+```{r}
+counts.long$condition %>% unique()
+counts.long[, group := factor(group, levels=levels(meta.dt$group))] # need levels dor the string
+
+# its fine we know the counts are in log scale at higher counts; key point is dont trust the values at low LFCs..
+g <- ggplot(counts.long, aes(x=group, y=vstCounts, fill=condition)) +
+  geom_boxplot() +
+  labs(x='Group', y='vstCounts') +
+  scale_fill_manual(values=condition.col) +
+  theme_bw() +
+  coord_cartesian() # adjusting margins
+
+g
+BackupAsPDF(g, 'vstDistributions.boxplots')
+```
+ok, I think all the QC checks out.. now we want to i) create volcanoplots & heatmaps of each of hte groups, enrichment the differentially upregulated sets and share the tables from the analysis
+First filter the interaction set to just the interaction terms. Others are covered in our group comparisons
+```{r}
+# just take the set of interaction terms and save these results and combine with the other 
+interactionTerms <- setdiff(unique(res.interaction.dt$contrast),unique(res.group.dt$contrast))
+
+comb.dt <- rbind(res.group.dt, res.interaction.dt[contrast %in% interactionTerms,])
+```
+Create our standard annotations; add a term for STRINGID, so it can be easily imported into string
+
+```{r}
+string.alias <- fread('~/Documents/utils/mg_utils/data/stringDB/9606.protein.aliases.v12.0.txt.gz')# %>% 
+setnames(string.alias, new=c('stringID', 'gene', 'source'))
+
+# like 13.5 k stringID mappings
+string.alias[source == 'Ensembl_HGNC', unique(gene)] %in%  unique(comb.dt$rn)  %>% 
+  table()
+
+# cadd annotation info
+comb.dt[string.alias[source == 'Ensembl_HGNC',], stringID := i.stringID, on=c(rn='gene')]
+comb.dt[, adj.pvalue := p.adjust(pvalue, method='BH'), by=contrast]
+comb.dt[, sig := 'not']
+comb.dt[abs(log2FoldChange) > 1 & adj.pvalue < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')]
+comb.dt[!grepl('interacton', contrast), c('numerator', 'denominator') := tstrsplit(contrast, '-', keep=c(1,2))]
+setnames(comb.dt, old='rn', new='gene')
+
+
+#fwrite(comb.dt, ScriptAndDatedFileName('DESeqContrasts.combined.csv.gz'))
+```
+
+Layout of plot grid
+```{r}
+library(patchwork)
+
+g <- ggplot(comb.dt[sig != 'not' & !grepl('interaction', contrast), .N, by=.(sig,contrast)], aes(x=contrast, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  #facet_wrap(.~grepl('interaction', contrast), scales='free_x') +
+  scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  labs(title=expression("Significant genes from pairwise contrasts"),
+       subtitle=expression("abs" ~ log[2] ~ "FC > 1 & p.adj < 0.05"),
+       y='N genes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        axis.title.x= element_blank())
+g
+BackupAsPDF(g, 'nSigHits.pairwise.barplot')
+
+p <- ggplot(comb.dt[sig != 'not' & grepl('interaction', contrast), .N, by=.(sig,contrast)], aes(x=contrast, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  #facet_wrap(.~grepl('interaction', contrast), scales='free_x') +
+  scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  labs(title=expression("Significant Interaction effect"),
+       subtitle=expression("abs" ~ log[2] ~ "FC > 1 & p.adj < 0.05"),
+       y='N genes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        axis.title.x= element_blank())
+
+p
+BackupAsPDF(p, 'nSigHits.interaction.barplot', dimensions=c(6,5))
+
+# patchwork plot of the two sets of results
+patch <- g + p +
+  plot_layout(widths=c(4,2))
+patch
+BackupAsPDF(patch, 'nSigHits.combined.barplot')
+```
+lets loop through the contrasts and plot the volcanoplots to see how the different conditions look
+
+```{r}
+plot.dir <- c('/Users/martingordon/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/080824_PWcomparisons_data/pdfs/volcanoplots')
+
+lapply(unique(comb.dt$contrast), function(x){
+
+ g <-  ggplot(comb.dt[contrast==x,], aes(y=-log10(adj.pvalue), x=log2FoldChange, colour = sig, label=gene)) +
+    geom_point(size=1) +
+    #ggrepel::geom_text_repel(data=comb.dt[sig != 'not',], max.iter = 1000, max.overlaps = 20, size=2.5) +
+    labs(title=x, y=expression(-log[10] ~' adj.pvalue'))  +
+    scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    #facet_grid2(virus~timepoint, scales='free', independent = 'all') +
+    theme_bw()
+ g
+})
+```
+These fold changes are much too large; try shrinkage methods to help with visualization; 
+We plot thes
+
+```{r}
+res.group <- list(# comparison to WT (per stimulant)
+                  'dEX11_LPS-WT_LPS'= as.data.table(lfcShrink(dds.group, contrast=c('group', 'dEX11_LPS', 'WT_LPS'), type='ashr', 
+                                                              res=results(dds.group, contrast=c('group', 'dEX11_LPS', 'WT_LPS'), filterFun=ihw)), keep.rownames=T),
+                  'S12N_LPS-WT_LPS'= as.data.table(lfcShrink(dds.group, contrast=c('group', 'S12N_LPS', 'WT_LPS'), type='ashr', 
+                                                             res=results(dds.group, contrast=c('group', 'S12N_LPS', 'WT_LPS'), filterFun=ihw)), keep.rownames=T),
+                  'dEX11_HKCA-WT_HKCA' = as.data.table(lfcShrink(dds.group, contrast=c("group",'dEX11_HKCA', 'WT_HKCA'), type='ashr',
+                                                                 res=results(dds.group, contrast=c("group",'dEX11_HKCA', 'WT_HKCA'), filterFun=ihw)), keep.rownames=T),
+                  'S12N_HKCA-WT_HKCA' = as.data.table(lfcShrink(dds.group, contrast=c("group",'S12N_HKCA', 'WT_HKCA'), type='ashr',
+                                                                res=results(dds.group, contrast=c("group",'S12N_HKCA', 'WT_HKCA'), filterFun=ihw)), keep.rownames=T),
+                  # within genotype stimulant comparison
+                  'dEX11_HKCA-dEX11_LPS' = as.data.table(lfcShrink(dds.group, contrast=c("group",'dEX11_HKCA', 'dEX11_LPS'), type='ashr', 
+                                                                   res=results(dds.group, contrast=c("group",'dEX11_HKCA', 'dEX11_LPS'), filterFun=ihw)), keep.rownames=T),
+                  'S12N_HKCA-S12N_LPS' = as.data.table(lfcShrink(dds.group, contrast=c("group",'S12N_HKCA', 'S12N_LPS'), type='ashr', 
+                                                                 res=results(dds.group, contrast=c("group",'S12N_HKCA', 'S12N_LPS'), filterFun=ihw)), keep.rownames=T),
+                  'WT_HKCA-WT_LPS' =  as.data.table(lfcShrink(dds.group, contrast=c('group', 'WT_HKCA', 'WT_LPS'), type='ashr',
+                                                              res=results(dds.group, contrast=c('group', 'WT_HKCA', 'WT_LPS'), filterFun=ihw)), keep.rownames=T),
+                  # mutant comparison (per stimulant)
+                  'dEX11_LPS-S12N_LPS'= as.data.table(lfcShrink(dds.group, contrast=c('group', 'dEX11_LPS', 'S12N_LPS'),  type='ashr',
+                                                                res=results(dds.group, contrast=c('group', 'dEX11_LPS', 'S12N_LPS'), filterFun=ihw)),keep.rownames=T),
+                  'dEX11_HKCA-S12N_HKCA'= as.data.table(lfcShrink(dds.group, contrast=c('group', 'dEX11_HKCA', 'S12N_HKCA'), type='ashr', 
+                                                                  res=results(dds.group, contrast=c('group', 'dEX11_HKCA', 'S12N_HKCA'), filterFun=ihw)),keep.rownames=T))
+
+res.group.dt <- rbindlist(res.group,idcol='contrast')
+fwrite(res.group.dt, ScriptAndDatedFileName('prelim.dea.groupContrasts.wLFCshrinkage.csv.gz'))
+```
+do the same for the interaction terms... I guess do we still want to filter sig hits based on a LFC of 1?
+
+```{r}
+res.interaction <- list('WT_HKCA-WT_LPS' =  as.data.table(lfcShrink(dds, contrast=c('treatment', 'HKCA', 'LPS'), type='ashr',
+                                                                    res=results(dds, contrast=c('treatment', 'HKCA', 'LPS'), filterFun=ihw)), keep.rownames=T), # treatment effect WT
+                        'dEX11_LPS-WT_LPS'= as.data.table(lfcShrink(dds, contrast=c('condition', 'dEX11', 'WT'), type='ashr',
+                                                                    res=results(dds, contrast=c('condition', 'dEX11', 'WT'), filterFun=ihw)),keep.rownames=T),# genotype effect dex11 vs WT (for LPS ref)
+                        'S12N_LPS-WT_LPS'= as.data.table(lfcShrink(dds, contrast=c('condition', 'S12N', 'WT'), type='ashr',
+                                                                   res=results(dds, contrast=c('condition', 'S12N', 'WT'), filterFun=ihw)), keep.rownames=T), #genotype effect S12N vs WT (for LPS ref)
+                        #  interaction: how is response to treatment different across the genotypes
+                        'interaction.dEX11.WT'  = as.data.table(lfcShrink(dds, coef="treatmentHKCA.conditiondEX11", type='ashr', # interaction: how is the genotpye different across treatments? (dEX11 & WT)
+                                                                          res=results(dds, name="treatmentHKCA.conditiondEX11",  filterFun=ihw)),keep.rownames=T),
+                        'interaction.S12N.WT'  = as.data.table(lfcShrink(dds, coef="treatmentHKCA.conditionS12N", type='ashr',# interaction: how is the genotpye different across treatments? (S12N & WT)
+                                                                         res=results(dds, name="treatmentHKCA.conditionS12N",  filterFun=ihw)), keep.rownames=T), 
+                        'interaction.S12N.dEX11' = as.data.table(lfcShrink(dds, contrast=c("treatmentHKCA.conditionS12N", "treatmentHKCA.conditiondEX11"), type='ashr',# interaction: interaction: how is the genotpye different across
+                                                                                           res=results(dds, contrast=list("treatmentHKCA.conditionS12N", "treatmentHKCA.conditiondEX11"),  filterFun=ihw)), keep.rownames=T))  
+res.interaction.dt <- rbindlist(res.interaction, idcol = 'contrast')
+
+fwrite(res.interaction.dt, ScriptAndDatedFileName('prelim.dea.wInteraciton.wLFCshrinkage.gz'))
+```
+read in the new dts, tidy and save 
+```{r}
+res.group.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_16_prelim.dea.groupContrasts.wLFCshrinkage.csv.gz')
+res.interaction.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_16_prelim.dea.wInteraciton.wLFCshrinkage.gz')
+```
+
+```{r}
+# just take the set of interaction terms and save these results and combine with the other 
+interactionTerms <- setdiff(unique(res.interaction.dt$contrast),unique(res.group.dt$contrast))
+comb.dt <- rbind(res.group.dt, res.interaction.dt[contrast %in% interactionTerms,])
+```
+Create our standard annotations; add a term for STRINGID, so it can be easily imported into string
+
+```{r}
+string.alias <- fread('~/Documents/utils/mg_utils/data/stringDB/9606.protein.aliases.v12.0.txt.gz')# %>% 
+setnames(string.alias, new=c('stringID', 'gene', 'source'))
+
+# like 13.5 k stringID mappings
+string.alias[source == 'Ensembl_HGNC', unique(gene)] %in%  unique(comb.dt$rn)  %>% 
+  table()
+
+# cadd annotation info
+comb.dt[string.alias[source == 'Ensembl_HGNC',], stringID := i.stringID, on=c(rn='gene')]
+comb.dt[, adj.pvalue := p.adjust(pvalue, method='BH'), by=contrast]
+comb.dt[, sig := 'not']
+comb.dt[abs(log2FoldChange) > 1 & adj.pvalue < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')]
+comb.dt[!grepl('interacton', contrast), c('numerator', 'denominator') := tstrsplit(contrast, '-', keep=c(1,2))]
+setnames(comb.dt, old='rn', new='gene')
+```
+
+Read in the combined differential analysis scores; I think we want to rank by sign LFC * -log10(pvalue)
+Filtered at 10reads in >=80% of samples
+```{r}
+#fwrite(comb.dt, ScriptAndDatedFileName('DESeqContrasts.combined.wLFCshrinkage.moreStringentFiltering.csv.gz'))
+comb.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_16_DESeqContrasts.combined.wLFCshrinkage.moreStringentFiltering.csv.gz')
+```
+
+```{r}
+g <- ggplot(filtered.dt[sig != 'not' & !grepl('interaction', contrast), .N, by=.(sig,contrast)], aes(x=contrast, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  #facet_wrap(.~grepl('interaction', contrast), scales='free_x') +
+  scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  labs(title=expression("Significant genes from pairwise contrasts"),
+       subtitle=expression("abs" ~ log[2] ~ "FC > 1 & p.adj < 0.05"),
+       y='N genes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        axis.title.x= element_blank())
+g
+#BackupAsPDF(g, 'nSigHits.pairwise.barplot')
+
+p <- ggplot(comb.dt[sig != 'not' & grepl('interaction', contrast), .N, by=.(sig,contrast)], aes(x=contrast, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  #facet_wrap(.~grepl('interaction', contrast), scales='free_x') +
+  scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  labs(title=expression("Significant Interaction effect"),
+       subtitle=expression("abs" ~ log[2] ~ "FC > 1 & p.adj < 0.05"),
+       y='N genes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        axis.title.x= element_blank())
+
+p
+#BackupAsPDF(p, 'nSigHits.interaction.barplot', dimensions=c(6,5))
+
+# patchwork plot of the two sets of results
+patch <- g + p +
+  plot_layout(widths=c(4,2))
+patch
+#BackupAsPDF(patch, 'nSigHits.combined.barplot')
+```
+## 04-17-25
+ok, re-evaluate the genes we are looking at; instead of enforcing measurements in a set number of rows (in our case only two), enforce that the gene is i) present in all reps of a condition and ii) has at least 10 reads in both
+I think this will help with some of the noise filtering and still keep the promising genes
+
+Write function to filter out genes not represented in at least all replicates of one condition;
+Could use smarter filtering; look at CoV of the gene within each condition, see where the best one falls in sample distribution, if in low/high quantile, drop
+```{r}
+dds <- readRDS('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_15_dds.CARD9variants.wInteractionTerm.rds')
+
+# return vector of gene names that are present in all reps of at least one condition 
+identifyGenesInAllReplicates <- function(mat, countThreshold, nConditions){
+  
+  allCounts.dt <- setDT(reshape2::melt(mat))
+  setnames(allCounts.dt, new=c('gene', 'sample','counts'))
+  # specific to my setup; hard to generalise; maybe use dt and efocre specific colnames
+  allCounts.dt[, rep := tstrsplit(sample, '_', keep=3)]
+  allCounts.dt[, condition := gsub('_[123]$','', sample)]
+  
+  summary.dt <- allCounts.dt[, .(nSamples=length(unique(sample)),sample, gene, counts), by=condition]
+  # counts must meet counts threshold in all reps of at least one condition
+  goodGenes <- summary.dt[,  goodGene := ifelse(sum(counts > countThreshold) == nSamples, 1, 0), by=.(condition,gene)] %>% 
+    .[, .(passThres = sum(goodGene)), by=.(gene)] %>% 
+    .[passThres >=  nConditions, unique(gene)]
+  
+  return(goodGenes)
+}
+
+# filter our genes to this, redraw the volcanoplots
+goodGenes <- identifyGenesInAllReplicates(counts(dds), countThreshold=10, nConditions=1)
+```
+
+Read in the original, remove these noisy genes, and regenerate volcanoplots
+(quickly adjust the pval floor for plotting purposes)
+```{r}
+comb.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_16_DESeqContrasts.combined.wLFCshrinkage.csv.gz')
+filtered.dt <- comb.dt[gene %in% goodGenes,]
+
+#  setting a lfc threshold to move values; otherwise all the sig small FCs also get visualized
+# update the zero to lowest numeric val in each contrast
+floor.dt <- comb.dt[pvalue != 0 & abs(log2FoldChange) >= 1, .SD[which.min(pvalue)], by=contrast] %>% 
+  .[,.(contrast, pvalue)]
+
+# assign the values from floor dt
+filtered.dt[, plotPval := ifelse(pvalue == 0, floor.dt[contrast == contrast, pvalue], pvalue), by=contrast]
+filtered.dt[, plotPAdj := p.adjust(plotPval, method='BH'), by=contrast]
+#fwrite(filtered.dt, ScriptAndDatedFileName('DESeqContrasts.combined.wLFCshrinkage.filtered.csv.gz'))
+filtered.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_18_DESeqContrasts.combined.wLFCshrinkage.filtered.csv.gz')
+```
+
+Filtering count mat for things with < 10 reads in 80% of samples produces more reasonable things.. I think go with this for now, otherwise too noisy
+We can go digging for individual genes if missing
+For pvalues of 0, (below computation limit I guess?), take the lowest non-zero pval and assign per contrast
+
+Fix this, only want to assign these values 
+```{r}
+filtered.dt[grepl('interaction', contrast), unique(contrast)]
+
+plot.dir <- 'volcanoplots_goodGenes/'
+library(ggbreak)
+
+lapply(unique(filtered.dt$contrast), function(x){
+
+ g <-  ggplot(filtered.dt[contrast==x,], aes(y=-log10(plotPAdj), x=log2FoldChange, colour = sig, label=gene)) +
+    geom_hline(yintercept = -log10(0.05), linetype='dashed', alpha=0.5) +
+    geom_vline(xintercept = c(-1,1), linetype='dashed', alpha=0.5) +
+    geom_point(size=1) +
+    scale_x_continuous(breaks=seq(-15,15,5)) +
+    ggrepel::geom_text_repel(data=filtered.dt[sig != 'not' & contrast==x,][order(pvalue),][1:100,], max.iter = 1000, max.overlaps = 20, size=2.5, segment.alpha=.5, segment.linetype='dashed') +
+    labs(title=x, y=expression(-log[10] ~' adj.pvalue'))  +
+    scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    theme_classic() +
+    coord_cartesian(xlim=c(-15,15))
+   
+    print(g)
+    BackupAsPDF(g, paste0(plot.dir,x,'xlims.volcanoplot'))
+})
+# focus in on a closer view of the sign hits
+lapply(unique(filtered.dt$contrast), function(x){
+
+ g <-  ggplot(filtered.dt[contrast==x,], aes(y=-log10(plotPAdj), x=log2FoldChange, colour = sig, label=gene)) +
+    geom_hline(yintercept = -log10(0.05), linetype='dashed', alpha=0.5) +
+    geom_vline(xintercept = c(-1,1), linetype='dashed', alpha=0.5) +
+    geom_point(size=1) +
+    #scale_x_continuous(breaks=seq(-15,15,5)) +
+    ggrepel::geom_text_repel(data=filtered.dt[sig != 'not' & contrast==x,][order(pvalue),][1:100,], max.iter = 1000, max.overlaps = 20, size=2.5, segment.alpha=.5, segment.linetype='dashed') +
+    labs(title=x, y=expression(-log[10] ~' adj.pvalue'))  +
+    scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    theme_classic()
+
+ g
+    BackupAsPDF(g, paste0(plot.dir,x,'.volcanoplot'))
+})
+```
+
+Heatmaps of the significant genes; lets just plot per contrast as otherwise gets too complicated
+Also want colors for the plotting
+
+Set a threshold of 20 LFC and see what the heatmap looks like; are these noise, or genuine values in the volcanoplot?
+```{r}
+counts.dt <- fread('./output/salmon.merged.gene_counts.tsv')
+#tpm.dt <- fread('./output/salmon.merged.gene_tpm.tsv') # normalized values for vi
+counts.dt
+counts.dt[gene_name == gene_id] # all idnetical 
+counts.dt[, gene_id := NULL]
+
+counts.mat <- as.matrix(counts.dt, rownames='gene_name')
+
+
+summary.dt <- setDT(melt(counts.dt))[, .(meanCounts=mean(value), sdCounts=sd(value)), by=gene_name][, rankCounts := rank(meanCounts)]
+```
+plot the missing genes; some maybe interesting, so keep, maybe for plot focus on hte 
+```{r, fig.height=8, fig.width=8}
+genes.oi <- filtered.dt[abs(log2FoldChange) > 20 & adj.pvalue < 0.05, unique(gene)]
+
+#
+submat <- counts.mat[rownames(counts.mat) %in% genes.oi & rownames(counts.mat) %in% goodGenes,]
+
+
+missingRows <- apply(submat, 1, function(x){sum(x == 0)}) %>% 
+  data.table(gene = names(.),
+             count=.)
+
+row_ha <- rowAnnotation(nMissing = apply(submat, 1, function(x){sum(x ==0)}))
+
+hm <- Heatmap(log2(submat+1),
+              column_split = list(#tstrsplit(colnames(submat), '_', keep=1, '_'),
+                                  tstrsplit(colnames(submat), '_', keep=2, '_'),
+                                  tstrsplit(colnames(submat), '_', keep=1, '_')),
+              column_title_gp = gpar(fontsize=10, fontface='bold'),
+              col=viridis(25), 
+              cluster_columns = F,
+              right_annotation = row_ha,
+              row_title = paste0(nrow(submat), ' genes'),
+             # col = colorRamp2(colors=redbluColpal, breaks=c(4,2,0,-2,-4)),
+              column_names_gp = gpar(fontsize=7),
+              row_names_gp = gpar(fontsize=4),
+              name='log2 counts',
+              border=T,
+              show_row_dend = F,
+              show_row_names = T)
+hm
+BackupAsPDF(hm, 'absLFC20threshold.afterFiltering.heatmap')
+```
+
+Quickly check the oldComb.dt; find significant genes with LFC > 10/5 and plot;do these loog good
+For filtering, enforce that each gene is at least fully represented in one group
+
+```{r}
+norm.mat <- fread('/Users/martingordon/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_15_norm.counts.csv.gz') %>% 
+  dcast(., gene~sample, value.var='vstCounts') %>% 
+  as.matrix(rownames='gene')
+
+contrast.oi <- grep('interaction', filtered.dt$contrast, invert=T, value=T) %>% 
+  unique()
+```
+
+heatmaps of the DE genes
+```{r, fig.height=6, fig.width=8}
+plot.dir <- 'Heatmaps/'
+
+lapply(contrast.oi, function(x){
+  
+  # ge tthe sig genes
+  genes.oi <- filtered.dt[contrast == x & sig != 'not', unique(gene)]
+  
+  condRegx <- strsplit(x, '-') %>% 
+    unlist(.) %>% 
+    paste(., collapse='|')
+  # get the conditions we are contrasting
+  submat <- norm.mat[rownames(norm.mat) %in% genes.oi, grepl(condRegx, colnames(norm.mat))]
+  
+  submat <- sweep(submat, 1, apply(submat, 1, mean, na.rm=T))
+  
+  colAnn <- HeatmapAnnotation(df=data.table(condition=unlist(tstrsplit(colnames(submat), '_', keep=1)),
+                                            treatment=unlist(tstrsplit(colnames(submat), '_', keep=2))
+                                            ),
+                              col=list('condition'=condition.col, 
+                                       'treatment'=treatment.col))
+  hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =T,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        show_row_names = F,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+        row_title = paste0(nrow(submat), ' genes (|LFC| >2 & padj < 0.05)'), 
+        #column_split = factor(stringr::str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(-3,-1.5,0,1.5,3), colors=redbluColpal),
+        name=('Counts vs Mean'),
+        border=T)
+
+  hm <- draw(hm, column_title=paste(unlist(strsplit(x, '-')), collapse=' vs '))
+  BackupAsPDF(hm, paste0(plot.dir,x, '.sigGenes.meanSweep.heatmap'))
+ })
+```
+Heatmap of the interactor set; how do these look across the different groups
+
+```{r}
+pw.contrasts <- grep('interaction', filtered.dt$contrast, invert=T, value=T) %>% 
+  unique()
+interactor.contrasts <- grep('interaction', filtered.dt$contrast, invert=F, value=T) %>% 
+  unique()
+lps.comparisons <- c("dEX11_LPS-WT_LPS","S12N_LPS-WT_LPS", "dEX11_LPS-S12N_LPS")
+hkca.comparisons <- c( "dEX11_HKCA-WT_HKCA","S12N_HKCA-WT_HKCA","dEX11_HKCA-S12N_HKCA")
+treatment.comparisons <- c("dEX11_HKCA-dEX11_LPS","S12N_HKCA-S12N_LPS","WT_HKCA-WT_LPS")
+
+
+lapply(interactor.contrasts, function(x){
+  
+  # ge tthe sig genes
+  genes.oi <- filtered.dt[contrast == x & sig != 'not', unique(gene)]
+  
+  # grab all cols 
+  condRegx <- strsplit(gsub('interaction[.]','',x), '[.]') %>% 
+    unlist(.) %>% 
+    paste(., collapse='|')
+  # get the conditions we are contrasting
+  submat <- norm.mat[rownames(norm.mat) %in% genes.oi, grepl(condRegx, colnames(norm.mat))]
+  
+  submat <- sweep(submat, 1, apply(submat, 1, mean, na.rm=T))
+  
+  colAnn <- HeatmapAnnotation(df=data.table(condition=unlist(tstrsplit(colnames(submat), '_', keep=1)),
+                                            treatment=unlist(tstrsplit(colnames(submat), '_', keep=2))
+                                            ),
+                              col=list('condition'=condition.col, 
+                                       'treatment'=treatment.col))
+  hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =T,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        show_row_names = F,
+        column_split = unlist(tstrsplit(colnames(submat), '_', keep=1)),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+        row_title = paste0(nrow(submat), ' genes (|LFC| >2 & padj < 0.05)'), 
+        #column_split = factor(stringr::str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(-3,-1.5,0,1.5,3), colors=redbluColpal),
+        name=('Counts vs Mean'),
+        border=T)
+
+  hm <- draw(hm)
+  #hm <- draw(hm, column_title=paste(unlist(strsplit(x, '-')), collapse=' vs '))
+  BackupAsPDF(hm, paste0(plot.dir,x, '.sigGenes.meanSweep.heatmap'))
+ })
+```
+See overlaps of the significant genes between the groups
+
+euleer plot
+# look at overlaps of the genotype comparisons for each treatment, for each stimulus & for the interaction
+(ie what is similiar/different when we compare WT to both mutants)
+# I dont know if we need the mutant to mutant comparisons
+```{r}
+# look at venn diagram overlaps of the different g
+
+getGenesInContrast <- function(dt, contrastOI, LFCThreshold, pvalThreshold){
+  
+  geneSet <- dt[contrast == contrastOI & abs(log2FoldChange) >= LFCThreshold & adj.pvalue < pvalThreshold, gene] %>% 
+   list()
+  return(geneSet)
+}
+```
+
+venn diagram of overlap of sig gene ids
+Are these strange? so much of dEX11 is unique...
+Maybe want to split out up and down reg genes... leave as is for now
+```{r}
+# plot the euler
+
+# lps comparisons
+p <- plot(eulerr::euler(sapply(lps.comparisons, function(x){getGenesInContrast(filtered.dt, x, 1, 0.05)})),
+     quantities = TRUE,
+     legend=TRUE
+     )
+BackupAsPDF(p, 'nSigHits.GenotypeLPSComparisons.vennDiagram')
+
+#hkca 
+p <- plot(eulerr::euler(sapply(hkca.comparisons, function(x){getGenesInContrast(filtered.dt, x, 1, 0.05)})),
+     quantities = TRUE,
+     legend=TRUE
+     )
+p
+BackupAsPDF(p, 'nSigHits.GenotypeHKCAComparisons.vennDiagram')
+
+
+#treatment compairsons
+p <- plot(eulerr::euler(sapply(treatment.comparisons, function(x){getGenesInContrast(filtered.dt, x, 1, 0.05)})),
+     quantities = TRUE,
+     legend=TRUE
+     )
+p
+BackupAsPDF(p, 'nSigHits.TreatmentComparisons.vennDiagram')
+
+
+# interactions
+p <- plot(eulerr::euler(sapply(interactor.contrasts, function(x){getGenesInContrast(filtered.dt, x, 1, 0.05)})),
+     quantities = TRUE,
+     legend=TRUE
+     )
+p
+BackupAsPDF(p, 'nSigHits.InteractionsOverlap.vennDiagram')
+```
+Heatmap of ISGs
+Read in ISGs first
+
+Use same plotting as the interaction set so we can see if there is a significant change between genotypes/treatments
+```{r, fig.height=5,fig.width=7}
+
+lapply(interactor.contrasts, function(x){
+  
+  # ge tthe sig genes
+  genes.oi <- filtered.dt[contrast == x & sig != 'not', unique(gene)]
+  
+  # grab all cols 
+  condRegx <- strsplit(gsub('interaction[.]','',x), '[.]') %>% 
+    unlist(.) %>% 
+    paste(., collapse='|')
+  # get the conditions we are contrasting
+  submat <- norm.mat[rownames(norm.mat) %in% isGenes, grepl(condRegx, colnames(norm.mat))]
+  
+  submat <- sweep(submat, 1, apply(submat, 1, mean, na.rm=T))
+  
+  colAnn <- HeatmapAnnotation(df=data.table(condition=unlist(tstrsplit(colnames(submat), '_', keep=1)),
+                                            treatment=unlist(tstrsplit(colnames(submat), '_', keep=2))
+                                            ),
+                              border=TRUE,
+                              col=list('condition'=condition.col, 
+                                       'treatment'=treatment.col))
+  
+  rowAnn <- rowAnnotation(`Interaction Effect`=ifelse(rownames(submat) %in% genes.oi, 'yes', 'no'),
+                          border=TRUE,
+                          col=list(`Interaction Effect`=c('yes'= "#1F9E89FF", 'no'="white")))
+  
+  hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        left_annotation = rowAnn,
+        cluster_columns =T,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        show_row_names = T,
+        column_split = unlist(tstrsplit(colnames(submat), '_', keep=1)),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+   #     row_title = paste0(nrow(submat), ' ISGs'), 
+        #column_split = factor(stringr::str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(-3,-1.5,0,1.5,3), colors=redbluColpal),
+        name=('Counts vs Mean'),
+        border=T)
+
+  hm <- draw(hm)
+  #hm <- draw(hm, column_title=paste(unlist(strsplit(x, '-')), collapse=' vs '))
+  BackupAsPDF(hm, paste0(plot.dir,x, '.ISGs.meanSweep.heatmap'))
+ })
+```
+
+Just do a plot of the ISGs across the 3 genotypes
+First lps, then hkca
+```{r fig.height=5,fig.width=7}
+sig.genes <- filtered.dt[contrast %in% lps.comparisons & sig != 'not', unique(gene)]
+
+submat <- norm.mat[rownames(norm.mat) %in% isGenes, grepl('LPS', colnames(norm.mat))]
+# lets do a median sweep and see what falls out;
+# could also sweep WT from the counts
+submat <- sweep(submat, 1, apply(submat,1, mean, na.rm=T))
+
+# heatmap 
+colAnn <- HeatmapAnnotation(df=data.table(condition=unlist(tstrsplit(colnames(submat), '_', keep=1)),
+                                            treatment=unlist(tstrsplit(colnames(submat), '_', keep=2))
+                                            ),
+                              border=TRUE,
+                              col=list('condition'=condition.col, 
+                                       'treatment'=treatment.col))
+  
+rowAnn <- rowAnnotation(`|LFC| > 1 &\npadj < 0.05`=ifelse(rownames(submat) %in% sig.genes, 'yes', 'no'),
+                          border=TRUE,
+                          col=list(`|LFC| > 1 &\npadj < 0.05`=c('yes'="#26828EFF", 'no'="white")))
+  
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        left_annotation = rowAnn,
+        cluster_columns =T,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        show_row_names = T,
+        column_split = unlist(tstrsplit(colnames(submat), '_', keep=1)),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+   #     row_title = paste0(nrow(submat), ' ISGs'), 
+        #column_split = factor(stringr::str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(-3,-1.5,0,1.5,3), colors=redbluColpal),
+        name=('Counts vs Mean'),
+        border=T)
+
+hm <- draw(hm)
+BackupAsPDF(hm, paste0(plot.dir,'genotype.LPS.ISGs.meanSweep.heatmap'))
+```
+
+```{r fig.height=5,fig.width=7}
+sig.genes <- filtered.dt[contrast %in% hkca.comparisons & sig != 'not', unique(gene)]
+
+submat <- norm.mat[rownames(norm.mat) %in% isGenes, grepl('HKCA', colnames(norm.mat))]
+# lets do a median sweep and see what falls out;
+# could also sweep WT from the counts
+submat <- sweep(submat, 1, apply(submat,1, mean, na.rm=T))
+
+# heatmap 
+colAnn <- HeatmapAnnotation(df=data.table(condition=unlist(tstrsplit(colnames(submat), '_', keep=1)),
+                                            treatment=unlist(tstrsplit(colnames(submat), '_', keep=2))
+                                            ),
+                              border=TRUE,
+                              col=list('condition'=condition.col, 
+                                       'treatment'=treatment.col))
+  
+rowAnn <- rowAnnotation(`|LFC| > 1 &\npadj < 0.05`=ifelse(rownames(submat) %in% sig.genes, 'yes', 'no'),
+                          border=TRUE,
+                          col=list(`|LFC| > 1 &\npadj < 0.05`=c('yes'= "#26828EFF", 'no'="white")))
+  
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        left_annotation = rowAnn,
+        cluster_columns =T,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        show_row_names = T,
+        column_split = unlist(tstrsplit(colnames(submat), '_', keep=1)),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+   #     row_title = paste0(nrow(submat), ' ISGs'), 
+        #column_split = factor(stringr::str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(-3,-1.5,0,1.5,3), colors=redbluColpal),
+        name=('Counts vs Mean'),
+        border=T)
+
+hm <- draw(hm)
+BackupAsPDF(hm, paste0(plot.dir,'genotype.HKCA.ISGs.meanSweep.heatmap'))
+```
+## Enrichment analysis
+Run enrichment analysis, but maybe better considering the huge LFCs to run fGSEA
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+
+gmt.kegg <- loadKegg('hsa', 'uniprot')[,.(ont, protein=gene, ont.id)]
+
+# try it but use GMT go for now maybe
+gmt.kegg[, gene := multiUniprots2multiGenes(protein)]
+gmt.kegg[, simplifiedGene := gsub('[.].+','', gene)]
+
+universe <- rownames(norm.mat)
+```
+
+```{r}
+filtered.dt[, enrich.grp := paste0(contrast,'.',sig)]
+
+  # run GO enrichment on each group seperately
+enrich.dt <- enricherOnGroups(filtered.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+ 
+
+#fwrite(enrich.dt, ScriptAndDatedFileName('enrich.go.bp.csv.gz'))
+enrich.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_18_enrich.go.bp.csv.gz')
+
+# simplify the enrichment by GO terms 
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                         gmt=gmt.go, 
+                                                         groupColumn = 'enrich.grp',
+                                                         max_pAdjust = 0.1)
+
+
+
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('enrich.simplified.go.bp.csv.gz'))
+```
+
+prepare a plot of the enrichment heatmap
+Are these treatment conditions all cell-cycle matched? Different batches? HUGE number of differenes between the groups
+```{r, fig.height=7, fig.width=8}
+subdt[, enrich.grp := factor(enrich.grp)]
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = subdt,
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  #column_split=stringr::str_extract(levels(subdt$enrich.grp), 'up|down'),
+                                  upperThreshold = 8,
+                                  negCols=unique(grep('down', subdt$enrich.grp, value=T)),
+                                  topN=10,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+ht
+BackupAsPDF(ht, 'go.bp.simplified.heatmap')
+```
+
+# try something like set diff on the set of GO terms significant in each genotype conditon and plot a heatmap of this 
+```{r}
+subdt[p.adjust < 0.05, by=.(ID, enrich.grp)]
+```
+Write output and share 
+```{r}
+filtered.wide <- dcast(filtered.dt, gene~contrast, value.var=c('log2FoldChange', 'pvalue', 'padj'))
+#fwrite(filtered.wide, ScriptAndDatedFileName('deseq2.DEanalysis.wideformat.csv'))
+```
+
+
+## 04-21-25
+
+A couple of other analysis to do:
+KEGG enrichment
+rank plots of LFCs
+GSEA enrichment (can we pre-rank?)
+Scatterplots of enrichments between conditions (see what falls off the diagonal)
+Integrate with CRISPR scores (maybe; leave as is for now until we have more clarity)
+
+rank plots of log2Fold changes; label the top scoring genes
+Dont know if these plots are in any way helpful...
+```{r}
+plot.dir <- 'rankPlots/'
+
+filtered.dt[, rankLFC := rank(abs(log2FoldChange)), by=contrast]
+
+lapply(contrast.oi, function(x){
+  
+  g <- ggplot(filtered.dt[contrast == x,], aes(x=rankLFC, y=abs(log2FoldChange),color=sig, label=gene)) +
+    geom_point(shape='.') +
+    ggrepel::geom_label_repel(data=filtered.dt[contrast == x & sig != 'not',][order(pvalue),][1:50,], max.overlaps = 20, size=2) +
+    labs(main=x, y=expression(abs~'LFC')) +
+    scale_color_manual(values=c('not'='grey', 'up'=redbluColpal[1], 'down'=redbluColpal[5])) +
+    theme_classic()
+  
+  BackupAsPDF(g, paste0(plot.dir, x, '.rankplot'))
+})
+
+interactor.contrasts
+
+lapply(interactor.contrasts, function(x){
+  
+  g <- ggplot(filtered.dt[contrast == x,], aes(x=rankLFC, y=abs(log2FoldChange),color=sig, label=gene)) +
+    geom_point(shape='.') +
+    ggrepel::geom_label_repel(data=filtered.dt[contrast == x & sig != 'not',][order(pvalue),][1:50,], max.overlaps = 20, size=2) +
+    labs(main=x, y=expression(abs~'LFC')) +
+    scale_color_manual(values=c('not'='grey', 'up'=redbluColpal[1], 'down'=redbluColpal[5])) +
+    theme_classic()
+  
+  BackupAsPDF(g, paste0(plot.dir, x, '.rankplot'))
+})
+```
+KEGG enrichment
+
+```{r}
+
+gmt.kegg[, old.gene := gene]
+gmt.kegg[, old.protein := protein]
+gmt.kegg[, protein := gene]
+
+
+  # run GO enrichment on each group seperately
+enrich.dt <- enricherOnGroups(filtered.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = gmt.kegg, 
+                              universe = universe)
+ 
+
+#fwrite(enrich.dt, ScriptAndDatedFileName('enrich.kegg.csv.gz'))
+enrich.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_21_enrich.kegg.csv.gz')
+
+# simplify the enrichment by GO terms 
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                         gmt=gmt.go, 
+                                                         groupColumn = 'enrich.grp',
+                                                         max_pAdjust = 0.1)
+
+#fwrite(simp.enrich$simplified, ScriptAndDatedFileName('enrich.simplified.kegg.csv.gz'))
+```
+
+Look at the PW comparions and subset to these for plotting 
+```{r, fig.height=7, fig.width=8}
+# look at plots for these groups seperately
+#lps.comparisons <- c("dEX11_LPS-WT_LPS","S12N_LPS-WT_LPS", "dEX11_LPS-S12N_LPS")
+#hkca.comparisons <- c( "dEX11_HKCA-WT_HKCA","S12N_HKCA-WT_HKCA","dEX11_HKCA-S12N_HKCA")
+#treatment.comparisons <- c("dEX11_HKCA-dEX11_LPS","S12N_HKCA-S12N_LPS","WT_HKCA-WT_LPS")
+#interactor.contrasts
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt[enrich.grp %like% paste0(lps.comparisons, collapse='|')],
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  #column_split=stringr::str_extract(levels(subdt$enrich.grp), 'up|down'),
+                                  upperThreshold = 8,
+                                  negCols=unique(grep('down', enrich.dt[enrich.grp %like% paste0(lps.comparisons, collapse='|')]$enrich.grp, value=T)),
+                                  topN=10,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+ht
+BackupAsPDF(ht, 'kegg.LPSgrp.simplified.heatmap')
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt[enrich.grp %like% paste0(hkca.comparisons, collapse='|')],
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  #column_split=stringr::str_extract(levels(subdt$enrich.grp), 'up|down'),
+                                  upperThreshold = 8,
+                                  negCols=unique(grep('down', enrich.dt[enrich.grp %like% paste0(hkca.comparisons, collapse='|')]$enrich.grp, value=T)),
+                                  topN=10,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+ht
+BackupAsPDF(ht, 'kegg.HKCAgrp.simplified.heatmap')
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt[enrich.grp %like% paste0(treatment.comparisons, collapse='|')],
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  #column_split=stringr::str_extract(levels(subdt$enrich.grp), 'up|down'),
+                                  upperThreshold = 8,
+                                  negCols=unique(grep('down', enrich.dt[enrich.grp %like% paste0(treatment.comparisons, collapse='|')]$enrich.grp, value=T)),
+                                  topN=10,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+ht
+BackupAsPDF(ht, 'kegg.treatmentComparisons.simplified.heatmap')
+
+# interaction comparison
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt[enrich.grp %like% paste0(interactor.contrasts, collapse='|')],
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  #column_split=stringr::str_extract(levels(subdt$enrich.grp), 'up|down'),
+                                  upperThreshold = 8,
+                                  negCols=unique(grep('down', enrich.dt[enrich.grp %like% paste0(interactor.contrasts, collapse='|')]$enrich.grp, value=T)),
+                                  topN=10,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+ht
+BackupAsPDF(ht, 'kegg.interactionEffgrp.simplified.heatmap')
+```
+*GSEA*
+Lets try GSEA enrichment to side-step this issue of thresholds
+For our scores, we will try i) signed pvalue and ii) LFC
+Reason to try LFC is to not overweigh all these infinite pvalues in the dataset... smaller range
+
+Run on this set
+treatment.comparisons <- c("dEX11_HKCA-dEX11_LPS","S12N_HKCA-S12N_LPS","WT_HKCA-WT_LPS")
+interactor.contrasts <- grep('interaction', filtered.dt$contrast, invert=F, value=T) %>% 
+  unique()
+lps.comparisons <- c("dEX11_LPS-WT_LPS","S12N_LPS-WT_LPS", "dEX11_LPS-S12N_LPS")
+hkca.comparisons <- c( "dEX11_HKCA-WT_HKCA","S12N_HKCA-WT_HKCA","dEX11_HKCA-S12N_HKCA")
+
+
+```{r}
+# first differential score; signed pval
+filtered.dt[, diffScore := pvalue * sign(log2FoldChange)]
+
+# just run the analysis on all contrasts for first pass
+all.contrasts <- unique(filtered.dt$contrast)
+names(all.contrasts) <- all.contrasts
+
+GOBP.list <- split(gmt.go$gene, gmt.go$ont) 
+# only consider genesets with 10+ members 
+GOBP.list <- GOBP.list[sapply(GOBP.list, function(x) length(x) >= 10)]
+
+# run on different subsets for speed and combine
+lpssea <- lapply(lps.comparisons, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = GOBP.list,
+                                           minSize = 10,
+                                           filtered.dt[contrast == contOI][!is.na(diffScore), setNames(diffScore, gene)],
+                                           scoreType = "std")
+         
+         setorder(sea.out, pval)
+         sea.out[, contrast := contOI]
+       }) |> rbindlist()
+
+hkcasea <- lapply(hkca.comparisons, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = GOBP.list,
+                                           minSize = 10,
+                                           filtered.dt[contrast == contOI][!is.na(diffScore), setNames(diffScore, gene)],
+                                           scoreType = "std")
+         
+         setorder(sea.out, pval)
+         sea.out[, contrast := contOI]
+       }) |> rbindlist()
+
+# interactor set
+intsea <- lapply(interactor.contrasts, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = GOBP.list,
+                                           minSize = 10,
+                                           filtered.dt[contrast == contOI][!is.na(diffScore), setNames(diffScore, gene)],
+                                           scoreType = "std")
+         
+         setorder(sea.out, pval)
+         sea.out[, contrast := contOI]
+       }) |> rbindlist()
+```
+
+take the gsea results, look at the pairwise or lps contrasts and plot
+Then retry with the LFC ranking 
+
+
+
+scatterplots of GO enrichment in each of the conditions/contrasts
+Ask Qs about experimental set-up; v low variability are these cells in different stages of the cell-cycle?
+
+
+
+
+*not used*
+test ggbreak... looks terrible, leave as is
+
+```{r}
+
+"#440154FF" "#482878FF" "#3E4A89FF" "#31688EFF" "#26828EFF" "#1F9E89FF" "#35B779FF" "#6DCD59FF" "#B4DE2CFF" "#FDE725FF"
+test.dt <- filtered.dt[contrast == 'dEX11_LPS-WT_LPS']
+
+viridis(10)
+g <-  ggplot(test.dt, aes(y=-log10(plotPAdj), x=log2FoldChange, colour = sig, label=gene)) +
+    geom_hline(yintercept = -log10(0.05), linetype='dashed', alpha=0.5) +
+    geom_vline(xintercept = c(-1,1), linetype='dashed', alpha=0.5) +
+    geom_point(size=1) +
+  #  ggrepel::geom_text_repel(data=test.dt[sig != 'not',][-log10(plotPAdj) > 200,], max.iter = 1000, 
+  #                           max.overlaps = 20, size=2.5, segment.alpha=.5, segment.linetype='dashed') +
+    labs(title='', y=expression(-log[10] ~' adj.pvalue'))  +
+    scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    theme_classic()
+
+  g1 <- g + scale_y_break(breaks= c(30,30), scales='free')
+   # scale_y_break(breaks= c(20,200))
+  
+print(g)
+
+```
+
+Large LFC protein profiles; take a 
+```{r}
+
+# look at anythinfg with an lfc > 5 and just check the profile
+genes.oi <- old.comb.dt[abs(log2FoldChange) > 5 & adj.pvalue < 0.05, unique(gene)]
+#
+submat <- counts.mat[rownames(counts.mat) %in% genes.oi & rownames(counts.mat) %in% goodGenes,]
+
+
+missingRows <- apply(submat, 1, function(x){sum(x == 0)}) %>% 
+  data.table(gene = names(.),
+             count=.)
+
+row_ha <- rowAnnotation(naCount = ifelse(apply(submat, 1, function(x){sum(x >= 10)}) > 2, 'good', 'bad'), col=list(naCount=c('good'='red', 'bad'='navy')))
+
+
+hm <- Heatmap(log2(submat+1),
+              column_split = list(#tstrsplit(colnames(submat), '_', keep=1, '_'),
+                                  tstrsplit(colnames(submat), '_', keep=2, '_'),
+                                  tstrsplit(colnames(submat), '_', keep=1, '_')),
+              column_title_gp = gpar(fontsize=10, fontface='bold'),
+              col=viridis(25), 
+              cluster_columns = F,
+              right_annotation = row_ha,
+              row_title = paste0(nrow(submat), ' genes'),
+             # col = colorRamp2(colors=redbluColpal, breaks=c(4,2,0,-2,-4)),
+              column_names_gp = gpar(fontsize=7),
+              name='log2 counts',
+              border=T,
+              show_row_names = F)
+hm
+BackupAsPDF(hm, 'largeLFC.genes.heatmap')
+```
+
+```{r}
+reduceLFCsig <- old.comb.dt[sig != 'not' & !gene %in% genes.oi, unique(gene)]
+
+submat <- counts.mat[rownames(counts.mat) %in% reduceLFCsig,]
+
+hm <- Heatmap(log2(submat+1),
+              column_split = list(#tstrsplit(colnames(submat), '_', keep=1, '_'),
+                                  tstrsplit(colnames(submat), '_', keep=2, '_'),
+                                  tstrsplit(colnames(submat), '_', keep=1, '_')),
+              column_title_gp = gpar(fontsize=10, fontface='bold'),
+              col=viridis(25), 
+              cluster_columns = F,\
+              
+              #right_annotation = row_ha,
+              row_title = paste0(nrow(submat), ' genes'),
+             # col = colorRamp2(colors=redbluColpal, breaks=c(4,2,0,-2,-4)),
+              column_names_gp = gpar(fontsize=7),
+              name='log2 counts',
+              border=T,
+              show_row_names = F)
+hm
+```
+

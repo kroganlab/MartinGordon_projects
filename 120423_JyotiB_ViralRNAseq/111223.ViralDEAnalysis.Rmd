@@ -1,0 +1,201 @@
+---
+title: "111223.ViralDEAnalysis"
+author: "Martin Gordon"
+date: "2023-12-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Differential Expression Analysis of Viral Strains
+
+currently have:
+bam file with N mapped reads to viral segments using idxstat
+quant.sf but no viral sequences contained within... gene_id (ensembl identifier) missing from gtf so dropped
+
+Quantification step
+----
+issue is with the RSEM refernece index generation for the transcriptome; seems it searched for ensembl ids to build reference idx and then threw out the viral segments with no ensembl ids...
+Options: see if there is an option with the pipeline to build the reference idx and use directly, or else use featureCounts etc. to map directly to this and count.
+
+
+Takehome:
+---
+Issue is I didnt create the STAR indices prior to the run and enforce use of specific indx
+To continue, just take the gff file and the mapped bam files and run featureCounts to get counts per segment.. simplier quick-fix
+use unstranded option for featureCounts
+use unstran
+
+12/12/23
+---
+Rerun the quantification and summarised counts using featureCount
+Import the individual datasets, extracts cols needed, merge by geneName and import into DESeq2
+
+Read in packages 
+```{r load-packages, message=FALSE, warning=FALSE, echo=TRUE}
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(tximport)
+library(DESeq2)
+library(ashr) #adaptive shrinkage estimator to improve lFC estimates in DESEq2
+library(apeglm)
+library(IHW) # Independent Hypothesis Weighting 
+library(ComplexHeatmap)
+library(stringr)
+
+
+library(genefilter) # not available 
+
+# annotations
+#library(biomaRt)
+
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+```
+
+prepare sample metadata
+```{r}
+path <- 'output'
+
+input <- dir(path=path, pattern = "*quant.sf$", recursive = T, full.names = TRUE) %>% 
+  data.table() %>% 
+  setnames('.', 'path') %>% 
+  .[, file.names := gsub("output/(brisbane|victoria).host.quant/|.quant.sf", "", path) ] %>% 
+  .[, hybrid.genome := str_extract(file.names, '(brisbane|victoria).host')]
+
+
+# add metadata
+input[, condition := str_extract(file.names, '(Brisbane|Victoria|Mock)' ) ]
+input[, biorep := str_extract(file.names, '[123]{1}(?=.(victoria|brisbane).host)')] #positve lookahead to extract final int before *.host prefix
+input[, timepoint := str_extract(file.names, '(0|3|6|12|24){1}(?=_[123]{1}.(victoria|brisbane).host)')] #positve lookahead to extract final int before *.host prefix
+
+# create contrast groups
+input[, group := paste0(condition,'_', timepoint)]
+
+# seprate groups based on alignment genome
+input.list <- split(input, input$hybrid.genome)
+```
+
+read in the featureCounts data 
+
+
+```{r}
+path <- 'output'
+
+input <- dir(path=path, pattern = "*featureCounts.txt$", recursive = T, full.names = TRUE) %>% 
+  data.table() %>% 
+  setnames('.', 'path') %>% 
+  .[, file.names := gsub("output/(brisbane|victoria).host.featureCounts/|.featureCounts.txt", "", path) ] %>% 
+  .[, hybrid.genome := str_extract(path, '(brisbane|victoria).host')]
+
+```
+read in all the datatables, tidy and collapse
+
+```{r}
+# read in all files
+input.list <- lapply(input$path, function(x){
+  x.dt <- fread(x) %>%  data.table()
+  x.dt <- x.dt[, .SD, .SDcols=c(1,6,7)]
+})
+
+# now colbind the dts, by geneID and length cols
+merge.dts <-  function(x,y,byCols){
+  
+  merge.dt <- merge(x=x, y=y, by=byCols)
+  return(merge.dt)
+}
+
+
+#
+lapply(input.list, head)
+
+merge.dts(input.list[[1]], input.list[[2]], byCols = c('Geneid', 'Length'))
+
+input.list[[2]]
+```
+
+
+
+
+Not needed
+-----
+need file names as rownames for the metadata so convert to tibble
+```{r}
+input.list <-  lapply(input.list, function(x){
+  
+  x <- as.tibble(x) %>% 
+    column_to_rownames('file.names')
+  
+  rownames(x) <-  gsub('[.](brisbane|victoria).host' ,'', rownames(x))
+  return(x)
+})
+
+```
+read in the txt2gene output
+-----
+Issue here is salmon has discarded the viral references for quantification
+look for gene segments belonging to the viral genomes, if absent, add rows to txt2gene for Influneza 
+Issue here... our txt2gene file only contains reads mapped to virus...
+
+lets look at one of the quant.sf files and try extract reads mapping to non-human
+Seems here that each of the outpu salmon quant files only map to human reads...
+Can see from our bam file output that we also have counts mapped to each viral segment
+
+Lets return to the STAR alignment output and see if we can identify a file with the viral mapped reads retained
+
+
+```{r}
+vic.txt2g <- fread('./output/victoria.host.quant/victoria.host_salmon_tx2gene.tsv', col.names = c('transcript', 'gene', 'symbol')) 
+bris.txt2g <- fread('./output/brisbane.host.quant/brisbane.host_salmon_tx2gene.tsv') 
+
+vic.txt2g[]
+colnames(nf.txt2g) <- c('transcript', 'gene', 'symbol')
+
+vic.txt2g[grep('ENSG', gene, invert=T)]
+
+
+test.quant <-  fread('./output/victoria.host.quant/Victoria_24_1.victoria.host.quant.sf')
+dim(test.quant) # 229486 transcript IDs identified
+
+
+test.quant[, grep('ENST', Name, invert=T)] %>%  length()
+
+test.quant
+```
+```{bash}
+head ./output/victoria.host.quant/victoria.host_salmon_tx2gene.tsv
+```
+
+
+
+read in txt2gene from output
+```{r}
+# txt2gene from nf pipeline run - no lost transcripts
+nf.txt2g <- read_tsv('./output/star_salmon/salmon_tx2gene.tsv', col_names = F) 
+nf.txt2g
+colnames(nf.txt2g) <- c('transcript', 'gene', 'symbol')
+```
+
+Summarising transcript level abundances to the gene level using tximport
+
+```{r tximport-txt2gene}
+txi_files <- input$path
+names(txi_files) <- input$file.names
+
+#tximport: convert transcript level abundances to gene
+txi <- tximport(files = txi_files, type = "salmon", tx2gene = nf.txt2g) 
+
+# safety check; assert that col in txi match order and rownames in metadata table. # TRUE
+all(rownames(sample_meta) == colnames(txi[["counts"]])) 
+```
+
+
+```{r}
+View(input)
+input <- dir(path=path, pattern = "*.host.quant/*quant.sf$", recursive = T, full.names = TRUE)
+```
+

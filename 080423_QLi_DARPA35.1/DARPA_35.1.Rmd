@@ -1,0 +1,940 @@
+---
+title: "DARPA35.1"
+author: "Martin Gordon"
+date: "2023-08-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## DARPA 35.1 
+
+Time series analysis MOR receptor
+(T0,T1,T15,T30)
+Quick QC of the data, run the timeseries analysis, return heatmaps and enrichment etc (enrichment TODO - does it make sense to do enrichment with a timeseries analysis?)
+Compare with DAMGO (DAR30)? Speak to Ben; maybe just an UPset or venn diagram of sig hits
+Check with only 4 timepoints for significant changes? (ask ben)
+Touch base with Ben Monday; for now just complete ananlysis
+
+
+```{r packages}
+library(data.table)
+library(MSstats)
+library(ggplot2)
+library(magrittr)
+library(circlize)
+library(ComplexHeatmap)
+library(parallelDist) #needed for some custom enrichment functions
+library(ggvenn)
+library(randomcoloR)
+library(RColorBrewer)
+library(stringr)
+
+#source Bens utility scripts
+source ("/Users/martingordon/Documents/utils/bp_utils/MS_ModelFitting_TimeSeries.R")
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+```
+
+
+
+# Loaad spec
+
+```{r}
+#spec <- fread ("/Users/ben/Box/DAR031/20230322_DAR31_MSstats_Report.xls")
+spec <- fread ("./data/20230802_212344_DAR35.1_EXc_dirDIA_AllRuns_MSStatsFormatReport.tsv")
+```
+
+```{r}
+head(spec)
+mean (log2(spec$Intensity))
+sd(log2(spec$Intensity))
+
+unique(spec$Condition)
+```
+
+Again a left hand side shoulder, seems there is imputation for this data
+
+```{r}
+hist(log2(spec$Intensity), breaks = 100)
+
+
+g <- ggplot(spec, aes(x=log2(Intensity), fill=Condition)) + 
+  geom_histogram(bins=100) + 
+  facet_wrap(~Condition) 
+
+g
+
+BackupAsPDF(g, '.conditions.histogram.')
+
+
+```
+Still seems to be a linear relationship between data 
+Remove noise
+```{r}
+wide <- dcast(spec, ProteinName+PeptideSequence+PrecursorCharge~Condition+BioReplicate, value.var = "Intensity")
+
+ggplot (wide, aes (x =log2(MOR_00_1), y = log2(Z28_01_1))) + geom_point(shape = ".") + geom_density_2d() + coord_fixed()
+```
+
+```{r}
+hist(log2(spec$Intensity), breaks = 100)
+spec <- spec[Intensity > 2^4,]
+```
+```{r}
+g <- ggplot(spec, aes(x=log2(Intensity), fill=Condition)) + 
+  geom_histogram(bins=100) + 
+  facet_wrap(~Condition) 
+
+g
+
+BackupAsPDF(g, '.conditions.clean.histogram.')
+```
+What are these shoulders? Seems imputation is turned on
+Not a lot of proteins recovered it seems..
+
+```{r}
+wide <- dcast(spec, ProteinName+PeptideSequence+PrecursorCharge~Condition+BioReplicate, value.var = "Intensity")
+
+ggplot (wide, aes (x =log2(MOR_00_1), y = log2(Z28_01_2))) + geom_point(shape = ".") + geom_density_2d() 
+
+```
+
+Counts per condition
+need to drop Z28_01.1 & Z28_05.3
+
+```{r, fig.width = 10, fig.height = 5}
+numColors <- length(unique(spec$Condition))
+rColors <- randomcoloR::distinctColorPalette(numColors) 
+p <- ggplot (spec, aes (x = interaction(BioReplicate, Condition), fill = Condition)) + geom_bar()  + scale_fill_manual(values = rColors) + theme_bw() + rotate.x.axis.text
+BackupAsPDF(p, "SpectronautRowCounts.")
+```
+
+```{r, fig.width = 10, fig.height = 4}
+p <- ggplot (spec[, .(numFeatures = length(unique(paste0(PeptideSequence, PrecursorCharge)))), by =.(BioReplicate, Condition)], 
+        aes (x = interaction(BioReplicate, Condition), y= numFeatures, fill = Condition)) +
+  geom_col() +
+  theme_bw() +
+  scale_fill_manual(values = rColors)  +
+  rotate.x.axis.text
+p
+BackupAsPDF(p, "FeatureCounts.")
+
+```
+Just drop these two samples
+
+```{r}
+drop.cols <- c('Z28_01.1', 'Z28_05.3')
+spec <- spec[!paste0(Condition,'.',BioReplicate) %chin% drop.cols,]
+
+
+g <- ggplot(spec, aes(x=paste0(Condition, '.', BioReplicate), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot()  +
+  scale_fill_manual(values = rColors)  +
+  rotate.x.axis.text
+
+BackupAsPDF(g, 'feature.intensity.boxplots.')
+```
+
+
+
+## PCA, features
+```{r}
+featureMat <- dcast (spec[!Condition %in% c("Cyto")],
+                     paste0(PeptideSequence, PrecursorCharge)~Condition+BioReplicate, value.var = "Intensity") |> as.matrix(rownames = "PeptideSequence")
+
+featureMat <- featureMat[complete.cases(featureMat), ]
+```
+Festure Intensity boxplots
+
+```{r}
+
+g <- ggplot(spec, aes(x=paste(Condition, BioReplicate), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+
+BackupAsPDF(g, '.boxplots.intensity.')
+```
+
+
+
+```{r}
+boxplot(log2(featureMat))
+```
+
+
+
+```{r}
+pcaOut <- prcomp(t(log2(featureMat)))
+
+colInfo <- data.table(colname = colnames(featureMat))
+colInfo
+colInfo[,c("treat", "time", "rep") := tstrsplit(colname, "[_.]", keep = c(1,2,3)) ] # v useful fucntion
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = time, shape = treat)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA.Complete.Features")
+
+```
+
+Difficult to discern pattern here.. lets color points by timepoint, treatment and bio rep seperately to see if we can identify patterns
+No obvious trends with timepoint
+Second PC seems to broadly seperate batch (assuming this is bioreplicate)
+
+```{r}
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = time, shape = treat)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+ # scale_color_brewer(type = "seq", palette = "Reds") +
+  scale_shape_manual(values = 21:25) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA.complete.Features.time.")
+```
+
+
+
+# protein summarization:
+10/08/23 added cyto back in for merging for location coefficients
+
+```{r}
+
+#mssInput <- specFileToCompleteMSstats(spec[!Condition %in% c("Cyto", "Endo", "GalT", "LAMP1", "LAMTOR1", "PM")])
+#mssInput[, IsotopeLabelType := 'L']
+
+
+mssInput <- specFileToCompleteMSstats(spec)
+mssInput[, IsotopeLabelType := 'L']
+
+```
+
+```{r}
+dp.out<- MSstats::dataProcess(setDF(mssInput), MBimpute =  FALSE, featureSubset = "highQuality", remove_uninformative_feature_outlier = TRUE)
+```
+
+```{r}
+fwrite (dp.out$ProteinLevelData, ScriptAndDatedFileName("ProteinLevelData.wCyto.csv"))
+fwrite (dp.out$FeatureLevelData, ScriptAndDatedFileName("FeatureLevelData.wCyto.csv.gz"))
+```
+
+
+```{r}
+protQuant <- fread ("./DARPA_35.1_data/2023_08_10_ProteinLevelData.wCyto.csv")
+```
+
+
+```{r}
+prot.mat <- dcast (protQuant, Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+```
+
+PCA at protein level
+
+```{r}
+nrow(prot.mat)
+prot.mat <- prot.mat[complete.cases(prot.mat),]
+nrow(prot.mat)
+```
+
+No clear trend on time
+```{r}
+pcaOut <- prcomp(t(prot.mat))
+
+colInfo <- data.table(colname = colnames(prot.mat))
+colInfo[,c("treat", "time", "rep") := tstrsplit(colname, "[_.]", keep = c(1,2,3)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = time, shape = treat)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+BackupAsPDF(p, "PCA.complete.proteins.time.")
+
+```
+Seems to be some clustering according to biorep... lets look at protein intensity boxplots and clustering to see if renormalisation needed...
+```{r}
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = rep, shape = treat)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, "PCA.complete.proteins.biorep.")
+```
+
+Boxplots. Renormalise the data 
+```{r}
+
+ggplot(protQuant, aes(x=paste0(GROUP,'.', SUBJECT), y=LogIntensities, fill=GROUP)) +
+  geom_boxplot() + 
+  theme(
+    axis.text.x = element_text(angle=90)
+  )
+```
+`
+
+# renormalize using TMP
+Find the TMP offset  and subtract logIntensities
+
+```{r}
+prot.mat <- dcast (protQuant, Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+
+#perform tmp normalisation
+tmp <- medpolish(prot.mat, na.rm = TRUE) #iteratively subtract row and col median values 
+tmp.dt <- data.table(offset = tmp$col, group_subject = names(tmp$col))
+
+protQuant[,group_subject := paste0(GROUP,'_',SUBJECT)]
+protQuant[tmp.dt, normalize.offset := i.offset, on = 'group_subject']
+protQuant[, LogIntensities := LogIntensities - normalize.offset]
+
+
+head(prot.mat)
+
+fwrite(protQuant, ScriptAndDatedFileName("ProteinLevelData.tmpnorm.wCyto.csv"))
+```
+
+Boxplots. Renormalise the data 
+```{r}
+
+g <- ggplot(protQuant, aes(x=paste0(GROUP,'.', SUBJECT), y=LogIntensities, fill=GROUP)) +
+  geom_boxplot() + 
+  theme(
+    axis.text.x = element_text(angle=90)
+  )
+
+BackupAsPDF(g, 'protein.intensity.tmpnorm.boxplots.')
+```
+Look at PCA again fter renormalisation
+
+```{r}
+prot.mat <- dcast (protQuant, Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+prot.mat <- prot.mat[complete.cases(prot.mat),]
+
+pcaOut <- prcomp(t(prot.mat))
+
+colInfo <- data.table(colname = colnames(prot.mat))
+colInfo[,c("treat", "time", "rep") := tstrsplit(colname, "[_.]", keep = c(1,2,3)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = time, shape = treat)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA.complete.proteins.tmpnorm.time")
+
+```
+Generate heatmaps
+Colored by treatment, timepoint.. more breakdown by timepoint & biorep (batch 3 clusters)
+
+```{r}
+
+clusterwithNA <- function(x, val=0,...){
+  x[is.na(x)] <- val
+  hclust(dist(x),...)
+}
+
+
+subMat <- prot.mat[sample(rownames(prot.mat), size=3000),]
+
+type <-str_extract(colnames(subMat),"(?<=_)[0-9]{1}$") #pos lookbehind modify as needed 
+
+#ha <- HeatmapAnnotation(grp = type, annotation_name_side = "right", col= list(grp = c('MOR_00'='red', 'Z28_01' = 'blue', 'Z28_05'='green', 'Z28_10'='orange', 'Z28_30'='cyan', 'Z47_01'='purple', 'Z47_05'='yellow',  "Z47_10"='pink', 'Z47_30'='darkgrey')))
+#ha <- HeatmapAnnotation(grp = type, annotation_name_side = "right", col= list(grp = c('00'='red', '01' = 'blue', '05'='green', '10'='orange', '30'='cyan')))
+
+ha <- HeatmapAnnotation(grp = type, annotation_name_side = "right", col= list(grp = c('0'='red', '1' = 'blue', '2'='green', '3'='orange')))
+
+  #generate heatmap
+hm <- Heatmap(subMat,
+        top_annotation = ha,
+        cluster_rows = clusterwithNA(subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(subMat)),
+        na_col = 'grey',
+       # column_title = paste0(' heatmap'),
+        name = "Log2 Int.")
+hm
+
+
+
+BackupAsPDF(hm, '.logints.biorep.heatmap.')
+```
+median sweep and visualise
+
+```{r}
+scaled.mat <- sweep(prot.mat, 1, FUN='-',apply(prot.mat,1, median, na.rm=T))
+
+
+subMat <- scaled.mat[sample(rownames(scaled.mat), size=3000),]
+
+
+type <- sub("_[0-9]{1}$", "", colnames(subMat)) #grp
+#type <- str_extract(colnames(subMat),"(?<=_)[0-9]{2}") #time
+#type <-str_extract(colnames(subMat),"(?<=_)[0-9]{1}$") #rep pos lookbehind modify as needed 
+#type <-sub("_[0-9]{2}_[0-9]{1}$", "", colnames(subMat)) #treat 
+
+
+#ha <- HeatmapAnnotation(grp = type, annotation_name_side = "right", col= list(grp = c('00'='red', '01' = 'blue', '05'='green', '10'='orange', '30'='cyan')))
+ha <- HeatmapAnnotation(grp = type, annotation_name_side = "right", col= list(grp = c('MOR_00'='red', 'Z28_01' = 'blue', 'Z28_05'='green', 'Z28_10'='orange', 'Z28_30'='cyan', 'Z47_01'='purple', 'Z47_05'='yellow',  "Z47_10"='pink', 'Z47_30'='darkgrey')))
+
+  #generate heatmap
+hm <- Heatmap(subMat,
+        top_annotation = ha,
+        cluster_rows = clusterwithNA(subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(subMat)),
+        na_col = 'grey',
+       # column_title = paste0(' heatmap'),
+        name = "Log2 Int.")
+hm
+
+
+BackupAsPDF(hm, 'scaled.logints.sample.heatmap.')
+```
+## what do the known-background protein intensities look like:
+
+This section is only relevant for an APEX dataset.  APEX works by labeling neighboring/interacting proteins with biotin which is then used to purify labeled proteins. There are also proteins that are endogenously biotinylated which will co-purify with the APEX-labeled proteins.  Here we look at a subset of these endogenous biotin proteins, and we inspect their post-normalization background levels, which are inversely related to the labeling-efficiency of APEX.  More background after normalization implies there is less APEX-labeled signal.
+
+```{r, fig.width = 10, fig.height = 4}
+biotin.carboxylases.up <- c("O00763","P05165","P11498","Q13085","Q96RQ3")
+
+p <- ggplot(protQuant[Protein %in% biotin.carboxylases.up], aes (x = interaction ( SUBJECT, GROUP ), y = LogIntensities, color = Protein)) + geom_line(aes(group = Protein)) + geom_point(aes(shape = as.factor(SUBJECT))) +
+  #geom_text(data = protQuant[Protein %in% c("O00763")], aes(label = paste0(GROUP, ".", SUBJECT), size = paste0(GROUP, "_", SUBJECT) %in% problemRuns)) +
+  rotate.x.axis.text
+
+p
+BackupAsPDF(p, "BiotinCarboxylaseLevels.")
+
+```
+Request genes of interest,
+Seems to be some increase in Z47 relative to 
+
+```{r}
+
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+protQuant[, c("drug", "time") := tstrsplit(GROUP, "_")]
+
+p <- ggplot(protQuant[gene %in% c("ARRB2", "EEA1", "EYA4", "SNX3", "FBXW11;BTRC", 'WASHC4') & drug != "MOR"], 
+            aes (x = time, y = LogIntensities, color = as.factor(SUBJECT))) + 
+  geom_line(aes(group = as.factor(SUBJECT))) + 
+  geom_point(aes(shape = as.factor(SUBJECT))) +
+  rotate.x.axis.text +
+  facet_grid(gene~drug, scales= "free_y") +                                                              # Change font size
+  theme(strip.text.x = element_text(size = 8),
+        strip.text.y = element_text(size = 5))
+
+BackupAsPDF(p, 'genesOI.linegraph')
+```
+Plotting MORIPs 
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3695902/
+CSN5, AUP1, (SIAH1 and SIAH2),DOK4,DOK5, RanBP9, Kv5.1, VAPA or VAP33, WLS, pACT
+Share when we get a better list of things
+
+```{r}
+mor.ip <- c('CSN5', 'AUP1', 'SIAH1', 'SIAH2','DOK4','DOK5', 'RanBP9', 'Kv5.1', 'VAPA','VAP33', 'WLS', 'pACT')
+
+p <- ggplot(protQuant[gene %in% mor.ip & drug != "MOR"], 
+            aes (x = time, y = LogIntensities, color = as.factor(SUBJECT))) + 
+  geom_line(aes(group = as.factor(SUBJECT))) + 
+  geom_point(aes(shape = as.factor(SUBJECT))) +
+  rotate.x.axis.text +
+  facet_grid(gene~drug, scales= "free_y") +                                                              # Change font size
+  theme(strip.text.x = element_text(size = 8),
+        strip.text.y = element_text(size = 5))
+
+p
+#BackupAsPDF(p, 'MORIP.linegraph')
+```
+Create a new T0 condition for both agonists using 
+
+```{r}
+protQuant <- fread('DARPA_35.1_data/2023_08_04_ProteinLevelData.tmpnorm.csv')
+
+# rename and add back to prot.Quant
+# duplicating; check that ther eis not an issue with this with the algorithm
+Z28_0 <-  protQuant[GROUP == 'MOR_00', ] %>% .[,GROUP := "Z28_00"]
+Z47_0 <-  protQuant[GROUP == 'MOR_00',] %>%  .[,GROUP := "Z47_00"]
+
+p.quant.merge <- Reduce(rbind,(list(protQuant, Z28_0,Z47_0))) %>% 
+  .[GROUP != 'MOR_00',] %>% 
+  .[order(GROUP)]
+
+p.quant.merge[, unique(GROUP) ]
+```
+
+# fit cubic time courses
+
+```{r}
+
+p.quant.merge[, c("drug", "timeStr") := tstrsplit(GROUP, "_")]
+p.quant.merge[, SUBJECT := sprintf ("batch.%d", SUBJECT)]
+p.quant.merge[, rankTime := as.integer(as.factor(timeStr))] #timeranked to 0-5
+p.quant.merge[, .(timeStr, rankTime)] %>% unique() #timepoint to time rank 
+
+allDrugs <- sort(unique(p.quant.merge$drug))
+names(allDrugs) <- allDrugs
+
+allDrugs
+
+#run timeseires analysis for each drug
+
+out.list <- lapply(allDrugs, function(d) nicePolyFits.fullTable(p.quant.merge[drug == d], splitColumn = "Protein", polyColumn = "rankTime", yColumn = "LogIntensities", otherTerms = "SUBJECT"))
+```
+
+
+```{r}
+allFits <- rbindlist(out.list, idcol = "drug")
+
+allFits[, adj.pvalue := p.adjust(pvalue, method = "BH"), by = drug]
+allFits[, gene := multiUniprots2multiGenes(Protein)]
+
+```
+
+Volcano plots
+
+```{r}
+
+allFits[, sig := "not"]
+allFits[abs(log2FC) > log2(1.5) & adj.pvalue < 0.05, sig := ifelse(log2FC > 0, "up", "down")]
+
+g <- ggplot (allFits, aes(x = log2FC, y = -log10(adj.pvalue), color = sig)) + scale_color_manual(values = c(not = "gray", up = "red", blue = "down")) + geom_point() + facet_wrap(~drug) + coord_cartesian(c(-10,10)) +
+  ggrepel::geom_text_repel(aes(label = gene))
+
+BackupAsPDF(g, 'volcanoplots.t0-t30')
+
+range (allFits$log2FC, na.rm = TRUE)
+```
+
+```{r}
+fwrite(allFits, ScriptAndDatedFileName("allFits.csv"))
+```
+
+Not significant...
+```{r}
+allFits[gene == "ARRB2"]
+```
+
+
+
+```{r, fig.height = 5, fig.width = 6}
+allFits <- fread('./DARPA_35.1_data/2023_08_04_allFits.csv')
+
+allFits[, sig := "not"]
+allFits[abs(log2FC) > log2(1.5) & pvalue < 0.01, sig := ifelse(log2FC > 0, "up", "down")]
+allFits[, gene := multiUniprots2multiGenes(Protein)]
+
+p <- ggplot (allFits, aes(x = log2FC, y = -log10(pvalue), color = sig)) + scale_color_manual(values = c(not = "gray", up = "red", down = "blue")) + geom_point(show.legend = FALSE) + facet_wrap(~drug, ncol = 1) + coord_cartesian(xlim = c(-10, 10)) +
+  ggrepel::geom_text_repel(data = allFits[sig %in% c("up", "down")], aes(label = gene), show.legend = FALSE, size = 2, max.overlaps = 20) +
+  theme_bw()
+p
+
+BackupAsPDF(p, 'volcanoplots.t0-t30.pval<0.01')
+
+
+```
+
+
+```{r, fig.width = 6, fig.height = 10}
+
+sigProteins <- allFits[sig != "not", Protein]
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProteins], gene~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "gene")
+hm <- Heatmap (prot.mat, cluster_rows = T, cluster_columns = FALSE, row_names_gp  = gpar(fontsize= 5), column_split = tstrsplit(colnames(prot.mat), "_")[[1]])
+hm
+
+BackupAsPDF(hm, 'logIntensitiy.heatmap.t0-t30.pval<0.01', dim=c(7,12))
+
+
+protQuant
+```
+
+```{r, fig.width = 6, fig.height = 6}
+numMissing <- rowSums(is.na(prot.mat))
+numMissing
+prot.mat <- prot.mat[numMissing < ncol(prot.mat)/2,]
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat,1, median, na.rm = TRUE))
+
+hm <- Heatmap (prot.mat, cluster_rows = TRUE, cluster_columns = FALSE, row_names_gp  = gpar(fontsize= 4), column_split = tstrsplit(colnames(prot.mat), "_")[[1]], name = "log2 vs Median")
+hm
+BackupAsPDF(hm, 'log2vssmedian.heatmap.scaled.t0-t30.pval<0.01', dim=c(7,12))
+```
+
+
+Just generate heatmap of the upregulated genes
+
+```{r}
+sigProteins <- allFits[sig == "up", Protein]
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProteins], gene~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "gene")
+hm <- Heatmap (prot.mat, cluster_rows = T, cluster_columns = FALSE, row_names_gp  = gpar(fontsize= 5), column_split = tstrsplit(colnames(prot.mat), "_")[[1]])
+hm
+
+BackupAsPDF(hm, 'logIntensitiy.upreg.heatmap.t0-t30.pval<0.01', dim=c(7,12))
+
+```
+```{r, fig.width = 6, fig.height = 6}
+numMissing <- rowSums(is.na(prot.mat))
+
+prot.mat <- prot.mat[numMissing < ncol(prot.mat)/2,]
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat,1, median, na.rm = TRUE))
+
+hm <- Heatmap (prot.mat, cluster_rows = TRUE, cluster_columns = FALSE, row_names_gp  = gpar(fontsize= 4), column_split = tstrsplit(colnames(prot.mat), "_")[[1]], name = "log2 vs Median")
+hm
+BackupAsPDF(hm, 'log2vssmedian.upreg.heatmap.scaled.t0-t30.pval<0.01', dim=c(7,12))
+```
+
+Log2FC heatmap of genes
+
+```{r}
+sig.genes <- allFits[sig != "not",gene]
+
+ms.mat <- allFits %>% 
+  dcast(gene~drug, value.var = 'log2FC') %>% 
+  as.matrix(rownames='gene')
+
+ms.mat <- ms.mat[rownames(ms.mat) %in% sig.genes,]
+
+hm <- Heatmap (ms.mat, cluster_rows = cluster.w.NA(ms.mat), cluster_columns = FALSE, row_names_gp  = gpar(fontsize= 4), column_split = tstrsplit(colnames(ms.mat), "_")[[1]],  width = ncol(ms.mat)*unit(20, "mm"), name = "log2FC")
+hm
+BackupAsPDF(hm, 'log2FC.heatmap.pval<0.01', dim=c(7,12))
+
+
+```
+Remove gene names and collapse replicates
+
+```{r}
+sigProteins <- allFits[sig == "up", Protein]
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+
+protQuant[, mean.LogIntensities := mean(LogIntensities, na.rm=T), by=.(Protein,GROUP)]
+protQuant[is.na(mean.LogIntensities), mean.LogIntensities := mean.LogIntensities, by=.(Protein,GROUP)]
+
+
+prot.mat <- dcast (protQuant[Protein %in% sigProteins], gene~GROUP+SUBJECT, value.var = "mean.LogIntensities") |> as.matrix(rownames = "gene")
+prot.mat <- prot.mat[complete.cases(prot.mat),]
+
+colnames(prot.mat) <- sub("_[0-3]{1}$", '', colnames(prot.mat))
+# subset the matrix to remove dup rows
+duplicated.columns <- duplicated(t(prot.mat))
+prot.mat <- prot.mat[, !duplicated.columns]
+
+
+hm <- Heatmap (prot.mat, cluster_rows = cluster.w.NA(prot.mat), cluster_columns = FALSE, width = ncol(prot.mat)*unit(6, "mm"), height = nrow(prot.mat)*unit(1.1, "mm"),row_names_gp  = gpar(fontsize= 4), column_split = tstrsplit(colnames(prot.mat), "_")[[1]], name = "log2 Intensity")
+hm
+BackupAsPDF(hm, 'heatmap.grp.mean.logintensities.long')
+
+
+```
+Also perform a median sweep plot
+
+```{r}
+sigProteins <- allFits[sig == "up", Protein]
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+
+protQuant[, mean.LogIntensities := mean(LogIntensities, na.rm=T), by=.(Protein,GROUP)]
+protQuant[is.na(mean.LogIntensities), mean.LogIntensities := mean.LogIntensities, by=.(Protein,GROUP)]
+
+
+prot.mat <- dcast (protQuant[Protein %in% sigProteins], gene~GROUP+SUBJECT, value.var = "mean.LogIntensities") |> as.matrix(rownames = "gene")
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat,1, median, na.rm = TRUE))
+prot.mat <- prot.mat[complete.cases(prot.mat),]
+
+colnames(prot.mat) <- sub("_[0-3]{1}$", '', colnames(prot.mat))
+# subset the matrix to remove dup rows
+duplicated.columns <- duplicated(t(prot.mat))
+prot.mat <- prot.mat[, !duplicated.columns]
+
+
+hm <- Heatmap (prot.mat, cluster_rows = cluster.w.NA(prot.mat), cluster_columns = FALSE, width = ncol(prot.mat)*unit(6, "mm"), height = nrow(prot.mat)*unit(1.1, "mm"), row_names_gp  = gpar(fontsize= 4), column_split = tstrsplit(colnames(prot.mat), "_")[[1]], name = "Ints. vs median")
+hm
+BackupAsPDF(hm, 'heatmap.grp.mean.median.sweep.logintensities.long')
+```
+
+
+
+```{r}
+source ("../../bp_utils/UniprotIDMapping.R")
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+protQuant[, c("drug", "time") := tstrsplit(GROUP, "_")]
+
+
+p <- ggplot(protQuant[gene %in% c("ARRB2", "KCTD12", "EYA4", "PRKCD") & drug != "Cyto"], aes (x = time, y = LogIntensities, color = as.factor(SUBJECT))) + geom_line(aes(group = as.factor(SUBJECT))) + geom_point(aes(shape = as.factor(SUBJECT))) +
+  #geom_text(data = protQuant[Protein %in% c("O00763")], aes(label = paste0(GROUP, ".", SUBJECT), size = paste0(GROUP, "_", SUBJECT) %in% problemRuns)) +
+  rotate.x.axis.text +
+  facet_grid(gene~drug, scales= "free_y")
+
+p
+
+```
+
+Reduce size of the 
+```{r, fig.width = 5, fig.height = 6}
+source ("../../bp_utils/UniprotIDMapping.R")
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+protQuant[, c("drug", "time") := tstrsplit(GROUP, "_")]
+
+p <- ggplot(protQuant[gene %in% c("SNX3", 'KCTD12', "EEA1", "ARRB2", "EYA4", "PALD1", "WASHC4") & drug != "MOR"], aes (x = as.integer(time), y = LogIntensities, color = as.factor(SUBJECT))) + geom_line(aes(group = as.factor(SUBJECT))) + geom_point(aes(shape = as.factor(SUBJECT))) +
+  #geom_text(data = protQuant[Protein %in% c("O00763")], aes(label = paste0(GROUP, ".", SUBJECT), size = paste0(GROUP, "_", SUBJECT) %in% problemRuns)) +
+  rotate.x.axis.text +
+  facet_grid(gene~drug, scales= "free_y") +
+  guides(color='none',
+         shape='none')
+        
+
+p
+
+BackupAsPDF(p, 'log2FC.genesoi.linegraph')
+```
+
+Tables in wide format (write function?)
+
+```{r}
+allFits[, .(drug,Protein,gene,pvalue,adj.pvalue,log2FC,sig)] %>% 
+  dcast(Protein+gene~drug, value.var = c('pvalue','adj.pvalue','log2FC','sig')) %>% 
+  fwrite(ScriptAndDatedFileName("allFits.tidy.csv"))
+
+```
+
+09/08/23
+Compare these agonists with DAMGO and PZM21 
+Enrichment plots for the two anotagonists data (just compare any genes that moved up or down over time series)
+
+```{r}
+hekProt <- fread ("./data/2020_10_08_MOR_Full_DataProcess_Normalized_RunlevelData.txt.gz")
+hekProt[, gene := multiUniprots2multiGenes(Protein)]
+hekProt[, SUBJECT := sprintf("batch.%d", SUBJECT) ]
+hekProt[, GROUP := GROUP_ORIGINAL]
+hekProt[, c("receptor", "drug", "time") := tstrsplit(GROUP, "_")]
+# clean
+hekProt[drug == 'P', drug := 'PZM21']
+hekProt[drug == 'D', drug := 'DAMGO']
+
+# our data 
+protQuant <- fread('DARPA_35.1_data/2023_08_04_ProteinLevelData.tmpnorm.csv')
+#allFits <- fread('~/Documents/projects/080423_QLi_DARPA35.1/DARPA_35.1_data/2023_08_04_allFits.csv')
+protQuant[, GROUP := paste0('MOR_',GROUP)]
+protQuant[, SUBJECT := paste0('batch.', SUBJECT)]
+protQuant[, c("receptor", "drug", "time") := tstrsplit(GROUP, "_")]
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+protQuant[drug == 'MOR', drug := 'Ctrl']
+
+```
+2*2 plot per gene 
+```{r}
+comb.dt <- rbind(hekProt, protQuant, fill=T) # hekProt[GROUP %like% '_[DP]_' & gene %in% genes.oi,] 
+
+# genes of interest
+genes.oi <-c("SNX3", 'KCTD12', "EEA1", "ARRB2", "EYA4", "PALD1", "WASHC4")
+
+lapply(genes.oi,function(x){
+  
+  p = ggplot(comb.dt[gene %in% x & drug != "Ctrl" & drug != "M"], aes (x = as.integer(time), y = LogIntensities, color = as.factor(SUBJECT))) + 
+   geom_line(aes(group = as.factor(SUBJECT))) +
+   geom_point(aes(shape= as.factor(SUBJECT))) +
+   rotate.x.axis.text +
+   ggtitle(x) +
+   xlab('time') +
+   facet_wrap(~drug, scales= "free_y") +
+   
+  # guides(color='none',
+  #       shape='none') +
+  theme_bw()
+  BackupAsPDF(p, paste0(x, '.all.timepoints.linegraph.'))
+})
+
+```
+t0-t30 plots of each gene
+
+```{r}
+lapply(genes.oi,function(x){
+  
+  p = ggplot(comb.dt[gene %in% x & drug != "Ctrl" & drug != "M" & time %in% c("0","01","05","10","30")], aes (x = as.integer(time), y = LogIntensities, color = as.factor(SUBJECT))) + 
+   geom_line(aes(group = as.factor(SUBJECT))) +
+   geom_point(aes(shape= as.factor(SUBJECT))) +
+   rotate.x.axis.text +
+   ggtitle(x) +
+   xlab('time') +
+   facet_wrap(~drug, scales= "free_y") +
+  theme_bw()
+  p
+  BackupAsPDF(p, paste0(x, '.t0-t30.linegraph.'))
+})
+unique(comb.dt$time)
+  
+```
+GO enrichment heatmaps
+Regen sig column for genes threshold: abs(log2FC) > log2(0.58) & pval < 0.01 
+
+```{r}
+# read in the ts results
+allFits <- fread('~/Documents/projects/080423_QLi_DARPA35.1/DARPA_35.1_data/2023_08_04_allFits.csv')
+# regen sig 
+allFits[, sig := 'not']
+allFits[pvalue < 0.01 & log2FC > log2(.58), sig := ifelse(log2FC > 0, 'up', 'down')]
+allFits[,enrich_grp := paste0(drug,'.',sig)]
+
+
+# read in GO gmt annotation
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "UNIPROT")
+
+universe <- unique(allFits$Protein)
+enrich.dt <- enricherOnGroups(allFits[sig != 'not'], groupColumns = 'enrich_grp', geneColumn = "Protein", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'enrich_grp', topN = 10, title='GO term enrichment', 
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 5)
+
+BackupAsPDF(ht, 'go.enrich.heatmap')
+
+
+View(enricherOnGroups)
+```
+tidy version of output with sig label for pval < 0.01 & log2FC > 0.58
+
+```{r}
+allFits[, .(drug,Protein,gene,pvalue,adj.pvalue,log2FC,sig)] %>% 
+  dcast(Protein+gene~drug, value.var = c('pvalue','adj.pvalue','log2FC','sig')) %>% 
+  fwrite(ScriptAndDatedFileName("allFits.pval<0.01.tidy.csv"))
+```
+
+HEatmap of all significant genes @ pval < 0.01 and abs(log2FC) > 0.58
+Read in the results csv 
+
+```{r}
+protQuant <- fread('./DARPA_35.1_data/2023_08_04_ProteinLevelData.tmpnorm.csv')
+mss.r <- fread('./DARPA_35.1_data/2023_08_04_allFits.csv')
+
+protQuant[]
+p.mat <- protQuant %>% 
+  dcast(Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+
+
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+  
+# get list of sig genes
+mss.r[,sig :=  fcase(
+  is.na(pvalue) | is.na(log2FC) |pvalue > 0.01 | abs(log2FC) < .58, 'not',
+  pvalue < 0.01 & log2FC < -.58, 'down',
+  pvalue < 0.01 & log2FC > .58, 'up') ]
+
+sig.genes <- mss.r[sig != 'not', gene]
+
+```
+Heatmap of sig genes
+
+```{r}
+subMat <- p.mat[rownames(p.mat) %chin% sig.genes,]
+
+cluster.w.NA <- function(dat, na.val=0,...){
+  dat[is.na(dat)] <- na.val
+  hclust(dist(dat))
+}
+
+Heatmap(subMat, cluster_rows = cluster.w.NA(subMat), cluster_columns = F,row_names_gp  = gpar(fontsize= 5), column_split = tstrsplit(colnames(p.mat), "_")[[1]])
+```
+
+
+```{r}
+extra_var = c('yearID', 'teamID', 'G', 'L') # model covariates added to ERA + G
+
+#comb: generate all combinations of n elements ranging from 0 to length of extra_var
+#0L,1L etc: handled as integer not double
+
+#lapply produced a list of matrices and unlist flattens into a character vector
+models = unlist( 
+  lapply(0L:length(extra_var), combn, x = extra_var, simplify = FALSE),
+  recursive = FALSE
+)
+models
+```
+

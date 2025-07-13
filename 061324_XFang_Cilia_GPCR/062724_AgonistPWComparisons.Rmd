@@ -1,0 +1,296 @@
+---
+title: "062724_AgonistPWComparisons"
+author: "Martin Gordon"
+date: "2024-06-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+In addition to the earlier contrasts, we also need to run a PW comparison of the agonist vs w/o agonist groups
+(same background (cells) in this case, so hopefully cleaner signal?)
+
+
+Maybe todo: attach a linechart of the endogenous biotincarboxylases
+Try find more of these 
+Tidy the plots to make our point for the differential analysis
+Finish regenerating the plots
+
+```{r cars}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+library(scales)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+Run the pw comparisons
+```{r}
+p.quant <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_26_ProteinLevelQuant.renorm.csv')
+dp.out <- readRDS('./062424_PWComparisons_data/2024_06_24_dp.out.rds')
+
+f.quant <- setDT(dp.out$FeatureLevelData)
+
+p.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+p.quant[, LogIntensities := newLogInts]
+f.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+
+dp.out$FeatureLevelData <- f.quant
+dp.out$ProteinLevelData <- p.quant
+```
+
+ID mappings file 
+
+```{r}
+# lets map the homologs to the mss output and write the complete and tidied data to file 
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+```
+
+Run the comparisons w/wo agonist
+```{r}
+grep('_In', p.quant$GROUP, value=T) %>%  unique()
+
+contrasts.list <- list('+cilia_SMO_ag vs +cilia_SMO' = data.table(V1='+cilia_SMO_ag', V2='+cilia_SMO'),
+                       '+cilia_GPR161_ag vs +cilia_GPR161' = data.table(V1='+cilia_GPR161_ag', V2='+cilia_GPR161'),
+                       '+cilia_Pth2r_ag vs +cilia_Pth2r' = data.table(V1='+cilia_Pth2r_ag', V2='+cilia_Pth2r'),
+                       '+cilia_Crhr2_ag vs +cilia_Crhr2' = data.table(V1='+cilia_Crhr2_ag', V2='+cilia_Crhr2'),
+                       '+cilia_Pde8A_In vs +cilia_Pde8A' = data.table(V1='+cilia_Pde8A_In', V2='+cilia_Pde8A'),
+                       '+cilia_Pde8B_In vs +cilia_Pde8B' = data.table(V1='+cilia_Pde8B_In', V2='+cilia_Pde8B'))
+
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(p.quant$GROUP), 
+                               labels = names(contrasts.list))
+```
+
+Run the comparisons w/wo agonists
+
+```{r}
+# run msstats correcting for batch 
+mss <- groupComparison(contrast.matrix=contrasts.mat, 
+                       verbose=T,
+                       data=dp.out)
+
+mss.dt <- setDT(mss$ComparisonResult)
+```
+
+process the msstats output
+```{r}
+# write out raw results
+mss.dt[, gene := multiUniprots2multiGenes(as.character(Protein), species = 'MOUSE')]
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+mss.dt[, sig := 'not']
+mss.dt[abs(log2FC) > 0.58 & pvalue < 0.005, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+mss.dt[abs(log2FC) > 0.58 & pvalue < 0.005,]
+
+# merge with human ID table
+anno.dt <- merge(mss.dt, unique(mh_mappings[,.(SWISS_PROT_IDs.mouse, SWISS_PROT_IDs.human,Symbol.human)], by='SWISS_PROT_IDs.mouse'), by.x='Protein', by.y='SWISS_PROT_IDs.mouse', all.x=T, all.y=F)
+```
+
+Write out the cilia comparisons to file, plot quickly and generate heatmaps
+log2FC > 0.58 * pval < 0.05
+
+```{r}
+fwrite(anno.dt, ScriptAndDatedFileName('mss.pwComparisons.agonistComparisons.csv'))
+fwrite(dcast(anno.dt, gene+Protein~Label, value.var = c('log2FC','pvalue', 'p.adj')), ScriptAndDatedFileName('mss.pwComparisons.agonistComparisons.wide.csv'))
+```
+plot of N sig hits
+V low number of hits with additon of agonist... not great results...maybe I've washed out the biological signal by renormalizing?
+Need to return to the ori output and process
+
+```{r}
+g <- ggplot(mss.dt[sig != 'not', .N, by=.(sig,Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Significant hits per contrast (log2FC > 0.58 & pvalue < 0.005)') +
+  scale_fill_manual(values=c('down'=muted('blue'), 'up'=muted('red'))) +
+  ylab('Number of significant hits') +
+  xlab('Contrasts') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=9))
+g
+
+BackupAsPDF(g, 'N.sigHits.agonists.barplots',dimensions = c(8,9))
+```
+
+Heatmap of the significant hits..
+Nothing really of interest I think...
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(p.quant$GROUP)))
+
+sig.prots <- mss.dt[sig != 'not', unique(Protein)]
+
+p.mat <- dcast(p.quant, Protein~paste0(GROUP,'.', SUBJECT), value.var='newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+submat <-  sweep(p.mat, 1, apply(p.mat,1 ,median,na.rm=T))
+
+submat <- submat[rownames(submat) %in% sig.prots, grep('[-]cilia', colnames(submat), invert=T)]
+
+colnames(submat) <- gsub('[.]batch','', colnames(submat))
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+# need to adjust the column order 
+
+#make a column annotation to show the differences in the groups
+# create annotation
+ann <- data.table(group = colnames(submat))
+ann[, cilia_present := ifelse(grepl('-cilia', group), 'No', 'Yes')]
+ann[, 'agonist/inhibitor' := ifelse(grepl('_In[.][0-9]{1}$|_ag[.][0-9]{1}$', group), 'Yes', 'No')]
+ann[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$|_In[.][0-9]{1}$",'', group)]
+ann[, rep := str_extract(group, '[0-9]$')]
+
+# unique col palette
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(ann$status)))
+names(col.pal) <- unique(ann$status)   
+
+colours <- list('agonist/inhibitor' = c('Yes' = '#EE6677', 'No'='#228833'),
+                'status' = col.pal)
+   
+colAnn <- HeatmapAnnotation(df = ann[,.(status,`agonist/inhibitor_present`)], col= colours)
+
+hm <- Heatmap(submat,
+        cluster_columns=F,
+        cluster_column_slices = F,
+        border=T,
+        name='Ints/Median',
+        row_title = sprintf('%s Proteins (FC +/- 50%% & pval < 0.005)', nrow(submat)),
+        top_annotation = colAnn,
+        column_names_gp = gpar(fontsize=8),
+        column_title_gp = gpar(fontsize=10),
+        row_names_gp = gpar(fontsize=7),
+        column_split = list(ann$status))
+                            #gsub('[+-]{1}cilia_|[.][0-9]$','', colnames(submat))))
+      
+hm
+BackupAsPDF(hm, 'sigProts.agonistContrast.FC1.5.pval0.005.heatmap', dimensions=c(14,11))
+
+
+# subset of just the contrasted pairs in the analysis
+hm <- Heatmap(submat,
+        cluster_columns=F,
+        cluster_column_slices = F,
+        border=T,
+        name='Ints/Median',
+        row_title = sprintf('%s Proteins (FC +/- 50%% & pval < 0.005)', nrow(submat)),
+        top_annotation = colAnn,
+        column_names_gp = gpar(fontsize=8),
+        column_title_gp = gpar(fontsize=10),
+        row_names_gp = gpar(fontsize=7),
+        column_split = list(ann[grep('PM|ARL13b|GPR124|GPR135', colnames(submat), invert=T), status]))
+
+
+colAnn
+      
+BackupAsPDF(hm, 'sigProts.agonistContrast.samplesCompared.FC1.5.pval0.005.heatmap', dimensions=c(14,11))
+```
+volcanoplots 
+
+```{r}
+g <- ggplot(mss.dt, aes(x=log2FC, y=-log10(pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[sig != 'not'], show.legend = FALSE, size = 4, max.overlaps = 20) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  ggtitle('Agonists vs No agonist') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  facet_wrap(~Label, scales='free_x') +
+  theme_bw()
+g
+BackupAsPDF(g, 'contrasts.agonists.volcano', dimensions=c(14,14))
+```
+Run enrichment of these proteins 
+
+GO CC enrichment first
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+```
+
+```{r}
+# define the universe, the total set of identified genes in our study
+universe <- as.character(unique(p.quant$Protein))
+
+mss.dt[, enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('agonistContrasts.GO.CC.enrichments.csv'))
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('agonistContrasts.GO.CC.simplified.enrichments.csv'))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, 
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO Cellular Component', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'agonistContrast.GOCC.enrichments.heatmap', dimensions=c(10,10))
+```
+Run GO BP enrichment
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='BP', keyType='UNIPROT')
+```
+
+```{r}
+# define the universe, the total set of identified genes in our study
+universe <- as.character(unique(p.quant$Protein))
+
+mss.dt[, enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+enrich.dt
+# this is a very small set, just save the output
+# cant simplify further...
+fwrite(enrich.dt, ScriptAndDatedFileName('agonistContrasts.GO.BP.enrichments.csv'))
+```
+
+Plot pka mouse protein 
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+
+```
+

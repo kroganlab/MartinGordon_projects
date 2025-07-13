@@ -1,0 +1,1200 @@
+---
+title: "100125_ABandRNAseq_ISG&Viralplots.Rmd"
+author: "Martin Gordon"
+date: "2025-01-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Jyoti request; just plot the ISG and viral proteins/reads plots for the comparison
+
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(seqinr)
+library(readxl)
+library(DESeq2)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+
+
+getwd()
+```
+
+Read in all the files to use for the comparisons
+
+```{r}
+p.quant.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_09_merged.proteinlvldata.csv')
+mss.dt <-  fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_08_mss.pwcomparisons.ortholog.annotations.csv')
+viral.prots <- read.csv('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_08_viralproteins.csv')
+
+# pw comparisons; need to also create a cell_line column for the comparison
+deseq.dt <- list('vsMock'=fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/080824_PWcomparisons_data/2024_08_08_PWcomparisonsvsMock.postProc.csv'),
+                 'vsStrain'=fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/PWComparisonsTimepoint_data/2024_08_13_PWcomparisons.viralTimepoint.csv')) %>% 
+  rbindlist(use.names = T)
+
+# rnanseq counts; to use w or wo viral reads included? use w/o viral reads
+#rna.quant.dt <- list('MRC5'=fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/091824_dataPreparationforJyoti_data/2024_09_18_humanCounts.normalized.csv'),
+#                     'RFe' =fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/091824_dataPreparationforJyoti_data/2024_09_18_batCounts.normalized.csv')) %>% 
+#  rbindlist(use.names = T, idcol='cell_line', fill=T) %>% 
+#  melt(., id.vars=c('cell_line', 'rn'))
+#setnames(rna.quant.dt, new=c('cell_line', 'gene', 'sample', 'vst.counts'))
+#rna.quant.dt[, sample := gsub('.quant.sf', '', sample)]
+#fwrite(rna.quant.dt, ScriptAndDatedFileName('rnaSeq.salmonQuant.csv'))
+
+rna.quant.dt <-  fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_rnaSeq.salmonQuant.csv')
+
+#bat.mat assay(vst(hu.vsMock.dds, blind=F)) normalization.. keep same for featCounts
+viral.rna <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/083024_viralComparisons_data/2024_08_31_viral.subgenomicRNA.counts.csv')
+
+# could use the bam stats file to normalize by seq depth
+```
+
+First, lets use the new annotation file; no good. need to first deal with multi-mappers
+
+```{r}
+isg <- setDT(read_xlsx('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/docs/List of ISGs and cytokines.xlsx', sheet = 2))
+proinflam <-  setDT(read_xlsx('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/docs/List of ISGs and cytokines.xlsx', sheet = 1))
+cytochemo <- setDT(read_xlsx('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/docs/List of ISGs and cytokines.xlsx', sheet = 3))
+
+
+hu.bat.key <- fread('./docs/ensembl_beta_bat_human_homology.tsv')
+
+
+# basic handelling of multimappers in this data; take the average of % identity and %coverage, and take the highest 
+hu.bat.key[, avg_id_cov := mean(c(query_perc_id, query_perc_cov), na.rm=T), by=.I]
+
+#colnames are ID,parent, gene
+hu.txt2g <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/output/tx2gene/huSARS.tx2gene.tsv', header=F)
+bat.txt2g <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/output/tx2gene/batSARS.tx2gene.tsv', header =F)
+```
+
+Tidy the pquant file
+
+ISG distribution for humans 
+```{r}
+# leave out the ENS and ENtrez ids for now... seems to fix the multimapper issue, but could get better alignment if used another way...
+hu.bat.key <- hu.bat.key[,.(rfe_gene_name, human_gene_name, query_perc_id, query_perc_cov, avg_id_cov)] %>% 
+  unique()
+  
+# take the max average coverage/perc identify for mapping per gene (some genes with multiple mappings due to multiple ensembl ids
+hu.bat.key <- hu.bat.key[,.SD[which.max(avg_id_cov)], by=.(rfe_gene_name,human_gene_name)]
+
+# remove the records where either the bat or human key is na
+hu.bat.key <- hu.bat.key[!(is.na(rfe_gene_name) | is.na(human_gene_name))]
+
+# now we need a gene-gene mapping... heres an example of the issue:
+# for each subtable, we could find the delta in average id/coverage? and 
+hu.bat.key[human_gene_name == 'OR7A17']
+hu.bat.key[,.N, by=human_gene_name][N > 1][order(-N)] # almost 153 human genes mapping to different bat species
+
+multi.mappers <- hu.bat.key[,.N, by=human_gene_name][N > 1, human_gene_name]
+# plot and keep the SD
+summary.dt <- hu.bat.key[human_gene_name %in% multi.mappers, .(nOrtho=.N, sd.avg = sd(avg_id_cov, na.rm=T), sd.perc.id =sd(query_perc_id, na.rm=T), sd.query.cov =sd(query_perc_cov, na.rm=T)), by=human_gene_name]
+
+g <- ggplot(summary.dt, aes(x=sd.perc.id, sd.query.cov, color=as.factor(nOrtho))) +
+  geom_point() +
+  scale_color_viridis(discrete = T)
+
+g
+BackupAsPDF(g, 'ortholog.multimappers.dotplot')
+
+# take the 1:1 mapping with the highest avg
+hu.bat.key <- hu.bat.key[,.SD[which.max(avg_id_cov)], by=.(human_gene_name)]
+
+bat.hu.key <- hu.bat.key[,.SD[which.max(avg_id_cov)], by=.(rfe_gene_name)]
+
+g <- ggplot(bat.hu.key, aes(x=query_perc_id, query_perc_cov)) +
+  geom_hex() +
+  scale_fill_viridis() +
+  theme_bw()
+
+BackupAsPDF(g, 'identityvsCoverage.dotplot')
+```
+Looks ok for now, vast majority of points in the upper right quadrant
+Save file and proceed; could be more careful with the mapping
+
+```{r}
+#fwrite(hu.bat.key, ScriptAndDatedFileName('hu.bat.idMapping.firstPass.csv'))
+#fwrite(bat.hu.key, ScriptAndDatedFileName('bat.hu.1to1.idMapping.firstPass.csv')) # 1:1 in both directions
+hu.bat.key <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_bat.hu.1to1.idMapping.firstPass.csv')
+```
+
+Updating all the files with this new annotation information..
+
+```{r}
+# cant merge by gene names, need to go from ensembl ids, and at we have ncbi....
+rna.quant.dt[cell_line == 'MRC5']
+merge(rna.quant.dt[cell_line == 'MRC5'], hu.bat.key, by.x='gene', by.y='human_gene_name', all.x=T)
+
+rna.quant.dt[cell_line == 'RFe']
+
+rna.dt <- rbind(merge(rna.quant.dt[cell_line == 'MRC5'], hu.bat.key, by.x='gene', by.y='human_gene_name', all.x=T),
+                merge(rna.quant.dt[cell_line == 'RFe'], hu.bat.key, by.x='gene', by.y='rfe_gene_name', all.x=T), 
+                fill=T)
+
+#fwrite(rna.dt, ScriptAndDatedFileName('rnaQuant.newEnsemblAnnotations.csv'))
+rna.quant.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_rnaQuant.newEnsemblAnnotations.csv')
+
+prot.dt <- rbind(merge(p.quant.dt[cell_line == 'MRC5'], hu.bat.key, by.x='gene', by.y='human_gene_name', all.x=T),
+                merge(p.quant.dt[cell_line == 'RFe'], hu.bat.key, by.x='gene', by.y='rfe_gene_name', all.x=T), 
+                fill=T)
+
+#fwrite(prot.dt, ScriptAndDatedFileName('protQuant.newEnsemblAnnotations.csv'))
+p.quant.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_protQuant.newEnsemblAnnotations.csv')
+
+de.dt <- rbind(merge(deseq.dt[cell_line == 'MRC5'], hu.bat.key, by.x='gene', by.y='human_gene_name', all.x=T),
+                merge(deseq.dt[cell_line == 'RFe'], hu.bat.key, by.x='gene', by.y='rfe_gene_name', all.x=T), 
+                fill=T)
+
+#fwrite(de.dt,  ScriptAndDatedFileName('rnaPWcomparisons.newEnsemblAnnotations.csv'))
+deseq.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_rnaPWcomparisons.newEnsemblAnnotations.csv')
+
+ms.dt <-  rbind(merge(mss.dt[cell_line == 'MRC5'], hu.bat.key, by.x='gene', by.y='human_gene_name', all.x=T),
+                merge(mss.dt[cell_line == 'RFe'], hu.bat.key, by.x='gene', by.y='rfe_gene_name', all.x=T), 
+                fill=T)
+#fwrite(ms.dt,  ScriptAndDatedFileName('protPWcomparisons.newEnsemblAnnotations.csv'))
+```
+
+read in the data
+```{r}
+mss.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_protPWcomparisons.newEnsemblAnnotations.csv') 
+deseq.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_rnaPWcomparisons.newEnsemblAnnotations.csv')
+
+# the quant info....
+p.quant.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_protQuant.newEnsemblAnnotations.csv')
+rna.quant.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_rnaQuant.newEnsemblAnnotations.csv')
+```
+
+
+Need to compare timepoint and strain labels between the sets and harmonize
+```{r}
+deseq.dt[grepl("9bI_N_P80T", contrast), contrast := gsub("9bI_N_P80T", "9b_T72I_N_P80T", contrast)]
+deseq.dt[, contrast := gsub('[.]' , '_', contrast)]
+deseq.dt[, contrast := gsub('h' , 'hpi', contrast)]
+deseq.dt[, contrast := gsub('_vs_' , '-', contrast)]
+deseq.dt[, contrast := gsub('WA' , 'WT', contrast)]
+deseq.dt[, timepoint := gsub('h' , 'hpi', timepoint)]
+deseq.dt[, c('numerator', 'denominator') := tstrsplit(contrast, '-', keep=c(1,2))]
+deseq.dt[, `:=`(numerator = gsub('_[0-9]{1,2}hpi', '', numerator),
+                 denominator = gsub('_[0-9]{1,2}hpi', '', denominator)
+                 )]
+
+deseq.dt[, Label := paste0(numerator, '_', timepoint, '-', denominator, '_', timepoint)]
+deseq.dt[grepl('-Mock', Label), Label := sub('_[0-9]{1,2}hpi$', '', Label)]
+
+# labels all match
+mss.dt$Label %>% unique() %>% sort()
+deseq.dt$Label %>% unique() %>% sort()
+
+# fix numerator and denominator and add strain suffix
+deseq.dt[, `:=`(numerator_strain = numerator,
+                denominator_strain = denominator
+                )]
+
+deseq.dt[,numerator := paste0(numerator,'_', timepoint)]
+deseq.dt[denominator != 'Mock', denominator := paste0(denominator,'_', timepoint)]
+
+# set mss.dt numerator strain and denominator strain info
+mss.dt[, numerator_strain := gsub('_[0-9]{1,2}hpi', '', numerator)]
+mss.dt[, denominator_strain := gsub('_[0-9]{1,2}hpi', '', denominator)]
+
+deseq.dt[, contrast_strain := paste0(numerator_strain, '-', denominator_strain)]
+mss.dt[, contrast_strain := paste0(numerator_strain, '-', denominator_strain)]
+
+mss.dt$numerator %>% unique()
+deseq.dt$numerator %>% unique()
+
+mss.dt$denominator_strain %>% unique()
+deseq.dt$denominator_strain %>% unique()
+p.quant.dt$timepoint %>% unique()
+
+rna.quant.dt[, sample := gsub('RFe_|MRC5_', '', sample)]
+rna.quant.dt$timepoint %>% unique()
+
+rna.quant.dt[, sample := gsub("9bI_N_P80T", "9b_T72I_N_P80T", sample)]
+rna.quant.dt[, sample := gsub('_T1', '', sample)]
+
+rna.quant.dt[, SUBJECT := as.numeric(gsub('_', '', str_extract(sample, '_[123]$')))]
+rna.quant.dt[, GROUP := gsub('_[123]$','', sample)]
+rna.quant.dt[, GROUP := gsub('h','hpi', GROUP)]
+rna.quant.dt[, timepoint := ifelse(GROUP == 'Mock', 'na', str_extract(GROUP,'[0-9]{1,2}h'))]
+rna.quant.dt[, timepoint := gsub('h', 'hpi', timepoint)]
+```
+
+I think now files match (mostly); save files and use these for the plotting functions
+```{r}
+# write out the two files 
+#fwrite(mss.dt,  ScriptAndDatedFileName('protPWcomparisons.newEnsemblAnnotations.csv'))
+mss.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_protPWcomparisons.newEnsemblAnnotations.csv')
+#fwrite(deseq.dt, ScriptAndDatedFileName('rnaPWcomparisons.newEnsemblAnnotations.csv'))
+deseq.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_rnaPWcomparisons.newEnsemblAnnotations.csv')
+# write out the pquant files
+#fwrite(rna.quant.dt, ScriptAndDatedFileName('rnaQuant.newEnsemblAnnotations.csv'))
+rna.quant.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_rnaQuant.newEnsemblAnnotations.csv')
+```
+
+ISG heatmaps
+
+restricting the rest of our plotting and analysis to just the contrasts of interest to Jyoti for Thursday
+```{r}
+contrasts.oi <- grep('9b_T72I_N_P80T.+N_P80T|9b_T72I.+WT|9b_T72I.+Mock', mss.dt$Label, value=T) %>%  
+  unique()
+
+# set the viral strains and timepoint levels
+mss.dt[, timepoint := factor(timepoint, levels=c("6hpi","12hpi","24hpi","48hpi"))]
+deseq.dt[, timepoint := factor(timepoint, levels=c("6hpi","12hpi","24hpi","48hpi"))]
+```
+
+```{r}
+mss.dt$contrast_strain %>%  unique()
+
+col.cmd <- scale_color_manual(values=c())
+
+g <- ggplot(mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG  & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  #geom_text(data=mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG & !is.infinite(abs(log2FC)),]) + 
+  ggtitle('AB MRC5 ISG profiles') +
+  geom_text_repel(data=mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+                  position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  scale_fill_ipsum() +
+  #scale_color_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'AB.MRC5.ISGs.boxplots', format='pdf')
+
+# plot the RFe set 
+g <- ggplot(mss.dt[cell_line == 'RFe' & Label %in% contrasts.oi & human_gene_name %in% isg$ISG  & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('AB RFe ISG profiles') +
+  geom_text_repel(data=mss.dt[cell_line == 'RFe' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, human_gene_name, '')),
+                  position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  scale_fill_ipsum() +
+  scale_color_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'AB.RFe.ISGs.boxplots', format='pdf')
+```
+Also show the RNAseq set:
+
+```{r}
+g <- ggplot(deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG  & !is.infinite(abs(log2FoldChange)),], aes(x=timepoint, y=log2FoldChange, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  #geom_text(data=mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG & !is.infinite(abs(log2FC)),]) + 
+  ggtitle('RNAseq MRC5 ISG profiles') +
+  geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FoldChange) > 1.5, gene, '')),
+                  position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  scale_fill_ipsum() +
+  scale_color_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'RNAseq.MRC5.ISGs.boxplots', format='pdf')
+
+
+g <- ggplot(deseq.dt[cell_line == 'RFe' & Label %in% contrasts.oi & human_gene_name %in% isg$ISG  & !is.infinite(abs(log2FoldChange)),], aes(x=timepoint, y=log2FoldChange, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  #geom_text(data=mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG & !is.infinite(abs(log2FC)),]) + 
+  ggtitle('RNAseq RFe ISG profiles') +
+  geom_text_repel(data=deseq.dt[cell_line == 'RFe' & Label %in% contrasts.oi & human_gene_name %in% isg$ISG,], aes(label=ifelse(abs(log2FoldChange) > 1.5, gene, '')),
+                  position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  scale_fill_ipsum() +
+  scale_color_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'RNAseq.RFe.ISGs.boxplots', format='pdf')
+```
+Combine the different modalities and lets plot FC on the same scale
+
+```{r}
+deseq.dt[, modality := 'RNAseq']
+mss.dt[, modality := 'AB Proteomics']
+
+comb.de.dt <- rbind(deseq.dt, mss.dt, fill=T)
+
+g <- ggplot(comb.de.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG  & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('MRC5 ISG profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  scale_fill_ipsum() +
+  scale_color_ipsum() +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+BackupAsPDF(g, 'MRC5.isg.response.lfc.boxplot', format='pdf', dimensions = c(8,11))
+
+# do the same for RFe
+
+g <- ggplot(comb.de.dt[cell_line == 'RFe' & Label %in% contrasts.oi & human_gene_name %in% isg$ISG  & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  scale_fill_ipsum() +
+  scale_color_ipsum() +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+BackupAsPDF(g, 'RFe.isg.response.lfc.boxplot', format='pdf', dimensions = c(8,11))
+```
+Drop Mock and replot to highlight changes among the other groups 
+
+```{r}
+# drop mock to stop the value inflation
+contrasts.oi <- grep('Mock', contrasts.oi, invert=T, value=T)
+contrasts.oi
+g <- ggplot(comb.de.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG  & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('MRC5 ISG profiles for 9b_T72I_N_P80T comparisons') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  scale_fill_manual(values=c( "9b_T72I_N_P80T-WT"="#3363ff","9b_T72I_N_P80T-N_P80T"="#83ffed")) +
+  scale_color_manual(values=c( "9b_T72I_N_P80T-WT"="#3363ff","9b_T72I_N_P80T-N_P80T"="#83ffed")) +
+  #scale_fill_ipsum() +
+  #scale_color_ipsum() +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'MRC5.isg.response.lfc.noMock.boxplot', format='pdf', dimensions = c(8,11))
+
+# do the same for RFe
+
+g <- ggplot(comb.de.dt[cell_line == 'RFe' & Label %in% contrasts.oi & human_gene_name %in% isg$ISG  & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG profiles for 9b_T72I_N_P80T comparisons') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  scale_fill_manual(values=c( "9b_T72I_N_P80T-WT"="#3363ff","9b_T72I_N_P80T-N_P80T"="#83ffed")) +
+  scale_color_manual(values=c( "9b_T72I_N_P80T-WT"="#3363ff","9b_T72I_N_P80T-N_P80T"="#83ffed")) +
+  #scale_fill_ipsum() +
+  #scale_color_ipsum() +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+BackupAsPDF(g, 'RFe.isg.response.lfc.noMock.boxplot', format='pdf', dimensions = c(8,11))
+```
+
+```{r}
+
+contrasts.oi
+contrasts.oi <- grep('Mock', unique(comb.de.dt$contrast_strain), invert=, value=T)
+comb.de.dt[, contrast_strain := factor(contrast_strain, levels=c("WT-Mock", "N_P80T-Mock", "9b_T72I_N_P80T-Mock"))]
+
+comb.de.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG  & !is.infinite(abs(log2FC)),]
+
+g <- ggplot(comb.de.dt[cell_line == 'MRC5' & contrast_strain %in% contrasts.oi & gene %in% isg$ISG  & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('MRC5 ISG profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  #scale_fill_ipsum() +
+  #scale_color_ipsum() +
+  scale_fill_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  scale_color_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'MRC5.isg.response.lfc.vsMock.boxplot', format='pdf', dimensions = c(8,11))
+
+# do the same for RFe
+
+g <- ggplot(comb.de.dt[cell_line == 'RFe' & contrast_strain %in% contrasts.oi & human_gene_name %in% isg$ISG  & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  #scale_fill_ipsum() +
+  #scale_color_ipsum() +
+  scale_fill_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  scale_color_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+BackupAsPDF(g, 'RFe.isg.response.lfc.vsMock.boxplot', format='pdf', dimensions = c(8,11))
+```
+Instead of plotting LFC values directly, lets plot the z-scores (perhaps its a normalization issue?..)
+
+```{r}
+dcast(comb.de.dt, gene~paste0(modality, '.', Label), value.var = 'log2FC')
+
+comb.de.dt[,.N, by=.(modality,Label,cell_line)]
+comb.de.dt[!is.na(log2FC) & !is.infinite(abs(log2FC)), zscore.LFC := (log2FC - mean(log2FC, na.rm=T))/sd(log2FC, na.rm=T), by=.(modality,Label,cell_line)]
+comb.de.dt[, zscore.scale := scale(log2FC, center = T, scale=T),  by=.(modality,Label,cell_line)]
+
+comb.de.dt[modality == "AB Proteomics" & is.na(log2FC),]
+
+#NaN
+```
+
+look at the z-score distributions of the LFC values
+
+```{r}
+g <- ggplot(comb.de.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG  & !is.infinite(abs(zscore.LFC)),], aes(x=timepoint, y=zscore.LFC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('MRC5 ISG profiles for 9b_T72I_N_P80T comparisons') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change (z-score)") +
+  scale_fill_manual(values=c( "9b_T72I_N_P80T-WT"="#3363ff","9b_T72I_N_P80T-N_P80T"="#83ffed")) +
+  scale_color_manual(values=c( "9b_T72I_N_P80T-WT"="#3363ff","9b_T72I_N_P80T-N_P80T"="#83ffed")) +
+  
+  #scale_fill_ipsum() +
+  #scale_color_ipsum() +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'MRC5.isg.response.zscore.lfc.noMock.boxplot', format='pdf', dimensions = c(8,11))
+
+# do the same for RFe
+
+g <- ggplot(comb.de.dt[cell_line == 'RFe' & Label %in% contrasts.oi & human_gene_name %in% isg$ISG  & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=zscore.LFC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG profiles for 9b_T72I_N_P80T comparisons') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change (z-score)") +
+  scale_fill_manual(values=c( "9b_T72I_N_P80T-WT"="#3363ff","9b_T72I_N_P80T-N_P80T"="#83ffed")) +
+  scale_color_manual(values=c( "9b_T72I_N_P80T-WT"="#3363ff","9b_T72I_N_P80T-N_P80T"="#83ffed")) +
+  #scale_fill_ipsum() +
+  #scale_color_ipsum() +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+BackupAsPDF(g, 'RFe.isg.response.zscorelfc.noMock.boxplot', format='pdf', dimensions = c(8,11))
+```
+Plot scatterplots of the z-scores of the log2FCs for the contrasts we are interested in
+Subset to the orthologs in both groups
+MRC5  plots of AB and RNAseq agreement
+
+```{r}
+# create a vector of each combo of labels
+UniqueFactorCombos <- function(lab, sep=',', allow.dups=F){
+  
+  x <- expand.grid(unique(lab), unique(lab)) %>% 
+    setDT() 
+  # remove self references
+  x <- x[Var1 != Var2, ] 
+  # remove reverse 
+  # extract cols oi, sort vector alphabeticallly and then collapse
+  x[, paste.vec := paste(Var1, Var2, sep=sep)] # think this can be removed...
+  x[, vec.combo := apply(x[, c("Var1", "Var2")], 1, function(x) paste(sort(x), collapse = sep))]
+  
+  if (allow.dups %in% c('T','TRUE')) {
+    
+    message('output may contain duplicate combinations')
+    message(paste0(nrow(x), ' combinations returned..'))
+    return(x[, .(Var1, Var2)])
+    
+  } else {
+    
+    message('removed duplicate combinations')
+    message(paste0(nrow(unique(x, by='vec.combo')), ' combinations returned..'))
+    return(unique(x, by='vec.combo')[, .(Var1, Var2)])
+  }
+}
+```
+
+maybe look to remove the infinite valyes
+```{r}
+library(tidymodels)
+contrast.pairs <- unique(comb.de.dt$Label)
+
+
+contrasts.oi <- grep('-Mock', unique(comb.de.dt$Label), value = T)
+
+lapply(grep('6hpi',contrasts.oi, invert=T, value=T),  function(x){
+  
+  dt <- dcast(comb.de.dt[cell_line == 'MRC5' & Label %in% x & !is.infinite(abs(log2FC)),], gene~interaction(modality,Label), value.var = c('log2FC','sig'))
+  
+  # print
+  # get the ori names
+  lFC.x <- colnames(dt)[2]
+  lFC.y <- colnames(dt)[3]
+  sigx <- colnames(dt)[4]
+  sigy <- colnames(dt)[5]
+
+  setnames(dt, new=c('gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+  
+  # could try nested if else but not working v well....
+  dt[, label := 'not']
+  dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'both']
+  #dt[gene %in% viral.prots$viral.prots, label := 'SARS-CoV2']
+  
+  
+  # change the order of points in dt so SARS Cov2 are at top 
+  dt[, label := factor(label, levels=c('SARS-CoV2', 'both', 'x-axis sig', 'y-axis sig', 'not'))]
+  dt <- dt[order(label)]
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=gene)) +
+    geom_point() +
+
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('y-axis sig'='#990033', 'x-axis sig'="#2A788EFF",'SARS-CoV2'="#669966", 'not'='grey', 'both'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not',],size = 2, max.overlaps = 20) +
+    ggrepel::geom_text_repel(data=dt[gene %in% viral.prots$viral.prots,],size = 2, max.overlaps = 20, color = '#669966') +
+   # ggrepel::geom_text_repel(data=dt[Protein %in% virus.prots,],size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "#669966") +
+    xlab(paste(lFC.x, 'log2 fold change',sep=' ')) +
+    ylab(paste(lFC.y, 'log2 fold change',sep=' ')) +
+    ggtitle(paste('RNAseq vs AB Proteomics FC comparisons')) + 
+    theme_ipsum() + 
+    coord_obs_pred() +
+    theme(axis.text.x = element_text(angle=90),
+          panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) 
+  
+  g
+  BackupAsPDF(g, paste0('scatterplots/MRC5_RNAseq_ABProts/',x,'.rna.ab.log2FC.scatterplots.'), dimensions = c(7,7))
+})
+```
+Same plot for RFe
+
+```{r}
+comb.de.dt[cell_line == 'RFe' & is.na(gene)]
+
+dcast(comb.de.dt[cell_line == 'RFe' & Label %in% contrasts.oi & !is.infinite(abs(log2FC)),], gene~interaction(modality,Label), value.var = c('log2FC','sig')) %>% 
+  View()
+
+comb.de.dt[cell_line == 'RFe' & gene == 'CENPH', gene := interaction(Protein, ';', gene)]
+
+comb.de.dt[cell_line == 'RFe' & Label %in%  contrasts.oi & !is.infinite(abs(log2FC)),]
+
+lapply(grep('6hpi',contrasts.oi, invert=T, value=T),  function(x){
+  
+  dt <- dcast(comb.de.dt[cell_line == 'RFe' & Label %in% x & !is.infinite(abs(log2FC)),], gene~interaction(modality,Label), value.var = c('log2FC','sig'))
+  
+  print(head(dt))
+  # print
+  # get the ori names
+  lFC.x <- colnames(dt)[2]
+  lFC.y <- colnames(dt)[3]
+  sigx <- colnames(dt)[4]
+  sigy <- colnames(dt)[5]
+
+  setnames(dt, new=c('gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+  
+  # could try nested if else but not working v well....
+  dt[, label := 'not']
+  dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'both']
+  
+  
+  # change the order of points in dt so SARS Cov2 are at top 
+  dt[, label := factor(label, levels=c('SARS-CoV2', 'both', 'x-axis sig', 'y-axis sig', 'not'))]
+  dt <- dt[order(label)]
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=gene)) +
+    geom_point() +
+
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('y-axis sig'='#990033', 'x-axis sig'="#2A788EFF",'SARS-CoV2'="#669966", 'not'='grey', 'both'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not',],size = 2, max.overlaps = 20) +
+    ggrepel::geom_text_repel(data=dt[gene %in% viral.prots$viral.prots,],size = 2, max.overlaps = 20, color = '#669966') +
+   # ggrepel::geom_text_repel(data=dt[Protein %in% virus.prots,],size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "#669966") +
+    xlab(paste(lFC.x, 'log2 fold change',sep=' ')) +
+    ylab(paste(lFC.y, 'log2 fold change',sep=' ')) +
+    ggtitle(paste('RNAseq vs AB Proteomics FC comparisons')) + 
+    theme_ipsum() + 
+    coord_obs_pred() +
+    theme(axis.text.x = element_text(angle=90),
+          panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) 
+  
+  g
+  BackupAsPDF(g, paste0('scatterplots/RFe_RNAseq_ABProts/',x,'.rna.ab.log2FC.scatterplots.'), dimensions = c(7,7))
+})
+```
+
+
+Try get the comparisons to the different strains also so we can try highlight ISGs/certain types of genes that may be moving
+Why can we not see which of these are moving?
+
+```{r}
+contrasts.oi <- grep('9b_T72I_N_P80T.+N_P80T|9b_T72I.+WT', mss.dt$Label, value=T) %>%  
+  unique()
+
+
+lapply(grep('6hpi',contrasts.oi, invert=T, value=T),  function(x){
+  
+  dt <- dcast(comb.de.dt[cell_line == 'MRC5' & Label %in% x & !is.infinite(abs(log2FC)),], gene~interaction(modality,Label), value.var = c('log2FC','sig'))
+  
+  print(dt)
+  print(dim(dt))
+  # print
+  # get the ori names
+  lFC.x <- colnames(dt)[2]
+  lFC.y <- colnames(dt)[3]
+  sigx <- colnames(dt)[4]
+  sigy <- colnames(dt)[5]
+
+  setnames(dt, new=c('gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+  
+  # could try nested if else but not working v well....
+  dt[, label := 'not']
+  dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'both']
+  #dt[gene %in% viral.prots$viral.prots, label := 'SARS-CoV2']
+  
+  
+  # change the order of points in dt so SARS Cov2 are at top 
+  dt[, label := factor(label, levels=c('SARS-CoV2', 'both', 'x-axis sig', 'y-axis sig', 'not'))]
+  dt <- dt[order(label)]
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=gene)) +
+    geom_point() +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('y-axis sig'='#990033', 'x-axis sig'="#2A788EFF",'SARS-CoV2'="#669966", 'not'='grey', 'both'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not',],size = 2, max.overlaps = 20) +
+    ggrepel::geom_text_repel(data=dt[gene %in% viral.prots$viral.prots,],size = 2, max.overlaps = 20, color = '#669966') +
+   # ggrepel::geom_text_repel(data=dt[Protein %in% virus.prots,],size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "#669966") +
+    xlab(paste(lFC.x, 'log2 fold change',sep=' ')) +
+    ylab(paste(lFC.y, 'log2 fold change',sep=' ')) +
+    ggtitle(paste('RNAseq vs AB Proteomics FC comparisons')) + 
+    theme_ipsum() + 
+    coord_obs_pred() +
+    theme(axis.text.x = element_text(angle=90),
+          panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))  +
+    coord_cartesian(xlim=c(-4,4), ylim=c(-4,4))
+  
+  BackupAsPDF(g, paste0('scatterplots/MRC5_RNAseq_ABProts/',x,'.rna.ab.log2FC.scatterplots.'), dimensions = c(7,7))
+})
+```
+RFe plots
+```{r}
+
+lapply(grep('6hpi',contrasts.oi, invert=T, value=T),  function(x){
+  
+  dt <- dcast(comb.de.dt[cell_line == 'RFe' & Label %in% x & !is.infinite(abs(log2FC)),], gene~interaction(modality,Label), value.var = c('log2FC','sig'))
+  
+  print(dt)
+  print(dim(dt))
+  # print
+  # get the ori names
+  lFC.x <- colnames(dt)[2]
+  lFC.y <- colnames(dt)[3]
+  sigx <- colnames(dt)[4]
+  sigy <- colnames(dt)[5]
+
+  setnames(dt, new=c('gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+  
+  # could try nested if else but not working v well....
+  dt[, label := 'not']
+  dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'both']
+  #dt[gene %in% viral.prots$viral.prots, label := 'SARS-CoV2']
+  
+  
+  # change the order of points in dt so SARS Cov2 are at top 
+  dt[, label := factor(label, levels=c('SARS-CoV2', 'both', 'x-axis sig', 'y-axis sig', 'not'))]
+  dt <- dt[order(label)]
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=gene)) +
+    geom_point() +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('y-axis sig'='#990033', 'x-axis sig'="#2A788EFF",'SARS-CoV2'="#669966", 'not'='grey', 'both'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not',],size = 2, max.overlaps = 20) +
+    ggrepel::geom_text_repel(data=dt[gene %in% viral.prots$viral.prots,],size = 2, max.overlaps = 20, color = '#669966') +
+   # ggrepel::geom_text_repel(data=dt[Protein %in% virus.prots,],size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "#669966") +
+    xlab(paste(lFC.x, 'log2 fold change',sep=' ')) +
+    ylab(paste(lFC.y, 'log2 fold change',sep=' ')) +
+    ggtitle(paste('RNAseq vs AB Proteomics FC comparisons')) + 
+    theme_ipsum() + 
+    coord_obs_pred() +
+    theme(axis.text.x = element_text(angle=90),
+          panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) 
+  
+  g + coord_cartesian(xlim=c(-4,4), ylim=c(-4,4))
+  BackupAsPDF(g, paste0('scatterplots/RFe_RNAseq_ABProts/',x,'.rna.ab.log2FC.scatterplots.'), dimensions = c(7,7))
+})
+```
+
+SO have now plotted the AB against each other. Generate scatterplot of RFe and MRC5 protein data
+
+```{r}
+
+```
+
+
+
+Test for differences in group means using lm function
+
+```{r}
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+
+# get a flag for
+isg.dt <- comb.de.dt[(gene %in% isg$ISG | human_gene_name %in% isg$ISG) & !is.na(log2FC) & !is.infinite(abs(log2FC)), ]
+
+isg.dt[, Label := as.factor(Label)]
+
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~ Label){  
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  return (as.data.table(contrast1))
+}
+
+lm.out <- linearModelsAllProteins(isg.dt[cell_line == 'MRC5'],
+                                  formulaList = list(BasicModel =  log2FC ~ Label),
+                                  splitColumn = 'modality',
+                                  postProcessFunction = emmeans.contrastOfContrasts, cl = 6) |> suppressWarnings()
+
+
+mrc5.isg <- lm.out$coef[!grepl('Intercept', term), .(modality, contrast=term, LFC=Estimate, p.value)]
+mrc5.isg[, contrast := gsub('Label' , '', contrast)]
+mrc5.isg[, p.adj := p.adjust(p.value, method='BH'), by=.(modality)]
+
+mrc5.isg.grps <- lm.out$postProcess[, .(modality, contrastOfcontrast=contrast, LFC=estimate, p.value)]
+mrc5.isg.grps[p.value < 0.05]
+mrc5.isg.grps[grepl('24hpi-Mock.+24hpi-Mock', contrastOfcontrast)]
+#fwrite(mrc5.isg, ScriptAndDatedFileName('mrc5.isg.lmTests.csv'))
+
+
+lm.out <- linearModelsAllProteins(isg.dt[cell_line == 'RFe'],
+                                  formulaList = list(BasicModel =  log2FC ~ Label),
+                                  splitColumn = 'modality',
+                                  postProcessFunction = emmeans.contrastOfContrasts, cl = 6) |> suppressWarnings()
+
+rfe.isg <- lm.out$coef[!grepl('Intercept', term), .(modality, contrast=term, LFC=Estimate, p.value)]
+rfe.isg[, contrast := gsub('Label' , '', contrast)]
+rfe.isg[, p.adj := p.adjust(p.value, method='BH'), by=.(modality)]
+
+rfe.isg
+
+rfe.isg.grps <- lm.out$postProcess[, .(modality, contrastOfcontrast=contrast, LFC=estimate, p.value)]
+rfe.isg.grps[p.value < 0.05]
+rfe.isg.grps[grepl('48hpi-Mock.+48hpi-Mock', contrastOfcontrast)]
+
+fwrite(rbind(rfe.isg.grps[,cell_line :='RFe'], mrc5.isg.grps[, cell_line := 'RFe']), ScriptAndDatedFileName('isgGroups.lm.contrasts.csv'))
+```
+
+Now get the zscores of each of the fold changes and replot
+Double check this calculation before sharing.. these distributions seem wrong..
+```{r}
+comb.de.dt[!is.infinite(abs(log2FC)), LFC.zscore := scale(log2FC), by=.(Label, modality, cell_line)]
+comb.de.dt[cell_line == 'MRC5' & modality == 'AB Proteomics']
+
+
+g <- ggplot(comb.de.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG  & !is.infinite(abs(LFC.zscore)),], aes(x=timepoint, y=LFC.zscore, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('MRC5 ISG profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="LFC z-score") +
+  scale_fill_ipsum() +
+  scale_color_ipsum() +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+#BackupAsPDF(g, 'MRC5.isg.response.zscore.boxplot', format='png', dimensions = c(8,11))
+
+# do the same for RFe
+g <- ggplot(comb.de.dt[cell_line == 'RFe' & Label %in% contrasts.oi & human_gene_name %in% isg$ISG  & !is.infinite(abs(LFC.zscore)),], aes(x=timepoint, y=LFC.zscore, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="LFC z-score") +
+  scale_fill_ipsum() +
+  scale_color_ipsum() +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+#BackupAsPDF(g, 'RFe.isg.response.zscore.boxplot', format='png', dimensions = c(8,11))
+
+```
+Remove mock and replot
+
+```{r}
+
+```
+
+
+
+
+*Todo* we need to sort out the mapping information
+
+If we just naively map between genes, what do we lose?
+
+```{r}
+#18k genes that map to each other
+hu.bat.key[, .(rfe_gene_name, human_gene_name, query_perc_id, query_perc_cov)]
+
+
+
+# cant merge by gene names, need to go from ensembl ids, and at we have ncbi....
+merge(rna.quant.dt[cell_line == 'MRC5'], hu.bat.key[, .(rfe_gene_name, human_gene_name, query_perc_id, query_perc_cov)], by.x='gene', by.y='human_gene_name', all.x=T)
+
+merge(rna.quant.dt[cell_line == 'MRC5'], hu.bat.key[, .(rfe_gene_name, human_gene_name, query_perc_id, query_perc_cov)], by.x='gene', by.y='human_gene_name', all.x=T)
+
+
+
+library("biomaRt")
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", mirror = "asia")
+
+hu.txt2g[, ]
+
+getBM(attributes=c("refseq_mrna", "ensembl_gene_id", "hgnc_symbol"), filters = "refseq_mrna", values=hu.txt2g$V1, mart= ensembl)
+
+listDatasets(ensembl)
+```
+
+
+Pull out the ensembl refseq map
+
+```{r}
+library("biomaRt")
+ensembl<-  useMart("ensembl", dataset="hsapiens_gene_ensembl")
+
+values<- c("NM_001101", "NM_001256799", "NM_000594")
+
+getBM(attributes=c("refseq_mrna", "ensembl_gene_id", "hgnc_symbol"), filters = "refseq_mrna", values = values, mart= ensembl)
+
+
+
+```
+
+```{r}
+# create anno hu object
+ah <- AnnotationHub()
+
+
+# if all you know is species name etc, you can recover this record, get metadata and search
+# Find an orgDB for this exotic species and retrieve specific info
+dm <- query(ah, c("Rhinolophus ferrumequinum"))
+
+# get the metadata cols and grep to find file tpyes you want
+mcols(dm) %>% as.data.table(keep.rownames=T) %>% 
+  .[grep('OrgDb', rdataclass), rn] # id AH108239
+
+
+
+# dowload the file; use double brackets notation
+org.rt.db <- dm[['AH108239']] # or
+
+
+keys(org.rt.db) %>% unique()
+
+keys(org.Hs.eg.db, keytype = 'GOALL')
+```
+
+
+
+**Todo** 
+Viral reads not included in the feature counts summarization... need to check the GTF file for why this is the case
+
+*maybe no need to do this yet...* leave as is for now
+First off, before comparing the data, look at the feature counts vs salmon mapping to confirm the counts are similar for bat and human
+
+```{r}
+bat.featCounts.mat <- fread('../080624_JBatra_SARS2RNAseqHuBat/output/featureCounts/batSARS.featureCounts.txt') %>% 
+  .[, c("Chr","Start", "End", "Strand", "Length"):= NULL] %>% 
+  as.matrix(rownames='Geneid')
+
+hu.featCounts.mat  <- fread('../080624_JBatra_SARS2RNAseqHuBat/output/featureCounts/hsSARS.featureCounts.txt') %>% 
+  .[, c("Chr","Start", "End", "Strand", "Length"):= NULL] %>% 
+  as.matrix(rownames='Geneid')
+
+colnames(bat.featCounts.mat) <- gsub('/wynton/group/krogan/mgordon/projects/072524_JBatra_SARS2RNAseqHuBat/output/batSARS2/star_salmon/|.markdup.sorted.bam', '', colnames(bat.featCounts.mat))
+colnames(hu.featCounts.mat) <- gsub('/wynton/group/krogan/mgordon/projects/072524_JBatra_SARS2RNAseqHuBat/output/huSARS2/star_salmon/|.markdup.sorted.bam', '', colnames(hu.featCounts.mat))
+
+
+bat.featCounts.mat[grep('QHO60600', rownames(bat.featCounts.mat)),]
+```
+use DESeq2 to process these to count matrices; compare counts to the salmon summarisation
+First set up the metadata
+```{r}
+meta.data <- data.table(sample=dir('../080624_JBatra_SARS2RNAseqHuBat/output/salmonOut', full.names = F, pattern='quant.sf'))
+meta.data[, `:=`(host=ifelse(grepl('MRC5', sample), 'human', 'bat'),
+                 timepoint=ifelse(grepl('Mock', sample), '', str_extract(sample, '[0-9]{1,2}h')),
+                 virus=ifelse(grepl('Mock', sample), 'Mock', gsub('MRC5_|RFe_|_[0-9]{1,2}h.+', '', sample))
+                 )]
+
+# now want to set T0 and Mock as baseline for factor levels
+meta.data[, `:=`(virus=factor(virus, levels=c('Mock','WA', 'N_P80T', '9bI_N_P80T')),
+                 timepoint=factor(timepoint, levels=c('','6h', '12h', '24h', '48h'))
+                 )]
+
+
+# another fix; tp and virus are confounded for Mock, so we need to create a 'group' variable 
+meta.data[, condition := factor(ifelse(virus=='Mock', 'Mock', paste(virus, timepoint, sep='.')))]
+meta.data[, condition := relevel(condition, ref='Mock')]
+
+bat.meta <- data.frame(meta.data[host=='bat',], row.names = 'sample')
+hu.meta <- data.frame(meta.data[host=='human',], row.names = 'sample')
+
+
+# scrub quant.sf from meradata
+rownames(bat.meta) <- gsub('.quant.sf' ,'', rownames(bat.meta))
+rownames(hu.meta) <- gsub('.quant.sf' ,'', rownames(hu.meta))
+
+# reset the tp levels for human as missing 6hr
+hu.meta$timepoint <-  factor(hu.meta$timepoint, levels=c('12h', '24h', '48h'))
+bat.meta$timepoint <-  factor(bat.meta$timepoint, levels=c('6h', '12h', '24h', '48h'))
+```
+match the col and rownames
+```{r}
+colnames(hu.featCounts.mat) == rownames(hu.meta)
+colnames(bat.featCounts.mat) == rownames(bat.meta)
+
+
+bat.featCounts.mat[rownames(bat.featCounts.mat) == 'genomic',]
+```
+run deseq2 on both
+```{r}
+dds.bat <- DESeqDataSetFromMatrix(countData=bat.featCounts.mat,
+                                  colData = bat.meta, 
+                                  design =~condition)
+
+
+dds.hu <- DESeqDataSetFromMatrix(countData=hu.featCounts.mat,
+                                 colData = hu.meta, 
+                                 design =~condition)
+```
+
+filter out low counts
+
+```{r}
+keep <- apply(counts(dds.hu) >= 10, 1, sum) >= 3
+dds.hu <- dds.hu[keep,]
+
+keep <- apply(counts(dds.bat) >= 10, 1, sum) >= 3
+dds.bat <- dds.bat[keep,]
+```
+
+notes on contrasts in deseq2
+```{r}
+dds.hu <- DESeq(dds.hu)
+dds.bat <- DESeq(dds.bat)
+
+#saveRDS(dds.hu, ScriptAndDatedFileName('dds.featCounts.human.rds'))
+#saveRDS(dds.bat, ScriptAndDatedFileName('dds.featCounts.bat.rds'))
+```
+now normalize the counts and recover; compare with a scatterplot to the original set
+
+```{r}
+hu.mat <- assay(vst(dds.hu, blind=F))
+bat.mat <- assay(vst(dds.bat, blind=F))
+
+hu.counts.dt <- reshape2::melt(hu.mat) %>% 
+  setnames(.,new=c('gene', 'sample', 'vst.counts'))
+
+bat.counts.dt <- reshape2::melt(bat.mat) %>% 
+  setnames(., new=c('gene', 'sample', 'vst.counts'))
+
+hu.raw <- reshape2::melt(assay(dds.hu))
+setnames(hu.raw, new=c('gene', 'sample', 'raw.counts'))
+
+bat.raw <- reshape2::melt(assay(dds.bat))
+setnames(bat.raw, new=c('gene', 'sample', 'raw.counts'))
+
+
+bat.counts.dt <- setDT(merge(bat.counts.dt, bat.raw, by=c('gene', 'sample')))
+hu.counts.dt <- setDT(merge(hu.counts.dt, hu.raw, by=c('gene', 'sample')))
+
+# add an idcol and write to file
+hu.counts.dt[, cell_line := 'MRC5']
+bat.counts.dt[, cell_line := 'RFe']
+
+
+rna.featCount.quant.dt <- rbind(hu.counts.dt, bat.counts.dt)
+
+```
+
+```{r}
+text <- fread('../080624_JBatra_SARS2RNAseqHuBat/output/featureCounts/batSARS.featureCounts.txt')
+```
+
+
+
+ISG plots; also do z-score as might help normalize the distribution
+
+*todo* 
+ISG boxplots
+Viral protein expression
+

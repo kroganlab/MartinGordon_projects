@@ -1,0 +1,838 @@
+---
+title: "042225_DifferentialTranslation_editedVsNonEdited"
+author: "Martin Gordon"
+date: "2025-04-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Overview
+Differential analysis of edited vs non-edited transcripts; How does editing impact tranlational efficiency?
+Previously ran an an analysis at the tissue-level, didn't really find a lot of interest possibly the edited set were 'washed out' by abundance of non-edited 
+Now instead, we try analyse the edited vs non-edited directly, focusing on OL tissue due to issues with sequencing of the gill tissue samples
+
+
+NB: this tool assumes a common slope (.ie relationship between the translated mRNA level and the total mRNA level shows the same slope for each condition).. Is this valid in our case?
+
+Note on how the APV model works: (found in the vignette)
+The APV model fitted in anota2seq for analysis of changes in translational efficiency leading to altered protein levels uses a model with translated mRNA as dependent variable and total mRNA and the sample class variable as independent variables. In other words, a common slope for all sample categories is considered and the change in translational efficiency is def ined as the difference in intercepts
+
+```{r packages}
+library(data.table)
+library(Rsamtools)
+library(ComplexHeatmap)
+library(magrittr)
+library(ggplot2)
+library(devtools)
+library(riboWaltz)
+library(hrbrthemes)
+library(anota2seq)
+library(gridExtra)
+library(tximport) #make count matrix for anotaSeq import
+library(RColorBrewer)
+library(seqinr)
+library(viridis)
+library(circlize)
+library(stringr)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/bamProcessing.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+col.pal <- getQualitativePalette(n=13)
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+```
+
+First step is to quantify the transcripts in each set
+Using a salmon quant script to quantify the reads in each bam file
+```{bash, eval=FALSE}
+find ./output/riboseq_bamfiles_firstPass/filtered/*/splitBams -name "*.bam" -print0 | xargs -0 -n1 -I{} sh -c 'bam=$1; echo "./script/run_salmonQuant.sh "$bam""; ./script/run_salmonQuant.sh "$bam" ' xargs-sh {}
+```
+
+Ok, now that the counts are completed; lets read in the data
+
+```{r}
+bam.files <- dir('./output/salmonQuant/042225_editsVsnoEdits', full.names = T,recursive =T, pattern = 'quant.sf')
+
+# pull out the subset of files we are interested in 
+rna.files <- grep('RNA_OPTIC', bam.files, value=T)
+ribo.files <- grep('RIBO_OPTIC', bam.files, value=T)
+ribo.files <- grep('altRIBO', ribo.files, invert=T, value=T)
+
+rna.list <- lapply(rna.files, fread)
+names(rna.list) <- sapply(strsplit(rna.files, '[/]'), function(x){x[5]})
+names(rna.files) <- sapply(strsplit(rna.files, '[/]'), function(x){x[5]})
+
+# and riboseq
+ribo.list <- lapply(ribo.files, fread)
+names(ribo.list) <- sapply(strsplit(ribo.files, '[/]'), function(x){x[5]})
+names(ribo.files) <- sapply(strsplit(ribo.files, '[/]'), function(x){x[5]})
+
+# read int he trasncirpt to gene name mapper
+tx2gene <- fread('./output/salmonQuant/riboSeq/tx2gene.tsv')
+setnames(tx2gene, new=c('tID', 'gID', 'gID2'))
+tx2gene <- tx2gene[,.(tID, gID)]
+
+
+rna.list[[]]
+```
+
+Summarise the transcript counts to gene-level measurments
+```{r}
+rna.txi <- tximport(rna.files, type = "salmon", tx2gene = tx2gene)
+ribo.txi <- tximport(ribo.files, type = "salmon", tx2gene = tx2gene)
+```
+save the counts to file 
+
+```{r}
+fwrite(rna.txi$counts, row.names = T, sep='\t', ScriptAndDatedFileName('rna.tximport.counts.txt'))
+fwrite(ribo.txi$counts,row.names = T, sep='\t', ScriptAndDatedFileName('ribo.tximport.counts.txt'))
+```
+Merge the two matrices and filter out rows with no measurments in any of the conditions
+```{r}
+rna.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/042225_DEA_editedVsNonEdited_data/2025_04_22_rna.tximport.counts.txt')
+ribo.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/042225_DEA_editedVsNonEdited_data/2025_04_22_ribo.tximport.counts.txt')
+
+dim(rna.txi$counts)
+dim(ribo.txi$counts)
+```
+
+```{r}
+count.mat <- merge(rna.dt, ribo.dt, by='V1', all.x=T, all.y=T) %>% 
+  as.matrix(rownames='V1')
+```
+
+Many transcripts in the gtf; subset this to CDS and/or transcripts where we have recorded counts in any of the samples
+Read in Jacks list and use this to filter 
+Filter to just proteins in the CDS
+
+```{r}
+cdsSeqs <- seqinr::read.fasta('./data/wynton_downloads//Dpealeiiv2_Protein_CDS.fasta', seqtype='AA', as.string = TRUE, strip.desc = T) %>% 
+  names(.)
+cdsSeqs <- paste0(cdsSeqs, '.g')
+
+# subset to our cds set
+count.mat <- count.mat[rownames(count.mat) %in% cdsSeqs,]
+
+# of the set of ~25k cds transcripts, approx 5k have no reads
+apply(count.mat, 1, function(x){sum(x==0) == 12})  %>% 
+  sum()
+
+# remove these 0 count trasncripts from our data
+count.mat <- count.mat[apply(count.mat, 1, function(x){sum(x==0) != 12}),]
+```
+
+Just take the nf-core pipeline sample sheet and adjust
+```{r}
+example.dt <- fread('./031025_anota2seq_firstPass_data/2025_03_10_metadata.csv')
+example.dt %>%  
+  head()
+count.mat
+
+meta.dt <- data.table(sample=colnames(count.mat))
+meta.dt[, `:=`(type = ifelse(grepl('RNA', sample), 'mRNA', 'RPF'),
+               condition = ifelse(grepl('proteinCodingEdits', sample), 'proteinCodingEdits', 'noEdits'),
+               rep=as.numeric(gsub('_', '', stringr::str_extract(sample, '_[0-9]{1,2}_')))
+               )]
+
+meta.dt[, rep := ifelse(rep %in% c(10,4), 1, 
+                    ifelse(rep %in% c(11,5), 2,
+                           3))]
+# fix one sample
+meta.dt[sample %like% 'RNA_OPTIC_4', rep := 3]
+
+# give nice new sample name
+meta.dt[, sname := paste(type,condition, rep, sep='_')]
+
+#fwrite(meta.dt, ScriptAndDatedFileName('metadata.csv.gz'))
+meta.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/042225_DEA_editedVsNonEdited_data/2025_04_22_metadata.csv.gz')
+```
+
+plot a PCA of the edited and unedited; is editing the main distinguishing factor? Think it will be read depth..
+Looks like seq depth is the main driver of variance in the data, or at least strongly correlated with it...
+```{r}
+submat <- count.mat[complete.cases(count.mat),]
+submat[submat < 1] <- NA
+submat <- submat[complete.cases(submat),]
+
+# only 3k features, but lets see how it looks
+dim(submat) %>% 
+  print()
+
+submat <- log2(submat +1)
+
+pcaOut <- prcomp(t(submat), center=T, scale. =T)
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+pcaDT <- merge(pcaDT, meta.dt, by.x = "rn", by.y = "sample", all.x = TRUE)
+  
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = type, shape = condition)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=sname), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_brewer(type='qual', palette='Set2') +
+    ggtitle(label=paste0("PCA using ",  nrow(submat), ' genes')) +
+    theme_bw() +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'type.raw.pca')
+
+
+# check if depth
+sumCounts <- apply(count.mat, 2, function(x) log2(sum(x)+1)) %>% 
+  data.table(sample=names(.),
+             log2SumCounts=.)
+
+pcaDT <- merge(pcaDT, sumCounts, by.x = "rn", by.y = "sample", all.x = TRUE)
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = log2SumCounts, shape = condition)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=sname), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    #scale_fill_brewer(type='qual', palette='Set2') +
+    ggtitle(label=paste0("PCA using ",  nrow(submat), ' genes')) +
+    theme_bw() +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+           color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'seqDepth.raw.pca')
+```
+Visualize the 0-imputed data for missing; 
+Seems to better distinguish edited vs non-edited (primary driver of variation along x) but I wonder if this is just due to shared missing transcripts (shallow sequencing)
+
+```{r}
+submat <- count.mat[complete.cases(count.mat),]
+
+submat <- log2(submat +1)
+
+pcaOut <- prcomp(t(submat), center=T, scale. =T)
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+pcaDT <- merge(pcaDT, meta.dt, by.x = "rn", by.y = "sample", all.x = TRUE)
+  
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = type, shape = condition)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=sname), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_brewer(type='qual', palette='Set2') +
+    ggtitle(label=paste0("PCA using ",  nrow(submat), ' genes')) +
+    theme_bw() +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'type.0imputeMissing.pca')
+```
+Ok, it is what it is and not much we can do about sequencing depth 
+Proceed as is and lets see if we can identify transcripts differentially translated 
+
+```{r, anota2seq_input}
+rna.mat <- count.mat[, meta.dt[type == 'mRNA', sample]]
+colnames(rna.mat)
+ribo.mat <- count.mat[, meta.dt[type == 'RPF', sample]]
+colnames(ribo.mat)
+
+# create vector flagging condition type in each column
+phenoVec <- meta.dt[type == 'RPF', condition]
+
+# look good
+phenoVec
+colnames(rna.mat)
+colnames(ribo.mat)
+```
+```{r, prepareCountsDT}
+count.dt <- setDT(reshape2::melt(count.mat))
+setnames(count.dt, new=c('transcript', 'sample', 'counts'))
+
+#fwrite(count.dt[meta.dt, , on='sample'], ScriptAndDatedFileName('raw.counts.csv.gz'))
+count.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/042225_DEA_editedVsNonEdited_data/2025_04_22_raw.counts.csv.gz')
+```
+
+Run anota2seq and identify differential translation
+First pass filter out zeros as likely problematic
+Issues with N influential data points much higher than expected, also perhaps the pval of interaction is higher at low-pval so potentially biased (common slope not appropriate?)
+
+```{r, anota2seq}
+ads <- anota2seqDataSetFromMatrix(dataP=ribo.mat,
+                                  dataT=rna.mat,
+                                  phenoVec = phenoVec,
+                                  dataType = "RNAseq",
+                                  transformation = 'TMM-log2',
+                                  filterZeroGenes=TRUE, # need to keep due to low sequencing depth in the edited set 
+                                  normalize = T)
+
+saveRDS(ads, ScriptAndDatedFileName('anotaSeq.rmZeroCountGenes.obj.rds'))
+ads <- readRDS('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/042225_DEA_editedVsNonEdited_data/2025_04_22_anotaSeq.rmZeroCountGenes.obj.rds')
+
+ads <- anota2seqPerformQC(ads, generateSingleGenePlots = TRUE, useRVM = TRUE)
+ads <- anota2seqResidOutlierTest(ads, generateSingleGenePlots = TRUE, nGraphs=10)
+```
+For first pass, lets assess how the filtered with 0 counts looks
+generae contrast matrix
+```{r}
+myContrast <- matrix(nrow=length(levels(as.factor(phenoVec))),
+ncol=length(levels(as.factor(phenoVec)))-1)
+rownames(myContrast) <- levels(as.factor(phenoVec))
+myContrast[,1] <- c(-1,1)
+myContrast
+
+colnames(myContrast) <- c('proteinCodingEdits-noEdits')
+```
+perform the differential analysis 
+
+Anota2seq performs separate analyses for changes in:
+translated mRNA (riboseq)
+total mRNA
+translation (modulation in translated mRNA adjusted for corresponding changes in total mRNA) and 
+buffering (alterations in total mRNA adjusted for corresponding changes in translated mRNA)
+
+changes in translation and buffering both indicate altered translational efficiency (a change in the proportion of transcripts transcribed from a gene that is translated), 
+it is crucial to separate these two modes of regulation as changes in translation, but not buffering, are expected to modulate protein level
+
+```{r}
+ads
+
+debug(anota2seqAnalyze)
+ads <- anota2seqAnalyze(ads, contrasts=myContrast, fileStem='proteinCodingEdits_noEdits')
+
+#saveRDS(ads, ScriptAndDatedFileName('anotaSeq.proteinCodingEditsvsNoEdits.rmZeroGenes.obj.rds'))
+ads <- readRDS('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/042225_DEA_editedVsNonEdited_data/2025_04_22_anotaSeq.proteinCodingEditsvsNoEdits.rmZeroGenes.obj.rds')
+
+
+# algorithmic details
+# we run a linear model, with ribo Counts as response and RNAcounts and condition the predictors
+test.lm <- lm(ribo.norm.mat[1, ] ~ rna.norm.mat[1, ] + phenoVec)
+sum.lm <- summary(test.lm) # summarise the lm
+sum.lm$sigma # residual SE; how well the line fits the data
+
+rnaSlope <- sum.lm$coefficients[2, 1] # just gets the slope for the RNA. the rate of change in rbio for every one unit of RNA
+rnaSlope
+# after taking the slope, we test if it is < 0 or greater than 1 for translation analysis, or <-1 or > 0 for buffering analysis
+# why?
+# function takes as input teh lm model, the slope and the analysis
+if (analysis[reg] == "translation") {
+          if (apvSlope[i] < 0 | apvSlope[i] > 1) {
+            # basically, we test here if the slope is significantly different to 1 and assign a pvalue
+            # 1 being a 1:1 relationshipe between ribo and mRNA counts (ie 1 unit increase in ribo = 1 unit increase in rna)
+            # function is below
+            apvSlopeP[i] <- anota2seqSlopeTest(tmpLm = tmpApv, 
+              curSlope = apvSlope[i], analysis = "translation")
+          }
+        }
+        if (analysis[reg] == "buffering") {
+          if (apvSlope[i] < -1 | apvSlope[i] > 0) {
+            apvSlopeP[i] <- anota2seqSlopeTest(tmpLm = tmpApv, 
+              curSlope = apvSlope[i], analysis = "buffering")
+          }
+        }
+
+
+# calcualtes group means and assigns to contrast matic
+        contMat <- contrasts(tmpList$phenoType)
+        for (j in 1:dim(contMat)[2]) {
+          contMatRed <- contMat[contMat[, j] != 0, j]
+          tmpContMat <- matrix(nrow = length(contMatRed), 
+            ncol = 4)
+          rownames(tmpContMat) <- names(contMatRed)
+          colnames(tmpContMat) <- c("contrast", "estimate", 
+            "groupN", "T_mean")
+          for (k in 1:dim(tmpContMat)[1]) {
+            tmpGroup <- rownames(tmpContMat)[k]
+            tmpEst <- mean(dataP[i, phenoVecOrg == tmpGroup]) - #predicts difference between observed mean polysomal RNA and the model-predicted mean (based on total RNA and slope)
+              (tmpSlope * mean(dataT[i, phenoVecOrg == 
+                tmpGroup])) 
+            tmpCovMean <- mean(dataT[i, phenoVecOrg == 
+              tmpGroup]) #mean of total mRNA
+            tmpContMat[k, "contrast"] <- contMatRed[k]
+            tmpContMat[k, "estimate"] <- tmpEst
+            tmpContMat[k, "groupN"] <- sum(phenoVecOrg == 
+              tmpGroup) #N measurments in group
+            tmpContMat[k, "T_mean"] <- tmpCovMean
+          }
+# normalize contrast coefficients
+# This ensures balanced group comparisons, especially in unequal sample size cases.
+tmpContMatCopy <- tmpContMat
+          tmpContMatCopy[tmpContMatCopy[, "contrast"] > 
+            0, "contrast"] <- tmpContMatCopy[tmpContMatCopy[, 
+            "contrast"] > 0, "contrast"]/sum(abs(tmpContMatCopy[tmpContMatCopy[, 
+            "contrast"] > 0, "contrast"]))
+          tmpContMatCopy[tmpContMatCopy[, "contrast"] < 
+            0, "contrast"] <- tmpContMatCopy[tmpContMatCopy[, 
+            "contrast"] < 0, "contrast"]/sum(abs(tmpContMatCopy[tmpContMatCopy[, 
+            "contrast"] < 0, "contrast"]))
+          tmpDiffEff <- sum(tmpContMatCopy[, "contrast"] * 
+            tmpContMatCopy[, "estimate"])
+          
+          # fits a lm to the total RNA 
+          lmT <- lm(dataT[i, ] ~ as.factor(phenoVecOrg))
+          lmTAov <- anova(lmT)
+          tmpCovSS <- lmTAov[2, 2] # estimates variance explained by the mRNA # SS residuals
+          tmpCovMean <- mean(dataT[i, ])
+          tmpCov <- sum(tmpContMatCopy[, "contrast"] * 
+            (tmpContMat[, "T_mean"] - tmpCovMean))
+          tmpN <- sum(tmpContMatCopy[, "contrast"] * 
+            tmpContMatCopy[, "contrast"]/tmpContMat[, 
+            "groupN"])
+          tmpErrorAdjusted <- tmpError * tmpError * 
+            c(tmpN + (tmpCov * tmpCov/tmpCovSS))
+          apvMSerror[i, j] <- tmpErrorAdjusted
+          apvEff[i, j] <- tmpDiffEff
+          apvDf[i, j] <- 1
+        }
+    
+          
+anova(lm(rna.norm.mat[1, ] ~as.factor(phenoVec)))
+# then its does a 'slope test': code here; take the summary of the lm as input and the pval for the slope
+# rease we have opposite effects of buffering and translation is there are opposite effects: trranslaiton: ribo up, mRNA not moving, buffering is the opposite, which suggests increased efficiency
+# so negaitve slope; as predictor increases by 1 unit, the response (ribo counts) decreases 
+anota2seqSlopeTest <- function(tmpLm, curSlope, analysis){
+    tmpLmSum <- summary(tmpLm)
+    if(analysis == "translation"){
+        if(curSlope < 0 ){
+            ##we are doing a one tailed test compared to the 2 tailed test in the output i.e. divide p by 2
+            slopeP <- tmpLmSum$coefficients[2,4] / 2
+        }
+        if(curSlope>1){
+            ##compare if slope is sig different to 1
+            tmpSlopeEst <- tmpLmSum$coefficients[2,1] - 1
+            tmpSlopeErr <- tmpLmSum$coefficients[2,2]
+            tmpSlopeT <- tmpSlopeEst/tmpSlopeErr
+            ##using resiual dfs to test p-value
+            tmpSlopeDf <- tmpLm$df.residual
+            slopeP <- 1-pt(tmpSlopeT, tmpSlopeDf)
+        }
+    }
+    if(analysis == "buffering"){
+        if(curSlope < -1 ){
+            ##we are doing a one tailed test compared to the 2 tailed test in the output i.e. divide p by 2
+            slopeP <- tmpLmSum$coefficients[2,4] / 2
+        }
+        if(curSlope > 0){
+            ##compare if slope is sig different to 1
+            tmpSlopeEst <- tmpLmSum$coefficients[2,1] - 1
+            tmpSlopeErr <- tmpLmSum$coefficients[2,2]
+            tmpSlopeT <- tmpSlopeEst/tmpSlopeErr
+            ##using resiual dfs to test p-value
+            tmpSlopeDf <- tmpLm$df.residual
+            slopeP <- 1-pt(tmpSlopeT, tmpSlopeDf)
+        }
+    }
+    return(slopeP)
+}
+
+```
+
+what do the pval histograms look like? not great... most things just moving due to changes in RNAseq/riboseq abundance; not a lot of things changing with RNAseq abundance, but, there might be a couple, so maybe stick with this
+```{r}
+help(anota2seqGetOutput)
+
+anota.dt <- list(translation=as.data.table(anota2seqGetOutput(ads, analysis = "translation", output = "full", selContrast = 1), keep.rownames = T),
+                 buffering=as.data.table(anota2seqGetOutput(ads, analysis = "buffering", output = "full", selContrast = 1), keep.rownames = T),
+                 mRNA_abundance=as.data.table(anota2seqGetOutput(ads, analysis = "mRNA abundance", output = "full", selContrast = 1), keep.rownames = T),
+                 translated_mRNA=as.data.table(anota2seqGetOutput(ads, analysis = "translated mRNA", output = "full", selContrast = 1), keep.rownames = T),
+                 total_mRNA=as.data.table(anota2seqGetOutput(ads, analysis = "total mRNA", output = "full", selContrast = 1), keep.rownames = T)) %>% 
+  rbindlist(., fill=T, idcol='analysis')
+
+setnames(anota.dt, old='rn', new='gene')
+
+anota2seqPlotPvalues(ads, selContrast = 1, plotToFile = FALSE)
+
+```
+
+
+What pvalues are being plotted:
+Looks here like most of the differences are due to differential riboseq or rnaseq, but there must be some signal at the buffering/translation also has a peak 
+```{r}
+g <- ggplot(anota.dt, aes(x=apvRvmPAdj, color=analysis)) +
+  geom_density(alpha=0.25) +
+  geom_vline(xintercept = 0.1, linetype='dashed') +
+  labs(title='pvalue distributions', x='p.adjust') +
+  scale_color_brewer(type='qual', palette=2) +
+  theme_bw() +
+  guides(color=guide_legend(override.aes = list(geom ='line')))
+g
+BackupAsPDF(g, 'padj.distribution.density')
+
+
+# plot the raw pvalues
+g <- ggplot(anota.dt, aes(x=apvRvmP, color=analysis)) +
+  geom_density(alpha=0.25) +
+  geom_vline(xintercept = 0.1, linetype='dashed') +
+  labs(title='pvalue distributions', x='pvalue') +
+  scale_color_brewer(type='qual', palette=2) +
+  theme_bw() +
+  guides(color=guide_legend(override.aes = list(geom ='line')))
+
+g
+BackupAsPDF(g, 'pval.distribution.density')
+```
+Adjust pvalues based on testing param? its alright for now, just leave as is and try pull out examples
+What do these pvals mean? are they interpretable?
+```{r}
+f.ads <- anota2seqSelSigGenes(Anota2seqDataSet = ads, selContrast = 1, minSlopeTranslation =-1, maxSlopeTranslation = 2, minSlopeBuffering =-2, maxSlopeBuffering = 1, maxPAdj = 0.05)
+
+anota2seqPlotGenes(f.ads, selContrast = 1, analysis = "translation", plotToFile = TRUE)
+```
+
+Effect seems to be the distance (in log space) between the two slopes, pvalue is the statistical test if the intercept of the two groups is different, padj is the adjusted pvalue
+```{r}
+anota.clean <- anota.dt[, .(analysis, gene, slope=apvSlope, effectSize=apvEff, pvalue=apvRvmP, padj=apvRvmPAdj)]
+
+#fwrite(anota.clean, ScriptAndDatedFileName('tranlationEfficiency.analysis.csv.gz'))
+anota.clean <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/042225_DEA_editedVsNonEdited_data/2025_04_22_tranlationEfficiency.analysis.csv.gz')
+anota.clean[,  sig := 'not']
+anota.clean[padj < 0.05 & abs(effectSize) >= 1, sig := ifelse(effectSize > 1, 'translation up', 'translation down')]
+```
+This is just a fold change of the normalized values
+Pull out the matrices, both normalized and raw, for plotting 
+```{r}
+# I think this contains our fold changes; lets test and if so we can take this 
+delta.mat <- ads@deltaData[[1]]
+rna.norm.mat <- ads@dataT
+ribo.norm.mat <-  ads@dataP
+
+rna.norm.counts <- setDT(reshape2::melt(rna.norm.mat))
+setnames(rna.norm.counts, new=c('gene', 'sample', 'rna.norm.counts'))
+
+ribo.norm.counts <- setDT(reshape2::melt(ribo.norm.mat))
+setnames(ribo.norm.counts, new=c('gene', 'sample', 'ribo.norm.counts'))
+
+# confirm these are in correct order
+colnames(delta.mat) <- c('edits_vs_noEdits_RPF', 'edits_vs_noEdits_mRNA', 'RPF-mRNA', 'mRNA-RPF')
+delta.counts <- reshape2::melt(delta.mat)
+setnames(delta.counts, new=c('gene', 'contrast', 'FoldChange'))
+
+# 308 sig genes with sig differential translation across the two conditions
+anota.clean[analysis == 'translation' & padj < 0.05]
+```
+
+Volcanoplot of the anota2seq results
+```{r, fig.width=8, fig.height=5}
+# just plot anything that is significantly different between the groups
+g <- ggplot(anota.clean[analysis=='translation'], aes(x=effectSize, y=-log10(pvalue), label=gene, color=sig)) +
+  geom_point(size=1.25) +
+  ggrepel::geom_text_repel(data=anota.clean[analysis=='translation' & padj < 0.05,]) +
+  labs(title='Significant Translational Regulation', subtitle='Edited vs Non-edited') + 
+  scale_color_manual(values=c('not'='grey80', 'translation up'="#FB9A99", 'translation down'= "skyblue2")) +
+  coord_cartesian(xlim=c(-30,30)) +
+  theme_bw()
+
+BackupAsPDF(g, 'tranlationRegulation.edtiedVsnonEdited.volcanoplot')
+
+```
+Proportion of upregulated and downregulated genes 
+
+```{r fig.width=4, fig.height=5}
+g <- ggplot(anota.clean[analysis=='translation', .N, by=.(analysis,sig)][, sig := factor(sig, levels=c('translation up', 'translation down', 'not'))], aes(x=analysis, y=N, fill=sig)) +
+  geom_bar(stat='identity') +
+  labs(title='Number of differentially translated genes', subtitle='Edited vs Non-edited') + 
+  scale_fill_manual(values=c('not'='grey80', 'translation up'="#FB9A99", 'translation down'= "skyblue2")) +
+  theme_bw()
+
+BackupAsPDF(g, 'nSigHits.barplot')
+```
+Take the subset of genes with differential translation and plot a heatmap;
+What counts to use? I think for now maybe TPM is OK? Just want to normalize for depth 
+Look also at the norm mats; what do they look like for these genes
+
+# setting thresholds from the vignette to define the riboCounts ~ rnaCounts relationship (slope)
+This plot looks suspicious to me... clearly things that are flaged as controlled by translation are driven by differences in total mRNA abundance... need to look into these
+
+```{r, fig.width=7, fig.height=5}
+# min slope translation and max slope translation
+# looking to identify genes with slopes indicating changes in translational efficiency leading to altered protein levels are too large can be excluded
+f.ads <- anota2seqSelSigGenes(Anota2seqDataSet = ads, selContrast = 1, minSlopeTranslation =-1, maxSlopeTranslation = 2, minSlopeBuffering =-2, maxSlopeBuffering = 1, maxPAdj = 0.05)
+f.ads <- anota2seqRegModes(f.ads)
+
+
+g <- ggplot(anota2seqGetOutput(f.ads,output="singleDf",selContrast=1), aes(x=totalmRNA.apvEff, y=translatedmRNA.apvEff, color=singleRegMode)) +
+  geom_vline(xintercept = 0, linetype='dashed', alpha=0.5) +
+  geom_hline(yintercept=0, linetype='dashed', alpha=0.5) +
+  labs(title='Comparison of total mRNA vs RPF expression', subtitle='Edited vs Non-edited genes', x='FC total mRNA', y='FC Ribosome Protected Fragments (RPF)') +
+  geom_point(alpha=0.8, size=1) +
+  scale_color_brewer(type='qual', palette=2) +
+  theme_bw()
+g
+BackupAsPDF(g, 'totalvsRPF.scatterplot')
+```
+I dont know if the volcanoplot makes sense... how does this algorithm define up and down? Need to double check this
+For now, pull out these things with  a i) slope < 0 | slope > 1
+
+Pull out things that are assigned to differential translation based on padj; not a huge list, s
+
+Assumption for log2-TMM is majority not differentially expressed
+Some negative counts in the data; what does this even mean?
+
+```{r heatmap, fig.width=9, fig.height=13}
+sig.translated.ids <- anota.clean[analysis == 'translation' & padj < 0.05, unique(gene)]
+
+# same col order
+sum(rownames(ribo.norm.mat) == rownames(rna.norm.mat))  == length(rownames(ribo.norm.mat))
+
+# just cbind as rows match
+comb.norm.mat <- cbind(ribo.norm.mat, rna.norm.mat)
+
+# 
+hm <- Heatmap(comb.norm.mat[rownames(comb.norm.mat) %in% sig.translated.ids,],
+        column_split = list(ifelse(grepl('RIBO', colnames(comb.norm.mat)), 'RPF', 'total mRNA'),
+                            ifelse(grepl('proteinCoding', colnames(comb.norm.mat)), 'Edits', 'No Edits')
+                            ),
+        cluster_column_slices = F,
+        name='normalizedCounts\n(log2 TMM)',
+        border=T,
+        col=colorRamp2(breaks=c(0,5,10,15), colors=viridis(4)),
+        show_row_names=T, 
+        show_column_names = F,
+        row_names_gp = gpar(fontsize=4))
+
+hm
+BackupAsPDF(hm, 'sigTranslated.normCounts.heatmap')
+
+# almost 200n genes witha a negative value
+comb.norm.mat[comb.norm.mat < 0]
+rownames(comb.norm.mat)[comb.norm.mat[comb.norm.mat < 0]] 
+```
+Lets plot a heatmap of the 'difference of differences'
+Within each omics; calculate the foldchange, and then plot these counts
+Once we have plotted the normalized counts; use TPM/CPM normalization and plot the same heatmap; do the same genes standout?
+
+```{r  heatmap-FC, fig.width=7, fig.height=14}
+
+# we calculate FC per sample; sweep out the mean of the control group (no Edits)
+comb.sweep.mat <- cbind(sweep(ribo.norm.mat[,grepl('proteinCoding', colnames(ribo.norm.mat))], 1, apply(ribo.norm.mat[, grepl('noEdits', colnames(ribo.norm.mat))], 1, mean, na.rm=T)), 
+                       sweep(rna.norm.mat[,grepl('proteinCoding', colnames(rna.norm.mat))], 1, apply(rna.norm.mat[, grepl('noEdits', colnames(rna.norm.mat))], 1, mean, na.rm=T)))
+
+# 
+hm <- Heatmap(comb.sweep.mat[rownames(comb.sweep.mat) %in% sig.translated.ids,],
+        column_split = list(ifelse(grepl('RIBO', colnames(comb.sweep.mat)), 'RPF', 'total mRNA'),
+                            ifelse(grepl('proteinCoding', colnames(comb.sweep.mat)), 'Edits', 'No Edits')
+                            ),
+        cluster_column_slices = F,
+        name='Edits counts/\nnoEdits counts',
+        border=T,
+        col=colorRamp2(breaks=c(8,4,0,-4,-8), colors=redbluColpal),
+        show_row_names=T, 
+        show_column_names = F,
+        row_names_gp = gpar(fontsize=4))
+
+hm
+BackupAsPDF(hm, 'sigTranslated.FoldChangeVsUnEdited.heatmap')
+```
+
+Finally, plot the proportion of edited reads per sample; Is the proportion higher for the RNAseq than the Riboseq
+```{r, fig.height=4, fig.width=5}
+nReads.dt <- apply(count.mat, 2, sum) %>% 
+  data.table(sample=names(.), 
+             mappedReads=.)
+
+meta.dt <- meta.dt[nReads.dt, , on='sample']
+meta.dt[, sampleMappedReads := sum(mappedReads), by=.(type,rep)]
+
+g <-  ggplot(meta.dt, aes(x=paste0(type,'.',rep), y=mappedReads, fill=factor(condition, levels=c('proteinCodingEdits', 'noEdits')))) +
+  geom_bar(stat='identity',position = 'fill') +
+  scale_fill_brewer(type='qual', palette=3) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90)) +
+  guides(fill=guide_legend('status'))
+
+g
+BackupAsPDF(g, 'proportionEditedSites.barplot')
+```
+Interesting, seems we are recovering fewer edits in the riboseq data, by looking at proportion we are essentially normalizing for size right?
+What is our sequencing depth for each sample
+```{r}
+g <-  ggplot(meta.dt, aes(x=paste0(type,'.',rep), y=log10(sampleMappedReads), color=type)) +
+  geom_point() +
+  scale_color_brewer(type='qual', palette=4) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90)) +
+  guides(fill=guide_legend('status'))
+
+BackupAsPDF(g, 'Counts.mappedReads.dotplot')
+```
+write out the count matrices to share
+```{r}
+#fwrite(comb.norm.mat[, colnames(count.mat)], row.names =T, ScriptAndDatedFileName('normalized.gene.counts.csv.gz'))
+#fwrite(count.mat, row.names =T, ScriptAndDatedFileName('raw.gene.counts.csv.gz'))
+
+```
+Look at the log2 values of the raw matrix; the normalization seems ok; remember the riboseq & rnaseq libraries are normalized seperately, do we assume counts are similar?
+If we look at delta fold changes, we are normalizing within omics... how does this impact the slope for the model? Wont this determine the slope? Maybe we dont want to filter by extreme slop values consdiering this?
+
+```{r, fig.height=5, fig.width=8}
+g <- ggplot(setDT(reshape2::melt(comb.norm.mat))[, condition := gsub('_[0-9]{1,2}_','_', Var2)], aes(x=Var2, fill=condition, y=value)) +
+  geom_boxplot() +
+  scale_fill_brewer(type='qual', palette=3) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=6))
+g
+BackupAsPDF(g, 'normCounts.boxplots')
+```
+Does normalizing by library depth considering the vastly different sequencing depth maybe be an issue and overamplify differences.. maybe its ok for now, leave as is
+```{r}
+delta.mat[rownames(delta.mat) == 'Dopeav2000042m.g',]
+# does this match the counts
+count.mat[rownames(count.mat) == 'Dopeav2000042m.g',]
+rna.norm.mat[rownames(rna.norm.mat) == 'Dopeav2000042m.g',]
+ribo.norm.mat[rownames(ribo.norm.mat) == 'Dopeav2000042m.g',]
+```
+
+prepare the import 
+```{r}
+counts.mat <- dcast(counts.dt[gene %in% goodCounts], gene~sample, value.var = 'counts') %>% 
+    as.matrix(rownames=1)
+help(anota2seqDataSetFromMatrix)
+
+ads <- anota2seqDataSetFromMatrix(dataP=ribo.mat,
+                                  dataT=rna.mat,
+                                  phenoVec = phenoVec,
+                                  dataType = "RNAseq",
+                                  transformation = 'TMM-log2',
+                                  normalize = T)
+
+
+#saveRDS(ads, ScriptAndDatedFileName('anotaSeq.tmmNorm.obj.rds'))
+ads <- readRDS('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/031025_anota2seq_firstPass_data/2025_03_11_anotaSeq.tmmNorm.obj.rds')
+
+# run anota2seqPerformQC
+ads <- anota2seqPerformQC(ads)
+# run anota2seqResidOutlerTest(ads)
+ads <- anota2seqResidOutlierTest(ads)
+```
+
+Look at the counts matrices (raw and see if we can normalize by length to compare)
+```{r}
+adar.genes <- c('Dopeav2118252m', 'Dopeav2016222m','Dopeav2017526m', 'Dopeav2005419m')
+
+
+# read in the fasta to get the gene length
+count.dt  <- fread('042225_DEA_editedVsNonEdited_data/2025_04_22_raw.counts.csv.gz')
+count.dt[, gene := gsub('[.]g', '', transcript)]
+
+count.dt[gene %in% adar.genes & condition == 'noEdits',]
+ggplot(count.dt[gene %in% adar.genes,], aes(x=gene, y=log2(counts+1))) +
+  geom_point() +
+  facet_grid(~paste0(type, '.', condition)) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+count.dt[gene %in% adar.genes,]
+```
+TPM normalization
+It is calculated by dividing the number of reads mapped to a transcript by the transcript length. This value is then divided by the sum of mapped reads to all transcripts after normalization for transcript length. It is then multiplied by one million
+
+
+Check this is correct
+
+Read in the fasta to pull out the gene lengths for the norm proceedure
+
+```{r}
+# read in fa with all the genes
+cdsSeqs <- seqinr::read.fasta('./data/wynton_downloads//Dpealeiiv2_Protein_CDS.fasta', seqtype='AA', as.string = F, strip.desc = T) 
+             
+raw.mat <- dcast(count.dt, gene~sample, value.var='counts') %>% 
+  as.matrix(rownames='gene')
+
+gene.lens <-  sapply(cdsSeqs, function(x) length(x))
+gene.lens <-  gene.lens[names(gene.lens) %in% rownames(raw.mat)]
+
+source("~/Documents/utils/mg_utils/r_utils/differentialTesting.R")
+# tpm matrix
+tpm.mat <- rawCountsToTPM(raw.mat, gene.lens)
+
+apply(tpm.mat, 1, function(x){sum(x==0) == ncol(tpm.mat)})
+```
+
+```{r}
+tpm.counts <- setDT(reshape2::melt(tpm.mat))
+setnames(tpm.counts, new=c('gene', 'sample', 'tpmCounts'))
+
+count.dt[tpm.counts, TPM := i.tpmCounts, on=c('gene', 'sample')]
+
+
+ggplot(count.dt[gene %in% adar.genes,], aes(x=gene, y=log2(counts))) +
+  geom_point() +
+  facet_grid(~paste0(type, '.', condition), scales='free_y') +
+  labs(title='raw Counts') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+ggplot(count.dt[gene %in% adar.genes,], aes(x=gene, y=log2(TPM))) +
+  geom_point() +
+  facet_grid(~paste0(type, '.', condition), scales='free_y') +
+  labs(title='TPM') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+gene.lens[names(gene.lens) %in% adar.genes]
+```
+
+Maybe show 
+```{r}
+g <- ggplot(count.dt[gene %in% adar.genes & condition != 'proteinCodingEdits',], aes(x=gene, y=TPM, color=gene)) +
+  geom_point(size=1.5) +
+  facet_grid(~paste0(type), scales='free_y') +
+  scale_color_brewer(type='qual', palette=4, direction=-1 ) +
+  labs(title='ADAR gene counts', subtitle='TPM') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+g
+BackupAsPDF(g, 'ADARcounts.tpm.dotplot')
+```
+## pull out the edits for Jack and share
+
+```{r}
+comb.edits <- fread('')
+```
+
+
+```{r}
+edits.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/033125_rnaEdits_data/2025_03_31_proteinCoding.edits.csv.gz')
+
+ggplot(edits.dt[,.N, by=.(sample,Strand)], aes(x=Strand, y=N)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~sample)
+
+edits.dt[1,`BaseCount[A,C,G,T]`]
+str_extract(edits.dt[1,`BaseCount[A,C,G,T]`])
+str_extract_all(edits.dt[1,`BaseCount[A,C,G,T]`],'[0-9]+')
+
+unlist(str_extract_all("[700, 0, 0, 5]",'[0-9]+'))
+
+
+edits.dt$AllSubs %>% unique()
+```
+function to pull out the number of reads mapping to each 
+```{r}
+getEditReadCounts <- function(dt){
+  
+  
+  
+}
+```
+

@@ -1,0 +1,273 @@
+---
+title: "viralProteinsplot"
+author: "Martin Gordon"
+date: "2024-08-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Plot the distribution of the viral proteins data to ensure it matches what we already have
+
+```{r}
+
+library(DESeq2)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(circlize)
+library(ComplexHeatmap)
+library(ggrepel)
+library(readxl)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj; eg facet_grid allow x/y axis to vary
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+library(viridis)
+library(readxl)
+library(viridis)
+
+library(biomaRt)
+
+# RNAseq DE functions
+library(tximport)
+library(DESeq2)
+library(IHW)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+```
+
+Read in the gtf and the feature counts data
+
+```{r}
+#CoV2
+sars2.gtf <- fread(cmd = "grep -v '#' ./output/annoFiles/SARS2_WA.gtf") %>% 
+  .[V3 == 'gene', .(ref=V1,start=V4, stop=V5, info=V9)]
+sars2.gtf[, c('gene_id', 'gene') := tstrsplit(gsub('\\"|gene_id\\s|gene\\s', '', info), ';', keep=c(1,5))]
+
+
+gene.names <- sars2.gtf[, gene_id]
+
+bat.counts <- fread('./output/featureCounts/batSARS.featureCounts.txt') 
+cols.oi <- c('Geneid', grep('[.]markdup[.]sorted.bam', colnames(bat.counts), value=T))
+
+bat.counts <- bat.counts[, ..cols.oi]
+colnames(bat.counts) <- gsub('/wynton/group/krogan/mgordon/projects/072524_JBatra_SARS2RNAseqHuBat/output/batSARS2/star_salmon/|.markdup.sorted.bam', '', colnames(bat.counts))
+bat.counts <- as.matrix(bat.counts, rownames='Geneid')
+# human
+hu.counts <- fread('./output/featureCounts/hsSARS.featureCounts.txt') 
+cols.oi <- c('Geneid', grep('[.]markdup[.]sorted.bam', colnames(hu.counts), value=T))
+
+hu.counts <- hu.counts[, ..cols.oi]
+colnames(hu.counts) <- gsub('/wynton/group/krogan/mgordon/projects/072524_JBatra_SARS2RNAseqHuBat/output/huSARS2/star_salmon/|.markdup.sorted.bam', '', colnames(hu.counts))
+hu.counts <- as.matrix(hu.counts, rownames='Geneid')
+
+```
+Create the metadata column
+
+```{r}
+
+meta.data <- data.table(sample=dir('./output/salmonOut', full.names = F, pattern='quant.sf'))
+meta.data[, `:=`(host=ifelse(grepl('MRC5', sample), 'human', 'bat'),
+                 timepoint=ifelse(grepl('Mock', sample), '', str_extract(sample, '[0-9]{1,2}h')),
+                 virus=ifelse(grepl('Mock', sample), 'Mock', gsub('MRC5_|RFe_|_[0-9]{1,2}h.+', '', sample))
+                 )]
+
+# now want to set T0 and Mock as baseline for factor levels
+meta.data[, `:=`(virus=factor(virus, levels=c('Mock','WA', 'N_P80T', '9bI_N_P80T')),
+                 timepoint=factor(timepoint, levels=c('','6h', '12h', '24h', '48h'))
+                 )]
+
+
+# another fix; tp and virus are confounded for Mock, so we need to create a 'group' variable 
+meta.data[, condition := factor(ifelse(virus=='Mock', 'Mock', paste(virus, timepoint, sep='.')))]
+meta.data[, condition := relevel(condition, ref='Mock')]
+
+bat.meta <- data.frame(meta.data[host=='bat',], row.names = 'sample')
+hu.meta <- data.frame(meta.data[host=='human',], row.names = 'sample')
+
+# reset the tp levels for human as missing 6hr
+hu.meta$timepoint <-  factor(hu.meta$timepoint, levels=c('12h', '24h', '48h'))
+bat.meta$timepoint <-  factor(bat.meta$timepoint, levels=c('6h', '12h', '24h', '48h'))
+
+rownames(bat.meta) <- gsub('[.]quant[.]sf', '', rownames(bat.meta))
+rownames(hu.meta) <- gsub('[.]quant[.]sf', '', rownames(hu.meta))
+```
+
+
+```{r}
+all(rownames(bat.meta) == colnames(bat.counts))
+all(rownames(hu.meta) == colnames(hu.counts))
+
+dds.hu <- DESeqDataSetFromMatrix(countData = hu.counts,
+                                 colData = hu.meta,
+                                 design = ~ condition)
+
+dds.bat <- DESeqDataSetFromMatrix(countData = bat.counts,
+                                  colData = bat.meta,
+                                  design = ~ condition)
+                                  
+```
+
+```{r}
+keep <- apply(counts(dds.hu) >= 10, 1, sum) >= 3
+dds.hu <- dds.hu[keep,]
+
+keep <- apply(counts(dds.bat) >= 10, 1, sum) >= 3
+dds.bat <- dds.bat[keep,]
+```
+
+notes on contrasts in deseq2
+```{r}
+dds.hu <- DESeq(dds.hu)
+dds.bat <- DESeq(dds.bat)
+
+#saveRDS(dds.hu, ScriptAndDatedFileName('dds.human.vsMock.featureCountswVirus.rds'))
+#saveRDS(dds.bat, ScriptAndDatedFileName('dds.bat.vsMock.featureCountswVirus.rds'))
+```
+
+plot a heatmap of the SARS2 counts in each condition
+
+```{r}
+# extract the matrices.. dont use this method as inflates the 0's. Here we can see Mock is inflated to 7 with this transformation, which is basically 0
+#hu.mat <- assay(vst(dds.hu, blind=F))
+#bat.mat <-  assay(vst(dds.bat, blind=F))
+# look into why...
+hu.mat <- log2(counts(dds.hu, normalized=T)[rownames(counts(dds.hu)) %in% gene.names,] + 1)
+bat.mat <- log2(counts(dds.bat, normalized=T)[rownames(counts(dds.bat)) %in% gene.names,] + 1)
+
+# convert the names 
+rownames(hu.mat)[rownames(hu.mat) %in% gene.names] <- sars2.gtf[, .(gsub('\\s','',gene))]$V1
+rownames(bat.mat)[rownames(bat.mat) %in% gene.names] <- sars2.gtf[, .(gsub('\\s','',gene))]$V1
+```
+
+plot heatmap of the viral proteins
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=8)
+
+
+submat <- hu.mat[, grep('Mock', colnames(hu.mat), invert=T) ]
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+# lets make a color vectoe
+colours <- list('timepoint' = c('12h'="#228833", '24h'="#CCBB44", '6h'='#66CCEE', '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[4], '9bI_N_P80T'=col.pal[6]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'human' & virus != 'Mock',.(virus)],
+                            col = colours)
+
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =F,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+        column_split = factor(str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(-4,0,4), colors=c('blue','white','red')),
+        name=('log2Counts vs Median'),
+        border=T,
+        show_row_names = T)
+
+hm
+BackupAsPDF(hm, 'human.viralProts.medianSweep.heatmap')
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'bat' & virus != 'Mock',.(virus)],
+                            col = colours)
+
+# now look at bat
+submat <- bat.mat[, grep('Mock', colnames(bat.mat), invert=T) ]
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T), FUN='-')
+
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =F,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+        column_split = factor(str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        #col = colorRamp2(breaks=c(-4,0,4), colors=c('blue','white','red')),
+        name=('log2Counts vs Median'),
+        border=T,
+        show_row_names = T)
+
+hm
+BackupAsPDF(hm, 'bat.viralProts.medianSweep.heatmap')
+```
+try barplots of each of the counts
+```{r}
+hu.dt <- reshape2::melt(hu.mat)
+bat.dt <-  reshape2::melt(bat.mat)
+
+bat.dt <- merge(y=bat.dt, x=meta.data[host == 'bat', .(sample=gsub('[.]quant[.]sf', '', sample), host, timepoint, virus, condition)], by.y='Var2', by.x='sample', all.y=T)
+hu.dt <- merge(y=hu.dt, x=meta.data[host == 'human', .(sample=gsub('[.]quant[.]sf', '', sample), host, timepoint, virus, condition)], by.y='Var2', by.x='sample', all.y=T)
+
+comb.dt <- rbind(hu.dt, bat.dt)
+```
+
+
+plot a barlpot of each of the counts
+Instead of averaging take the N protien as it is the most abundant during infection and used as a marker
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=8)
+
+
+summary.dt <- comb.dt[, .(timepoint, avgCounts = mean(value, na.rm=T)), by=.(condition, virus, host, Var1)] %>%  unique()
+
+g <- ggplot(summary.dt[virus != 'Mock' & Var1 == 'N' ], aes(x=virus, y=2^avgCounts,fill=virus, col=virus)) +
+  geom_bar(stat='Identity', alpha=0.4) +
+  geom_point(data=comb.dt[virus != 'Mock' & Var1 == 'N' ], aes(x=virus, y=value, fill=virus), size=2) +
+  facet_grid2(host~timepoint, independent = T, scales='free') +
+  scale_fill_manual(values=col.pal) +
+  scale_color_manual(values=col.pal) +
+  ggtitle('SARS2 N protein expression') +
+  ylab(expression(log[2] ~ 'counts + pseudocount')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+BackupAsPDF(g, 'sars2Nprotein.barplot',dimensions = c(8,6))
+```
+
+now questionable how useful these comparisons are going to be... discuss with Jyoti later
+
+
+```{r}
+rawCountsToTPM <- function(mat, gene.length){
+  
+  if (nrow(mat) != length(gene.length)){
+    
+    message('number of genes in matrix does not match the vector of gene lengths supplied. Exiting..')
+    stop()
+  }
+  x <- mat / gene.length
+  tpm.mat <- t( t(x) * 1e6 / colSums(x) )
+  return(tpm.mat)
+}
+```
+
+

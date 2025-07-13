@@ -1,0 +1,701 @@
+---
+title: "061725_D123_BPSECMS_pipeline"
+author: "Martin Gordon"
+date: "2025-06-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Analysis of Donor1-3 HIV data; first load in the protein quant data, look at standard QC plots etc first to see sample agreement, then perform the PPI detection and differential analysis
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(viridis)
+library(pracma)
+library(magick)
+library(eulerr)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+mw standards 
+same standards for all 3 files
+```{r}
+mw.standards <- fread('./data/HIV_Infection_CD4T_cells/SEC_Profiles/D1-D3-cal_SRT.txt')
+setnames(mw.standards, new=c('fraction', 'mw'))
+# want the standards in daltons (right?)
+mw.standards[, mw := mw*1000]
+mc <- calculateFractionMassConverters(mw.standards)
+```
+
+read in the cleaned/normalized interpolated intensity values for D1 and D2
+```{r}
+# this is the second set of SEC data; now process the donor3 data
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.donor1donor2.normalized.interpolated.scaled.csv.gz')
+
+allFiles <- dir(path='./data/HIV_Infection_CD4T_cells/Spectronaut_Reports_061625', full.names = T, recursive = T, pattern="*Report.tsv")
+allFiles <- grep('Cell_Lysis', invert=T, allFiles, value=T)
+```
+Read in all results from file and process in the same way
+
+```{r}
+sec.ls <- lapply(grep('Protein_Report.tsv', allFiles, value=T), fread)
+names(sec.ls) <- unlist(tstrsplit(grep('Protein_Report.tsv', allFiles, value=T), '/', 4)[6])
+
+sec.ls <- lapply(sec.ls, function(x) {dt <- reshape2::melt(x, id.vars=c('PG.MolecularWeight', 'PG.ProteinGroups')); setnames(dt, old=c('value'), new='intensity'); return(setDT(dt))})
+```
+tidy the datatables; check the fractions match what we expect
+
+```{r}
+lapply(sec.ls, function(x){
+  x[, c('fraction', 'test') := as.list(str_extract_all(variable, '[0-9]+', simplify = T)), by=.I]
+})
+
+
+lapply(sec.ls, function(x){
+  sdcols <- c('fraction', 'test')
+  x[, (sdcols) := lapply(.SD, as.numeric), .SDcols=sdcols]
+})
+
+# all looks good
+lapply(sec.ls, function(x){
+  x[fraction != test,]
+  x[, all(order(unique(fraction)) == seq(1,72,1))]
+  })
+
+# drop unnecessary cols 
+lapply(sec.ls, function(x){
+  x[, c('variable', 'test') := NULL]
+  setnames(x, old=c('PG.MolecularWeight', 'PG.ProteinGroups'), new=c('mw', 'protein'))
+  return(x)
+})
+
+sec.dt <- rbindlist(sec.ls, idcol='sample')
+sec.dt[, c('replicate', 'treatment') := tstrsplit(sample, '-', keep=c(1,2))]
+sec.dt[, replicate := as.numeric(sub('[A-Z]', '', replicate))]
+
+#fwrite(sec.dt, ScriptAndDatedFileName('hiv.donor123.rawinput.csv.gz'))
+sec.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.donor123.rawinput.csv.gz')
+nrow(sec.dt)
+```
+add gene, mw, org annotation
+```{r}
+idmapper <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_D3_MSstatsSmmarization_data/2025_06_16_hiv.d3.peptide.ints.long.csv.gz')[, .(gene, protein,mw, org)] %>% 
+  unique()
+
+sec.dt <- merge(sec.dt[, -c('mw')], idmapper, by='protein', all.x=T)
+
+col.order <- c("sample", "treatment", "replicate", "fraction", "protein", "gene", "mw", "org", "intensity")
+#fwrite(sec.dt[, ..col.order], ScriptAndDatedFileName('hiv.donor123.rawinput.csv.gz'))
+
+sec.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.donor123.rawinput.csv.gz')
+sec.dt[, sample := factor(sample, levels=c("D1-Uninfected", "D1-Challenged_Infected", "D1-Challenged_Uninfected",
+                                           "D2-Uninfected", "D2-Challenged_Uninfected", "D2-Challenged_Infected",
+                                           "D3-Uninfected", "D3-Challenged_Uninfected", "D3-Challenged_Infected"))]
+```
+
+elutions look quite different? much more proteins detected in the 2nd set than set3.. also the curves look pretty different
+```{r nproteins, fig.width=8, fig.height=6}
+qc.dt <- qcSummaryTable(sec.dt)
+
+# number of protiens eluting looks good
+BackupAsPDF(qcPlotProteinCount(qc.dt), 'Nproteins.linechart') +
+  theme_classic()
+```
+Interesting the shapes are also subtly different instead of just y-axis shift (intensity difference) Need to fit a different curve to each sample I think?
+```{r medpolish, fig.width=8, fig.height=6}
+g <- qcPlotMedianInt(qc.dt) +
+  theme_bw()
+g
+BackupAsPDF(g, 'medianPolish.linechart')
+```
+Donor 1 uninfected failed?
+Also viral protein profiles are quite different...
+```{r, heatmaps, fig.width=20, fig.height=6}
+sec.dt[, interpolated := FALSE]
+
+View(scaledIntensityMatrices)
+intMats <- scaledIntensityMatrices(sec.dt, useInterpolated = FALSE)
+
+BackupAsPDF(intensityHeatmaps(intMats, 
+                              border=T), 'raw.ints.heatmap')
+
+# and viral only 8 detectedand v different profile
+BackupAsPDF(intensityHeatmaps(lapply(intMats, function(x){ return(x[rownames(x) %in% viral.prots,])}), 
+                              border=T), 'viral.raw.ints.heatmap')
+```
+
+Fit loess to each sample (fit an interaction model as there is a clear donor effect visible here between 2 & 3)
+
+```{r, detect-outliers}
+allFits <- fitLocalCubics(qc.dt, window = 15, sampleTerm = "interaction")
+labelOutliers(qc.dt, allFits, threshold = 2) 
+
+p <-plotNormAndOutlierFits(qc.dt , allFits)
+BackupAsPDF(p, 'localRegression.window15.linechart')
+```
+```{r, normalize-by-residuals}
+normalizeByResiduals(secLong.dt = sec.dt, qc.dt)
+#fwrite(sec.dt, ScriptAndDatedFileName('hiv.donor123.rawinput.csv.gz'))
+sec.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.donor123.rawinput.csv.gz')
+sec.dt[, interpolated := NULL]
+```
+Visualize the new QC results
+Most fractions look pretty good; I still think we can do a quick imputation step to tidy up a couple of fraction in `Challenged_Uninfected_3`, but otherwise things look pretty good
+```{r norm-qc}
+norm.qc.dt <- qcSummaryTable(sec.dt)
+
+g <- qcPlotMedianInt(norm.qc.dt) +
+  theme_bw()
+g
+BackupAsPDF(g, 'normalized.qc')
+```
+
+Normalization looks great! A couple of problematic fractions, but fall outside the informative windows
+Turn on interpolation anyway and save the values for (possibly) plotting later...
+```{r}
+sec.long <- interpolateMissingAndOutlierFractions(sec.dt, qc.dt, fractions = seq(1,72,1), maxGap = 2)
+#fwrite(sec.long, ScriptAndDatedFileName('sec.long.normalized.interpolated.csv.gz'))
+sec.long <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_sec.long.normalized.interpolated.csv.gz')
+```
+plot the normalized set; looks to have cleaned issues in later fraction 
+```{r nproteins, fig.width=8, fig.height=6}
+new.qc.dt <- qcSummaryTable(sec.long)
+
+g <- qcPlotMedianInt(new.qc.dt) +
+  theme_bw()
+g
+BackupAsPDF(g, 'normalized.interpolated.qc')
+
+# number of protiens eluting looks good
+BackupAsPDF(qcPlotProteinCount(new.qc.dt), 'Nproteins.interpolated.linechart') +
+  theme_classic()
+```
+The two heatmaps to compare
+I think the reason the interpolation 'half works' as these are not flagged as outlier samples based on ints alone, so may need to adjust this for the interpolation function to inlcude fractions with low N proteins relative to neighbours
+```{r, heatmaps, fig.width=20, fig.height=6}
+intMats <- scaledIntensityMatrices(sec.long, useInterpolated = TRUE)
+
+BackupAsPDF(intensityHeatmaps(intMats, 
+                              border=T), 'norm.interpolated.prots.heatmap')
+
+intMats <- scaledIntensityMatrices(sec.long, useInterpolated = FALSE)
+
+BackupAsPDF(intensityHeatmaps(intMats, 
+                              border=T), 'norm.prots.heatmap')
+```
+Remove proteins with < 5 consecutvie measurements
+Do this after interpolation on expanded but non-interpolated data to ensure the consecutvie meaurements are consecutive functions...
+```{r}
+# want to run this on the originalOIntensity as dont want to consider mssing 
+sec.long[, ori.intensity := originalIntensity]
+sec.long[is.na(ori.intensity), ori.intensity := 0]
+
+
+sec.long  <- MaxConsecutiveDetections(secLong.dt = sec.long, idcol = 'protein', intsCol = 'ori.intensity', detectionCutoff=0, plot=T)
+sec.long[, passDetections := FALSE]
+sec.long[consecutiveDetections >=5, passDetections := TRUE]
+
+g <- ggplot(sec.long[, length(unique(protein)), by=.(sample,passDetections)], aes(x=sample, y=V1, fill=passDetections)) +
+  geom_bar(stat='identity') +
+  theme_bw() +
+  scale_fill_brewer(type='qual', palette=3) +
+  guides(fill=guide_legend('> 5 consecutive fraction detections')) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'nProteinsConsecDetections.barplot')
+```
+Remove the filtered proteins and save the results. This will be our starting set for the analysis
+```{r}
+# keep passing proteins in sec.long 
+fwrite(sec.long[passDetections == TRUE,], ScriptAndDatedFileName('sec.long.normalized.interpolated.filtered.csv.gz'))
+```
+
+```{r}
+sec.long <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_sec.long.normalized.interpolated.filtered.csv.gz')
+```
+
+
+## QC plots of clean data
+
+We basically want to answer how similar/different are the samples
+Need to make a call on the whether a third donor is needed; look at pairwise sample correlations
+
+First scale our intensity. use the interpolated values for now, wont really impact results as few fractions impacted
+```{r}
+scaleByTotalIntensity(sec.long)
+scaleByMaxIntensity(sec.long)
+
+corMat <- qcFullSampleCorrelation(sec.long)
+corMat
+#' plot correlation matrices
+#' taken from https://jokergoo.github.io/ComplexHeatmap-reference/book/a-single-heatmap.html#customize-the-heatmap-body
+
+plotSampleCorrelationHeatmap <- function(cor.mat=cor.mat,...){
+  
+  #enforce same row and column ordering
+  od =  hclust(dist(cor.mat))$order
+  cm = cor.mat[od, od]
+
+  hm <- Heatmap(cm,
+                name='Sample Pearson Corr.',
+                rect_gp = gpar(type = "none"), 
+                cluster_rows = F, 
+                cluster_columns = F,
+                column_names_gp = gpar(fontsize=8),
+                row_names_gp = gpar(fontsize=8),
+	              cell_fun = function(j, i, x, y, w, h, fill) {
+		            if(i >= j) {
+		              grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		              grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='white'))
+		              }
+	             },
+		            ...)
+  draw(hm)
+}
+BackupAsPDF(plotSampleCorrelationHeatmap(corMat, col=viridis(10)), 'sampleFraction.correlations.heatmap')
+```
+basically looks at a sliding window to see if fractions become more similar, but not the case
+Take away is one of the D1 samples has failed  (challenged uninfected) and D2 and D3 are very different expression patterns 
+
+start comparisons from fraction 20 due to the difficulties with earlier fractions
+Not promising; clearly huge donor effect v little correlation between donors 2&3
+```{r, cross-corr-barplot, fig.width=12, fig.height=10}
+cc.dt <- crossCorrelationFullSample(sec.long, startFraction = 20, endFraction = 60, radius=5)
+
+sampleOrdr <- c('D1-Challenged_Infected','D1-Challenged_Uninfected', 'D1-Uninfected',
+                'D2-Challenged_Infected','D2-Challenged_Uninfected', 'D2-Uninfected',
+                'D3-Challenged_Infected', 'D3-Challenged_Uninfected', 'D3-Uninfected')
+
+cc.dt[, refSample_fct := factor(refSample, levels=sampleOrdr)]
+cc.dt[, otherSample_fct := factor(otherSample, levels=sampleOrdr)]
+cc.dt
+g <- ggplot(cc.dt, aes(y=pearsonR, x=offset, fill=pearsonR)) +
+  geom_bar(stat='identity') +
+  facet_grid(refSample_fct~otherSample_fct) +
+  scale_fill_viridis_c() +
+  theme_bw() +
+  theme(strip.text=element_text(size=6)) 
+
+g
+BackupAsPDF(g, 'crossCor.barplot')
+```
+before we do this, lets tidy the sample names
+
+```{r}
+sec.long[treatment == 'Challenged_Infected', treatment:= 'Infected']
+sec.long[treatment == 'Challenged_Uninfected', treatment := 'Challenged']
+sec.long[, sample.old := sample]
+sec.long[, sample := paste0(treatment, '_', replicate)]
+
+```
+
+```{r}
+full.cor.dt <- qcFractionByFractionCorrelation(sec.long)
+```
+
+```{r, fig.width=9, fig.height=5}
+g <- qcFractionCorrelationLinePlot(full.cor.dt,
+                                   splitByReplicate=T, 
+                                   colorFacetStrips = T)
+BackupAsPDF(function()grid.draw(g), 'fractionCorrelation.lineplot.splitReps.pdf')
+
+```
+I find the collapsed version too confusing, use the split version
+```{r, fig.width=6, fig.height=5}
+g <- qcFractionCorrelationLinePlot(full.cor.dt,
+                                   splitByReplicate=F, 
+                                   colorFacetStrips = T)
+BackupAsPDF(function()grid.draw(g), 'fractionCorrelation.lineplot.splitReps.collapsed.pdf')
+```
+
+Color by donor?
+
+```{r, fig.width=7, fig.height=5}
+full.cor.dt[, ref.treatment.old := ref.treatment]
+full.cor.dt[, other.treatment.old := other.treatment]
+full.cor.dt[, ref.treatment := ref.replicate]
+full.cor.dt[, other.treatment := other.replicate]
+
+g <- qcFractionCorrelationLinePlot(full.cor.dt,
+                                   splitByReplicate=F, 
+                                   colorFacetStrips = T)
+
+BackupAsPDF(function()grid.draw(g), 'fractionCorrelation.donorColor.lineplot.splitReps.collapsed.pdf')
+```
+# peak detection
+```{r}
+
+# if we normalized, we have to catch the post-normalization matrices
+normInt.mats <- scaledIntensityMatrices(sec.dt, useInterpolated = TRUE)
+peakTables <- lapply(normInt.mats, goodPeaksTableFromIntensityMatrix, minCV = -Inf)
+
+allPeaks <- rbindlist(peakTables, idcol = "sample")
+allPeaks[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+```
+
+```{r, fig.width = 8, fig.height = 7}
+# udpate height for more samples
+p <- ggplot(allPeaks, aes(x= peakLocation, fill = goodPeak)) + 
+  geom_bar() + 
+  facet_grid(treatment~replicate) +
+  theme_bw()
+p
+BackupAsPDF(p, "peakCounts.perfraction.barplot")
+```
+
+# fraction adjustments based on peaks
+This will update the peakTables sec.dt with new standardized fraction numbers
+```{r}
+# I don't trust hte alignment below about fraction 20, so update `startFitAtPeak` to skip it
+standardizeAllPeakTablesToStandard(peakTables, sec.dt, standardIdx = "Uninfected_3", fitPortion = 0.65, minPeaksPerFraction = 45, startFitAtPeak = 20)
+sec.dt[, standardFraction.global := standardFraction]
+```
+
+Donors seem too different to align. lets try another way
+Split the DT into, donor lists and process seperately. Then combine the output together
+
+```{r}
+peakTables.ls <- lapply(seq(1,3,1), function(x){
+  
+  mats.subset <- normInt.mats[grepl(paste0(x,'$'), names(normInt.mats))]
+  print(names(mats.subset))
+  peakTables <- lapply(mats.subset, goodPeaksTableFromIntensityMatrix, minCV = -Inf)
+  return(peakTables)
+})
+
+# now align peaks within each donor
+sec.long <- lapply(seq(1,3,1), function(x){
+  subdt <- copy(sec.dt[replicate == x,])
+  standardizeAllPeakTablesToStandard(peakTables.ls[[x]], subdt, standardIdx = 3, fitPortion = 0.65, minPeaksPerFraction = 45, startFitAtPeak = 20)
+  return(subdt)
+}) %>% rbindlist(.)
+```
+now we have standard fractions and standard fractions global. Lets use the local alignment and interpolate intensities, we can then use these these values fro plotting
+
+```{r}
+sec.dt[, intensity_interpolated := approx(standardFraction, intensity, xout = fraction)$y, by = .(sample, protein)]
+#fwrite(sec.dt, ScriptAndDatedFileName('hiv.d123.processed.ints.csv.gz'))
+sec.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.processed.ints.csv.gz')
+```
+
+Todo:
+filter protein peaks using MW
+Detect PW PPI 
+Perform differential analysis
+Upload the new data to the app
+
+```{r}
+#standards <- loadStandardsFractionToMW ("~/Downloads/cal_biosep.txt")
+mc <- calculateFractionMassConverters(standards)
+
+# label fractions by mass, and fraction/proteins by mass ratio, aka log2MassNumber
+sec.dt[, fractionMass := mc$fraction2Mass(standardFraction)]
+sec.dt[, log2MassNumber := log2(fractionMass/as.numeric(mw))]
+
+
+# pay attention to which cofmX.XXXX is used below: cofmN.standardized
+scorePeakByMassShift <- function(peak.dt, mw){
+  # the 150% fraction
+  peak.dt[sec.dt, fiftyPCFraction := mc$mass2Fraction(1.2 * as.numeric(mw)), on = "protein"]
+  peak.dt[!is.na(fiftyPCFraction), goodPeak.rm.monomers := goodPeak & cofmN.standardized < fiftyPCFraction]
+  peak.dt
+}
+
+# collapse to one list (1 level unnesting)
+peakTables <- do.call(c,peakTables.ls)
+
+purrr::walk(peakTables, scorePeakByMassShift, mw)
+
+allPeaks <- rbindlist(peakTables, idcol='sample')
+allPeaks[is.na(goodPeak.rm.monomers), goodPeak.rm.monomers := FALSE]
+#fwrite(allPeaks, ScriptAndDatedFileName('hiv.d123.detectedPeaks.csv.gz'))
+```
+Actually the filtration looks pretty good 
+```{r}
+allPeaks <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.detectedPeaks.csv.gz')
+allPeaks[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+# udpate height for more samples
+p <- ggplot(allPeaks, aes(x= peakLocation, fill = goodPeak.rm.monomers)) + 
+  geom_bar() + 
+  facet_grid(treatment~replicate) +
+  theme_bw()
+p
+BackupAsPDF(p, "peakCounts.filtered.perfraction.barplot")
+```
+
+```{r prepare-gs}
+# id mapper for protein -> string ID
+huString.mapper <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_protein.string.idMapper.csv.gz')
+
+#need to merge our protein ids with 
+gs.interactors <- goldStandardPairs(huString.mapper[protein %in% sec.long$protein, unique(stringID)], 
+                                    corum.path = NULL,
+                                    string.links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                                    string.info.path =  NULL,
+                                    stringCombinedScoreThreshold = 400)
+
+gs.decoys <- decoysFromString(huString.mapper[protein %in% sec.long$protein, unique(stringID)], 
+                              links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                              info.path =  NULL)
+gs.decoys[, source := 'string']
+
+gs.comb.interactors <- rbind(gs.interactors, gs.decoys)
+```
+## peak-peak correlations
+```{r, peak-correlations}
+# just ensure a refresh
+intMats <- scaledIntensityMatrices(sec.dt, useInterpolated = FALSE)
+
+View(windowedCorrelation)
+peakMatrices <- purrr::map2(intMats, peakTables, goodPeaksMatFromPeaksTable)
+corPeaks.ls <- purrr::map2(intMats, peakMatrices, windowedCorrelation, outerRadius = 6)
+
+allPeakCorrs <- rbindlist(purrr::map(corPeaks.ls, "cor"), idcol = "sample")
+```
+
+```{r annotate-peakDT}
+# read in datatables
+allPeakCorrs[huString.mapper, gene1 := i.stringID, on = c(protein1 = "protein")]
+allPeakCorrs[huString.mapper, gene2 := i.stringID, on = c(protein2 = "protein")]
+allPeakCorrs[idmapper, alias1 := i.gene, on = c(protein1 = "protein")]
+allPeakCorrs[idmapper, alias2 := i.gene, on = c(protein2 = "protein")]
+
+
+# for now use protein as gene for the NA gene
+allPeakCorrs[is.na(gene1), gene1 := protein1]
+allPeakCorrs[is.na(gene2), gene2 := protein2]
+
+allPeakCorrs[is.na(alias1), alias1 := protein1]
+allPeakCorrs[is.na(alias2), alias2 := protein2]
+#fwrite(allPeakCorrs, ScriptAndDatedFileName('secms.hiv.d123.allByallPeakCorr.csv.gz'))
+allPeakCorrs <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_secms.hiv.d123.allByallPeakCorr.csv.gz')
+```
+
+The scores seem to do a good job of distinguishing truth set vs decoys
+```{r,plot-correlations, fig.width=9,fig.height=6}
+g <-  ggplot(allPeakCorrs[gene1 < gene2 & gs != 'unknown'], aes(x = sample, fill = gs)) +
+    geom_bar() + 
+    labs(title=paste0('Breakdown of detected interactors (R >= .9)')) +
+    theme_bw() + 
+    scale_fill_manual(values=c('decoy'='grey70', 'interactor'='gold'))
+g
+BackupAsPDF(g, 'interactorSet.breakdown.barplot')
+
+g <- ggplot(allPeakCorrs[gene1 < gene2 & pearsonR >= 0.99 & gs != 'unknown'], aes(x = sample, fill = gs)) +
+    geom_bar() + 
+    labs(title=('Breakdown of detected interactors'), subtitle='pearson R > 0.99') +
+    theme_bw() + 
+    scale_fill_manual(values=c('decoy'='grey70', 'interactor'='gold'))
+g
+BackupAsPDF(g, 'interactorSet.breakdown.r99.barplot')
+```
+```{r}
+allGenes <- huString.mapper$stringID %>% 
+  unique()
+denomInteractor <- nrow(gs.interactors[gene1 %in% allGenes & gene2 %in% allGenes])
+denomDecoy <- nrow(gs.decoys[gene1 %in% allGenes & gene2 %in% allGenes])
+```
+Using log-likihood ratio approach; how more likey is the PPI derived from the truth set than the random set
+Looks liek a lot of decoys also correlate with
+```{r ppi-scoring}
+scoreByGS(allPeakCorrs, denomDecoy, denomInteractor, column = "corScore", groupByVariable = c("sample", "start"))
+```
+plot the LLR to see how; distance between lines is what is being scored
+```{r}
+g <- ggplot(allPeakCorrs, aes(x = corScore, y = log10RateRatioID, color = start)) + geom_hline(yintercept = 0.0, lty = "dotted") + 
+    geom_line(aes(group = start)) + 
+    facet_wrap(~sample, ncol=3) + 
+    scale_color_viridis_c(option = "H", name = "fraction") + 
+    theme_bw()
+g
+BackupAsPDF(g, 'LLR.samples.linechart')
+
+
+allPeakCorrs[corScore > 10]
+
+ggplot(sec.long[sample == 'Infected_3' & protein %in%c('P04233','P01889'),], aes(x=fraction, y=intensity_totalScaled, color=protein)) +
+  geom_point() +
+  geom_line(aes(group=protein))
+
+# Im super confident a lot of duplicate rows made it into INfected_3, ... that is an insanely high value of perfect cor scores
+g <- ggplot(allPeakCorrs[pearsonR == 1, .N, by=sample], aes(x=sample, y=log2(N))) +
+  geom_bar(stat='identity') +
+  labs(title='Number of PPI with perfect correlation scores')
+BackupAsPDF(g, 'N.perfectCor.scores.pdf')
+```
+Just looking at the elution profiles, I am not sure if I trust anything before fraction 20 in the allpeakCors set for infected_3, 
+I think these might just be missing fractions surround by a single measurment
+histogram clearly highlights this; drop these measurements
+```{r}
+ggplot(allPeakCorrs[pearsonR == 1], aes(x=prot1Peak)) +
+  geom_histogram(bins=72) +
+  facet_wrap(~sample)
+```
+I think looking at this we want to use non-interpolated values for peak finding, but proceed as is for now as this will be researched anyway..
+```{r}
+filteredPeakCorrs <- allPeakCorrs[!(sample == 'Infected_3' & (prot1Peak < 20)| prot2Peak < 20),]
+
+g <- ggplot(allPeakCorrs, aes(x = corScore, y = log10RateRatioID, color = start)) + geom_hline(yintercept = 0.0, lty = "dotted") + 
+    geom_line(aes(group = start)) + 
+    facet_wrap(~sample, ncol=3) + 
+    scale_color_viridis_c(option = "H", name = "fraction") + 
+    theme_bw()
+g
+```
+save the ppi best scores to file 
+repeat peak finding and analysis w/o the using the interpolated values and see if this removes the FP set
+
+```{r}
+stoichDevThreshold <- log2(1 + 0.2)
+
+setorder(allPeakCorrs, sample, -log10RateRatioID )
+
+summary <- filteredPeakCorrs[, .SD[1], by= .(sample, protein1, protein2, gene1, gene2, prot1Peak, prot2Peak, gs) # best correlation per pair of peaks
+                          ][, .(sumLLRatio = sum(log10RateRatioID[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]), # only sum peaks that are within 20% of the first
+                                numPeaks = .N,
+                                numSameStoichPeaks  = sum (abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold)),
+                            by = .(sample, protein1, protein2, gene1, gene2, gs)
+                            ]
+setorder(summary, sample, -sumLLRatio)
+fwrite (summary[gene1 < gene2], ScriptAndDatedFileName("hiv.d123.peaksimilarities.csv.gz"))
+```
+
+## cosine similarity
+TODO....
+
+
+## Differential peak analysis
+
+read files
+```{r}
+# all filtered peaks 
+allPeaks <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.detectedPeaks.csv.gz')
+allPeaks <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.detectedPeaks.csv.gz')
+
+fwrite(allPeaks, ScriptAndDatedFileName('detectedPeaks.csv'))
+# dont consider monomeric peaks in th eset
+allPeaks[,goodPeak := goodPeak.rm.monomers]
+
+sec.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.processed.ints.csv.gz')
+```
+
+Now, we want to split the datasets into two donors, run seperately and run each group pairwise. Inspect the results in the app
+```{r}
+allTreatments <- sec.long$treatment %>% 
+  unique()
+
+
+allByAll <- function(items){
+  data.table(x = items)[, .(y = items), by = x][]
+}
+
+pair.mat <- allByAll(allTreatments)[x < y] %>% 
+  as.matrix()
+
+allPeaks[,treatment := tstrsplit(sample, "_", keep=1)]
+
+
+contrastTreatmentSubset <- function (treatments, sec.dt, allPeaks){
+  print (treatments)
+  allPeaks <- allPeaks[treatment %in% treatments]
+  allPeaks[, proteinPeakCluster := NULL]
+  # per protein, join peaks across runs into clusters
+  allPeaks[goodPeak == TRUE, proteinPeakCluster := clusterPeaks(cofmN.standardized, maxDistance = 2.5), by = protein]
+
+  # per peak cluster (per protein), summarize to a center (and height etc, but most important is center)
+  peakClusters <- allPeaks[!is.na(proteinPeakCluster), 
+                           .(.N, meanPeakHeight  = mean(peakHeight), center = mean(cofmN.standardized)),
+                           keyby = .(protein, proteinPeakCluster)]
+  
+  # split data into single-protein chunks
+  # peaks in the protein
+  peakClusters.subTables <- split(peakClusters, by = "protein")
+  # sec data per protein (only those in above table)
+  allProteins <- names(peakClusters.subTables)
+  sec.subTables <- split(sec.dt[treatment %in% treatments][protein %in% allProteins], by = "protein" )
+  
+  # iterate over proteins
+  names(allProteins) <- allProteins
+  anova.ls <- pbapply::pblapply(allProteins, function(proteinOI) anovaPeaksInOneProtein(sec.subTables[[proteinOI]], peakClusters.subTables[[proteinOI]], radius = 5))
+  
+  # format output
+  anova.dt <- rbindlist(anova.ls, use.names = TRUE, fill = TRUE, idcol = "protein")
+  print(anova.dt)
+  # friendly names
+  setnames(anova.dt,
+           old = c( "rn",        "Sum.Sq",     "Mean.Sq",    "F.value", "Pr..F."),
+           new = c( "modelTerm", "SumSquares", "MeanSquare", "F",       "p.F"))
+  
+  
+  peakClusters[anova.dt[modelTerm == "poly(standardFraction, 4):treatment"], treatmentDiff.p := i.p.F]
+  peakClusters[anova.dt[modelTerm == "treatment"], treatmentIntensity.p := i.p.F]
+
+  setorder(peakClusters, treatmentDiff.p, na.last = TRUE)
+  
+  peakClusters[, gene := multiUniprots2multiGenes(protein)]
+  setcolorder(peakClusters, c("protein", "gene"))
+  
+  return (peakClusters)
+}
+```
+
+now, run the analysis within each donor
+```{r}
+d1_pairwiseContrasts <- apply(pair.mat, 1, contrastTreatmentSubset, sec.dt[replicate == 1,], allPeaks[peakHeight > 0.01])
+d2_pairwiseContrasts <- apply(pair.mat, 1, contrastTreatmentSubset, sec.dt[replicate == 2,], allPeaks[peakHeight > 0.01])
+d3_pairwiseContrasts <- apply(pair.mat, 1, contrastTreatmentSubset, sec.dt[replicate == 3,], allPeaks[peakHeight > 0.01])
+
+names(d1_pairwiseContrasts) <- apply(pair.mat, 1, function(x) paste0(paste0(x, collapse = "_"), '_1'))
+names(d2_pairwiseContrasts) <- apply(pair.mat, 1, function(x) paste0(paste0(x, collapse = "_"), '_2'))
+names(d3_pairwiseContrasts) <- apply(pair.mat, 1, function(x) paste0(paste0(x, collapse = "_"), '_3'))
+
+allContrasts <- rbindlist(c(d1_pairwiseContrasts, d2_pairwiseContrasts, d3_pairwiseContrasts),idcol = "contrast")
+allContrasts[, treatmentDiff.padj := p.adjust(treatmentDiff.p, method='BH')]
+allContrasts[, treatmentIntensity.p := p.adjust(treatmentIntensity.p, method='BH')]
+
+fwrite(allContrasts, ScriptAndDatedFileName('hiv.d123.pwContrasts.csv.gz'))
+fwrite(allContrasts, ScriptAndDatedFileName('hiv.d123.pwContrasts.csv'))
+
+
+
+allContrasts.filtered <- allContrasts[center >= 20, ]
+allContrasts.filtered[, treatmentDiff.padj := p.adjust(treatmentDiff.p, method='BH')]
+allContrasts.filtered[, treatmentIntensity.p := p.adjust(treatmentIntensity.p, method='BH')]
+
+fwrite(allContrasts.filtered, ScriptAndDatedFileName('hiv.d123.pwContrasts.rmfrac20peaks.csv.gz'))
+```
+peak similarities; annotate with protein names and share
+
+```{r}
+
+idmapper <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_D3_MSstatsSmmarization_data/2025_06_16_hiv.d3.peptide.ints.long.csv.gz')[, .(gene, protein,mw, org)] %>% 
+  unique()
+peakCor <- fread('./061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.peaksimilarities.csv.gz')
+peakCor <- merge(peakCor, idmapper[, .(protein1=protein, alias1=gene)], by='protein1', all.x=T)
+peakCor <- merge(peakCor, idmapper[, .(protein2=protein, alias2=gene)], by='protein2', all.x=T)
+
+peakCor <- peakCor[, .(sample, protein1, protein2, alias1, alias2, gene1, gene2, gs, sumLLRatio, numPeaks, numSameStoichPeaks)]
+fwrite(peakCor, ScriptAndDatedFileName('hiv.d123.proteinCorrelations.csv'))
+```
+
+

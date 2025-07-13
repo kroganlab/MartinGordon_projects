@@ -1,0 +1,212 @@
+---
+title: "htr2a.plots"
+author: "Martin Gordon"
+date: "2023-12-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Generate plots of htr2a for DARPA meeting 4/12/23
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(magrittr)
+library(ComplexHeatmap)
+library(randomcoloR)
+library(stringr)
+library(OmnipathR)
+library(circlize)
+library(ggsignif)
+library(ggpubr)
+
+
+
+#source BP utility scripts
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/linearModels.R")
+
+# kinase enrichment analysis
+source("/Users/martingordon/Documents/utils/bp_utils/KinaseActivityScores.R")
+
+# mg utility functions
+source("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+```
+
+
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(5)
+
+
+mss.dt <- fread('~/Documents/projects/112823_XZhong_DARPA2/DE.ph.LMredo.noBatch_data/2023_11_30_mss.pwcomparisons.nobatch.csv')
+  
+dp.out <- readRDS('~/Documents/projects/112823_XZhong_DARPA2/DE.ph.LMredo.noBatch_data/2023_11_30_ph.mss.dataproc')
+p.quant<- setDT(dp.out$ProteinLevelData)
+p.quant[, gene := multiUniprotSites2multiGeneSites(Protein, species='MOUSE')]
+
+sites.oi <- c('Htr2a_S298','Htr2a_S421')
+
+g <- ggplot(p.quant[gene %in% sites.oi,], aes(x=GROUP, y=LogIntensities, color=GROUP)) +
+  geom_point() + 
+  stat_summary(fun.dat='mean_cl_boot', color='grey', size=0.2) +
+  scale_color_manual(values=col.pal) +
+  ggtitle('HTR2A PH sites') +
+  facet_wrap(~gene) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, vjust = 0.7))
+g
+BackupAsPDF(g, 'htr2a.sites.oi.linechart.fixedxaxis',dimensions=c(8,6))
+```
+another option; take the log2FC values per site, combine with SE estimates and overlay
+rotate and do a lollipop chart
+```{r}
+lab.col.pal <- randomcoloR::distinctColorPalette(5)
+
+g <- mss.dt[gene %in% sites.oi,] %>% 
+  ggplot(., aes(x=Label, y=log2FC, color=Label)) +
+  geom_segment(aes(x=Label, xend=Label, y=0, yend=log2FC), color='grey', lwd=.5, linetype=1) +
+  geom_point(size=3) +
+  geom_hline(yintercept=0, alpha=0.4, linetype=2) +
+  facet_wrap(~gene) +
+  ylim(c(-1,2)) +
+  theme_bw() + 
+  #coord_flip() +
+  scale_color_manual(values=c(lab.col.pal)) +
+  theme(
+    axis.text.x = element_text(angle=90, vjust=0.6)
+  )
+
+BackupAsPDF(g, 'htr2a.lollipop.basic.')
+
+# annotate with pval if < 0.05
+mss.dt[, lab := '']
+mss.dt[pvalue < 0.05, lab := ifelse(pvalue < 0.01, '**', '*')]
+mss.dt[pvalue < 0.001, lab := '***']
+
+g <- mss.dt[gene %in% sites.oi,] %>% 
+  ggplot(., aes(x=Label, y=log2FC, color=Label, label=paste0(lab, ' ', round(pvalue, 3) )) ) +
+  geom_segment(aes(x=Label, xend=Label, y=0, yend=log2FC), color='grey', lwd=.5, linetype=1) +
+  geom_point(size=3) +
+  geom_hline(yintercept=0, alpha=0.4, linetype=2) +
+  geom_text(data=mss.dt[gene %in% sites.oi & pvalue < 0.05], color='darkgrey', size=3, vjust=-2) +
+  facet_wrap(~gene) +
+  ylim(c(-1,2)) +
+  theme_bw() + 
+  #coord_flip() +
+  scale_color_manual(values=c(lab.col.pal)) +
+  theme(
+    axis.text.x = element_text(angle=90, vjust=0.6)
+  )
+
+g
+
+BackupAsPDF(g, 'htr2a.lollipop.pvals.')
+
+```
+include error bars as we want an estimate of SE on our plot
+
+```{r}
+g <- mss.dt[gene %in% sites.oi,] %>% 
+  ggplot(., aes(x=Label, y=log2FC, color=Label, label=paste0(lab, ' ', round(pvalue, 4) )) ) +
+  geom_segment(aes(x=Label, xend=Label, y=0, yend=log2FC), color='grey', lwd=.5, linetype=1) +
+  geom_point(size=3) +
+  geom_hline(yintercept=0, alpha=0.4, linetype=2) +
+  geom_text(data=mss.dt[gene %in% sites.oi & pvalue < 0.05], color='darkgrey', size=3, vjust=-2) +
+  facet_wrap(~gene) +
+  ylim(c(-1,2)) +
+  theme_bw() + 
+  coord_flip() +
+  scale_color_manual(values=c(lab.col.pal)) +
+  theme(
+    axis.text.x = element_text(angle=90, vjust=0.6)
+  )
+
+g
+```
+
+
+```{r}
+
+g <- mss.dt[gene %in% sites.oi,] %>% 
+  ggplot(., aes(x=Label, y=log2FC, color=Label, label=paste0(lab, ' ', round(pvalue, 3) )) ) +
+  #geom_segment(aes(x=Label, xend=Label, y=0, yend=log2FC), color='grey', lwd=.5, linetype=1) +
+  geom_hline(yintercept=0, alpha=0.4, linetype=2) +
+  geom_text(data=mss.dt[gene %in% sites.oi & pvalue < 0.05], color='darkgrey', font='bold', size=3.8, vjust=-4) +
+  geom_errorbar(data=mss.dt[gene %in% sites.oi,], aes(ymin=log2FC-SE, ymax=log2FC+SE, group=Label), width=0.2, lwd=.5, color='darkgrey') +
+  geom_point(size=3) +
+  facet_wrap(~gene) +
+  ylim(c(-1.1,2.2)) +
+  theme_bw() + 
+  #coord_flip() +
+  scale_color_manual(values=c(lab.col.pal)) +
+  theme(
+    axis.text.x = element_text(angle=90, vjust=0.6)
+  )
+g
+```
+last attempt; take the original plot and just use geom_
+look into why not working...
+
+one option I am thinking is
+```{r}
+# an annotation dataf 
+annotation_data <- data.table(
+  GROUP = c('M100', 'M100_Nbon', 'Nbon', 'Veh'),
+  xend = c('M100_Nbon', 'M100_Nbon', 'Nbon', 'M100_Nbon'),
+  y = c(15.4, 15, 15.5, 15.3),
+  annotation = c("**", "", "", "*"),
+  gene = rep(sites.oi[1], 4)
+)
+
+g <- ggplot(p.quant[gene %in% sites.oi,], aes(x=GROUP, y=LogIntensities, color=GROUP)) +
+  geom_boxplot(color='grey') +
+  geom_point() + 
+  geom_signif(stat="identity",
+             data=annotation_data,
+            aes(x=GROUP, y=y, xend=xend, yend=y, annotation=annotation),color='darkgrey', size=4) +
+  scale_color_manual(values=col.pal) +
+  ggtitle('HTR2A PH sites') +
+  facet_wrap(~gene) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, vjust = 0.7))
+g
+
+BackupAsPDF(g, 'htr2a.S298.sites.siglabelled.boxplots.')
+
+
+# try modifying slightly the GROUP name
+```
+```{r}
+g <- ggplot(p.quant[gene %in% sites.oi,], aes(x=GROUP, y=LogIntensities, color=GROUP)) +
+  geom_point() + 
+  stat_summary(fun.dat='mean_cl_boot', color='grey', size=0.2) +
+  scale_color_manual(values=col.pal) +
+  ggtitle('HTR2A PH sites') +
+  facet_wrap(~gene) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, vjust = 0.7))
+g
+```
+
+
+
+show boxplots of the sites with the sig difference
+```{r}
+
+stat.test <- data.table(group1=c('M100_Nbon', 'M100_Nbon'),
+                        group2=c('M100', 'Veh'),
+                        pval=c('** 0.002', '* 0.041'))
+
+g <- ggboxplot(p.quant[gene == 'Htr2a_S421',], x="GROUP", y="LogIntensities", color="GROUP", palette='simpsons', title='Htr2a_S421') 
+g
+BackupAsPDF(g, 'htr2a_S421.boxplots.pvalsInc.')
+```
+

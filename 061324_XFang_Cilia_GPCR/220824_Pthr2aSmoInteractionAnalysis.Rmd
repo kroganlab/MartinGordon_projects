@@ -1,0 +1,628 @@
+---
+title: "082224_Pth2rSmo_interactionAnalysis"
+author: "Martin Gordon"
+date: "2024-08-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Intro 
+
+Goal of the current analysis is to test for interaction between cell-line (ciliated vs non-ciliated) and ligand activation
+The question is: does the probe neighbourhood upon activation cilia-independent?
+
+## packages
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clusterin∂ƒg of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+library(viridis)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+```
+
+Lets use msstats to produce the model to test for interacitons (non-additivity) between conditions
+
+```{r}
+p.quant <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_26_ProteinLevelQuant.renorm.csv')
+
+# add other annotation information
+p.quant[, cilia_present := ifelse(grepl('[-]cilia', GROUP), 'No', 'Yes')]
+p.quant[, ag_present := ifelse(grepl('_ag|_In', GROUP), 'Yes', 'No')]
+p.quant[, probe := gsub("[-+]{1}cilia_|_ag{1}$|_In{1}$$",'', GROUP)]
+
+p.quant[,.N, by=.(ag_present, cilia_present, probe,GROUP)]
+
+dp.out <- readRDS('./062424_PWComparisons_data/2024_06_24_dp.out.rds')
+
+f.quant <- setDT(dp.out$FeatureLevelData)
+
+p.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+p.quant[, LogIntensities := newLogInts]
+f.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+
+dp.out$FeatureLevelData <- f.quant
+dp.out$ProteinLevelData <- p.quant
+```
+Create the contrast matrix
+```{r}
+levels(dp.out$ProteinLevelData$GROUP)
+```
+Looking at the interactor distributions, it looks like all the samples are very similar
+
+```{r}
+mss.dt <- fread('./070224_newPWComparisons_data/2024_07_03_all.mss.pwComparisons.csv')
+
+g <- ggplot(mss.dt[Label %like% '_In|_ag',], aes(x=pvalue)) +
+  geom_histogram() +
+  facet_wrap(~Label)
+
+BackupAsPDF(g, 'interactor.pval.histograms')
+```
+
+
+Not used... combine reps
+
+```{r, eval=FALSE}
+subset <- dp.out$ProteinLevelData[GROUP == '+cilia_SMO_ag',]
+subset[, GROUP := '+cilia_SMO_ag_dup']
+
+
+# add some random noise to the measurements
+subset[, LogIntensities := rnorm(mean=LogIntensities, n=1), by=.(Protein,RUN)]
+
+dp.out$ProteinLevelData <- rbind(dp.out$ProteinLevelData, subset[,-c('noisyLogIntensities')])
+```
+
+
+```{r}
+grep( '_ag|_In', dp.out$ProteinLevelData$GROUP, value=T) %>%  unique()
+
+#basicaly testing if the coefficient = 0
+contrasts.list <- list('Smo cilia:ligand interactions' = data.table(V1="+cilia_SMO_ag", V2="+cilia_SMO", V3='-cilia_SMO_ag', V4='cilia_SMO'),
+                       'Pth2r cilia:ligand interactions' = data.table(V1="+cilia_Pth2r_ag", V2="+cilia_Pth2r", V3='-cilia_Pth2r_ag', V4='-cilia_Pth2r'),
+                       '+cilia_Pth2r_ag vs -cilia_Pth2r_ag' = data.table(V1="+cilia_Pth2r_ag", V2='-cilia_Pth2r_ag'),
+                       '+cilia_SMO_ag vs -cilia_SMO_ag' = data.table(V1="+cilia_SMO_ag", V2='-cilia_SMO_ag'),
+                       '+cilia_Crhr2_ag vs -cilia_Crhr2_ag' =  data.table(V1="+cilia_Crhr2_ag", V2='-cilia_Crhr2_ag'),
+                       '+cilia_GPR161_ag vs -cilia_GPR161_ag' =  data.table(V1="+cilia_GPR161_ag", V2='-cilia_GPR161_ag'),
+                       '+cilia_Pde8A_In vs -cilia_Pde8A_In' = data.table(V1="+cilia_Pde8A_In", V2='-cilia_Pde8A_In'),
+                       '+cilia_Pde8B_In vs -cilia_Pde8B_In' = data.table(V1="+cilia_Pde8B_In", V2='-cilia_Pde8B_In')
+                       )
+
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(dp.out$ProteinLevelData$GROUP), 
+                               labels = names(contrasts.list))
+
+# fix the contrast matrix for the interaction analysis
+contrasts.mat[1,32] <- -1
+contrasts.mat[1,31] <-  1
+contrasts.mat[2,30] <-  -1
+contrasts.mat[2,29] <-  1
+```
+
+
+```{r}
+# run msstats correcting for batch 
+mss <- groupComparison(contrast.matrix=contrasts.mat, 
+                       verbose=T,
+                       data=dp.out)
+
+mss.dt <- setDT(mss$ComparisonResult)
+```
+Tidy the mss results
+
+```{r}
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=Label]
+mss.dt[, sig := 'not']
+mss.dt[, gene := multiUniprots2multiGenes(as.character(Protein), species = 'MOUSE')]
+
+mss.dt[abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+```
+
+Add protein counts info and write out
+
+```{r}
+mss.dt
+#table of N detected per feature
+nCounts.dt <- p.quant[, .SD[, .(numeratorCounts=.N, denominatorCounts=.N)], by=.(Protein,GROUP)]
+
+# maybe the easiest way is to split label in mss.dt into denominator and numerator, and then match label in this datatable and just take the sum of measurements
+mss.dt[, c('numerator', 'denomimator') :=  tstrsplit(Label, ' vs ', keep=c(1,2))]
+# fix for the interaction analysis
+
+comb.dt <- merge(x=mss.dt[!Label %in% c('Pth2r cilia:ligand interactions', 'Smo cilia:ligand interactions'),], y=nCounts.dt[,.(Protein, GROUP, numeratorCounts)], by.x=c('numerator','Protein'), by.y=c('GROUP','Protein'), all.x=T)
+
+comb.dt <- merge(x=comb.dt, y=nCounts.dt[,.(Protein, GROUP, denominatorCounts)], by.x=c('denomimator','Protein'), by.y=c('GROUP','Protein'), all.x=T)
+
+comb.dt <- rbind(comb.dt, mss.dt[Label %in% c('Pth2r cilia:ligand interactions', 'Smo cilia:ligand interactions'),], fill=T)
+
+#now, correct for those that have condition missing to only except present in all conditions as a positive result
+comb.dt[issue == 'oneConditionMissing', sig := ifelse(numeratorCounts == 3 | denominatorCounts == 3, 'oneConditionMissing', 'not')]
+
+fwrite(comb.dt, ScriptAndDatedFileName('pwComparisons.interactions.ciliaVsnonCilia.csv'))
+```
+
+
+
+```{r}
+g <- ggplot(mss.dt[sig != 'not', .N, by=.(sig,Label)], aes(x=reorder(Label, -N), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Significant hits per contrast (log2FC > 1 & p.adjust < 0.05)') +
+  xlab('Contrast') +
+  ylab('Number sig hits') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699', 'oneConditionMissing'='grey')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=10))
+g
+
+BackupAsPDF(g, 'sigHits.allContrasts.barplot', dimensions=c(12,10))
+```
+cila proteins
+```{r}
+# read in mouse to hu mapping table; will use this to collect all possible mappings from human to filter our results by
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+cilia.AM <- c('INPP5E', 'LCA5', 'PRKAR1A', 'ARL13B', 'SMO', 'EVC2', 'EVC', 'PKD2', 'TTC21B', 'PKHD1', 'IFT88', 'NPHP4', 'EFCAB7', 'CYS1')
+
+cilia.Consensus <- c('Pdap1','Cep131','Cep41','Ift122','Ift172','Ift52','Ift57','Ift74','Ift81','Ift88','Cfap97','Lca5','Cemip2','Wdr35',
+                     'Arl13b','Arl3','Inpp5e','Nme7','Kif3a','Kif3b','Kifap3','Ywhaz','Cys1','Evc2','Ttc21b','Ift56')
+
+# "Kiaa1430" "Ttc26"  not found in my mappings
+# alias on ncbi: Cfap97 & IFT56
+cilia.Consensus[!cilia.Consensus %in% unique(mh_mappings$Symbol.mouse)]
+
+# all found
+cilia.AM.prots <- mh_mappings[Symbol.human %in% cilia.AM, SWISS_PROT_IDs.mouse]
+
+cilia.prots <- c(cilia.AM.prots, cilia.Consensus)
+```
+
+
+
+```{r}
+subDT <- mss.dt
+subDT[sig != 'not' & issue == 'oneConditionMissing', sig := ifelse( (!is.na(numeratorCounts) & numeratorCounts == 3)  | (!is.na(denominatorCounts) & denominatorCounts==3), sig, 'not')]
+
+subDT[, lab := sig]
+subDT[, lab := ifelse(Protein %in% cilia.prots, 'cilia', lab)]
+
+
+g <- ggplot(subDT[!is.infinite(-log10(adj.pvalue)),], aes(x=log2FC, y=-log10(p.adj), col=lab, label=gene)) +
+  geom_point(alpha=0.5) + 
+  geom_point(data=subDT[Protein %in% c(cilia.prots),]) +
+  ylab('-log10 p-value') +
+  ggrepel::geom_text_repel(data=subDT[sig != 'not' & !is.infinite(-log10(adj.pvalue)),], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  ggtitle(paste0('cell-line contrasts + interaction analysis (FC +/- 50% & adj.pval < 0.05)')) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey', 'cilia'='#5ec962')) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'cellline.contrasts.cilaanno.volcano', dimensions=c(16,12))
+```
+plot reduced thresholds
+
+```{r}
+
+subDT[,sig := 'not']
+subDT[abs(log2FC) > 0.58 & pvalue < 0.005, sig := ifelse(log2FC > 0, 'up', 'down')]
+subDT[, lab := sig]
+subDT[, lab := ifelse(Protein %in% cilia.prots, 'cilia', lab)]
+
+g <- ggplot(subDT[!is.infinite(-log10(adj.pvalue)),], aes(x=log2FC, y=-log10(pvalue), col=lab, label=gene)) +
+  geom_point(alpha=0.5) + 
+  geom_point(data=subDT[Protein %in% c(cilia.prots),]) +
+  ylab('-log10 p-value') +
+  ggrepel::geom_text_repel(data=subDT[sig != 'not' & !is.infinite(-log10(adj.pvalue)),], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  ggtitle(paste0('cell-line contrasts + interaction analysis (FC +/- 50% & pval < 0.005)')) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey', 'cilia'='#5ec962')) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'cellline.contrasts.cilaanno.reducedThresholds.volcano', dimensions=c(16,12))
+```
+
+Go enrichment heatmaps
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='ALL', keyType='UNIPROT')
+```
+
+GO BP and GO cellular component
+---
+Issue with the enrichment results... seems many of these proteins are localized to the Golgi... have they been 
+```{r}
+
+# define the universe, the total set of identified genes in our study
+universe <- as.character(unique(p.quant$Protein))
+
+mss.dt[, enrich.grp := interaction(Label,sig)]
+
+
+enrich.dt <- enricherOnGroups(mss.dt[sig %in% c("down","up")], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('allContrasts.GO.enrichments.csv'))
+
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('allContrasts.GO.BP.simplified.enrichments.csv'))
+```
+
+```{r}
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, 
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO enrichment terms',
+                                row_names_gp = gpar(fontsize = 7), 
+                                upperThreshold = 8,
+                                #negCols=unique(grep('down', simp.enrich$simplified, value=T))) # ,
+                                column_names_gp= gpar(fontsize = 7))
+ht
+
+BackupAsPDF(ht, 'GO.enrich.heatmap', dimensions = c(11,15))
+```
+
+# write out the mss results in wide format for Aaron to inspect
+
+```{r}
+comb.dt %>%  colnames()
+
+fwrite(dcast(comb.dt, gene+Protein~Label, value.var = c('log2FC', 'pvalue', 'p.adj', 'numerator', 'numeratorCounts', 'denomimator', 'denominatorCounts')), ScriptAndDatedFileName('mssPWcomparisons.celllinesinteractions.wideformat.csv'))
+```
+
+
+
+Look into the oneCondition missing set more
+What is this set of proteins enriched for?
+
+```{r}
+
+```
+
+
+Lets look at the pvalue distributions
+Same as earlier 
+Clear systematic deviation from theoretical nulls..
+Looking at tstat distirbutions, there is a very clear peak around 0 with narrow tails; little happening
+When plotting the tStat distribution there is a sharp peak at 0 and very narrow range
+Basically evdience the shift may be very small, or we lack power to detect the shift
+
+Narrow tails mean that extreme test statistic values are less likely than in a standard t-distribution. This reduces the likelihood of observing significant differences (large test statistics), further contributing to higher p-values.
+
+```{r}
+# t statis
+
+g <- ggplot(mss.dt, aes(x=pvalue)) +
+  geom_histogram(boundary=0) +
+  facet_wrap(~Label, scales='free_y')
+g
+BackupAsPDF(g, 'interactionEffect.histograms')
+
+# construct a histogram of the test statistics going into this
+# this is difference in the group means divided by the standard error
+g <- ggplot(mss.dt, aes(x=Tvalue)) +
+  geom_histogram(boundary=0, binwidth=0.1) +
+  ggtitle('test statistic distribution') +
+  xlim(c(-5,5)) +
+  facet_wrap(~Label, scales='free')
+g
+BackupAsPDF(g, 'tStat.histogram')
+
+#calculate a datatable of the mean log intensities of each group
+g <- ggplot(mss.dt, aes(x=log2FC)) +
+  geom_histogram(boundary=0, binwidth=0.1) +
+  ggtitle('test statistic distribution') +
+  xlim(c(-5,5)) +
+  facet_wrap(~Label)
+g
+BackupAsPDF(g, 'LFC.histogram')
+
+
+g <- ggplot(mss.dt, aes(x=SE)) +
+  geom_histogram(boundary=0, binwidth=0.1) +
+  ggtitle('test statistic distribution') +
+  facet_wrap(~Label)
+g
+BackupAsPDF(g, 'SE.histogram')
+
+```
+
+
+
+
+I guess need to contact Xiaofang about details for the experimental design.. should these be paired t-tests?
+Key assumption of LM is *independence* of measurements.. are
+
+```{r}
+
+```
+
+
+I guess one alternative is a permutation test...
+Want to see if the effect == 0.. maybe take the t-statistic (which is just a measure of signal(FC)/noise) and permutat
+
+```{r}
+# run this over each label seperately
+
+lapply(mss.dt$Label, function(x){
+  
+  
+  
+  
+  
+})
+mss.dt
+```
+
+
+```{r}
+ggplot(mss.dt, aes(sample=Tvalue)) +
+  stat_qq() +
+  stat_qq_line(color = "red", linetype = "dashed") +
+  labs(title = "Q-Q Plot vs. Normal Distribution", x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  facet_wrap(~Label, scales='free') +
+  theme_minimal()
+
+qqnorm(mss.dt$Tvalue[mss.dt$Label == "Smo cilia vs Smo no cilia"])
+qqline(mss.dt$Tvalue[mss.dt$Label == "Smo cilia vs Smo no cilia"], col = "red", lwd = 2)
+
+
+
+mss.dt$Label %>%  unique()
+```
+
+```{r}
+my_data <- rnorm(100)
+
+# Q-Q plot with ggplot2
+df <- data.frame(sample = my_data)
+
+ggplot(df, aes(sample = sample)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  labs(title = "Q-Q Plot of Normally Distributed Data", x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_minimal()
+```
+
+```{r}
+mss.dt <- merge(x=mss.dt, y=p.quant[,.(NObservations=.N), by=Protein], by='Protein')
+mss.dt[, Var := (2^SE)* NObservations] #caclualte variance for each sample
+
+g <- ggplot(mss.dt, aes(x=Var, y=log2FC)) +
+  geom_point() +
+  geom_density_2d() +
+  facet_wrap(~Label)
+
+g
+
+
+mss.dt
+```
+Go back to the protein quant data with the group measurements, calcul
+```{r}
+summary.dt <- p.quant[probe %in% c("SMO", "Pth2r"), .(meanLogInts = mean(LogIntensities, na.rm=T),
+                                        variance = var(LogIntensities, na.rm=T),
+                                        stdDev = sd(LogIntensities, na.rm=T),
+                                        NObservations = .N), by=.(Protein,GROUP)]
+
+
+
+ggplot(summary.dt, aes(x=variance, fill=GROUP)) +
+  geom_density(alpha=0.5) +
+  xlim(c(0,2))
+
+ggplot(summary.dt, aes(x=meanLogInts, y=2^(stdDev))) +
+  geom_point() +
+  facet_wrap(~GROUP,scales='free_y') +
+  coord_cartesian(expand = F)
+
+ggplot(summary.dt, aes(x=meanLogInts, y=variance)) +
+  geom_point() +
+  facet_wrap(~GROUP,scales='free_y') +
+  coord_cartesian(expand = F)
+
+```
+Look at the 
+
+read int he protein quant data and add the new explanatory variables to the data
+
+```{r}
+p.quant <- fread('./062424_PWComparisons_data/2024_06_26_ProteinLevelQuant.renorm.csv')
+
+p.quant[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+# add other annotation information
+p.quant[, cilia_present := factor(ifelse(grepl('[-]cilia', GROUP), 'noCilia', 'Cilia'), levels=c('noCilia', 'Cilia'))]
+p.quant[, ligand_present := factor(ifelse(grepl('_ag|_In', GROUP), 'Ligand', 'noLigand'), levels=c('Ligand', 'noLigand'))]
+p.quant[, probe := factor(gsub("[-+]{1}cilia_|_ag{1}$|_In{1}$$",'', GROUP))]
+p.quant[, batch := factor(SUBJECT)]
+
+# subset the p.quant data to 
+p.quant <- p.quant[probe %in% c('SMO', 'Pth2r'),]
+
+p.quant[, LogIntensities := newLogInts]
+```
+
+'Clean' the p.quant data; try subtract batch?
+
+```{r}
+p.mat <- dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames="Protein")
+
+submat <-  sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T))
+
+# use by for aggregation
+ann <- p.quant[,.(sample=paste0(GROUP,'.',SUBJECT),
+                  batch=interaction('batch', SUBJECT)), by=.(GROUP,SUBJECT, ligand_present, cilia_present, probe)]
+
+ann$sample == colnames(submat)
+
+# match order in mat columns
+ann <- ann[match(colnames(submat), sample),]
+
+ann$sample == colnames(submat)
+
+Heatmap(submat,
+        column_split = ann$batch,
+        cluster_rows = clusterWNA(submat))
+
+
+
+```
+```{r}
+p.mat
+```
+
+
+
+read in associated metadata with the cilia annotated proteins
+```{r}
+# gprotein subunits 
+gp.subunits  <- c("Gnai2","Gna11","Gnaq","Gna12","Gna13", 'Gnl1', 'Gnb1', "Gnb2","Gnas", 'Gng5', 'Gnl3l', "Gns","Gnl3", "Gnl2", 'Gng12', 'Gnai3')
+
+# read in mouse to hu mapping table; will use this to collect all possible mappings from human to filter our results by
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+cilia.AM <- c('INPP5E', 'LCA5', 'PRKAR1A', 'ARL13B', 'SMO', 'EVC2', 'EVC', 'PKD2', 'TTC21B', 'PKHD1', 'IFT88', 'NPHP4', 'EFCAB7', 'CYS1')
+
+cilia.Consensus <- c('Pdap1','Cep131','Cep41','Ift122','Ift172','Ift52','Ift57','Ift74','Ift81','Ift88','Cfap97','Lca5','Cemip2','Wdr35',
+                     'Arl13b','Arl3','Inpp5e','Nme7','Kif3a','Kif3b','Kifap3','Ywhaz','Cys1','Evc2','Ttc21b','Ift56')
+
+# "Kiaa1430" "Ttc26"  not found in my mappings
+# alias on ncbi: Cfap97 & IFT56
+cilia.Consensus[!cilia.Consensus %in% unique(mh_mappings$Symbol.mouse)]
+
+# all found
+cilia.AM.prots <- mh_mappings[Symbol.human %in% cilia.AM, SWISS_PROT_IDs.mouse]
+cilia.Consensus.prots <- mh_mappings[Symbol.mouse %in% cilia.Consensus, SWISS_PROT_IDs.mouse]
+
+```
+
+I think we want to run this per probe, so split probe into a list
+
+```{r}
+p.quant.list <- split(p.quant, p.quant$probe)
+```
+
+
+Run the lm with an interaction term for cilia status
+What proteins show significant difference in impact depending cilia status?
+```{r}
+# how does ligand effect change given the cilia status of the cell. IE are the interacitons independent of cilia presence?
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~ligand_present|cilia_present){  
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+
+# postProcessFunction = emmeans.contrastOfContrasts tells it to use the function above after doing anova.
+# it is optional, adds significant time to the computation (~5x), but is nice to
+# put a magnitude and p value on specific differences of differences
+#
+# cl = 6 parameter says to use 6 processes.  Set to NULL if multiprocess is failing, or higher or lower as you wish.
+# Numbers near the number of processors available in your machine is probably counterproductive.
+
+
+p.quant.list
+
+lm.list <- lapply(p.quant.list, function(x){
+  
+  lm.out <- linearModelsAllProteins(p.quant, 
+                                  formulaList = list(Interaction =  newLogInts ~ batch + ligand_present ),
+                                  splitColumn = "Protein", 
+                                  postProcessFunction = emmeans.contrastOfContrasts, cl = 6) |> suppressWarnings()
+  return(lm.out)
+})
+```
+
+Now, rbind the anova and the emmeans outputs to 
+
+suggests this is a poor choice of test for the data?
+
+```{r}
+lm.list$Pth2r$anova[, probe := 'Pth2r']
+lm.list$SMO$anova[, probe := 'SMO']
+
+anova.dt <- rbind(lm.list$SMO$anova,lm.list$Pth2r$anova)
+
+g <- ggplot(anova.dt, aes(x=p.value)) +
+  geom_histogram(binwidth=0.01) +
+  facet_wrap(~term+probe, scales='free_y')
+g
+BackupAsPDF(g, 'newRes')
+#this us a crazy distribution
+
+anova.dt
+
+prots.oi <- anova.dt[probe =='SMO' & term == 'ligand_present' & p.value > 0.8, unique(Protein)]
+
+
+p.mat <-dcast(p.quant.list$SMO, Protein~GROUP+SUBJECT, value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- p.mat[rownames(p.mat) %in% prots.oi,]
+
+submat <- sweep(submat, 1, apply(submat,1,median ,na.rm=T))
+
+
+# these are clearly cilia seperated
+Heatmap(submat,
+        column_split = list(grepl('[+]cilia', colnames(submat)),
+                            grepl('ag', colnames(submat))
+                                  ),
+        show_row_names = F,
+        col = colorRamp2(breaks=c(-2,0,2), colors = c('blue', 'white', 'red')),
+        cluster_rows=clusterWNA(submat))
+
+
+# whhat aboubt 
+```
+

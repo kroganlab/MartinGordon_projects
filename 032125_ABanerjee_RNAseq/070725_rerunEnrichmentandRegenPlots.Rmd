@@ -1,0 +1,377 @@
+---
+title: "070725_rerunEnrichmentandRegenPlots"
+author: "Martin Gordon"
+date: "2025-07-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Atoshi wants to focus on the DEx11 vs WT comparisons
+We want to compare the genotype effect; DEx11 w HKCA vs WT w HKCA
+Read back in the differential results and the counts table and see if 
+
+
+```{r packages}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(DESeq2)
+library(tximport) # doubt this is needed if we just use the gene summarisation of the nf-core pipeline
+library(ggh4x) # additional functionality for ggplot2 obj; eg facet_grid allow x/y axis to vary
+library(scales) # axis and legend params
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(viridis)
+library(IHW) # independent hypothesis weighting for DESeq2; improved statistical power
+library(ggforce)
+library(simplifyEnrichment) # simplify GO enrichent terms
+library(eulerr)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+col.pal <- getQualitativePalette(n=6)
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+
+
+# for the different groups
+condition.col <- c('WT'="#1B9E77", 'dEX11'="#D95F02", 'S12N'="#7570B3")
+treatment.col <- c('LPS'= "#E6AB02",'HKCA'="#666666")
+#treatment.col <- c('LPS'= "#E6AB02", "#E7298A", "#A6761D", "#666666")
+
+
+# isgs for plotting; set passed around by Adrian
+isGenes <- fread('/Users/martingordon/Documents/projects/022624_AViDD_AB_PH_data/docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+
+```
+
+load counts and dea results
+
+```{r}
+counts.dt <- fread('./output/salmon.merged.gene_counts.tsv')
+#tpm.dt <- fread('./output/salmon.merged.gene_tpm.tsv') # normalized values for vi
+
+counts.dt[gene_name == gene_id] # all idnetical 
+counts.dt[, gene_id := NULL]
+
+counts.mat <- as.matrix(counts.dt, rownames='gene_name')
+
+# drop the S12N mat
+counts.mat <- counts.mat[, !grepl('S12N', colnames(counts.mat))]
+```
+
+create a metadata table for the analysis
+```{r metadata}
+meta.dt <- data.table(sample=colnames(counts.dt))
+meta.dt[, `:=`(condition = gsub('[_].+', '', sample),
+               treatment = stringr::str_extract(sample, 'HKCA|LPS'),
+               rep = stringr::str_extract(sample, '[123]$'))]
+
+meta.dt <- meta.dt[, group := paste0(condition,'_', treatment)] %>% 
+  .[condition != 'gene']
+
+
+meta.dt$group %>% unique()
+# set factor levels; only natural referece is for condition
+meta.dt[, `:=`(condition = factor(condition, levels=c('WT', 'dEX11', 'S12N')),
+               treatment = factor(treatment, levels=c('LPS','HKCA')),
+               group = factor(group, levels=c("WT_LPS","WT_HKCA","dEX11_HKCA","dEX11_LPS","S12N_HKCA","S12N_LPS")))
+               ]
+
+meta.dt <- meta.dt[condition != 'S12N']
+```
+This is the set of genes that have been filtered to only include consistent counts;
+subset to the group of interest
+```{r}
+comb.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_18_DESeqContrasts.combined.wLFCshrinkage.filtered.csv.gz')
+comb.dt <- comb.dt[!grepl('S12N', contrast),]
+```
+
+We also want the normalized counts; read in the deseq2 obj and extract 
+```{r}
+dds <- readRDS('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_15_dds.CARD9variants.wInteractionTerm.rds')
+
+norm.mat <- assay(vst(dds, blind=T))
+norm.mat <- norm.mat[, !grepl('S12N', colnames(norm.mat))]
+
+# same counts in dt format
+counts.long <- fread('041525_DifferentialAnalysis_FirstPass_data/2025_04_15_norm.counts.csv.gz')
+counts.long <- counts.long[condition != 'S12N']
+
+counts.long[, group := factor(group, levels=c('WT_LPS','WT_HKCA', 'dEX11_HKCA', 'dEX11_LPS'))]
+```
+
+# subset the contrast to  "dEX11_HKCA-WT_HKCA"
+We want to see the HKCA effect in the mut vs WT;
+Without baseline cant answer this question directly; cant tell if difference we see is how the cell is prepared, or actually genotype effect
+```{r}
+contrasts.oi <- c("dEX11_HKCA-WT_HKCA", "interaction.dEX11.WT")
+
+de.dt <- comb.dt[contrast %in% contrasts.oi]
+```
+
+
+FIrst thing to do; as we cant trust the hypogeometric tests as pvalues are essentially meaningless as things are so differeent, lets do a ranked based test (GSEA) and remove weighting by pvalue
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+
+imGenes <- gmt.go[grepl('immune|macrophage|cytokine|chemokine', ont), unique(gene)] # just look for a subset of things
+
+universe <- comb.dt$gene %>% 
+  unique()
+```
+Get the genes that we are interested in 
+
+```{r}
+complement.genes <- gmt.go[grepl('complement', ont), unique(gene)]
+interlukin.genes <- gmt.go[grepl('^IL[0-9]', gene), unique(gene)]
+phago.genes <-  gmt.go[grepl('phagocytosis', ont), unique(gene)]
+TLR.genes <- gmt.go[grepl('^TLR', gene), unique(gene)]
+```
+
+Run GSEA without weighting (just use the rank order, so similar to a KS test)
+```{r}
+de.dt[is.na(pvalue)]
+# we want to try use the geometric
+de.dt[, diffScore := -log10(pvalue) * sign(log2FoldChange)]
+
+
+contrasts.oi
+allsea <- lapply(contrasts.oi, 
+       function(contOI){
+         subdt <- de.dt[!is.na(diffScore) & !is.infinite(abs(diffScore)) & contrast == contOI]
+         print(subdt)
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(gmt.go$gene, gmt.go$ont),
+                                           subdt[order(-diffScore), setNames(diffScore, gene)], # rank score in descending order
+                                           gseaParam = 0, # dont want to use scores, just use the supplied ranking
+                                           scoreType = "std") # want two sided as we are ranking by sig pval
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) %>% 
+  rbindlist(idcol = "contrast")
+
+allsea[, enrich.grp := fcase(contrast == 1, "dEX11_HKCA-WT_HKCA",
+                             contrast == 2, "dEX11_HKCA-dEX11_LPS" ,
+                             contrast == 3, "interaction.dEX11.WT"
+                             )]
+
+#fwrite(allsea, ScriptAndDatedFileName('go.bp.gsea.rankbased.csv.gz'))
+```
+
+```{r}
+allsea <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/070725_rerunEnrichmentandRegenPlots_data/2025_07_07_go.bp.gsea.rankbased.csv.gz')
+```
+
+create a GSEA heatmap (simil.ar to the GOBP heatmap)
+
+
+```{r}
+allsea[,  geneSetSize := {
+    gene.ls <- strsplit(leadingEdge, '[|]')
+    vapply(gene.ls, function(x) length(x), FUN.VALUE = numeric(1))
+}]
+
+# ratio
+allsea[,  leadingEdgeRatio := geneSetSize/size ]
+
+```
+
+plot heatmaps of the 3 to see which terms are most significant 
+
+Cluster the significant GO terms form the analysis; handy high level view 
+
+```{r}
+pathways.oi  <- allsea[padj< 0.05, unique(pathway)]
+
+go.mat <- GO_similarity(gmt.go[ont %in% pathways.oi, unique(ont.id)])
+View(GO_similarity)
+
+go.mat[1:10,1:10]
+cluster_terms 
+
+
+go.hm <- simplifyGO(go.mat, 
+           max_words = 5, 
+           column_title = sprintf("dEX11_HKCA-WT_HKCA %s significant GO terms clustered", nrow(go.mat)),
+           word_cloud_grob_param = list(max_width = 80))
+```
+
+
+```{r}
+sigPathways <- allsea[padj < 0.05, unique(pathway)]
+
+mat <- dcast(allsea[pathway %in% sigPathways,], pathway~enrich.grp, value.var='NES') %>% 
+  as.matrix(rownames='pathway')
+
+# matrix of GO similarity terms
+go.mat <- GO_similarity(gmt.go[ont %in% sigPathways, unique(ont.id)])
+
+go.bp.clusters.dt <- cluster_terms(go.mat)
+
+go.mat <- simplifyGO(go.mat)
+```
+Share the results for the set we are interested in
+
+```{r}
+allsea <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/070725_rerunEnrichmentandRegenPlots_data/2025_07_07_go.bp.gsea.rankbased.csv.gz')
+
+subsea <- allsea[ padj < 0.05 & grepl('immune|inflam|interl|phagoc|complement', pathway)] %>% 
+  .[padj < 0.05]
+
+subsea[, contrast := enrich.grp]
+subsea[, enrich.grp := NULL]
+subsea
+fwrite(subsea, ScriptAndDatedFileName('gsea.dex11VsWTsubset.geneSetsOI.csv.gz'))
+
+
+subsea
+```
+
+Plot the gene distirbutions for the different gene sets of interest 
+Complement, interluknin and phagosome averages all seem to be up in the HKCA treated mutant relative to WT
+
+```{r}
+counts.summarized <- counts.long[group %in% c('dEX11_HKCA', 'WT_HKCA')][, .(groupCounts = mean(vstCounts, na.rm=T)),by=.(gene, group, condition, treatment)]
+
+ggplot(counts.summarized[gene %in% interlukin.genes,], aes(x=group, y=groupCounts, fill=group)) +
+  geom_boxplot() +
+  ggtitle('Interlukin gene count distributions') +
+  geom_sina() +
+  theme_bw()
+
+
+ggplot(counts.summarized[gene %in% TLR.genes,], aes(x=group, y=groupCounts, fill=group)) +
+  geom_boxplot() +
+  ggtitle('TLR gene count distributions') +
+  geom_sina() +
+  theme_bw()
+
+ggplot(counts.summarized[gene %in% complement.genes,], aes(x=group, y=groupCounts, fill=group)) +
+  geom_boxplot() +
+  ggtitle('complement gene set count distributions') +
+  geom_sina() +
+  theme_bw()
+
+ggplot(counts.summarized[gene %in% phago.genes,], aes(x=group, y=groupCounts, fill=group)) +
+  geom_boxplot() +
+  ggtitle('complement gene set count distributions') +
+  geom_sina() +
+  theme_bw()
+```
+Lets try boxplots of the significant GSEA results, with the individual genes labelled
+
+
+Combine the GSEA results with the individual genes and lets 
+Need to set a strignent threhsold for hte individual pathways as many are significant
+
+```{r}
+# dont want things larger than 500 genes to keep gene sets more specific
+# limit to the sets we were interested in
+sigPathways <- allsea[size >= 10 & size < 500 & padj < 0.05, ][grepl('immune|inflam|interl|phagoc|complement', pathway), unique(pathway)]
+
+# still over 100 pathways, but easier to parse
+subsea <- allsea[enrich.grp == "dEX11_HKCA-WT_HKCA" & pathway %in% sigPathways,]
+
+gsea.mapper <- gmt.go[subsea, , on=c(ont = 'pathway')]
+gsea.mapper
+subdt <- de.dt[contrast == 'dEX11_HKCA-WT_HKCA'][gsea.mapper, , on=c(gene = 'gene')]
+subdt <- subdt[!is.na(contrast)] 
+
+# tidy the  results
+subdt <- subdt[, .(contrast, gene, log2FoldChange, pvalue, adj.pvalue, sig, diffScore, pathway=ont, gsea.pval=pval, gsea.padj=i.padj, NES,size, leadingEdge)]
+
+
+fwrite(subdt, ScriptAndDatedFileName('dea.dex11.hkca.vs.WT.hkca.GSEAannotated.csv.gz'))
+```
+rbind to the de set to use as total/background for the plotting
+
+```{r}
+plt.dt <- rbind(subdt, de.dt[contrast == 'dEX11_HKCA-WT_HKCA'], fill=T)
+plt.dt[, description := pathway]
+plt.dt[is.na(description), description := 'total']
+setorder(plt.dt, gsea.padj, na.last = T)
+plt.dt[, description := factor(description, levels=rev(unique(plt.dt$description)))]
+```
+
+
+plot the gsea results and label the genes that have a large diff score
+
+```{r, gsea-violins, fig.height=11, fig.width=12}
+
+p  <- ggplot(plt.dt[!is.na(diffScore),], 
+             aes(y = description, x = abs(diffScore), color = gsea.padj < 0.05, shape = description == "total")) +
+  ggforce::geom_sina(scale = "width",   show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #ggforce::geom_sina(data = genesWDiffScores[complex == "total"], shape = ".", scale = "count", show.legend = FALSE) +
+  #facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "GSEA p.adj < 0.05)") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+  ggrepel::geom_text_repel(data  = plt.dt[!is.na(diffScore) & description != 'total' & !is.infinite(abs(diffScore))  & adj.pvalue < 0.05, .SD[order (-diffScore)][1:4], by = .(description, contrast)], aes(label=gene),show.legend = FALSE, size = 2, max.overlaps = 10) +
+  theme_bw() +
+  scale_y_discrete( labels = function(x)substr(x, 1, 60)) +
+  # uncomment to get shortened names in y axis
+  labs(title='dEX11_HKCA vs WT_HKCA',subtitle='GSEA Go Biological Processes', x='-log10 p.adj') +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+  
+p
+BackupAsPDF(p, 'gsea.dex11vsWT.gobp.violin')
+```
+
+```{r}
+subsea
+```
+
+
+I think this is a good visualization to start, but lets run the GSEA with geometric mean and just positive enrihchment and plot
+At the least this will reduce the plotting scale...
+See how it looks, return tables to Atoshi and lether review the results
+```{r}
+de.dt[, geom.diffScore := mean(c(-log10(plotPval), abs(log2FoldChange))), by=.I]
+
+# sort in descending order
+setorder(de.dt, -geom.diffScore, na.last = T)
+
+gm.allsea <- lapply(contrasts.oi, 
+       function(contOI){
+         print(de.dt[!is.na(geom.diffScore) & contrast == contOI])
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(gmt.go$gene, gmt.go$ont),
+                                           de.dt[!is.na(geom.diffScore)  & contrast == contOI][, setNames(geom.diffScore, gene)],
+                                           gseaParam = 0,
+                                           scoreType = "pos")
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) %>% 
+  rbindlist(idcol = "contrast")
+
+
+gm.allsea[, enrich.grp := fcase(contrast == 1, "dEX11_HKCA-WT_HKCA",
+                                contrast == 2, "dEX11_HKCA-dEX11_LPS" ,
+                                contrast == 3, "interaction.dEX11.WT"
+                             )]
+
+
+#fwrite(gm.allsea, ScriptAndDatedFileName('go.bp.gsea.rankbased.geoMean.csv.gz'))
+
+

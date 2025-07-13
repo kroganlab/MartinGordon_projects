@@ -1,0 +1,236 @@
+---
+title: "100324.hcSD_networkWork"
+author: "Martin Gordon"
+date: "2024-10-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Read in the 
+
+```{r packages}
+library(STRINGdb)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(viridis)
+library(ComplexHeatmap)
+library(igraph)
+
+
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+```
+
+Read in the final PPI set and subse to the hcASD we are interested in 
+Some IDs not matching; get uniprot IDs for these genes to try resolve
+
+Think this ASD dataset has been filtered by SAINT BFDR; Causing difference in the set of overlaps?
+ASD255 ASD102: two GWAS sets; ASD102 is higher threshold for filtering I think these are two sets of baits
+
+First read in the ASD gold standard set from the nature cohort study
+72 high qual genes and 185 lesser  (where did 255 come from? The 102 was from an older study I think)
+
+For now go with these 185; did any of this set pass our threshold?
+```{r}
+ASD.gs <- readxl::read_xlsx('./data/ASD.GS.xlsx', sheet=11) %>% 
+  as.data.table()
+
+asd.gs <- ASD.gs[ASD72 == 'TRUE' | ASD185 == 'TRUE', unique(gene)]
+```
+Read in the ASD ppi data
+
+```{r}
+# working with the unfiltered data
+asd.full.dt <-  fread('./data/FullUnfilteredPPIscores.txt')
+
+# hc set
+genes.oi <- c('SCN2A', 'SLC6A1', 'STXBP1', 'SYNGAP1', 'SHANK3', 'GRIN2B')
+
+# slight reduction of thresholds to more closelt match the plot
+# I think this is the filtering used to produce the above plot
+subset.dt <- asd.full.dt[Bait %in% genes.oi & BFDR <= 0.05 & rank_WD >= 0.97, ]
+
+# need to create an edge and node table 
+#d describes the edges of the network. Its first two columns are the IDs of the source and the target node for each edge. The following columns are edge attributes (weight, type, label, or anything else).
+#vertices starts with a column of node IDs. Any following columns are interpreted as node attributes
+
+edge.dt <- subset.dt[, .(source=Bait, target=PreyGene),]
+node.dt <- subset.dt[, .(nodeIDs=unique(c(Bait, PreyGene)))] # all nodes in our network
+
+# add other attributes
+node.dt[, bait := ifelse(nodeIDs %in% edge.dt$source, 'red', 'blue')]
+```
+Lets work on the network and see how it looks
+
+```{r}
+net <- graph_from_data_frame(d=edge.dt, directed = T, vertices = node.dt)
+
+
+plot(net,
+     remove.loops = T,
+     edge.arrow.size=.1,
+     vertex.color=V(net)$bait,
+     vertex.label.color='black',
+     vertex.label.size=0.5,
+     vertex.label.dist=0.7,
+     vertex.size=3
+     )
+
+```
+Add in the Bait info for prey 'SNRNP200' not included in the 
+Easiest way to do this; look through the baits in for ASD102/255 and then pull out any PreyGenes that are in our bait of gene subset
+Note; not adding alpahfold edges to network. Can be added later..
+
+How did I construct? All nodes from the hcASD set and their interactions, also nodes from the plot with ASD255/ASD102 with preys shared with hcASD set
+```{r}
+corum.complexes <- c('MRPS5', 'MRPS9', 'MRPS2', 'PRPF8', 'DDX23', 'PRPF6')
+
+# these are the baits from ASD102 and ASD255
+ASD255.baits <- c('SNRNP200', 'YWHAG', 'NAA15', 'NCKAP1','SHANK2')
+ASD102.baits <- c('HDLBP', 'KCNQ3', 'ANK2', 'DYRK1A', 'GIGYF1', 'ANKRD11')
+
+subset.dt <- asd.full.dt[Bait %in% genes.oi & BFDR <= 0.05 & rank_WD >= 0.97, ]
+
+# for now, using baits from our set with all interactions, and also the ASD102/255 baits with prey in our hcASD prey set
+subset.dt <- rbind(subset.dt, 
+                   asd.full.dt[Bait %in% c(ASD255.baits,ASD102.baits) & BFDR <= 0.05 & rank_WD >= 0.97 & (PreyGene %in% subset.dt$PreyGene |  PreyGene %in% subset.dt$Bait),]
+                   )
+
+
+edge.dt <- subset.dt[, .(source=Bait, target=PreyGene),] %>% 
+  unique()
+node.dt <- subset.dt[, .(nodeIDs=unique(c(Bait, PreyGene)))] # all nodes in our network 
+
+# adding attributes to tables
+node.dt[, `:=`(bait = ifelse(nodeIDs %in%genes.oi, 1,
+                             ifelse(nodeIDs %in% c(ASD255.baits,ASD102.baits), 2, 3)),
+               CORUM = ifelse(nodeIDs %in% corum.complexes, 1, 0),
+               hcASD = ifelse(nodeIDs %in% genes.oi, 1, 0),
+               ASD255 = ifelse(nodeIDs %in% ASD255.baits, 1, 0),
+               ASD102 = ifelse(nodeIDs %in% ASD102.baits, 1, 0))]
+
+
+# create aesthetic palettes
+col.pal <- c('salmon', 'white', 'black')
+shape.pal <- c('circle', 'square')
+border.pal <- c('black', 'lightgreen', 'white', 'yellow')
+
+```
+Lets make a network from the graph and 
+```{r}
+net <- graph_from_data_frame(d=edge.dt, directed = F, vertices = node.dt)
+
+# this layout not deterministic so dsave
+l <- layout_with_fr(net)
+l <- layout_with_kk(net)
+
+# need to highlight other nodes you added in
+plot(net,
+     edge.arrow.size=.1,
+     edge.color='grey',
+     vertex.label.color='black',
+     vertex.frame.color=ifelse(V(net)$bait == 2, 'lightgreen', 
+                               ifelse(V(net)$CORUM == 1, 'yellow', 'black')),
+     vertex.frame.width=ifelse(V(net)$bait == 2, 2, 
+                               ifelse(V(net)$CORUM == 1, 4, 1)),
+    # vertex.label.font=2,
+     vertex.label.cex=0.6,
+     vertex.label.dist=0.6,
+     mode='circle',
+     layout=l,
+     vertex.color=ifelse(V(net)$bait == 1, 'salmon', 
+                         ifelse(V(net)$bait == 2, 'white', 'black')),
+     vertex.shape=ifelse(V(net)$bait == 1, 'square',
+                           ifelse(V(net)$bait == 2, 'circle', 'circle')),
+     vertex.size=ifelse(V(net)$bait == 1, 6,
+                        ifelse(V(net)$bait == 2, 3.5, 3.5)),
+) %>% BackupAsPDF(., 'firstPassNetwork', dimensions=c(10,10))
+```
+
+
+
+not used 
+```{r}
+asd.full.dt[Bait %in% other.baits & BFDR <= 0.05 & rank_WD >= 0.97 & (PreyGene %in% subset.dt$PreyGene | PreyGene %in% subset.dt$Bait),]
+```
+
+Not u
+
+```{r}
+# BFDR < 0.05
+asd.dt <- fread('./data/D_Final_v3.txt')
+asd.dt %>%  summary()
+
+# hc set
+genes.oi <- c('SCN2A', 'SLC6A1', 'STXBP1', 'SYNGAP1', 'SHANK3', 'GRIN2B')
+
+
+# genes in the the plot; ,check if these match
+
+network.genes <- c('PTDSS2',
+'SLC6A1',
+'AUP1',
+'RABL3',
+'STXBP2',
+'EXOCI',
+'DOCK7',
+'PLOD3',
+'ZNRD2',
+'CDC42BPA',
+'SCN2A',
+'DHCR24',
+'SIMMT',
+'ORTN3',
+'SLC39A14',
+'MYH9',
+'CERS2',
+'NPTN',
+'UBR2',
+'SPNS1',
+'MRPS9',
+'PRKAA1',
+'MRPS5',
+'NT5C3A',
+'HINT1','MENT','ZNRD2','PLOD3','DOCK7','EXOCI','STXBP2','STXBP1','PRPF6', 'DDX23', 'PRPF8',
+'SYNGAP1', 'YWHAH', 'YWHAG', 
+)
+
+
+# all six baits found; just subset to these sets
+subset.dt <- asd.dt[Bait %in% genes.oi,]
+subset.dt['SLC6A1' == Bait,]
+# Awhy is there more APMS hits on the plot than found in the file?
+
+
+# this one seems to have more interactors on map than we recovered here..
+subset.dt[('SLC6A1' == Bait | 'SLC6A1' == PreyGene), ] # no preygene; 9 interactors vs 13 on map
+
+# SHANK3 has one extra on map, but it is also a prey gene for SHANK2
+subset.dt['SHANK3' == PreyGene, ] 
+
+# part of the ASD255 set of interactions it seems 
+# what is ASD255
+asd.dt['SLC6A1' == PreyGene,]
+
+# how many prey in each
+subset.dt[,.N, by=Bait] %>% 
+  .[order(N)]
+
+
+# maybe its a IDconversion issue? See what the uniprot IDs are for this list and see if we can recover the baits
+subset.dt[Bait == 'SLC6A1',]
+
+
+hist(subset.dt$`1-BFDR`)
+hist(asd.dt$rank_WD)
+
+summary(asd.dt)
+```

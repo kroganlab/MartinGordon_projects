@@ -1,0 +1,690 @@
+---
+title: "APEX_FirstLook"
+author: "Martin Gordon"
+date: "2024-02-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R McCall First Look
+
+issue with number of features in each runs... compared this with the Berkley group and they are detecting more, but still issue with the 
+
+packages
+
+```{r}
+library(data.table)
+library (ComplexHeatmap)
+library (circlize)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(magrittr)
+library(MSstats)
+library(ggrepel)
+library(circlize)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/bp_utils/EvidenceFile2MSstatsInput.R")
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+create keys file
+```{r}
+keys <- fread('./data/RitaMC_MQOut/experimentalDesignTemplate.txt')
+keys[, IsotopeLabelType := 'L']
+keys[, Condition := sub("_[123]$","", Experiment)]
+keys[, BioReplicate := str_extract(Experiment, "[123]$")]
+keys[, RawFile := Name]
+keys[, Run := .I]
+
+
+fwrite(keys[, .(RawFile, IsotopeLabelType, Condition, BioReplicate,Run)], './docs/keys.txt')
+```
+
+read in data and create the evidence file
+
+```{r}
+
+anno <- fread('./data//RitaMC_MQOut/combined/txt/summary.txt')
+protGroups <-  fread('./data//RitaMC_MQOut/combined/txt/proteinGroups.txt')
+keys <-  fread('./docs/keys.txt')
+
+keys
+```
+
+Read in the data and do a quick. QC
+
+```{r}
+spec <- fread('./data/RitaMC_MQOut/combined/txt/evidence.txt')
+
+# convert MQ output to suitable format (drop multi-mapping peptides etc..)
+spec.dt <- MaxQtoMSstatsFormat(evidence=spec, proteinGroups=protGroups, annotation=keys)
+spec.dt <- as.data.frame(spec.dt) %>% 
+  setDT()
+spec.dt <- merge(x=keys, y=spec.dt[, .(ProteinName, PeptideSequence, PrecursorCharge, FragmentIon, ProductCharge,Run,Fraction, Intensity)], by.x='RawFile', by.y='Run')
+```
+Use BPs evidenceFile to MSstats input..
+
+```{r}
+spec.proc <- prepareDataForMSStats('./data/RitaMC_MQOut/combined/txt/evidence.txt', './docs/keys.txt')
+
+any(spec.proc[, .N, by = .(Run, PeptideSequence, PrecursorCharge)]$N) > 1
+
+col.pal <-  randomcoloR::distinctColorPalette(length(unique(spec.proc$Condition)))
+
+g <- ggplot(spec.proc[!is.na(Intensity),.N, by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N detected features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+#BackupAsPDF(g, 'rawFeatureCounts.barplot')
+
+```
+
+Read in BPs evidence file and lets look at the number of features detected
+
+```{r}
+spec <- fread('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/bp_res/evidence.txt')
+keys.subset <- keys[RawFile %in% spec$`Raw file`,]
+fwrite(keys.subset, './docs/keys.subset.txt')
+
+spec.proc <- prepareDataForMSStats('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/bp_res/evidence.txt',
+                                   './docs/keys.subset.txt')
+
+
+g <- ggplot(spec.proc[!is.na(Intensity),.N, by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N detected features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+```
+
+
+
+check for and drop contaminants
+```{r}
+# remove contaminants
+spec.dt <- spec.dt[grep('CON_|REV_', ProteinName, invert = T)]
+
+#fwrite(spec.dt, './data/MQ_out_clean.txt')
+spec.dt <- fread('./data/MQ_out_clean.txt')
+
+```
+intensities look fine, no spec junk on lower shoulder..
+No multi peptides detected per condition
+```{r}
+any(spec.dt[, .N, by = .(Run, PeptideSequence, PrecursorCharge)]$N) > 1
+```
+
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(length(unique(spec.dt$Condition)))
+
+
+g <- ggplot(spec.dt[!is.na(Intensity),.N, by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N detected features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+
+BackupAsPDF(g, 'rawFeatureCounts.barplot')
+```
+```{r}
+
+g <- ggplot(spec.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+
+BackupAsPDF(g, 'raw.intensities.boxplot')
+```
+
+```{r}
+wide <- dcast(spec.dt, ProteinName+PeptideSequence+PrecursorCharge~Condition+BioReplicate, value.var = "Intensity")
+
+# not v similiar and lots of missing values..
+ggplot (wide, aes (x =log2(EccCmut_inf_BR1_1), y = log2(EccCmut_inf_BR2_1))) + geom_point(shape = ".") + geom_density_2d() + coord_fixed()
+ggplot (wide, aes (x =log2(EccCmut_inf_BR1_1), y = log2(EccCmut_inf_BR1_2))) + geom_point(shape = ".") + geom_density_2d() + coord_fixed()
+
+ggplot (wide, aes (x =log2(WT_inf_BR1_1), y = log2(EccCmut_inf_BR1_1))) + geom_point(shape = ".") + geom_density_2d() + coord_fixed()
+```
+```{r}
+featureMat <- dcast(spec.dt,
+                     paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") |> as.matrix(rownames = "PeptideSequence")
+
+featureMat <- featureMat[complete.cases(featureMat), ]
+
+```
+
+As i thought.. one of the runs is problematic... maybe drop?
+Look at the other MQ run to see how the other samples look...
+May need to drop these..
+Also, why is there a large amt of variance in the different samples?
+```{r}
+
+pcaOut <- prcomp(t(log2(featureMat)))
+
+colInfo <- data.table(colname = colnames(featureMat))
+
+colInfo
+colInfo[,c("status","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+colInfo[, biorep := str_extract(status,"[123]$") ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA_Complete_Features")
+```
+Regenerate and remove the other reps 
+```{r}
+
+dim(featureMat) # only 234 features w/o NA values??? This seeems v low... continue QC but check with Ben tomorrow
+featureMat[,!colnames(featureMat) %like% "EccCmut_inf_BR1" ]
+
+colnames(featureMat)
+pcaOut <- prcomp(t(log2(featureMat[,!colnames(featureMat) %like% "EccCmut_inf_BR1" ])))
+
+colInfo <- data.table(colname = colnames(featureMat))
+
+colInfo
+colInfo[,c("status","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+colInfo[, biorep := str_extract(status,"[123]$") ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA_Complete_Features_noMut1Grp")
+```
+```{r}
+featureMat <- dcast (spec.dt,
+                     paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") |> as.matrix(rownames = "PeptideSequence")
+
+#  log transform
+featureMat <-  log2(featureMat)
+
+dim(featureMat)
+dim(featureMat[complete.cases(featureMat),]) #only 234 cases...
+colnames(featureMat)
+
+# create annotation
+ann <- data.table(replicate=str_extract(colnames(featureMat),'[1-3]$'),
+                  biogroup=str_extract(colnames(featureMat),'BR[1-3]'),
+                  status=ifelse(grepl("EccCmut", colnames(featureMat)), 'EccCmut', 'WT'))
+
+
+colours <- list('biogroup' = c('BR1' = '#4477AA', 'BR2'="#228833", 'BR3'="#CCBB44"),
+                'replicate' = c('1' = '#4477AA', '2'='#66CCEE', '3'="#228833"),
+                'status' =c('WT'="#CCBB44", 'EccCmut'='#EE6677')
+                )
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+
+
+# subset the data
+submat <- featureMat[sample(rownames(featureMat), 2000), ]
+  
+
+hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities', column_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm, 'features.clustered.heatmap')
+
+
+submat <-  featureMat[complete.cases(featureMat),]
+
+hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities', column_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm, 'features.completeCases.clustered.heatmap')
+
+
+submat <- sweep(submat,1, STATS=apply(submat, 1, median, na.rm=T))
+hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities/Median',  column_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm, 'features.completeCases.clustered.medianscaled.heatmap')
+```
+I need to check this with Ben tomorrow..
+
+## Summarisation & Normalisation
+
+Running MSstats processing
+
+# protein summarization
+Takes median intensity from the samples.. add a tech replicate column
+see https://groups.google.com/g/msstats/c/6IMm-AMMOGA
+```{r}
+
+spec.dt[, Run := RawFile]
+spec.dt[, oldName := paste0(Condition, '.',BioReplicate)]
+spec.dt[, TechReplicate := BioReplicate]
+spec.dt[, BioReplicate := str_extract(Condition, '[123]$')]
+spec.dt[, Condition := str_extract(Condition, "WT|EccCmut")]
+
+# check formatting
+spec.dt[,.N, by=.(Condition, BioReplicate, oldName,TechReplicate,RawFile,Run)]
+
+
+dp.out <- MSstats::dataProcess(spec.dt, 
+                              MBimpute =  FALSE, 
+                              featureSubset = "highQuality", 
+                              remove_uninformative_feature_outlier = TRUE)
+```
+
+
+```{r}
+saveRDS(dp.out,  "./output/120224_dp.out.rds")
+
+fwrite (dp.out$ProteinLevelData, "./output/AB.ProteinLevelData.csv")
+fwrite (dp.out$FeatureLevelData, "./output/AB.FeatureLevelData.csv.gz")
+```
+
+
+
+```{r}
+p.quant <- fread("./output/AB.ProteinLevelData.csv")
+```
+
+boxplots of normalised intensities
+
+```{r}
+g <- ggplot(p.quant, aes (x= interaction(SUBJECT, GROUP,RUN), y = LogIntensities, fill = GROUP)) +
+  geom_boxplot() +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'protein.intensities.boxplot')
+```
+
+Protein Counts per sample
+
+```{r}
+g <- ggplot(p.quant[,.N,by=.(GROUP,SUBJECT,RUN)], aes(x=reorder(interaction(GROUP,SUBJECT,RUN)), y = N, fill = GROUP)) +
+  geom_bar(stat='Identity') +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'nProteins.barplot')
+```
+# pca of the protein summarised data
+ 
+```{r}
+prot.mat <- dcast (p.quant, Protein~interaction(GROUP,SUBJECT,RUN), value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+colnames(prot.mat)
+prot.mat %>% View()
+
+p.quant[Protein == 'sp|A0MZ66|SHOT1_HUMAN' & GROUP == 'WT' & SUBJECT == '1',]
+
+prot.mat <- prot.mat[complete.cases(prot.mat),]
+```
+
+
+```{r}
+
+pcaOut <- prcomp(t(prot.mat))
+
+colInfo <- data.table(colname = colnames(prot.mat))
+colInfo[,c("status","rep") := tstrsplit(colnames(prot.mat), "[.]", keep = c(1,2)) ]
+colInfo[, run := str_extract(status,"[123]$") ]
+
+colInfo
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+
+pcaDT %>%  head()
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = interaction(status,rep), shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA_Complete_Proteins.")
+
+
+#and with BR1 dropped...
+
+pcaOut <- prcomp(t(prot.mat[, !colnames(prot.mat) %like% "EccCmut_inf_BR1"]))
+
+colInfo
+colInfo[,c("status","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+colInfo[, biorep := str_extract(status,"[123]$") ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+pcaDT[, `:=`(timepoint = ifelse(grepl("[47]D", rn), str_extract(rn, "[47]D"), 'na'),
+             treat = gsub("[_.].+", "", rn)
+             )]
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC2, y=PC3,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA_Complete_Proteins_nomut1grp.")
+```
+
+variance explained:
+Huge amt explained due to first PC which corresponds to condition, which is good, but why is there so few proteins and features identified....
+I dont know anything else about model ro conditions, but 
+
+```{r}
+q <- qplot(1:10,  pcaPercentVar[1:10]) +
+  geom_line() +
+  xlab('Princpal Component 1:10') +
+  ylab(('% Variance explained')) +
+  ggtitle('All samples scree plot')
+
+q
+BackupAsPDF(q, 'pca.all.screeplot.')
+```
+biotinylated carboxylases
+-----
+Plot the biotinylated carboxylases
+None of the endogenous proteins detected... have we used the correct uniprot file?
+```{r}
+
+
+biotin.carboxylases.up <- c("O00763","P05165","P11498","Q13085","Q96RQ3")
+p <- ggplot(p.quant[Protein %in% biotin.carboxylases.up], aes (x = interaction ( SUBJECT, GROUP,RUN ), y = LogIntensities, color = Protein)) + geom_line(aes(group = Protein)) + geom_point(aes(shape = as.factor(SUBJECT)))
+#ackupAsPDF(p, "BiotinCarboxylaseLevels_")
+```
+
+
+
+read back in the R object and lets run DEA
+We want to model using lmm; add a 'batch' term to the subject
+
+```{r}
+dp.out <- readRDS("./output/120224_dp.out.rds")
+
+# we want to model 'batch' random effects
+# two options: pseudobulk (just take the mean of each group to summarise or lmm)
+# we want to 'batch' the groupd
+p.quant <-  setDT(dp.out$ProteinLevelData)
+#p.quant[, SUBJECT := paste0(GROUP,SUBJECT)]
+p.quant[, SUBJECT := paste0('batch.', SUBJECT)]
+
+dp.out$ProteinLevelData <- p.quant
+
+f.quant <- setDT(dp.out$FeatureLevelData)
+#f.quant[,SUBJECT := paste0(GROUP,SUBJECT)]
+f.quant[,SUBJECT := paste0('batch.', SUBJECT)]
+        
+        
+dp.out$ProteinLevelData <- p.quant
+dp.out$FeatureLevelData <- f.quant
+
+dp.out$ProteinLevelData
+```
+
+
+
+```{r}
+contrasts.mat <- matrix(c(-1,1), nrow=1, ncol=2)
+colnames(contrasts.mat) <-  c('WT', 'EccCmut')
+rownames(contrasts.mat) <- 'EccCmut-WT'
+
+# run msstats correcting for batch 
+mss <- groupComparison(contrast.matrix=contrasts.mat, data=dp.out)
+mss.dt <- setDT(mss$ComparisonResult)
+
+mss.dt[abs(log2FC) > 0.58 & pvalue < 0.05 & is.finite(log2FC), ]
+
+# larger SE when. modelling with lmm (batch)
+#7 and 12 DF: SE val with lmm 0.1879289	 0.1022959	
+```
+
+Contact Rita about the analysis and request access to the ArtMs sata
+
+
+
+not needed...
+---------
+
+```{r}
+spec.dt <-  spec
+spec.dt[, ProteinName := `Leading proteins`]
+
+spec.dt <- spec.dt[grep('CON_', ProteinName, invert = T)]
+spec.dt <- spec.dt[grep('REV_', ProteinName, invert = T)]
+
+spec.dt %>%  names()
+
+spec
+
+sp
+```
+
+```{r}
+
+col.pal <-  randomcoloR::distinctColorPalette(length(unique(spec.dt$Condition)))
+
+g <- ggplot(spec.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+
+BackupAsPDF(g, 'raw.intensities.boxplot')
+```
+
+Missed clevages
+
+```{r}
+spec.dt$`Potential contaminant` %>%  unique()
+```
+
+Issue here, the first mutant biorep has far less identified peptides than the others,
+Only 30k features identified also??? consistent across all tech reps..
+
+```{r}
+
+Portein.
+spec.dt <- spec.dt[Intensity > 2^5,]
+
+g <- ggplot(spec.dt[,.N, by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+
+BackupAsPDF(g, 'rawFeatureCounts.barplot')
+
+spec.dt$Condition %>%  unique()
+
+```
+```{r}
+wide <- dcast(spec.dt, Proteins+PeptideSequence+PrecursorCharge+Type~Condition+BioReplicate, value.var = "Intensity")
+
+(wide)
+
+
+spec.dt[PeptideSequence == 'GFAFVEYESHR' & Condition == 'EccCmut_inf_BR2',]
+# good agreement between replicates it looks like 
+
+# one of the mocks may be an issue but generally v simialr 
+ggplot (wide, aes (x =log2(EccCmut_inf_BR1), y = log2(Vehicle_7D_2))) + geom_point(shape = ".") + geom_density_2d() + coord_fixed()
+ggplot (wide, aes (x =log2(x4206_7D_2), y = log2(x4206_7D_4))) + geom_point(shape = ".") + geom_density_2d() + coord_fixed()
+
+spec$Type %>% unique()
+```
+ PCA features 
+ ----
+```{r}
+featureMat <- dcast(spec.dt,
+                     paste0(PeptideSequence,'.', PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") |> as.matrix(rownames = "PeptideSequence")
+
+
+featureMat
+featureMat <- featureMat[complete.cases(featureMat), ]
+
+spec.dt[PeptideSequence == 'AAAAAAALQAK' & Condition ==  "EccCmut_inf_BR1" & BioReplicate == 1,]
+
+
+spec.dt$Condition %>%  unique()
+```
+
+
+```{r}
+pcaOut <- prcomp(t(log2(featureMat)))
+
+colInfo <- data.table(colname = colnames(featureMat))
+
+colInfo
+colInfo[,c("status","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA_Complete_Features")
+```
+
+```{r}
+featureMat <- dcast (spec.dt,
+                     paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") |> as.matrix(rownames = "PeptideSequence")
+
+#  log transform
+featureMat <-  log2(featureMat)
+
+dim(featureMat)
+dim(featureMat[complete.cases(featureMat),])
+colnames(featureMat)
+
+# create annotation
+ann <- data.table(replicate=str_extract(colnames(featureMat),'[1-5]$'),
+                  treatment=sub("[_.].+", "", colnames(featureMat)),
+                  timepoint=ifelse(grepl("[47]D", colnames(featureMat)), str_extract(colnames(featureMat), "[47]D"), 'na'))
+
+
+colours <- list('timepoint' = c('na' = '#4477AA', '4D'="#228833", '7D'="#CCBB44"),
+                'replicate' = c('1' = '#4477AA', '2'='#66CCEE', '3'="#228833", '4'="#CCBB44", '5'='#EE6677'),
+                'treatment' =c('Mock' = col.pal[1], 'Vehicle'=col.pal[2], 'N1062D'=col.pal[3], 'x3769'=col.pal[4], 'x4052'=col.pal[5], 'x4206'=col.pal[6])
+                )
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+
+
+# subset the data
+submat <- featureMat[sample(rownames(featureMat), 2000), ]
+  
+
+
+hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities', column_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm, 'features.clustered.heatmap')
+
+submat <- sweep(submat,1, STATS=apply(submat, 1, median, na.rm=T))
+hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities/Median',  column_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm, 'features.clustered.medianscaled.heatmap')
+
+```

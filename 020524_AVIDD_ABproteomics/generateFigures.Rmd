@@ -1,0 +1,1043 @@
+---
+title: "tidyPlotsandTables"
+author: "Martin Gordon"
+date: "2024-02-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Regenerate the plots and generate tidy tables for the analysis
+
+### To do list for extra analysis
+- Contrast of Contrasts: compare Veh D7-D4 to treatments D7-D4 ii) attenuated D7-D4 to treatment D7-D4
+
+
+### To do list for plots
+- Generate tidy output tables of the protein quantification and msstats analysis - DONE
+- Generate volcanoplots for the conditions of interest, highlighting the SARS-CoV-2 genes - DONE 
+- Generate heatmaps for the interesing genes; collapse to group averages for both i) log2FC and ii) Ints - DONE
+- Scatterplots comparing log2FC values - DONE
+- Enrichment: Heatmap of the most significantly enriched groups in the comparisons.. inspect interesting geneSets - DONE
+- GoEnrichment Heatmaps - DONE 
+
+- GoEnrichment Heatmaps - collapse the groups
+- GoEnrichment LFC Heatmaps; try circular
+
+- z-score enrichment analysis of the ISGs and Pro_Inflammatory geneSets - Done 
+
+
+### Extras if time
+- circular heatmaps
+- overlaps of sig hits
+- wgcna
+-
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(nichenetr)
+library(patchwork) # combine plots
+library(viridis)
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+Read in all the data we will need and 
+
+```{r}
+#Immune response genes
+
+piGenes <- read_xlsx('docs/1-s2.0-S0092867423009157-mmc4.xlsx', col_names = T, sheet=7) %>% 
+  setDT(.) %>% 
+  .[category == 'Proinflammatory'] %>% 
+  .[,unique(gene)]
+
+isGenes <- fread('./docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+
+# p.quant 
+p.quant <- fread ("./output/AB.ProteinLevelData.csv")
+p.quant[, REP := SUBJECT]
+p.quant[, SUBJECT := interaction(GROUP,SUBJECT)]
+# for plotting group averages
+p.quant[, mean.LogIntensities := mean(LogIntensities, na.rm=T), by=.(Protein,GROUP)]
+
+#msstats output
+mss <- fread('./output/mss.contrasts.ab.csv')
+
+#clean the res
+mss <- mss[!is.infinite(abs(log2FC)) & !issue %in% c("oneConditionMissing","completeMissing"), ] %>% 
+  .[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')] %>% 
+  .[, sig := 'not'] %>% 
+  .[abs(log2FC) > 0.58 & adj.pvalue < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+```
+Map to human homologs using db on file and remove dups
+Checked the mappins these look good..
+```{r}
+# lets map the homologs to the mss output and write the complete and tidied data to file 
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+new.mss <- merge.data.table(x=mss, y=mh_mappings[,.(Symbol.mouse, Symbol.human, SWISS_PROT_IDs.mouse, SWISS_PROT_IDs.human)], by.x='Protein', by.y='SWISS_PROT_IDs.mouse', all.x=T)
+# nearly 7k more rows added... need to filter these out dups.
+# just take unqiue rows of DT based on Protein Label combo
+mss <- unique(new.mss, by=c("Protein", "Label"))
+
+new.p.quant <- merge.data.table(x=p.quant, y=mh_mappings[,.(Symbol.mouse, Symbol.human, SWISS_PROT_IDs.mouse, SWISS_PROT_IDs.human)], by.x='Protein', by.y='SWISS_PROT_IDs.mouse', all.x=T)
+p.quant <- unique(new.p.quant, by=c('Protein', 'GROUP', 'SUBJECT'))
+```
+
+Write out tidy format for both files
+
+```{r}
+#drop the mock comparisons and the comparisons with the other drugs
+contrasts.oi <- grep('-Mock|x4052|x3769', unique(mss$Label), invert = T, value=T)
+  
+# cast to wide format
+dcast(mss, Protein+gene+Symbol.human~Label, value.var = c('log2FC', 'pvalue', 'adj.pvalue')) %>% 
+  setnames(old='Symbol.human', new='gene.human') %>% 
+  fwrite(.,  ScriptAndDatedFileName('mss.pw.comparisons.wide.csv') )
+
+fread('~/Documents/projects/020524_AVIDD_ABproteomics/generateFigures_data/2024_02_08_mss.pw.comparisons.wide.csv')
+
+
+sig.prots <-  mss[sig != 'not', unique(Protein)]
+# cast to wide format
+dcast(mss[Protein %in% sig.prots,], Protein+gene+Symbol.human~Label, value.var = c('log2FC', 'pvalue', 'adj.pvalue')) %>% 
+  setnames(old='Symbol.human', new='gene.human') %>% 
+  fwrite(.,  ScriptAndDatedFileName('mss.pw.comparisons.siggenes.wide.csv') )
+
+fread('~/Documents/projects/020524_AVIDD_ABproteomics/generateFigures_data/2024_02_08_mss.pw.comparisons.siggenes.wide.csv')
+```
+
+For plot generation, just keep to the groups we want for the paper
+
+```{r}
+#drop the mock comparisons and the comparisons with the other drugs
+contrasts.oi <- grep('-Mock|x4052|x3769', unique(mss$Label), invert = T, value=T)
+groups.oi <- grep('Mock|x4052|x3769', unique(p.quant$GROUP), invert = T, value=T)
+
+mss.subset <-  mss[Label %in% contrasts.oi,]
+p.quant.subset  <- p.quant[GROUP %in% groups.oi,]
+
+```
+
+volcano plots
+---
+
+Identify the SARS-CoV2 genes in the data (by uniprot ID) and highlight these as a different color
+
+```{r}
+sars.cov2.features <-  fread('./docs/uniprotkb_organism_id_2697049_AND_revie_2024_02_09.tsv') 
+virus.prots <- sars.cov2.features[,unique(Entry)]
+```
+
+combined volcanoplot
+
+TODO: check why the 
+```{r}
+mss.subset[, label := sig] %>% 
+  .[Protein %in% virus.prots, label := 'viral']
+
+g <- ggplot(mss.subset, aes(x=log2FC, y=-log10(adj.pvalue), col=label, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.subset[sig != 'not' & !Protein %in% virus.prots,], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  # add the points for the SARS-CoV2 proteins
+  geom_point(data=mss.subset[Protein %in% virus.prots,], aes(x=log2FC, y=-log10(adj.pvalue)), col='#669966') +
+  ggrepel::geom_text_repel(data=mss.subset[Protein %in% virus.prots,],  size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "#669966") +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey', 'viral'='#669966')) +
+  facet_wrap(~Label, ncol=2) +
+  theme_bw()
+
+BackupAsPDF(g, 'combined.volcano', dimensions=c(12,18))
+  
+```
+
+generate individual volcano plot of each individual comparison
+
+```{r}
+lapply(contrasts.oi, function(x){
+  
+  print(x)
+  g <- ggplot(mss.subset[Label == x,], aes(x=log2FC, y=-log10(adj.pvalue), col=label, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.subset[Label == x & sig != 'not' & !Protein %in% virus.prots,], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  # add the points for the SARS-CoV2 proteins
+  ggtitle(x) +
+  geom_point(data=mss.subset[Label == x &Protein %in% virus.prots,], aes(x=log2FC, y=-log10(adj.pvalue)), col='#669966') +
+  ggrepel::geom_text_repel(data=mss.subset[Label == x & Protein %in% virus.prots,],  size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "#669966") +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey', 'viral'='#669966')) +
+  #facet_wrap(~Label, ncol=2) +
+  theme_bw()
+  
+ #BackupAsPDF(g, paste0(x, '.volcano.'))
+})
+```
+Heatmaps of the sig genes
+------
+Look at Intensities
+First plot all the significant genes in one plot and look at the clustering  
+
+```{r}
+# these are genes significant in these conditions
+sig.genes <- mss.subset[sig != 'not', unique(gene)]
+sig.prots <- mss.subset[sig != 'not', unique(Protein)]
+
+p.mat <- dcast(p.quant.subset, Protein~SUBJECT, value.var = "LogIntensities") %>% 
+      as.matrix (rownames = "Protein")
+
+# convert IDs and subset
+p.mat <- p.mat[rownames(p.mat) %in% sig.prots,]
+
+rownames(p.mat) <-  multiUniprots2multiGenes(rownames(p.mat), species='MOUSE')
+
+p.mat <-  sweep(p.mat, 1, STAT=apply(p.mat, 1, median, na.rm=T))
+
+hm <- Heatmap(p.mat, 
+              cluster_rows=clusterWNA(p.mat), 
+              show_row_names = T, 
+              cluster_columns = F, 
+              row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              column_split=sub("[.][1-5]$", "", colnames(p.mat)),
+              column_title_gp = gpar(fontsize=10),
+              name='Ints/Median', 
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))
+hm
+BackupAsPDF(draw(hm), paste0('heatmap.siggenes.medianscaled'), dimensions=c(9,16))
+```
+plot the collapsed results
+
+```{r}
+p.mat <- dcast(p.quant.subset[REP ==1, ], Protein~SUBJECT, value.var = "mean.LogIntensities") %>% 
+      as.matrix (rownames = "Protein")
+
+# convert IDs and subset
+p.mat <- p.mat[rownames(p.mat) %in% sig.prots,]
+
+rownames(p.mat) <-  multiUniprots2multiGenes(rownames(p.mat), species='MOUSE')
+
+p.mat <-  sweep(p.mat, 1, STAT=apply(p.mat, 1, median, na.rm=T))
+
+hm <- Heatmap(p.mat, 
+              cluster_rows=clusterWNA(p.mat), 
+              show_row_names = T, 
+              cluster_columns = F, 
+              show_column_names = F,
+              #top_annotation = colAnn, 
+              row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+             # col=colorRamp2(breaks=c(-3,0,3), colors=c('blue', 'white', 'red')),
+              column_split=colnames(p.mat),
+              column_title_gp = gpar(fontsize=6),
+              name='Ints/Median', 
+              column_names_gp = gpar(fontsize=6), 
+              row_names_gp = gpar(fontsize=5))
+hm
+BackupAsPDF(draw(hm), paste0('heatmap.siggenes.collapsed.medianscaled.'), dimensions=c(7,16))
+```
+Z-score plots
+all replicates
+```{r}
+p.mat <- dcast(p.quant.subset, Protein~SUBJECT, value.var = "LogIntensities") %>% 
+      as.matrix (rownames = "Protein")
+
+p.mat <-  scale(p.mat)
+
+# now subset to the sig hits
+p.mat <- p.mat[rownames(p.mat) %in% sig.prots,]
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat),species='MOUSE')
+
+hm <- Heatmap(p.mat, 
+              cluster_rows=clusterWNA(p.mat), 
+              show_row_names = T, 
+              cluster_columns = F, 
+              row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              column_split=sub("[.][1-5]$", "", colnames(p.mat)),
+              column_title_gp = gpar(fontsize=10),
+              name='z-score(Ints.)', 
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))
+hm
+
+BackupAsPDF(draw(hm), paste0('heatmap.siggenes.z-scores'), dimensions=c(9,16))
+```
+collapsed replicates
+
+```{r}
+p.mat <- dcast(p.quant.subset[REP==1,], Protein~SUBJECT, value.var = "mean.LogIntensities") %>% 
+      as.matrix (rownames = "Protein")
+
+p.mat <-  scale(p.mat)
+
+# now subset to the sig hits
+p.mat <- p.mat[rownames(p.mat) %in% sig.prots,]
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat),species='MOUSE')
+
+hm <- Heatmap(p.mat, 
+              cluster_rows=clusterWNA(p.mat), 
+              show_row_names = T, 
+              show_column_names = F,
+              cluster_columns = F, 
+              row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              column_split=sub("[.][1-5]$", "", colnames(p.mat)),
+              column_title_gp = gpar(fontsize=9),
+              name='z-score(Ints.)', 
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))
+hm
+BackupAsPDF(draw(hm, ), paste0('heatmap.siggenes.collapsed.z-scores'), dimensions=c(7,16))
+```
+Log2FC heatmaps for sig genes
+----
+Don't know if it makes sense to subset like this..
+Try heatmap of D4 veh vs D7 veh
+
+```{r}
+
+mss.subset$Label %>% unique()
+
+p.mat <- dcast(mss.subset, Protein~Label, value.var = c("log2FC")) %>% 
+  as.matrix(rownames='Protein')
+
+print(p.mat)
+p.mat <- p.mat[rownames(p.mat) %in% sig.prots,]
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat),species='MOUSE')
+
+hm <-  Heatmap(t(p.mat),
+                cluster_rows=T,
+                cluster_columns=T,
+                #col=colorRamp2(c(-2, 0, 1.5), c("blue", "white", "red")), 
+                name='log2FC', 
+                row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+                row_title_gp = gpar(fontsize=9),
+                column_title_gp = gpar(fontsize=9),
+                column_names_gp = gpar(fontsize=5), 
+                row_names_gp = gpar(fontsize=8))
+
+hm
+
+BackupAsPDF(draw(hm), paste0('heatmap.siggenes.log2FC.'), dimensions=c(18,6))
+```
+create log2FC scatterplots of each comparison; color by SE (take ngative log10 as lower is better)
+
+```{r}
+#all I need to do is create a vector of each combo of labels
+
+UniqueFactorCombos <- function(lab, sep=',', allow.dups=F){
+  
+  x <- expand.grid(unique(lab), unique(lab)) %>% 
+    setDT() 
+  # now filter out where they are the same, or labels are just swapped
+  x <- x[Var1 != Var2, ] 
+  # extract cols oi, sort vector alphabeticallly and then collapse
+  x[, paste.vec := paste(Var1, Var2, sep=sep)]
+  x[, vec.combo := apply(x[, c("Var1", "Var2")], 1, function(x) paste(sort(x), collapse = sep))]
+  
+  if (allow.dups %in% c('T','TRUE')) {
+    
+    message('output may contain duplicate combinations')
+    message(paste0(nrow(x), ' combinations returned..'))
+    return(x[, .(Var1, Var2)])
+    
+  } else {
+    
+    message('removed duplicate combinations')
+    message(paste0(nrow(unique(x, by='vec.combo')), ' combinations returned..'))
+    return(unique(x, by='vec.combo')[, .(Var1, Var2)])
+    
+  }
+}
+
+```
+
+
+Lets color by summagSigScore (most significant movers get highest score)
+
+```{r}
+contrast.pairs <-  UniqueFactorCombos(mss.subset$Label, allow.dups = F, sep=',')
+
+apply(contrast.pairs,1,  function(x){
+  
+  print(x)
+  print(mss.subset[Label %in% x, unique(Label)])
+  
+  dt <- dcast(mss.subset[Label %in% x,], Protein+gene~Label, value.var = c('log2FC','sig'))
+  
+  # print
+  setnames(dt, new=c('Protein', 'gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+  colnames(dt)
+  
+  # could try nested if else but not working v well....
+  dt[, label := 'not']
+  dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'both']
+  dt[Protein %in% virus.prots, label := 'viral']
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=gene)) +
+    geom_point() +
+    #xlim(c(-4,4)) +
+    #ylim(c(-4,4)) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('y-axis sig'='#990033', 'x-axis sig'="#2A788EFF",'viral'="#669966", 'not'='grey', 'both'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not',],size = 2, max.overlaps = 20) +
+    ggrepel::geom_text_repel(data=dt[Protein %in% virus.prots,],size = 2, max.overlaps = 20, color = '#669966') +
+   # ggrepel::geom_text_repel(data=dt[Protein %in% virus.prots,],size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "#669966") +
+    xlab(paste(x[1], 'log2 fold change',sep=' ')) +
+    ylab(paste(x[2], 'log2 fold change',sep=' ')) +
+    ggtitle(paste('Fold Change Comparisons')) + 
+    theme_bw()
+  
+  BackupAsPDF(g, paste0('scatterplots/',x[1], 'vs', x[2],'.log2FC.scatterplots.'))
+})
+
+```
+
+overplotting.. subset to sig hits (w/o MT correction) from all the comparisons 
+Dont save this.. subset each of the other comparisons we are interested in...
+
+```{r}
+
+# get uncorrected sig hits in both
+#mss.subset[, naive.sig := 'not']
+#mss.subset[pvalue < 0.05 & abs(log2FC) > 0.58, naive.sig := ifelse(log2FC > 0, 'up', 'down')]
+naive.hits <- mss.subset[pvalue < 0.05 & abs(log2FC) > 0.58, unique(Protein)]
+
+apply(contrast.pairs,1,  function(x){
+  
+  print(x)
+  print(mss.subset[Label %in% x & Protein %in% naive.hits, unique(Label)])
+  
+  dt <- dcast(mss.subset[Label %in% x & naive.sig != 'not',], Protein+gene~Label, value.var = c('log2FC','sig'))
+  
+  # print
+  setnames(dt, new=c('Protein', 'gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+  colnames(dt)
+  
+  # could try nested if else but not working v well....
+  dt[, label := 'not']
+  dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'both']
+  dt[Protein %in% virus.prots, label := 'viral']
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=gene)) +
+    geom_point() +
+    xlim(c(-4,4)) +
+    ylim(c(-4,4)) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('y-axis sig'='#990033', 'x-axis sig'="#2A788EFF",'viral'="#669966", 'not'='grey', 'both'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not',],size = 2, max.overlaps = 20) +
+    ggrepel::geom_text_repel(data=dt[Protein %in% virus.prots,],size = 2, max.overlaps = 20, color = '#669966') +
+   # ggrepel::geom_text_repel(data=dt[Protein %in% virus.prots,],size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "#669966") +
+    xlab(paste(x[1], 'log2 fold change',sep=' ')) +
+    ylab(paste(x[2], 'log2 fold change',sep=' ')) +
+    ggtitle(paste('Fold Change Comparisons')) + 
+    theme_bw()
+  
+  #BackupAsPDF(g, paste0(x[1], 'vs', x[2],'.log2FC.scatterplots.'))
+})
+```
+
+Seems we have quite high variabilty in log2FC estimates... 
+forest plot for estimate of confidence interval reliability
+
+```{r}
+# calculate confidence intervals
+mss.subset[, lower_ci := (log2FC  - 1.96)*SE]
+mss.subset[, upper_ci := (log2FC  + 1.96)*SE]
+
+ggplot(mss.subset[naive.sig != 'not' & sig == 'not',], aes(x = log2FC, y = gene)) +
+  geom_point(size = 2, color = "blue") +
+  geom_errorbarh(aes(xmin = lower_ci, xmax = upper_ci), height = 0.2, color = "blue") +
+  facet_wrap(~Label) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Forest Plot of log2FC Estimates",
+       x = "log2FC",
+       y = "Protein") +
+  theme_minimal()
+```
+
+# Enrichment
+Heatmaps of the most significantly enriched groups in the comparisons
+
+```{r}
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(dbName = 'org.Mm.eg.db', ontology = "ALL", keyType = "UNIPROT")
+
+# define the universe, the total set of identified genes in our study
+universe <- unique(p.quant$Protein)
+
+# now want to run enrichment on each 
+mss.subset[,enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.subset[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+#fwrite(enrich.dt, ScriptAndDatedFileName('GOenrichments.'))
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('GOenrichments.simplified'))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'enrich.grp', topN = 10, title='GO term enrichment', 
+                                  negCols=unique(simp.enrich$simplified$enrich.grp[grep('down', simp.enrich$simplified$enrich.grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 8)
+ht
+#BackupAsPDF(ht, 'go.heatmap.top10.', dimensions=c(8,8))
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'enrich.grp', topN = 10, title='GO term enrichment', 
+                                  negCols=unique(simp.enrich$simplified$enrich.grp[grep('down', simp.enrich$simplified$enrich.grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 8)
+
+ht
+
+#BackupAsPDF(ht, 'go.heatmap.top10.allterms.', dimensions=c(8,8))
+enrich.dt <-  fread('./generateFigures_data/2024_02_09_GOenrichments.')
+```
+
+Clear that for the treatment of interest, there is significant upregulation compared to WT in relaation to IR and acute response genes
+Lets take a look at these genesets
+
+```{r}
+acutephaseGenes <- unlist(strsplit(enrich.dt[Description == 'acute-phase response', geneID], "/"))
+
+g <- ggplot(mss.subset, aes (x = log2FC, y = -log10(adj.pvalue), color = sig, label = gene)) +
+  geom_point( alpha = 0.2) +
+  geom_point(data = mss.subset[Protein %in% acutephaseGenes]) +
+  facet_wrap(~Label, ncol=2) +
+  labs(title = 'acute-phase response genes', 
+       y='-log10 adj.pvalue') +
+  scale_color_manual(values = c(not = "gray", down = "blue", up = "red")) +
+  ggrepel::geom_text_repel(data = mss.subset[Protein %in% acutephaseGenes & sig != 'not'], aes(label=gene),  size = 2, max.overlaps = 100, color = "black") +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'acutePhasegenes.volcanplot', dimensions=c(10,14))
+```
+```{r}
+complementGenes <- unlist(strsplit(enrich.dt[Description == 'complement activation', geneID], "/"))
+
+g <- ggplot(mss.subset, aes (x = log2FC, y = -log10(adj.pvalue), color = sig, label = gene)) +
+  geom_point( alpha = 0.2) +
+  geom_point(data = mss.subset[Protein %in% complementGenes]) +
+  facet_wrap(~Label, ncol=2) +
+  labs(title = 'complement-activation genes', 
+       y='-log10 adj.pvalue') +
+  scale_color_manual(values = c(not = "gray", down = "blue", up = "red")) +
+  ggrepel::geom_text_repel(data = mss.subset[Protein %in% complementGenes & sig != 'not'], aes(label=gene),  size = 2, max.overlaps = 100, color = "black") +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'complementActivationgenes.volcanplot', dimensions=c(10,14))
+
+```
+
+negative regulation of hydrolase activity 
+
+```{r}
+hydrolaseRegGenes <- unlist(strsplit(enrich.dt[Description == 'negative regulation of hydrolase activity', geneID], "/"))
+
+g <- ggplot(mss.subset, aes (x = log2FC, y = -log10(adj.pvalue), color = sig, label = gene)) +
+  geom_point( alpha = 0.2) +
+  geom_point(data = mss.subset[Protein %in% hydrolaseRegGenes]) +
+  facet_wrap(~Label, ncol=2) +
+  labs(title = 'negative regulation of hydrolase activity genes', 
+       y='-log10 adj.pvalue') +
+  scale_color_manual(values = c(not = "gray", down = "blue", up = "red")) +
+  ggrepel::geom_text_repel(data = mss.subset[Protein %in% hydrolaseRegGenes & sig != 'not'], aes(label=gene),  size = 2, max.overlaps = 100, color = "black") +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'regulationHydrolaseActivity.volcanplot', dimensions=c(10,14))
+
+```
+humoral immune response gene sets
+
+```{r}
+IMGenes <- unlist(strsplit(enrich.dt[Description == 'humoral immune response', geneID], "/"))
+
+g <- ggplot(mss.subset, aes (x = log2FC, y = -log10(adj.pvalue), color = sig, label = gene)) +
+  geom_point( alpha = 0.2) +
+  geom_point(data = mss.subset[Protein %in% IMGenes]) +
+  facet_wrap(~Label, ncol=2) +
+  labs(title = 'humoral immune response genes', 
+       y='-log10 adj.pvalue') +
+  scale_color_manual(values = c(not = "gray", down = "blue", up = "red")) +
+  ggrepel::geom_text_repel(data = mss.subset[Protein %in% IMGenes & sig != 'not'], aes(label=gene),  size = 2, max.overlaps = 100, color = "black") +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'humoralImmuneResponse.volcanplot', dimensions=c(10,14))
+```
+Now inspect Jak2-STAT signalling gene sets... unfortunately no sets passed significance thresholds..
+```{r}
+simp.enrich$simplified[ID %like% "JAK" & p.adjust < 0.05,]
+```
+
+enrichment heatmaps with go enrichment annotation
+----
+Maybe actually just the treatment group sig genes, both t4 and t7, and then side bar annotations with the GO enrihcment group
+
+```{r}
+
+p.mat <- dcast(p.quant.subset, Protein~SUBJECT, value.var = "LogIntensities") %>% 
+      as.matrix (rownames = "Protein")
+
+p.mat <-  scale(p.mat)
+
+# now subset to the sig hits
+p.mat <- p.mat[rownames(p.mat) %in% sig.prots,]
+
+## anno barplots for GO enrichment results
+hydrolaseRegGenes_bar <- rownames(p.mat) %in% hydrolaseRegGenes
+hydro_genes <- rownames(p.mat)[hydrolaseRegGenes_bar]
+complementGenes_bar <- rownames(p.mat) %in% complementGenes
+comp_genes <- rownames(p.mat)[complementGenes_bar]
+acutephaseGenes_bar <- rownames(p.mat) %in% acutephaseGenes
+acute_genes <- rownames(p.mat)[acutephaseGenes_bar]
+IMGenes_bar <- rownames(p.mat) %in% IMGenes
+im_genes <- rownames(p.mat)[IMGenes_bar]
+
+# rowames of all anno plots
+names_bar <-  rownames(p.mat) %in% c(acutephaseGenes,complementGenes, hydrolaseRegGenes, IMGenes)
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat),species='MOUSE')
+
+
+ht_list = Heatmap(p.mat, 
+              cluster_rows=clusterWNA(p.mat), 
+              show_row_names = T, 
+              show_column_names = F,
+              cluster_columns = F, 
+              row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              name = "z-score (Ints.)",
+              column_split=sub("[.][1-5]$", "", colnames(p.mat)),
+              column_title_gp = gpar(fontsize=9),
+              heatmap_legend_param = list(direction='horizontal', title='z-score (Ints.)',
+              heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))  +
+  Heatmap(hydrolaseRegGenes_bar + 0, name = "hydrolase activity regulation", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(complementGenes_bar + 0, name = "complement activation", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(acutephaseGenes_bar + 0, name = "acute phase response", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  Heatmap(IMGenes_bar + 0, name = "humoral immune response", col = c("0" = "white", "1" = '#21918c'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(p.mat)[names_bar], 
+        labels_gp = gpar(fontsize = 6), padding = unit(0.2, "mm"))) 
+
+BackupAsPDF(draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="top"), 'heatmap.siggenes.GOenrich.z-scores', dimensions=c(8,12))
+
+
+# also try median scaled
+
+p.mat <- dcast(p.quant.subset, Protein~SUBJECT, value.var = "LogIntensities") %>% 
+      as.matrix (rownames = "Protein")
+
+p.mat <-  sweep(p.mat, 1, STATS=apply(p.mat, 1, median, na.rm=T))
+
+# now subset to the sig hits
+p.mat <- p.mat[rownames(p.mat) %in% sig.prots,]
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat),species='MOUSE')
+
+ht_list = Heatmap(p.mat, 
+              cluster_rows=clusterWNA(p.mat), 
+              show_row_names = T, 
+              show_column_names = F,
+              cluster_columns = F, 
+              row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              name = "z-score (Ints.)",
+              column_split=sub("[.][1-5]$", "", colnames(p.mat)),
+              column_title_gp = gpar(fontsize=9),
+              heatmap_legend_param = list(direction='horizontal', title='Ints./Median',
+              heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))  +
+  Heatmap(hydrolaseRegGenes_bar + 0, name = "hydrolase activity regulation", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(complementGenes_bar + 0, name = "complement activation", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(acutephaseGenes_bar + 0, name = "acute phase response", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  Heatmap(IMGenes_bar + 0, name = "humoral immune response", col = c("0" = "white", "1" = '#21918c'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(p.mat)[names_bar], 
+        labels_gp = gpar(fontsize = 6), padding = unit(0.2, "mm"))) 
+
+BackupAsPDF(draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="top"), 'heatmap.siggenes.GOenrich.medianScaled', dimensions=c(8,12))
+
+```
+
+Subset sig prots to the x4206 treatment group vs WT and view..
+Most of the sig hits we viewed are in this group...
+
+```{r}
+treat.prots <- mss.subset[Label %in% c("x4206_7D-Vehicle_7D","x4206_4D-Vehicle_4D") & sig != 'not', unique(Protein)]
+
+p.mat <- dcast(p.quant.subset, Protein~SUBJECT, value.var = "LogIntensities") %>% 
+      as.matrix (rownames = "Protein")
+
+p.mat <-  scale(p.mat)
+
+# now subset to the sig hits
+p.mat <- p.mat[rownames(p.mat) %in% treat.prots,]
+dim(p.mat)
+
+## anno barplots for GO enrichment results
+hydrolaseRegGenes_bar <- rownames(p.mat) %in% hydrolaseRegGenes
+hydro_genes <- rownames(p.mat)[hydrolaseRegGenes_bar]
+complementGenes_bar <- rownames(p.mat) %in% complementGenes
+comp_genes <- rownames(p.mat)[complementGenes_bar]
+acutephaseGenes_bar <- rownames(p.mat) %in% acutephaseGenes
+acute_genes <- rownames(p.mat)[acutephaseGenes_bar]
+IMGenes_bar <- rownames(p.mat) %in% IMGenes
+im_genes <- rownames(p.mat)[IMGenes_bar]
+
+# rowames of all anno plots
+names_bar <-  rownames(p.mat) %in% c(acutephaseGenes,complementGenes, hydrolaseRegGenes, IMGenes)
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat),species='MOUSE')
+
+ht_list = Heatmap(p.mat, 
+              cluster_rows=clusterWNA(p.mat), 
+              show_row_names = T, 
+              show_column_names = F,
+              cluster_columns = F, 
+              row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              name = "z-score (Ints.)",
+              column_split=sub("[.][1-5]$", "", colnames(p.mat)),
+              column_title_gp = gpar(fontsize=9),
+              heatmap_legend_param = list(direction='horizontal', title='z-score (Ints.)',
+              heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))  +
+  Heatmap(hydrolaseRegGenes_bar + 0, name = "hydrolase activity regulation", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(complementGenes_bar + 0, name = "complement activation", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(acutephaseGenes_bar + 0, name = "acute phase response", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  Heatmap(IMGenes_bar + 0, name = "humoral immune response", col = c("0" = "white", "1" = '#21918c'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(p.mat)[names_bar], 
+        labels_gp = gpar(fontsize = 6), padding = unit(0.2, "mm"))) 
+
+BackupAsPDF(draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="top"), 'heatmap.x4206vsVehsiggenes.GOenrich.z-scores', dimensions=c(8,12))
+
+hydrolaseRegGenes_bar
+
+# median scaled
+p.mat <- dcast(p.quant.subset, Protein~SUBJECT, value.var = "LogIntensities") %>% 
+      as.matrix (rownames = "Protein")
+
+p.mat <-  sweep(p.mat, 1, STATS=apply(p.mat, 1, median, na.rm=T))
+
+# now subset to the sig hits
+p.mat <- p.mat[rownames(p.mat) %in% treat.prots,]
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat),species='MOUSE')
+
+ht_list = Heatmap(p.mat, 
+              cluster_rows=clusterWNA(p.mat), 
+              show_row_names = T, 
+              show_column_names = F,
+              cluster_columns = F, 
+              row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              name = "z-score (Ints.)",
+              column_split=sub("[.][1-5]$", "", colnames(p.mat)),
+              column_title_gp = gpar(fontsize=9),
+              heatmap_legend_param = list(direction='horizontal', title='Ints./Median',
+              heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))  +
+  Heatmap(hydrolaseRegGenes_bar + 0, name = "hydrolase activity regulation", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(complementGenes_bar + 0, name = "complement activation", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(acutephaseGenes_bar + 0, name = "acute phase response", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  Heatmap(IMGenes_bar + 0, name = "humoral immune response", col = c("0" = "white", "1" = '#21918c'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(p.mat)[names_bar], 
+        labels_gp = gpar(fontsize = 6), padding = unit(0.2, "mm"))) 
+
+BackupAsPDF(draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="top"), 'heatmap.x4206vsVehsiggenes.GOenrich.medianScaled', dimensions=c(8,10))
+```
+
+collapse the GO enrichment annotations to one replicate
+
+```{r}
+
+p.mat <- dcast(p.quant.subset[REP == 1,], Protein~SUBJECT, value.var = "mean.LogIntensities") %>% 
+      as.matrix (rownames = "Protein")
+
+p.mat <-  sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T))
+
+# now subset to the sig hits
+p.mat <- p.mat[rownames(p.mat) %in% sig.prots,]
+
+## anno barplots for GO enrichment results
+hydrolaseRegGenes_bar <- rownames(p.mat) %in% hydrolaseRegGenes
+hydro_genes <- rownames(p.mat)[hydrolaseRegGenes_bar]
+complementGenes_bar <- rownames(p.mat) %in% complementGenes
+comp_genes <- rownames(p.mat)[complementGenes_bar]
+acutephaseGenes_bar <- rownames(p.mat) %in% acutephaseGenes
+acute_genes <- rownames(p.mat)[acutephaseGenes_bar]
+IMGenes_bar <- rownames(p.mat) %in% IMGenes
+im_genes <- rownames(p.mat)[IMGenes_bar]
+
+# rowames of all anno plots
+names_bar <-  rownames(p.mat) %in% c(acutephaseGenes,complementGenes, hydrolaseRegGenes, IMGenes)
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat),species='MOUSE')
+
+
+ht_list = Heatmap(p.mat, 
+              cluster_rows=clusterWNA(p.mat), 
+              show_row_names = T, 
+              show_column_names = F,
+              cluster_columns = F, 
+              row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              name = "z-score (Ints.)",
+              column_split=sub("[.][1-5]$", "", colnames(p.mat)),
+              column_title_gp = gpar(fontsize=9),
+              heatmap_legend_param = list(direction='horizontal', title='Ints/Median',
+              heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))  +
+  Heatmap(hydrolaseRegGenes_bar + 0, name = "hydrolase activity regulation", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(complementGenes_bar + 0, name = "complement activation", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(acutephaseGenes_bar + 0, name = "acute phase response", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  Heatmap(IMGenes_bar + 0, name = "humoral immune response", col = c("0" = "white", "1" = '#21918c'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(p.mat)[names_bar], 
+        labels_gp = gpar(fontsize = 6), padding = unit(0.2, "mm"))) 
+
+BackupAsPDF(draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="top"), 'heatmap.sigGenes.GOenrich.collapsed.medianScaled', dimensions=c(8,12))
+
+```
+now generate a log2FC plot of the data in both i) rectangular and ii) circular heatmap
+
+```{r}
+p.mat <- dcast(mss.subset, Protein~Label, value.var = "log2FC") %>% 
+      as.matrix (rownames = "Protein")
+
+# now subset to the sig hits
+p.mat <- p.mat[rownames(p.mat) %in% sig.prots,]
+
+## anno barplots for GO enrichment results
+hydrolaseRegGenes_bar <- rownames(p.mat) %in% hydrolaseRegGenes
+hydro_genes <- rownames(p.mat)[hydrolaseRegGenes_bar]
+complementGenes_bar <- rownames(p.mat) %in% complementGenes
+comp_genes <- rownames(p.mat)[complementGenes_bar]
+acutephaseGenes_bar <- rownames(p.mat) %in% acutephaseGenes
+acute_genes <- rownames(p.mat)[acutephaseGenes_bar]
+IMGenes_bar <- rownames(p.mat) %in% IMGenes
+im_genes <- rownames(p.mat)[IMGenes_bar]
+
+# rowames of all anno plots
+names_bar <-  rownames(p.mat) %in% c(acutephaseGenes,complementGenes, hydrolaseRegGenes, IMGenes)
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat),species='MOUSE')
+
+
+ht_list = Heatmap(p.mat, 
+              cluster_rows=clusterWNA(p.mat), 
+              show_row_names = T, 
+              show_column_names = F,
+              cluster_columns = F, 
+              row_title = paste0(nrow(p.mat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              name = "log2FC",
+              column_split=sub("[.][1-5]$", "", colnames(p.mat)),
+              column_title_gp = gpar(fontsize=9),
+              heatmap_legend_param = list(direction='horizontal', title='log2FC',
+              heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))  +
+  Heatmap(hydrolaseRegGenes_bar + 0, name = "hydrolase activity regulation", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(complementGenes_bar + 0, name = "complement activation", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(acutephaseGenes_bar + 0, name = "acute phase response", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  Heatmap(IMGenes_bar + 0, name = "humoral immune response", col = c("0" = "white", "1" = '#21918c'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm"))  +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(p.mat)[names_bar], 
+        labels_gp = gpar(fontsize = 6), padding = unit(0.2, "mm"))) 
+
+ht_list
+BackupAsPDF(draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="top"), 'heatmap.sigGenes.log2FC.GOenrich.', dimensions=c(12,12))
+```
+Lets try create some circular heatmaps...
+
+
+
+```{r}
+test_splitCircleHeatMap()
+```
+
+
+
+
+
+Not used....
+----
+
+plot the ISGs using just prot IDs to ensure its not an ID mapping issue..
+
+
+```{r}
+isProts <- mh_mappings[Symbol.human %in% (isGenes), SWISS_PROT_IDs.mouse]
+
+
+p.quant
+p.quant.subset
+p.mat <- dcast(p.quant.subset, Protein~interaction(GROUP,REP), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+subMat <- p.mat[rownames(p.mat) %in% isProts, ]
+
+Heatmap(subMat, cluster_columns = F, column_split = list(gsub("_[47]D[.][1-9]", '', colnames(subMat)),
+                                                         str_extract(colnames(subMat), '[74]D')
+                                                         ))
+```
+
+
+
+Try create a circular heatmap
+V granular to coordinate... try another package or maybe use Bens plot
+
+```{r}
+# need to convert the gene sets to  char vec
+col.order <- c( "x4206_4D.1","x4206_4D.2","x4206_4D.3","x4206_4D.4","x4206_4D.5",
+                "x4206_7D.1","x4206_7D.2","x4206_7D.3","x4206_7D.4",
+               "Vehicle_4D.1",  "Vehicle_4D.2",  "Vehicle_4D.3",  "Vehicle_4D.4",  "Vehicle_4D.5",
+               "Vehicle_7D.1",  "Vehicle_7D.2",  "Vehicle_7D.3",  "Vehicle_7D.4",
+               "N1062D_4D.1",  "N1062D_4D.2", "N1062D_4D.3",  "N1062D_4D.4", "N1062D_4D.5",  
+               "N1062D_7D.1",  "N1062D_7D.2", "N1062D_7D.3",  "N1062D_7D.4" 
+               )
+#circ.mat <- p.mat[,col.order]
+
+pdf("circular_heatmap.pdf")
+
+col_fun1 = colorRamp2(c(-3, 0, 3), c("blue", "white", "red"))
+circos.par(gap.after = 20)
+circos.heatmap(p.mat, col = col_fun1, cluster=clusterWNA(p.mat), rownames.side = 'outside',  track.height = 0.3)
+
+
+
+circos.track(track.index = get.current.track.index(), panel.fun = function(x, y) {
+        circos.rect(CELL_META$cell.xlim[2] + convert_x(1, "mm"), 0,
+                    CELL_META$cell.xlim[2] + convert_x(5, "mm"), 5,
+                    col = '#fde725', border = NA)
+        circos.text(CELL_META$cell.xlim[2] + convert_x(3, "mm"), 2.5,
+                    "x4206_4D", cex = 0.1, facing = "clockwise")
+
+        circos.rect(CELL_META$cell.xlim[2] + convert_x(1, "mm"), 5,
+                    CELL_META$cell.xlim[2] + convert_x(5, "mm"), 9,
+                    col = '#5ec962', border = NA)
+        circos.text(CELL_META$cell.xlim[2] + convert_x(3, "mm"), 7,
+                    "x4206_7D", cex = 0.1, facing = "clockwise")
+        
+        circos.rect(CELL_META$cell.xlim[2] + convert_x(1, "mm"), 9,
+                    CELL_META$cell.xlim[2] + convert_x(5, "mm"), 14,
+                    col = '#21918c', border = NA)
+        circos.text(CELL_META$cell.xlim[2] + convert_x(3, "mm"), 11.5,
+                    "Vehicle_4D", cex = 0.1, facing = "clockwise")
+        
+                circos.rect(CELL_META$cell.xlim[2] + convert_x(1, "mm"), 14,
+                    CELL_META$cell.xlim[2] + convert_x(5, "mm"), 18,
+                    col = '#3b528b', border = NA)
+        circos.text(CELL_META$cell.xlim[2] + convert_x(3, "mm"), 16,
+                    "Vehicle_7D", cex = 0.1, facing = "clockwise")
+        
+        
+                circos.rect(CELL_META$cell.xlim[2] + convert_x(1, "mm"), 18,
+                    CELL_META$cell.xlim[2] + convert_x(5, "mm"), 23,
+                    col = '#440154', border = NA)
+        circos.text(CELL_META$cell.xlim[2] + convert_x(3, "mm"), 20.5,
+                    "N1062D_4D", cex = 0.1, facing = "clockwise")
+        
+                circos.rect(CELL_META$cell.xlim[2] + convert_x(1, "mm"), 23,
+                    CELL_META$cell.xlim[2] + convert_x(5, "mm"), 27,
+                    col = '#990033', border = NA)
+        circos.text(CELL_META$cell.xlim[2] + convert_x(3, "mm"), 25,
+                    "N1062D_7D", cex = 0.1, facing = "clockwise")
+        
+}, bg.border = NA) 
+
+
+dev.off()
+
+circos.clear()
+
+# trgint to integrate these but size difficult....
+
+circos.heatmap(p.mat, col = col_fun1, cluster=clusterWNA(p.mat), rownames.side = 'outside',  track.height = 0.3)
+circos.heatmap(as.character(hydrolaseRegGenes_bar), col = c("FALSE" = "white", "TRUE" = '#fde725'), track.height = 0.03)
+circos.heatmap(as.character(complementGenes_bar), col = c("FALSE" = "white", "TRUE" = '#440154FF'), track.height = 0.03)
+circos.heatmap(as.character(acutephaseGenes_bar), col = c("FALSE" = "white", "TRUE" = '#5ec962'), track.height = 0.03)
+circos.heatmap(as.character(IMGenes_bar), col = c("FALSE" = "white","TRUE" = '#21918c'), track.height = 0.03)
+circos.clear()
+
+```
+

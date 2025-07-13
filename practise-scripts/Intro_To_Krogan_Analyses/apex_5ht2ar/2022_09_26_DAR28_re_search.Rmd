@@ -1,0 +1,621 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+all functions used should now be available at  https://github.com/kroganlab/bp_utils/tree/master
+check out specifically
+helper functions: https://github.com/kroganlab/bp_utils/blob/master/ManageScriptData.R
+polynomial time series: https://github.com/kroganlab/bp_utils/blob/master/MS_ModelFitting_TimeSeries.R
+MSstats HelperFunctions: https://github.com/kroganlab/bp_utils/blob/master/MSstats_Helper_Functions.R
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (circlize)
+library (ggplot2)
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+library (magrittr)
+
+
+
+source("./bp_utils/MSstats_Helper_Functions.R")
+source("./bp_utils/ManageScriptData.R")
+source("./bp_utils/MS_ModelFitting_TimeSeries.R")
+
+
+## these functions should already be available in ManageScriptData.R
+
+today <- function(){
+  format(Sys.time(), "%Y_%m_%d")
+}
+DateFileName <- function(x){
+  name <-   paste0(today(), "_", x)
+  print (name)
+  return (name)
+}
+
+ScriptNamedDir <- function(scriptName = NULL){
+  if(is.null(scriptName))
+    scriptName <- rstudioapi::getActiveDocumentContext()$path
+  if (is.null (scriptName) || scriptName == "")
+    stop("No script name found -- you may need to save this file first")
+  outDir <- gsub(".R(md)?$", "_data", scriptName, ignore.case = TRUE)
+  stopifnot( outDir != scriptName)
+  if (!dir.exists(outDir)){
+    message ("Creating directory associated with ", scriptName,", at ", outDir)
+    dir.create(outDir)
+  }
+  return(outDir)
+}
+
+ScriptAndDatedFileName <- function(x, scriptName = NULL){
+  dir <- ScriptNamedDir(scriptName)
+  fileName <- DateFileName(x)
+  path <- file.path(dir, fileName)
+  print (path)
+  return (path)
+}
+
+GetLatestScriptFile <- function(x, scriptName=NULL){
+  stopifnot (length(x) == 1)
+  dir <- ScriptNamedDir(scriptName)
+  filePattern <- paste0("^\\d{4}_\\d{2}_\\d{2}_", x, "$", collapse = "")
+  filesFound <- list.files(dir, filePattern)
+  stopifnot (length(filesFound) > 0)
+  if (length(filesFound) > 1){
+    message ("Multiple files  with matching names found.  Using the last one")
+    print (filesFound)
+  }
+  return (file.path(dir, tail(filesFound, 1)))
+} 
+
+PDFBackupFileName <- function(prefix = "", subDir = ""){
+  scriptDir <- ScriptNamedDir()
+  imageDir <- file.path(scriptDir, "pdfs", subDir)
+  if (!dir.exists(imageDir)) dir.create(imageDir, recursive = TRUE)
+  now <- format(Sys.time(),  "%Y_%m_%d__%H_%M__%S")
+  counter <- 0
+  path <- file.path (imageDir, sprintf("%s%s.%02d.pdf", prefix, now, counter))
+  while (file.exists(path)){
+    counter <- counter + 1
+    path <- file.path (imageDir, sprintf("%s%s.%02d.pdf", prefix, now, counter))
+  }
+  return (path)
+}
+
+BackupAsPDF <- function(graphics, prefix = "", subDir = "", dimensions = NULL){
+  path <- PDFBackupFileName(prefix, subDir)
+  if (is.null(dimensions))
+  dimensions <- dev.size(units = "in")
+
+  print (sprintf("Writing image to  %s", path))
+  cairo_pdf(path, width = dimensions[1], height = dimensions[2])
+  
+  # handle functions, my enrichment heatmaps that are part of a list
+  if ("function" %in% class(graphics)){
+    graphics()
+    g <- "finished" # something to print to console instead of graphics to device 
+  }else if (! ("ggplot" %in% class(graphics) | "grob" %in% class(graphics) | "Heatmap" %in% class(graphics) | "HeatmapList" %in% class(graphics))){
+    g <- graphics$hmList    
+  }  else{
+    g <- graphics
+  }
+  print (g)
+  
+  dev.off()
+  return (graphics)
+}
+
+
+
+
+
+WriteSessionInfo <- function(path = NULL){
+  if (is.null(path))
+    path <- ScriptAndDatedFileName("SessionInfo.txt")
+  si <- devtools::session_info()
+  fileOut <- file(path, open = "wt")
+  writeLines("─ Session info ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+             con = fileOut)
+  write.table(data.frame( value = unlist(si[[1]])), fileOut)
+  #writeLines(capture.output(data.frame(value = unlist(si[[1]]))), con = fileOut) # for some mysterious reason, this always goes to the notebook output when run in a notebook. type = "message" is no help...[shrug]
+  writeLines(capture.output(data.table(setting = names(si[[1]]), value = unlist(si[[1]]))), con = fileOut) # this too. Maybe an RStudio version issue
+  writeLines("─ Packages ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+             con  = fileOut)
+  #write.table(si[[2]], fileOut)
+  writeLines(capture.output(si[[2]]), con = fileOut)
+  close(fileOut)
+}
+
+WriteInstalledPackages <- function (path = NULL){
+  if (is.null(path))
+    path <- ScriptAndDatedFileName("Installed.Packages.csv")
+  package.mat <- installed.packages()
+  fwrite (as.data.table(package.mat, keep.rownames = TRUE), path)
+}
+
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+# Copy/Load
+
+*edit file path to MS stats input*
+This first code block writes the input data to a local directory, and serves as a record of where data came from.
+
+```{r, eval = FALSE}
+spec <- fread ("/path/to/20220911_181913_DAR28_HT2A_DAR30_SR_MSStatsFormatReport.xls")
+fwrite (spec, file.path (ScriptNamedDir(), "20220911_181913_DAR28_HT2A_DAR30_SR_MSStatsFormatReport.csv.gz"))
+
+```
+
+Read local copy
+
+```{r}
+spec <- fread (file.path (ScriptNamedDir(), "20220911_181913_DAR28_HT2A_DAR30_SR_MSStatsFormatReport.csv.gz"))
+
+dim(spec)
+summary(spec)
+```
+
+# Inspect input peptide level data
+
+
+## histogram of intensity
+The input data is intensity per peptide ion.
+
+These peptide intensities are output by the DIA software package spectronaut. We have learned that all intensities from spectronaut less than about 2^5 are likely garbage, and should be treated as missing values.
+
+```{r}
+hist(log2(spec$Intensity), breaks = 100)
+```
+
+### remove the low intensity outliers
+
+```{r}
+
+spec <- spec[Intensity > 2^5]
+```
+```{r}
+hist(log2(spec$Intensity), breaks = 100)
+```
+
+
+## fix some BioReplicate numbers so they are consistent across the whole experiment
+Before we proceed, clean up an issue in this file specifically.  BioReplicate here would be better called "Batch".  Two experiments are combined here, and all runs in the later experiment should be labeled as 4,5,6.  Some are curretnly 1,2,3 if they don't have a matching Condition in the first experiment.
+```{r}
+# data.table syntax.  The assignment operator := here creates a new column
+head(spec)
+
+spec[, runID := as.integer (gsub ("ex([0-9]+)\\.raw", "\\1", Run))]
+head(spec)
+
+# and here the same operator modifies an existing column based for a subset of rows
+spec[runID > 8000 & BioReplicate < 4, BioReplicate := BioReplicate + 3]
+
+```
+
+
+## balance of peptide identifications per MS run
+
+Each row in the table should be the intensity from one MS "feature" per run (an elution peak from a single peptide ion). It's possible that there are multiple features per peptide ion and run--if the peptide elutes in two different peaks perhaps.
+
+### are there any multiple-feature peptide ions?
+
+```{r}
+# data.table syntax here:
+# '.N' is a data.table shortcut for count of items in a subtable.  
+# subtables are defined by the 'by' argument.  
+# One subtable per unique combination of the 'by' variables
+# creating unique subtables for each combo.. should number of subtables == n rows 
+
+head(spec)
+
+any(spec[, .N, by = .(Run, PeptideSequence, PrecursorCharge)]$N) > 1
+dim(spec)
+```
+
+Return value of FALSE says that there are no multiple rows per petpide/charge/run so each row is a single peptide/charge/run. This lets me simply count rows below, which geom_bar does. Otherwise, I'd have to count based on unique peptide/charge. 
+
+
+
+### plot of peptide ions per run
+
+```{r, fig.width = 10, fig.height = 4}
+
+ggplot (data = spec, aes (x = paste0(Condition, "_", BioReplicate), fill = Condition)) + 
+  geom_bar() +
+  rotate.x.axis.text # this is defined in the default template of all my Rmd files
+
+
+```
+
+Some conditions have lower count than others, but the counts between replicates of some condition are relatively consistent.
+
+## Peptide intensity differences between runs
+
+```{r, fig.width = 10, fig.height = 4}
+
+ggplot (data = spec, aes (x = paste0(Condition, "_", BioReplicate),
+                          y = log2(Intensity), 
+                          fill = Condition)) + 
+  geom_boxplot() +
+  rotate.x.axis.text # this is defined in the default template of all my Rmd files
+
+
+```
+
+Differences are in line with the peptide-count differences. No single BioReplicate stands out from its peers, which is good. Endo_C20 is very different than the other Endo. As are LAMP1/LAMT from LAMTOR1
+
+# MSstats summarize peptide to protein intensities
+
+## prepare for MSstats data process
+
+MSstats likes its missing values explicit. By which I mean that if a valid peptide intensity is present in one run, it should get a row per run even when its not observed, but with the missing values Intensity set to NA. This is a utility function I wrote to help adding these rows with NA intensity. bp_utils is publicly available in krogan lab github
+
+```{r}
+spec.mss <- specFileToCompleteMSstats(spec)
+spec.mss[, IsotopeLabelType := 'L']
+setDF(spec.mss)  # MSstats likes data.frame not data.table, so convert to class data.frame
+
+```
+
+## MSstats dataProcess
+
+
+This will take a little while to run and likely output a large amount of warning messages. The warning messages can usually be safely ignored. If it fails with an error it is likely the fault of the `featureSubset` and `remove_uninformative_feature_outlier` arguments.  Remove those (so they revert to default)
+```{r, eval = FALSE}
+dp.out <- MSstats::dataProcess(spec.mss,
+                               featureSubset = "highQuality",
+                               remove_uninformative_feature_outlier = TRUE,
+                               MBimpute = FALSE )
+
+```
+
+### write out data to a file
+
+
+```{r}
+# the main data of interest is this one:
+fwrite (dp.out$ProteinLevelData, ScriptAndDatedFileName("ProteinLevelData.csv.gz"))
+
+#this table is mostly a copy of the input with some additional columns for hte post-normalization intensity (confusingly labeled ABUNDANCE), and columns for is_outlier and is_informative
+fwrite (dp.out$FeatureLevelData, ScriptAndDatedFileName("FeatureLevelData.csv.gz"))
+```
+
+
+# Protein level analysis
+Read from local file. Should be a duplicate of dp.out$ProteinLevelData.
+```{r}
+protQuant <- fread (GetLatestScriptFile("ProteinLevelData.csv.gz"))
+```
+
+
+
+The MSstats::dataProcess normalized by adjusting so that median peptide intensity is equal across runs.  This usually (but not always) results in properly normalized protein intensities.  Inspect with another boxplot to look at ProteinIntensity trends.
+
+```{r, fig.width = 10, fig.height = 4}
+p <- ggplot (protQuant, aes (x = interaction ( SUBJECT, GROUP), y = LogIntensities, fill = GROUP)) + geom_boxplot() + rotate.x.axis.text 
+BackupAsPDF(p, "BoxPlot_ProteinIntensity_")
+
+```
+
+
+Endo_C20 is again a little low, as are LAMP1/LAMT.  In this case, I'm not going to do anything about these yet because I think they have other problems that we will deal with.  But in general, you might want to apply another round of normalization here.
+
+
+## what do the known-background protein intensities look like:
+This section is only relevant for an APEX dataset.  APEX works by labeling neighboring/interacting proteins with biotin which is then used to purify labeled proteins. There are also proteins that are endogenously biotinylated which will co-purify with the APEX-labeled proteins.  Here we look at a subset of these endogenous biotin proteins, and we inspect their post-normalization background levels, which are inversely related to the labeling-efficiency of APEX.  More background after normalization implies there is less APEX-labeled signal.
+
+```{r}
+
+head(protQuant)
+
+biotin.carboxylases.up <- c("O00763","P05165","P11498","Q13085","Q96RQ3")
+
+p <- ggplot(protQuant[Protein %in% biotin.carboxylases.up], aes (x = interaction ( SUBJECT, GROUP ), y = LogIntensities, color = Protein)) + geom_line(aes(group = Protein)) + geom_point(aes(shape = as.factor(SUBJECT))) +  rotate.x.axis.text
+
+BackupAsPDF(p, "BiotinCarboxylaseLevels_")
+
+```
+## a couple genes we expect to move around
+```{r}
+
+getwd()
+
+source ("./bp_utils/UniprotIDMapping.R")
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+
+p <- ggplot(protQuant[gene %in% c("ARRB2","PRKCD")], aes (x = interaction ( SUBJECT, GROUP ), y = LogIntensities, color = gene)) + geom_line(aes(group = Protein)) + geom_point(aes(shape = as.factor(SUBJECT))) +  rotate.x.axis.text
+
+p
+```
+
+The large spikes for Endo_C20 and LAMP1/LAMT suggests that labeling by APEX was very low in these runs. That will be a problem for those runs.  Luckily here we have alternatives to use for these location references.
+
+# Inspect the data matrix
+## create the data matrix
+```{r}
+title = ""
+#data rreshaping - long to wide format.
+#protein vs interaction group and rep
+intensity.mat <- as.matrix(dcast(protQuant, Protein ~GROUP+SUBJECT, value.var = "LogIntensities"),
+                           rownames = "Protein")
+
+```
+
+## View 1000 random rows
+
+`Heatmap` is from the ComplexHeatmap package.
+
+```{r}
+#sub in 0 for NA val
+rowClusterWithNA <- function(mat, na.value = 0, ...){
+  mat[is.na(mat)] <- na.value
+  hclust(dist(mat), ...) #dis function euclidean by default?
+}
+
+subMat <- intensity.mat[sample.int(nrow(intensity.mat), 1000),]
+
+Heatmap(subMat,
+        cluster_rows = rowClusterWithNA(subMat),
+        name = "Log2 Int.")
+```
+
+### remove row medians
+Above heatmap appears to primarily cluster the low intensity proteins together and then the high intensity proteins, and the run-to-run trends appear secondary.  It will be easier to see between-run trends when the protein-to-protein intensity differences are removed. We do this by subtracting the row medians.
+
+```{r, fig.width = 10, fig.height= 8}
+#row median - median prot exp value across experiment
+
+# sweep subtracts a vector of values from either rows (dimension = 1) or columns (dimension = 2)
+# apply applies a function (median here) to each row (dimension = 1 )
+# used together here we are subtracting row medians
+intensity.mat <- sweep (intensity.mat, 1, apply (intensity.mat, 1, median, na.rm = TRUE))
+
+
+subMat <- intensity.mat[sample.int(nrow(intensity.mat), 1000),]
+
+Heatmap(subMat,
+        cluster_rows = rowClusterWithNA(subMat),
+        name = "Log2 Int.")
+```
+
+## PCA
+```{r}
+# pca requires no missing values.  Function complete.cases finds rows with no missing values
+complete.mat <- intensity.mat[complete.cases(intensity.mat),]
+
+Heatmap(complete.mat,
+        row_title = sprintf ("%d complete proteins", nrow(complete.mat)),
+        name = "Log2 Int\nvs Median",
+        show_row_names = FALSE,
+        cluster_columns = FALSE)
+```
+
+```{r}
+pcaOut <- prcomp(t(complete.mat))
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaDT[, mainGroup := tstrsplit(rn, "_")[[1]]] #transpose & split
+
+
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color = mainGroup )) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA using %d proteins (log intensity)", nrow(complete.mat))) 
+p
+
+BackupAsPDF(p, "PCA_Complete_Proteins")
+```
+PCA is good at finding outliers.  Put another way, it is overly sensitive to outliers.
+
+Repeat with the outliers left out:
+
+```{r}
+
+pcaOut <- prcomp(t(    complete.mat[, !grepl("Endo_C20_|LAMT_|LAMP1_", colnames(complete.mat))]      ))
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaDT[, mainGroup := tstrsplit(rn, "_")[[1]]]
+
+
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color = mainGroup )) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA using %d proteins (log intensity)", nrow(complete.mat))) 
+p
+
+BackupAsPDF(p, "PCA_Complete_Proteins_subset")
+
+```
+
+===============================
+Use new ratios to construct ratios vs Cyto
+Use old cyto and above ratios to construct pseudo-references for other spatial references.
+
+Wait for new re-search with SR03 spatial reference
+
+Predict localization coefficients
+Everything that changes labeling
+=========================
+
+# Find neighbors of HT2A
+
+```{r}
+protQuant <- fread (GetLatestScriptFile("ProteinLevelData.csv.gz"))
+
+# subset table to just hte receptor-APEX data
+receptor.dt <- protQuant[grep ("HT2A", GROUP)]
+
+# encode the time as an integer by rank
+receptor.dt[, c("receptor", "timeStr") := tstrsplit(GROUP, "_")]
+receptor.dt[, rankTime := as.integer(as.factor(timeStr))]
+
+#confirm it worked:
+unique(receptor.dt[, .(timeStr, rankTime)])
+
+receptor.dt[, SUBJECT := as.character(SUBJECT)]
+
+
+# load a function I'll make use of
+source ("./bp_utils/MS_ModelFitting_TimeSeries.R")
+nice.out <- nicePolyFits.fullTable (receptor.dt)
+
+source ("./bp_utils/UniprotIDMapping.R")
+nice.out[, gene := multiUniprots2multiGenes(Protein, simplify = TRUE, allowDups = FALSE)]
+
+# adjust p values using the Benjamini Hochberg method, which estimates False Discovery Rate
+nice.out[, fdr := p.adjust(pvalue, method = "BH")] 
+```
+
+
+
+## volcano plots
+```{r}
+# define significant proteins
+nice.out[, sig := "Not"]
+nice.out[fdr < 0.05 & abs(log2FC) > log2(1.5),
+         sig := ifelse (log2FC  > 0, "Up", "Down")]
+
+
+ggplot (nice.out, aes (x = log2FC, y = -log10(fdr), color = sig, label = gene)) +
+  geom_point() +
+  scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+  ggrepel::geom_text_repel(data = nice.out[sig != "Not"]  ,  size = 2, max.overlaps = 20) +
+  theme_bw()
+
+
+
+
+```
+
+# Gene Ontology enrichment, 
+aka  Over-Representation-Analysis
+```{r}
+source ("./bp_utils/enrichmentTestFunctions.R")
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# define the universe, the total set of identified genes in our study
+universe <- unique(nice.out$gene)
+
+# I have functions that will do this for all groups, but for now I do this explicitly on the two groups we have 
+enrich.list <- lapply (list(up = "Up", down = "Down"),
+                       function(direction){
+                         genes <- nice.out[sig == direction]$gene
+                         setDT(as.data.table(clusterProfiler::enricher(gene = genes, universe = universe, TERM2GENE = gmt.go)))
+                       }
+)
+
+enrich.dt <- rbindlist(enrich.list, idcol = "direction")
+
+
+enrichHeatmapBestPerGroup(enrich.dt, NULL, groupColumn = "direction", topN = 10)  # compare enrichment in the top 10 terms per group
+
+```
+
+Lots of redundancy in the GO terms by design.  We're not so interested in all of this redundancy, have ways of removing some of it, but that's for later...
+## inspect the significant endocytosis related genes
+```{r}
+endocytosisGenes <- unlist(strsplit (enrich.dt[Description == "endocytosis", geneID], "/"))
+
+
+ggplot (nice.out, aes (x = log2FC, y = -log10(fdr), color = sig, label = gene)) +
+  geom_point( alpha = 0.2) +
+  geom_point(data = nice.out[gene %in% endocytosisGenes]) +
+  scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+  ggrepel::geom_text_repel(data = nice.out[gene %in% endocytosisGenes]  ,  size = 2, max.overlaps = 100, color = "black") +
+  theme_bw()
+
+
+```
+
+### using heatmaps
+```{r, fig.width = 6, fig.height = 5}
+genesOI <- unlist(strsplit (enrich.dt[Description == "endocytosis", geneID], "/"))
+receptor.dt[, gene := multiUniprots2multiGenes(Protein)]
+
+# define a deviation from time 0 per Protein
+receptor.dt[, vsTime0 := LogIntensities - mean(LogIntensities[timeStr == "00"]), by = Protein]
+
+int.mat <- dcast (receptor.dt[gene %in% genesOI,], gene~timeStr+SUBJECT, value.var = "vsTime0") |>
+  as.matrix(rownames = "gene")
+
+#int.mat <- sweep(int.mat, 1, apply (int.mat, 1, median, na.rm = TRUE))
+
+Heatmap(int.mat, cluster_columns = FALSE, name = "log2FC vs mean time 00",
+        col = circlize::colorRamp2(breaks = c(-2, 0, 2), colors = c("blue", gray(0.95), "red")),
+        column_split = tstrsplit(colnames(int.mat), "_")[[1]])
+```
+
+
+## inspect the significant neuron development related genes
+```{r}
+genesOI <- unlist(strsplit (enrich.dt[Description == "neuron development", geneID], "/"))
+
+
+ggplot (nice.out, aes (x = log2FC, y = -log10(fdr), color = sig, label = gene)) +
+  geom_point( alpha = 0.2) +
+  geom_point(data = nice.out[gene %in% genesOI]) +
+  scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+  ggrepel::geom_text_repel(data = nice.out[gene %in% genesOI]  ,  size = 2, max.overlaps = 100, color = "black") +
+  theme_bw()
+
+
+```
+### using heatmaps
+```{r, fig.width = 6, fig.height = 10}
+genesOI <- unlist(strsplit (enrich.dt[Description == "neuron development", geneID], "/"))
+receptor.dt[, gene := multiUniprots2multiGenes(Protein)]
+
+# define a deviation from time 0 per Protein
+receptor.dt[, vsTime0 := LogIntensities - mean(LogIntensities[timeStr == "00"]), by = Protein]
+
+int.mat <- dcast (receptor.dt[gene %in% genesOI,], gene~timeStr+SUBJECT, value.var = "vsTime0") |>
+  as.matrix(rownames = "gene")
+
+#int.mat <- sweep(int.mat, 1, apply (int.mat, 1, median, na.rm = TRUE))
+
+Heatmap(int.mat, cluster_columns = FALSE, name = "log2FC vs mean time 00",
+        col = circlize::colorRamp2(breaks = c(-2, 0, 2), colors = c("blue", gray(0.95), "red")),
+        column_split = tstrsplit(colnames(int.mat), "_")[[1]])
+
+```
+
+
+# heatmap of all movers
+
+```{r, fig.width = 6, fig.height = 10}
+genesOI <- nice.out[sig != "Not", gene]
+
+int.mat <- dcast (receptor.dt[gene %in% genesOI,], gene~timeStr+SUBJECT, value.var = "vsTime0") |>
+  as.matrix(rownames = "gene")
+
+
+hm <- Heatmap(int.mat, cluster_columns = FALSE, name = "log2FC vs\nmean time 00",
+        col = circlize::colorRamp2(breaks = c(-2, 0, 2), colors = c("blue", gray(0.95), "red")),
+        column_split = tstrsplit(colnames(int.mat), "_")[[1]])
+
+hm
+```
+
+Too many genes above to read.  You can create an interactive heatmap that lets you zoom in on arbitrary selections:
+
+
+
+```{r}
+InteractiveComplexHeatmap::ht_shiny(hm)
+```
+
+

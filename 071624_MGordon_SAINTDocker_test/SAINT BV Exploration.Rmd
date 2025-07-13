@@ -1,0 +1,305 @@
+---
+title: "PCMI NMF BV Exploration"
+output: html_document
+date: "2024-07-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+library(nnls)
+library(data.table)
+library(ggplot2)
+library(ggforce)
+library(dplyr)
+```
+
+header col names = F (so we get default col names)
+```{r}
+SAINTSpecCount.df <- read.csv("../Rishima/2024_06_25_PCMI_spectral_count.csv")
+Interactors.df <- read.csv("../Rishima/2023_12_06_ASD_PPI_1881_interactions.csv")
+Batch14.Baits <- fread("../Rishima/2021Nov_PCMI_emptyGFPbatch14-saint-baits-spc.txt", header = F)
+Batch14.Bait.Names <- Batch14.Baits$V1
+```
+
+```{r}
+# Assuming your dataset is a data frame, you can use negative indexing to exclude columns
+SAINTSpecCount.df <- SAINTSpecCount.df[, !names(SAINTSpecCount.df) %in% Batch14.Bait.Names]
+
+#SAINTSpecCount.df <- (SAINTSpecCount.df[-(Batch14.df$V1)])
+#subset(SAINTSpecCount.df, select = -(Batch14Baits))
+```
+
+```{r}
+row.names(SAINTSpecCount.df) <- SAINTSpecCount.df$X
+SAINTSpecCount.df$X <- NULL
+```
+
+```{r}
+SAINTSpecCount.mt <- as.matrix(SAINTSpecCount.df)
+SAINTSpecCount.mt <- SAINTSpecCount.mt[-which(apply(SAINTSpecCount.mt, 1, max) == 0),]
+SAINTSpecCount.mt[SAINTSpecCount.mt == 0] <- NA
+```
+
+```{r}
+SAINTSpecmostlyFullRows <- apply(SAINTSpecCount.mt, 1, function(x)sum(!is.na(x)) > ncol(SAINTSpecCount.mt)/2)
+
+SAINTSpecCount.tmp.out <- medpolish(log2(SAINTSpecCount.mt[SAINTSpecmostlyFullRows,]), na.rm = TRUE)
+
+SAINTSpecCount.mt.norm <- sweep(SAINTSpecCount.mt, 2, 2^SAINTSpecCount.tmp.out$col, "/")
+```
+
+```{r}
+SAINTSpecCount.mt.norm[is.na(SAINTSpecCount.mt.norm)] <- 0
+
+SAINTScalingFactor <- sqrt(apply(SAINTSpecCount.mt.norm, 1, function(x)sum(x!=0)) /
+      ncol(SAINTSpecCount.mt.norm)) / 
+      apply(SAINTSpecCount.mt.norm, 1, max)
+
+SAINTSpecCount.scaled <- sweep(SAINTSpecCount.mt.norm, 1, SAINTScalingFactor, "*")
+```
+
+```{r}
+SAINTnmf.out <- NMF::nmf(SAINTSpecCount.scaled, rank = 6)
+```
+
+```{r}
+SAINT.BV <- SAINTnmf.out@fit@W
+```
+
+```{r}
+Batch14.spc <- fread("../Rishima/2021Nov_PCMI_emptyGFPbatch14-saint-interactions-spc.txt")
+
+wideBatch14 <- dcast(as.data.table(Batch14.spc, keepRowNames = TRUE), formula = "V3 ~ V1", value.var = "V4")
+
+merged.Batch14 <- merge(wideBatch14, SAINTScalingFactor |> as.data.table(keep.rownames = TRUE), by.x= "V3", by.y = "rn") 
+```
+
+```{r}
+row.names(merged.Batch14) <- merged.Batch14$V3
+merged.Batch14$V3 <- NULL
+
+Scaled.Batch14 <- sweep(merged.Batch14, 1, merged.Batch14$SAINTScalingFactor, "*")
+
+Scaled.Batch14$SAINTScalingFactor <- NULL
+```
+
+```{r}
+SAINT.BV <- (SAINTnmf.out@fit@W[row.names(Scaled.Batch14),])
+
+Scaled.Batch14[is.na(Scaled.Batch14)] <- 0
+
+SAINT.nnls <- apply(Scaled.Batch14, 2, function(coln) nnls(SAINT.BV, coln)$x)
+
+```
+
+```{r}
+SAINT.Pseudo.Control <- SAINT.BV %*% SAINT.nnls
+
+
+SAINT.Pseudo.Control %>% View()
+
+SAINT.PC.long <- melt(SAINT.Pseudo.Control, variable.name = "run", id.vars = "rn", value.name = "PC spc") |> setDT()
+
+SAINT.PC.long %>% View()
+
+SAINT.PC.long[, c("bait", "replicate") := tstrsplit(Var2, "\\-")]
+
+setnames(SAINT.PC.long, old = "Var1", new = "prey")
+
+setnames(SAINT.PC.long, old = "Var2", new = "run")
+
+SAINT.PC.long$replicate <- NULL
+```
+
+```{r}
+Batch14.interactions <- fread("../Rishima/2021Nov_PCMI_emptyGFPbatch14-saint-interactions-spc.txt")
+
+# add spc and bait col
+merged.Batch14.interactions <- merge(Batch14.interactions, SAINT.PC.long |> as.data.table(keep.rownames = TRUE), by.x = c("V3", "V2", "V1"), by.y = c("prey", "bait", "run"))
+
+merged.Batch14.interactions <- merged.Batch14.interactions[,c(3, 2, 1, 5)]
+
+merged.Batch14.interactions <- merge(merged.Batch14.interactions, SAINTScalingFactor |> as.data.table(keep.rownames = TRUE), by.x= "V3", by.y = "rn") 
+
+Scaled.Batch14.interactions <- sweep(merged.Batch14.interactions[, "PC spc"], 1, merged.Batch14.interactions$SAINTScalingFactor, "/")
+
+merged.Batch14.interactions$`PC spc` <- floor(Scaled.Batch14.interactions$`PC spc`)
+
+merged.Batch14.interactions$SAINTScalingFactor <- NULL
+
+
+
+SAINT.PC.long
+```
+
+```{r}
+test.mat <- dcast(merged.Batch14.interactions, V3~V1, value.var = 'spc') %>% 
+  as.matrix(rownames='V3')
+
+submat <- sweep(test.mat, 1, apply(test.mat,1,median,na.rm=T))
+
+submat[is.na(submat)] <- 0
+
+
+colnames(submat)
+library(ComplexHeatmap)
+Heatmap(submat,
+        column_split = gsub('\\-[0-9]{1,2}$','',colnames(submat)))
+```
+
+```{r}
+Batch14.interactions[, c('V1', 'V2') := lapply(.SD, function(x) paste0(x, '-14')), .SDcols = c('V1', 'V2')]
+
+Batch14.interactions <- Batch14.interactions[, .(V3,V1,V2,V4)]
+
+setnames(Batch14.interactions, old = "V4", new = "spc")
+setnames(merged.Batch14.interactions, old = "PC spc", new = "spc")
+
+Batch14.PC.interactions <- bind_rows(Batch14.interactions, merged.Batch14.interactions)
+```
+
+```{r}
+#Batch14.Baits.Original <- fread("../Rishima/Original.Batch14.Baits.txt", header = F)
+#Batch14.Baits.Original <- Batch14.Baits.Original[-1,]
+#merged.Baits.Interactions <- merge(Batch14.Baits.Original, Batch14.interactions |> as.data.table(keep.rownames = TRUE), by.x= c("V1", "V2"), by.y = c("V1", "V2"), all = TRUE)
+
+```
+
+```{r}
+SAINT.PC.long.Baits <- unique(SAINT.PC.long[,-c("prey", "PC spc")])
+
+SAINT.PC.long.Baits$control <- "C"
+
+SAINT.PC.long.Baits
+
+Batch14.Baits.dt <- setDT(fread("../Rishima/SAINTinput_batches/2021Nov_PCMI_emptyGFPbatch14-saint-baits-spc.txt"))
+
+setnames(Batch14.Baits.dt, old = "V1", new = "run")
+setnames(Batch14.Baits.dt, old = "V2", new = "bait")
+setnames(Batch14.Baits.dt, old = "V3", new = "control")
+
+merged.Batch14.Baits <- bind_rows(Batch14.Baits.dt, SAINT.PC.long.Baits)
+```
+
+```{r}
+#Batch14.Preys <- fread("../Rishima/SAINTinput_batches/2021Nov_PCMI_emptyGFPbatch14-saint-preys-spc.txt")
+#Batch14.PreyNames <- merged.Batch14.interactions$V3
+#merged.Batch14.Preys <- Batch14.Preys[, names(Batch14.Preys) %in% Batch14.PreyNames]
+```
+
+```{r}
+write.table(Batch14.PC.interactions, file = "merged.Batch14.interactions.txt", sep = "\t", 
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+write.table(merged.Batch14.Baits, file = "merged.Batch14.Baits.txt", sep = "\t", 
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+Batch14.PC.interactions
+merged.Batch14.Baits
+```
+
+
+
+QC files 
+
+```{r}
+getwd()
+
+testPreys <- fread("../Rishima/SAINTinput_batches/2021Nov_PCMI_emptyGFPbatch14-saint-preys-spc.txt")
+testInt <- fread('../Rishima/merged.Batch14.interactions.txt')
+testBait <- fread('../Rishima/merged.Batch14.Baits.txt', header=F)
+
+fwrite(testBait, './merged.Batch14.Baits.txt', sep='\t', col.names = F)
+help(fwrite)
+fread('../Rishima/SAINTinput_batches/2021Nov_PCMI_emptyGFPbatch14-saint-interactions-spc.txt', sep='\t', he)
+
+testInt['DEAF1-14' == V3,]
+
+unique(testInt$V3) %in%  unique(testBait$V2)
+
+
+# 1950 unique prey in file
+testPreys$V1 %>% unique() %>%  length()
+
+# how mant prey in int.. all preys match
+all(unique(testPreys$V1) %in% unique(testInt$V1))
+
+testInt$V2 %>%  unique()
+
+
+testInt[V3 == 'DEAF1-14', length(unique(V1))]
+
+testInt[V3 == 'DEAF1', length(unique(V1))]
+
+testBait[V2 == 'DEAF1-14']
+```
+SAINT cmd 
+```{bash}
+./saintDocker/saintDocker.sh spc ./merged.Batch14.interactions.txt ./SAINTinput_batches/2021Nov_PCMI_emptyGFPbatch14-saint-preys-spc.txt ./merged.Batch14.Baits.txt 
+testInt
+```
+
+```{r}
+minimalTest.bat <- testBait[grep('[-]14', V2, invert=T)]
+minimalTest.bat[V2 == 'ARID1B', V3 := 'T']
+
+fwrite(minimalTest.bat, 'minimalTest.baits.txt', sep='\t', col.names = F)
+
+
+minimalTest.int <- testInt[grep('[-]14', V3, invert=T)]
+
+fwrite(minimalTest.bat, 'minimalTest.int.txt', sep='\t', col.names = F)
+```
+
+minimal test runs; add one condition as bg from 14. fails no prey detected
+
+```{r}
+# first add to contrast mat
+minimalTest.bat[, V3 := 'C']
+minimalTest.bat <- rbind(testBait[V2 == 'SCN1A-14',], minimalTest.bat)
+
+minimalTest.bat[V2 == 'SCN1A-14', `:=`(V1 = gsub('[-]14','', V1),
+                                        V2 = gsub('[-]14', '', V2)
+                                        )]
+
+minimalTest.bat[V3 == 'T', `:=`(V1 = paste0('basis',V1),
+                                        V2 = paste0('basis',V2)
+                                        )]
+
+
+
+minimalTest.int[grep('[-]14', V3), `:=`(V2 = paste0('basis',V2),
+                                        V3 = paste0('basis',V3)
+                                        )]
+
+minimalTest.int <- testInt[grep('[-]14', V3, invert=T)]
+
+mintestSet <- testInt[V3 == 'SCN1A-14']
+mintestSet[, `:=`(V2 =gsub('[-]14','', V2),
+                  V3 = gsub('[-]14', '', V3)
+                                        )]
+
+
+mintestSet[,`:=`(V2 = paste0('basis',V2),
+                      V3 = paste0('basis',V3) )]
+                                        
+minimalTest.int <- rbind(mintestSet, minimalTest.int)
+
+fwrite(minimalTest.bat, 'minimalTest.baits.txt', sep='\t', col.names = F)
+fwrite(minimalTest.int, 'minimalTest.int.txt', sep='\t', col.names = F)
+```
+
+
+```{r}
+minimalTest.int[grep('[-]', V2)]
+```
+

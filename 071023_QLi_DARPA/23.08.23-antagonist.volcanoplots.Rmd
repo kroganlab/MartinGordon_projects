@@ -1,0 +1,553 @@
+---
+title: "23.08.23-antagonist.volcanoplots"
+author: "Martin Gordon"
+date: "2023-08-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Regenerate the antagonist volcanoplots 
+
+Antagonist only treatment: APEX proteomics results comparing antagonists (30min) with no treatment show whether or not the proximity proteome of PTGER4 is changed by antagonists. 
+  
+
+This is the question to be addressed with APEX proteomics and could potentially show the partial agonist property of the antagonists (if changes are seen). 
+
+Following on 1.a, more analysis could be performed: check the significantly changed proteins from PGE2 treatment to analyze these proteins' changes in antagonist treatment. 
+
+
+
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(MSstats)
+library(ComplexHeatmap)
+library(ggvenn)
+library(ggrepel)
+
+#source Bens utility scripts
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+Read in the results from DARPA 33.1
+```{r}
+ms.out <- fread('~/Documents/projects/071023_QLi_DARPA/DARPA_33_data/2023_08_09_mss.groupcomparisons.csv.gz')
+
+# add the sig label
+ms.out[, sig := 'not']
+ms.out[fdr < 0.05 & abs(log2FC) > 0.58, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+```
+
+extract contrasts OI
+
+```{r}
+# just take contrasts of interest
+labels.oi <- c( "AT29_PGE00 vs AT00_PGE00", "AT53_PGE00 vs AT00_PGE00", "AT99_PGE00 vs AT00_PGE00", 'AT00_PGE30 vs AT00_PGE00')
+
+ms.out <- ms.out[Label %in% labels.oi,]
+ms.out[,Label := gsub('NP', 'PGE', Label)]
+
+```
+
+multi-plot volcano 
+```{r}
+p <- ggplot (ms.out, aes (x = log2FC, y = -log10(pvalue), color = sig, label = gene)) +
+  geom_point() +
+  scale_color_manual(values = c(not = "gray", down = "blue", up = "red")) +
+  ggrepel::geom_text_repel(data = ms.out[sig != "not"]  ,  size = 2, max.overlaps = 20) +
+  theme_bw() +
+  facet_wrap(~ Label)
+p <- p + theme(strip.text.x.top = element_text(size=6))
+p
+#BackupAsPDF(p, ".volcanoplot.multipanel.")
+```
+ plot these individually w/o and adjust the y-axis to highlight points 
+ 
+```{r, fig.length=5, fig.width=6}
+# raw sig
+PTGER4.PGE2.genes <- ms.out[Label == "AT00_PGE30 vs AT00_PGE00" & pvalue < 0.05 & abs(log2FC) > .58, gene]
+PTGER4.PGE2.genes.fdr <- ms.out[Label == "AT00_PGE30 vs AT00_PGE00" & sig != 'not', gene]
+
+ms.out[, sig := 'not']
+ms.out[fdr < 0.05 & abs(log2FC) > 0.58, sig := ifelse(log2FC > 0, 'up', 'down')]
+ms.out[gene %in% PTGER4.PGE2.genes.fdr & Label != "AT00_PGE30 vs AT00_PGE00", sig := 'agonist.sig']
+
+
+test.mss.list <- split(ms.out, ms.out$Label)
+
+lapply(seq_along(test.mss.list), function(x,n,i){
+    
+    p <- ggplot (x[[i]], aes (x = log2FC, y = -log2(fdr), color = sig, label = gene)) +
+      geom_point() +
+      geom_point(data=x[[i]][sig == 'agonist.sig'], aes(x = log2FC, y = -log2(fdr))) +
+      scale_color_manual(values = c(not = "gray", down = "blue", up = "red", agonist.sig = "darkred")) +
+      ggtitle(paste0(n[[i]])) +
+      geom_hline(yintercept = -log2(0.05), linetype=2, alpha=0.5) +
+      geom_vline(xintercept = log2(1.5), linetype=2, alpha=0.5) +
+      geom_vline(xintercept = -log2(1.5), linetype=2, alpha=0.5) +
+      coord_cartesian(xlim=c(-4,4)) +
+      theme_minimal()
+    p
+  BackupAsPDF(p, paste0(n[[i]],".volcanoplot.PTGER4labelled.fdr<0.05&log2FC>.58"))
+  }, x=test.mss.list, n=names(test.mss.list))
+
+```
+ plot these individually with points sig in agonist only highlighted 
+ 
+```{r, fig.length=5, fig.width=6}
+
+lapply(seq_along(test.mss.list), function(x,n,i){
+    
+    p <- ggplot (x[[i]], aes (x = log2FC, y = -log10(fdr), color='lightgrey', label=gene)) +
+      geom_point() +
+      geom_point(data=x[[i]][gene %in% PTGER4.PGE2.genes.fdr], aes(x = log2FC, y = -log10(fdr))) +
+   #   scale_color_manual(values = c(not = "gray", down = "blue", up = "red")) +
+      ggrepel::geom_text_repel(data = x[[i]][sig != "not"] ,  size = 2, max.overlaps = 20) +
+      ggtitle(paste0(n[[i]])) +
+      geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.5) +
+      geom_vline(xintercept = log2(1.5), linetype=2, alpha=0.5) +
+      geom_vline(xintercept = -log2(1.5), linetype=2, alpha=0.5) +
+      coord_cartesian(xlim=c(-4,4)) +
+      theme_minimal()
+    p
+#  BackupAsPDF(p, paste0(n[[i]],".volcanoplot.fdr<0.05&log2FC>.58"))
+  }, x=test.mss.list, n=names(test.mss.list))
+
+```
+
+ 
+ 
+Drop pval threshold
+```{r}
+ms.out[, sig := 'not']
+ms.out[pvalue < 0.05 & abs(log2FC) > 0.58, sig := ifelse(log2FC > 0, 'up', 'down')]
+```
+Lets plot each of these individually - same coord cartesian
+
+Impact of PGE2 treatment and label in the volcano plots
+-----
+Identify genes differentially expressed between AT00_PGE30 AT00_PGE00 and label these sig genes in the dataset
+125 genes @ adj pval < 0.05 and abs(log2FC) > .58
+265 @ raw pvalue
+
+```{r}
+# raw sig
+PTGER4.PGE2.genes <- ms.out[Label == "AT00_PGE30 vs AT00_PGE00" & pvalue < 0.05 & abs(log2FC) > .58, gene]
+PTGER4.PGE2.genes.fdr <- ms.out[Label == "AT00_PGE30 vs AT00_PGE00" & sig != 'not', gene]
+
+PTGER4.PGE2.genes.fdr
+length(PTGER4.PGE2.genes.fdr) #265 prots DEA 
+
+ms.out <- ms.out[!Label == "AT00_PGE30 vs AT00_PGE00",]
+
+#split datatable by comparison
+test.mss.list <- split(ms.out, ms.out$Label)
+```
+
+
+Just plots of the raw p-values with differentially expressed genes identified
+Again looks like the PGE addition has the largest effect
+```{r volcanoplots}
+# use purr to plot each list element 
+
+lapply(seq_along(test.mss.list), function(x,n,i){
+    
+    p <- ggplot (x[[i]], aes (x = log2FC, y = -log10(pvalue), color = sig, label = gene)) +
+      geom_point() +
+      scale_color_manual(values = c(not = "gray", down = "blue", up = "red")) +
+      ggrepel::geom_text_repel(data = x[[i]][sig != "not"] ,  size = 2, max.overlaps = 20) +
+      ggtitle(paste0(n[[i]])) +
+      coord_cartesian(xlim=c(-4,4))
+      theme_minimal()
+    p
+  BackupAsPDF(p, paste0(n[[i]],".volcanoplot.pval<0.05&log2FC>.58"))
+  }, x=test.mss.list, n=names(test.mss.list))
+```
+
+labelling all sig (pval < 0.05 &  abs log2FC > .58) agonist only genes in the antagonist-only treatments
+
+
+```{r}
+
+lapply(seq_along(test.mss.list), function(x,n,i){
+    
+    p <- ggplot (x[[i]], aes (x = log2FC, y = -log10(pvalue), color = sig, label = gene)) +
+      geom_point() +
+      scale_color_manual(values = c(not = "gray", down = "blue", up = "red")) +
+      ggrepel::geom_text_repel(data = x[[i]][gene %in% PTGER4.PGE2.genes & sig != 'not'] ,  size = 2, max.overlaps = 20) +
+      ggtitle(paste0(n[[i]], ' (PGE2 treatment sig genes)')) +
+      coord_cartesian(xlim=c(-4,4), ylim=c(0,5))
+      theme_minimal()
+    p
+   #BackupAsPDF(p, paste0(n[[i]],".volcanoplot.PGE2+label.siggenes.pval<0.05"))
+  }, x=test.mss.list, n=names(test.mss.list))
+
+```
+20-09-23
+coloring all sig genes from the agonist only treatment in the antagonist only analysis
+
+```{r}
+
+lapply(seq_along(test.mss.list), function(x,n,i){
+    
+    p <- ggplot (x[[i]], aes (x = log2FC, y = -log10(pvalue), label=gene) ) +
+      geom_point(aes(alpha=0.6)) +
+      geom_point(data=x[[i]][gene %in% PTGER4.PGE2.genes], aes(x = log2FC, y = -log10(pvalue), color='red', alpha=0.6)) +
+      ggrepel::geom_text_repel(data = x[[i]][gene %in% PTGER4.PGE2.genes] ,  size = 2, max.overlaps = 20) +
+      ggtitle(paste0(n[[i]], ' (agonist-only sig genes colored)')) +
+      coord_cartesian(xlim=c(-4,4), ylim=c(0,5)) 
+      theme_minimal() +
+        labs(colour='PTGER4-agonist only sig abs(log2FC) > 0.58 & pval < 0.05)', alpha=NULL)
+      
+   BackupAsPDF(p, paste0(n[[i]],".volcanoplot.agonist.sig.genes.colored.pval<0.05"))
+  }, x=test.mss.list, n=names(test.mss.list))
+```
+
+20-09-23
+coloring all fdr corrected sig genes from the agonist only treatment in the antagonist only analysis
+
+```{r}
+lapply(seq_along(test.mss.list), function(x,n,i){
+    
+    p <- ggplot (x[[i]], aes (x = log2FC, y = -log10(pvalue), label=gene) ) +
+      geom_point(aes(alpha=0.6)) +
+      geom_point(data=x[[i]][gene %in% PTGER4.PGE2.genes.fdr], aes(x = log2FC, y = -log10(pvalue), color='red', alpha=0.6)) +
+      ggrepel::geom_text_repel(data = x[[i]][gene %in% PTGER4.PGE2.genes.fdr] ,  size = 2, max.overlaps = 20) +
+      ggtitle(paste0(n[[i]], ' (agonist-only sig genes colored)')) +
+      coord_cartesian(xlim=c(-4,4), ylim=c(0,5)) 
+      theme_minimal() +
+        labs(colour='PTGER4-agonist only sig abs(log2FC) > 0.58 & pval < 0.05)', alpha=NULL)
+      p
+      
+   BackupAsPDF(p, paste0(n[[i]],".volcanoplot.agonist.sig.genes.colored.fdr<0.05"))
+  }, x=test.mss.list, n=names(test.mss.list))
+```
+label free plots for clarity
+
+```{r}
+lapply(seq_along(test.mss.list), function(x,n,i){
+    
+    p <- ggplot (x[[i]], aes (x = log2FC, y = -log10(pvalue), label=gene) ) +
+      geom_point(aes(alpha=0.6)) +
+      geom_point(data=x[[i]][gene %in% PTGER4.PGE2.genes.fdr], aes(x = log2FC, y = -log10(pvalue), color='red', alpha=0.6)) +
+     # ggrepel::geom_text_repel(data = x[[i]][gene %in% PTGER4.PGE2.genes] ,  size = 2, max.overlaps = 20) +
+      ggtitle(paste0(n[[i]], ' (agonist-only sig genes colored)')) +
+      coord_cartesian(xlim=c(-4,4), ylim=c(0,5)) 
+      theme_minimal() +
+        guides(alpha='none') +
+        labs(colour='PTGER4-agonist only sig abs(log2FC) > 0.58 & pval < 0.05)', alpha=NULL)
+      
+   BackupAsPDF(p, paste0(n[[i]],".volcanoplot.agonist.sig.genes.colored.nolab.fdr<0.05"))
+  }, x=test.mss.list, n=names(test.mss.list))
+
+```
+
+
+Line chart of the antagonist (AT29-99) vs agonist (PGE2 treatment) effect 
+
+Read in the results from DARPA 33.1
+```{r}
+ms.out <- fread('~/Documents/projects/071023_QLi_DARPA/DARPA_33_data/2023_08_09_mss.groupcomparisons.csv.gz')
+
+# add the sig label
+ms.out[, sig := 'not']
+ms.out[fdr < 0.05 & abs(log2FC) > 0.58, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+```
+
+extract contrasts OI
+
+```{r}
+# just take contrasts of interest
+labels.oi <- c( "AT29_PGE00 vs AT00_PGE00", "AT53_PGE00 vs AT00_PGE00", "AT99_PGE00 vs AT00_PGE00", 'AT00_PGE30 vs AT00_PGE00')
+
+ms.out <- ms.out[Label %in% labels.oi,]
+ms.out[,Label := gsub('NP', 'PGE', Label)]
+
+```
+
+
+Lets plot for all
+
+```{r}
+ms.wide <- dcast(ms.out, gene~Label, value.var=c('log2FC'))
+colnames(ms.wide) <- gsub(" ", ".", colnames(ms.wide))
+
+antagonist.oi <- c('AT29_PGE00.vs.AT00_PGE00', 'AT53_PGE00.vs.AT00_PGE00', 'AT99_PGE00.vs.AT00_PGE00')
+
+g <- ggplot(ms.wide, aes(x=AT00_PGE30.vs.AT00_PGE00, y=AT29_PGE00.vs.AT00_PGE00, label=gene, alpha=0.4)) +
+  geom_point() +
+  geom_density2d() +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes],  size = 2, max.overlaps = 20) +
+  ggtitle('AT29')
+
+#BackupAsPDF(g, 'AT29.treat.scatterplot.')
+
+g <- ggplot(ms.wide, aes(x=AT00_PGE30.vs.AT00_PGE00, y=AT99_PGE00.vs.AT00_PGE00, label=gene, alpha=0.4)) +
+  geom_point() +
+  geom_density2d() +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes],  size = 2, max.overlaps = 20) +
+  ggtitle('AT99')
+
+#BackupAsPDF(g, 'AT99.treat.scatterplot.')
+
+g <- ggplot(ms.wide, aes(x=AT00_PGE30.vs.AT00_PGE00, y=AT53_PGE00.vs.AT00_PGE00, label=gene, alpha=0.4)) +
+  geom_point() +
+  geom_density2d() +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes],  size = 2, max.overlaps = 20) +
+  ggtitle('AT53')
+
+
+#BackupAsPDF(g, 'AT53.treat.scatterplot.')
+
+ms.out
+```
+
+150923
+---
+redo scatterplots and color by pval in the antagonist only set
+colored also by Std err to highlight measuremnts are not v reliable
+```{r}
+
+
+# adjust to include pvalue terms
+ms.wide <- dcast(ms.out[gene %in% PTGER4.PGE2.genes], gene~Label, value.var=c('log2FC', 'pvalue','adj.pvalue','SE'))
+colnames(ms.wide) <- gsub(" ", ".", colnames(ms.wide))
+
+#add a pvalue column for genes with pval in the 
+
+antagonist.oi <- c('AT29_PGE00.vs.AT00_PGE00', 'AT53_PGE00.vs.AT00_PGE00', 'AT99_PGE00.vs.AT00_PGE00')
+
+g <- ggplot(ms.wide[!gene %in% c('PLAG1', 'SYNGR1'),], aes(x=log2FC_AT00_PGE30.vs.AT00_PGE00, y=log2FC_AT29_PGE00.vs.AT00_PGE00, label=gene, color=SE_AT29_PGE00.vs.AT00_PGE00)) +
+  geom_point() +
+  geom_vline(xintercept = 0, alpha=0.5, linetype=2) +
+  xlab('agonist-only (PTGER4) vs control (Log2FC)') +
+  ylab('antagonist-only vs control (Log2FC)') +
+  geom_hline(yintercept = 0, alpha=0.5, linetype=2) +
+  xlim(-3, 3) +
+  ylim(-1.5, 2) +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes & !gene %in% c('PLAG1', 'SYNGR1')],  size = 2, max.overlaps = 20) +
+  ggtitle('AT29') + 
+  labs(color='Std Err')
+g
+
+BackupAsPDF(g, 'AT29.vs.PTGER4.sig.stderr.col.scatterplot.')
+
+
+ms.wide[is.infinite(abs(log2FC_AT29_PGE00.vs.AT00_PGE00)), gene]
+
+g <- ggplot(ms.wide[!gene %in% c('SIDT2', 'ZNF221;ZNF224')], aes(x=log2FC_AT00_PGE30.vs.AT00_PGE00, y=log2FC_AT99_PGE00.vs.AT00_PGE00, label=gene, color=SE_AT99_PGE00.vs.AT00_PGE00)) +
+  geom_point() +
+  geom_vline(xintercept = 0, alpha=0.5, linetype=2) +
+  geom_hline(yintercept = 0, alpha=0.5, linetype=2) +
+  xlab('agonist-only (PTGER4) vs control (Log2FC)') +
+  ylab('antagonist-only vs control (Log2FC)') +
+  #xlim(-3, 3) +
+  #ylim(-1.5, 2) +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes & !gene %in% c('SIDT2', 'ZNF221;ZNF224')],  size = 2, max.overlaps = 20) +
+  ggtitle('AT99') +
+  labs(color='Std Err.')
+
+g
+BackupAsPDF(g, 'AT99.vs.PTGER4.sig.stderr.col.scatterplot.')
+
+
+g <- ggplot(ms.wide[!is.infinite(abs(log2FC_AT53_PGE00.vs.AT00_PGE00))], aes(x=log2FC_AT00_PGE30.vs.AT00_PGE00, y=log2FC_AT53_PGE00.vs.AT00_PGE00, label=gene, color=SE_AT53_PGE00.vs.AT00_PGE00)) +
+  geom_point() +
+  geom_vline(xintercept = 0, alpha=0.5, linetype=2) +
+  geom_hline(yintercept = 0, alpha=0.5, linetype=2) +
+  xlab('agonist-only (PTGER4) vs control (Log2FC)') +
+  ylab('antagonist-only vs control (Log2FC)') +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes & !is.infinite(log2FC_AT53_PGE00.vs.AT00_PGE00)],  size = 2, max.overlaps = 20) +
+  ggtitle('AT53') +
+  labs(color='Std Err.')
+  #labs(color='antagonist-only -log10(pval)')
+
+g
+BackupAsPDF(g, 'AT53.vs.PTGER4.sig.stderr.col.scatterplot.')
+
+
+```
+
+
+
+
+200923
+----
+Redo the plots also showcasing only the FDR corrected results
+
+```{r, fig.width=6, fig.height=4}
+
+
+# adjust to include pvalue terms
+ms.wide <- dcast(ms.out[gene %in% PTGER4.PGE2.genes.fdr], gene~Label, value.var=c('log2FC', 'pvalue','adj.pvalue','SE'))
+colnames(ms.wide) <- gsub(" ", ".", colnames(ms.wide))
+
+#add a pvalue column for genes with pval in the 
+
+antagonist.oi <- c('AT29_PGE00.vs.AT00_PGE00', 'AT53_PGE00.vs.AT00_PGE00', 'AT99_PGE00.vs.AT00_PGE00')
+
+g <- ggplot(ms.wide[!gene %in% c('PLAG1', 'SYNGR1'),], aes(x=log2FC_AT00_PGE30.vs.AT00_PGE00, y=log2FC_AT29_PGE00.vs.AT00_PGE00, label=gene, color=SE_AT29_PGE00.vs.AT00_PGE00)) +
+#g <- ggplot(ms.wide[!gene %in% c('PLAG1', 'SYNGR1'),], aes(x=log2FC_AT00_PGE30.vs.AT00_PGE00, y=log2FC_AT29_PGE00.vs.AT00_PGE00, label=gene)) +
+  geom_point() +
+  geom_vline(xintercept = 0, alpha=0.5, linetype=2) +
+  xlab('agonist-only (PTGER4) vs control (Log2FC)') +
+  ylab('antagonist-only vs control (Log2FC)') +
+  geom_hline(yintercept = 0, alpha=0.5, linetype=2) +
+  #xlim(-3, 3) +
+  ylim(-2, 2) +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes & !gene %in% c('PLAG1', 'SYNGR1')],  size = 2, max.overlaps = 20) +
+  ggtitle('AT29') + 
+  labs(color='Std Err')
+g
+
+BackupAsPDF(g, 'AT29.vs.PTGER4.fdr.sig.scatterplot.')
+
+
+ms.wide[is.infinite(abs(log2FC_AT29_PGE00.vs.AT00_PGE00)), gene]
+
+g <- ggplot(ms.wide[!gene %in% c('SIDT2', 'ZNF221;ZNF224')], aes(x=log2FC_AT00_PGE30.vs.AT00_PGE00, y=log2FC_AT99_PGE00.vs.AT00_PGE00, label=gene, color=SE_AT99_PGE00.vs.AT00_PGE00)) +
+#g <- ggplot(ms.wide[!gene %in% c('SIDT2', 'ZNF221;ZNF224')], aes(x=log2FC_AT00_PGE30.vs.AT00_PGE00, y=log2FC_AT99_PGE00.vs.AT00_PGE00, label=gene)) +
+  geom_point() +
+  geom_vline(xintercept = 0, alpha=0.5, linetype=2) +
+  geom_hline(yintercept = 0, alpha=0.5, linetype=2) +
+  xlab('agonist-only (PTGER4) vs control (Log2FC)') +
+  ylab('antagonist-only vs control (Log2FC)') +
+  #xlim(-3, 3) +
+  ylim(-2, 2) +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes & !gene %in% c('SIDT2', 'ZNF221;ZNF224')],  size = 2, max.overlaps = 20) +
+  ggtitle('AT99') +
+  labs(color='Std Err.')
+
+g
+BackupAsPDF(g, 'AT99.vs.PTGER4.fdr.sig.scatterplot.')
+
+
+g <- ggplot(ms.wide[!is.infinite(abs(log2FC_AT53_PGE00.vs.AT00_PGE00))], aes(x=log2FC_AT00_PGE30.vs.AT00_PGE00, y=log2FC_AT53_PGE00.vs.AT00_PGE00, label=gene, color=SE_AT53_PGE00.vs.AT00_PGE00)) +
+#g <- ggplot(ms.wide[!is.infinite(abs(log2FC_AT53_PGE00.vs.AT00_PGE00))], aes(x=log2FC_AT00_PGE30.vs.AT00_PGE00, y=log2FC_AT53_PGE00.vs.AT00_PGE00, label=gene)) +
+  geom_point() +
+  geom_vline(xintercept = 0, alpha=0.5, linetype=2) +
+  geom_hline(yintercept = 0, alpha=0.5, linetype=2) +
+  xlab('agonist-only (PTGER4) vs control (Log2FC)') +
+  ylab('antagonist-only vs control (Log2FC)') +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes & !is.infinite(log2FC_AT53_PGE00.vs.AT00_PGE00)],  size = 2, max.overlaps = 20) +
+  ggtitle('AT53') +
+  ylim(-2, 2) +
+  labs(color='Std Err.')
+  #labs(color='antagonist-only -log10(pval)')
+
+g
+BackupAsPDF(g, 'AT53.vs.PTGER4.fdr.sig.scatterplot.')
+
+
+```
+
+
+
+
+
+
+
+
+Lets compare to the 11 receptor data. Replot with PTGER4 on the x axis and agonist on the Y
+
+Merge the 11 receptor data with this dataset
+
+```{r}
+receptor.mss <- fread('../082423_QLi_GPR_WGCNA/data/2022_08_31_NiceFitsPower3.csv')
+head(receptor.mss)
+
+rec.wide <- receptor.mss[ receptor == 'PTGER4' & gene %in% PTGER4.PGE2.genes,] %>% 
+  dcast(gene~receptor, value.var = 'log2FC')
+
+ms.wide[rec.wide, PTGER4 := i.PTGER4, on='gene']
+```
+
+```{r}
+
+g <- ggplot(ms.wide, aes(x= PTGER4, y=AT29_PGE00.vs.AT00_PGE00, label=gene, alpha=0.4)) +
+  geom_point() +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes],  size = 2, max.overlaps = 20) +
+  ggtitle('AT29')
+
+g
+#BackupAsPDF(g, 'AT29.treat.sig.scatterplot.')
+
+g <- ggplot(ms.wide, aes(x=PTGER4, y=AT99_PGE00.vs.AT00_PGE00, label=gene, alpha=0.4)) +
+  geom_point() +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes],  size = 2, max.overlaps = 20) +
+  ggtitle('AT99')
+
+g
+#BackupAsPDF(g, 'AT99.treat.sig.scatterplot.')
+
+g <- ggplot(ms.wide, aes(x=PTGER4, y=AT53_PGE00.vs.AT00_PGE00, label=gene, alpha=0.4)) +
+  geom_point() +
+  ggrepel::geom_text_repel(data = ms.wide[gene %in% PTGER4.PGE2.genes],  size = 2, max.overlaps = 20) +
+  ggtitle('AT53')
+
+g
+#BackupAsPDF(g, 'AT53.treat.sig.scatterplot.')
+```
+
+```{r}
+
+```
+
+
+
+
+Run enrichment on these genes to see if anything interesting pops up 
+
+```{r}
+#creat new factor col of combined label sig info
+ms.out[, enrich_grp:= interaction(Label,sig)]
+
+# all go ontology genes (biological process, cellular componetn & metabolic function) for enrichment analysis
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# all identified genes as the background set
+universe <- unique(ms.out$gene)
+
+# perform enrichment on significant genes for all groups
+enrich.dt <- enricherOnGroups(ms.out[sig != 'not'], groupColumns = 'enrich_grp', term2gene.gmt = gmt.go, universe = universe)
+
+#simplify enrich results to remove redundant GO terms
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, NULL, groupColumn = 'enrich_grp', topN = 10, negCols =unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 8) 
+# compare enrichment in the top 10 terms per group
+BackupAsPDF(ht, "heatmap_GO")
+```
+Enrichment table
+
+```{r}
+
+g <- ggplot(enrich.dt[p.adjust < 0.05,], aes(x=reorder(ID, -log10(p.adjust)), y=-log10(p.adjust), fill=enrich_grp)) + 
+  geom_col() + 
+  coord_flip() +
+  ggtitle('significant (adj.pval < 0.05) GO terms') +
+  geom_text(aes(label = GeneRatio, color = 'gene ratio'), vjust = .5, hjust = 1.5, size = 2) +
+  scale_fill_manual(values=c("#3b528b", '#21918c')) +
+  scale_colour_manual(values="white", guide = 'none') +
+  theme_bw() +
+  theme(legend.key.size = unit(4, 'mm'),
+        legend.text = element_text(size=6),
+        axis.text.y = (element_text(size=6))
+        )
+
+BackupAsPDF(g, 'sig.go.enrichment')
+```
+
+
+

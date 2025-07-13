@@ -1,0 +1,263 @@
+---
+title: "060325_POX_SECMS_firstLook"
+author: "Martin Gordon"
+date: "2025-06-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+ ## Preporcessing of the POX virus SEC-MS data
+Inlcude QC assessment of the replicates
+Loook at the viral protein profiles and see how they look
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# flag consec proteins
+source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+```
+Read in hte pox SECMS data and visualize
+So what are these samples?human cell-lin einfected pox samples?
+```{r}
+sec.long <- fread('./data/2024_10_25_SEC_MS_Input_Long.csv.gz')
+sec.long$sample %>% unique()
+
+
+# viral proteins; quick adn dirty way to find them... does thisd work?
+viral.prots <- fread('./data/2024_10_25_SEC_MS_Input_Long.csv.gz') %>% 
+  .[!grepl('HUMAN|mCherry', Protein.Names), unique(Protein.Names)]
+
+```
+
+```{r}
+#fwrite(sec.long[,.(protein=Protein.Group, gene=Genes, sample, treatment, replicate, fraction, intensity)], ScriptAndDatedFileName('seclong.input.csv.gz'))
+sec.long <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_poxSECMS_firstLook_data/2025_06_03_seclong.input.csv.gz')
+```
+Run standard QC on the data to see how the samples compare
+Maybe also a all-by-all correlation? Look at Bens work on this
+
+*QC*
+Looking at N proteins, seems there are a number of troublesome fractions. Can we try tidy these, impute missing values etc?
+Looks like Vaccinia rep1 just failed, need to remove this sample from the analysis, it's not going to be of much use
+```{r nproteins, fig.width=8, fig.height=6}
+qc.dt <- qcSummaryTable(sec.long)
+qcPlotProteinCount(qc.dt)
+# number of protiens eluting looks good
+
+BackupAsPDF(qcPlotProteinCount(qc.dt), 'Nproteins.linechart') +
+  theme_classic()
+```
+```{r medpolish, fig.width=8, fig.height=6}
+g <- qcPlotMedianInt(qc.dt) +
+  theme_bw()
+g
+BackupAsPDF(g, 'medianPolish.linechart')
+```
+plot intensity heatmap with all proteins;
+
+```{r, heatmaps, fig.width=8, fig.height=6}
+intMats <- scaledIntensityMatrices(sec.long)
+intensityHeatmaps(intMats)
+BackupAsPDF(intensityHeatmaps(intMats), 'filtered.prots.heatmap')
+```
+ remove rep1 for VacV and then focus on tidying up the complexes
+ 
+```{r}
+sec.long <- sec.long[sample != 'VacV_R1']
+#fwrite(sec.long, ScriptAndDatedFileName('seclong.input.dropVacV1.csv.gz'))
+sec.long <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_poxSECMS_firstLook_data/2025_06_03_seclong.input.dropVacV1.csv.gz')
+qc.dt <- qcSummaryTable(sec.long)
+```
+
+We need to tidy the problematic fractions and impute missing fractions
+```{r}
+intMats <- scaledIntensityMatrices(sec.long)
+intensityHeatmaps(intMats)
+```
+Missing value imputation; first identfiy the problematic fractions, zero out those measured values and impute the missing
+then we can run the co-elution detection and the differential analysis
+
+**Normalization**
+Fit loess to each sample (fit an additive model;plot outlier samples
+
+```{r}
+allFits <- fitLocalCubics(qc.dt, window = 15, sampleTerm = "additive")
+labelOutliers(qc.dt, allFits, threshold = 2) 
+
+p <-plotNormAndOutlierFits(qc.dt , allFits)
+p
+BackupAsPDF(p, 'localRegression.window15.linechart')
+```
+Normalize the intensities 
+
+```{r}
+normalizeByResiduals(secLong.dt = sec.long, qc.dt)
+#fwrite(sec.long, ScriptAndDatedFileName('sec.long.normalized.csv.gz'))
+sec.long <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_poxSECMS_firstLook_data/2025_06_03_sec.long.normalized.csv.gz')
+```
+
+Visualize output;
+```{r}
+new.qc.dt <- qcSummaryTable(sec.long)
+
+g <- qcPlotMedianInt(new.qc.dt) +
+  theme_bw()
+g
+BackupAsPDF(g, 'normalized.qc')
+```
+
+Clear issues with normalization of some outlier samples; interpolate missing fractions and proceed
+interpolate the normalized values and proceed
+```{r}
+interp.dt <- handleMissingandOutlierFractions(sec.long, qc.dt, fractionOrder = seq(1,72,1))
+#fwrite(interp.dt, ScriptAndDatedFileName('sec.long.normalized.interpolated.csv.gz'))
+sec.long <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_poxSECMS_firstLook_data/2025_06_03_sec.long.normalized.interpolated.csv.gz')
+```
+
+Results with the interpolated fractions look better. Lets run the differential analysis and proceed
+```{r}
+new.qc.dt <- qcSummaryTable(interp.dt)
+
+g <- qcPlotMedianInt(new.qc.dt) +
+  theme_bw()
+g
+BackupAsPDF(g, 'normalizedInterpolated.qc')
+```
+
+```{r, heatmaps, fig.width=10, fig.height=6}
+intMats <- scaledIntensityMatrices(sec.long)
+intensityHeatmaps(intMats)
+BackupAsPDF(intensityHeatmaps(intMats), 'norm.interpolated.prots.heatmap')
+```
+Remove proteins with < 5 consecutvie measurements
+Do this after interpolation on expanded but non-interpolated data to ensure the consecutvie meaurements are consecutive functions...
+```{r}
+# setNA ori.intensity to 0 for detection; these are the normalized values
+sec.long[is.na(ori.intensity), ori.intensity := 0]
+consec.dt  <- flagLowQualityFeatures(secLong.dt = sec.long, idcol = 'protein', intsCol = 'ori.intensity', ConsecFractionThreshold=5, detectionCutoff=0)
+
+g <- ggplot(consec.dt[passThreshold == FALSE,.N, by=sample], aes(x=sample, y=N)) +
+  geom_bar(stat='identity') +
+  theme_bw()
+g
+BackupAsPDF(g, 'nProteinsFailConsecDetections.barplot')
+```
+Filter out the proteins without sufficient number of consecutive detections
+```{r}
+# keep passing proteins in sec.long 
+fwrite(sec.long[consec.dt[passThreshold == TRUE, .(sample, protein=feature)],  on=.(protein, sample)], ScriptAndDatedFileName('sec.long.normalized.interpolated.filtered.csv.gz'))
+```
+
+
+
+**Functions**
+detect features with <N consecutvie measurements
+And fix the interpolation
+
+```{r}
+#' Flag low quality peptides based on missingness proportion, lack of consecutive detections <5 for now as required for peak detection
+flagLowQualityFeatures <- function(secLong.dt, idcol='peptideSequence', intsCol='intensity', ConsecFractionThreshold=5, detectionCutoff=0){
+  
+  .oneMatrix <- function(sub.dt){
+    mat <- dcast(sub.dt, sub.dt[[idcol]]~fraction, value.var = intsCol) %>% 
+      as.matrix(rownames = 1)
+    mat[is.na(mat)] <- 0.0
+    mat[order(rownames(mat)),]
+  }
+  
+    #' Identify the max number of consecitive measurmeents
+  .MaxConsecFractionMeasurments <- function(row, cutoff=detectionCutoff){
+    # get unique values in a vector and the maximum run of consec vals
+    detectVec <- rle(row > cutoff)
+    return(max(detectVec$lengths[detectVec$values == TRUE]))
+  }
+  
+  # one matrix per sample 
+  mats <- lapply(split(secLong.dt, list(secLong.dt$sample)), .oneMatrix)
+  
+  consec.dt <- lapply(mats, function(x) {
+    apply(x, 1, function(pep){ .MaxConsecFractionMeasurments(row = pep, cutoff = 0) }) %>% 
+    as.data.table(keep.rownames=T)
+  }) %>% 
+  rbindlist(idcol='sample')
+  
+  setnames(consec.dt, new=c('sample', 'feature', 'consecutiveDetections'))
+  consec.dt[, passThreshold := ifelse(consecutiveDetections >= ConsecFractionThreshold, TRUE, FALSE)]
+  return(consec.dt)
+}
+
+#interpolation function
+#' functin that when given sec.dt and the qc output, fills in missing and outlier fractions with NA
+#' datatable join to replace values in problematic fractions with NA
+handleMissingandOutlierFractions <- function(sec.dt, qc.dt, fractionOrder){
+  
+  # where the sample fraction is flagged an outlier, convert all the intensities to NA
+  sec.dt[, ori.intensity := intensity]
+  sec.dt[qc.dt[isOutlier == TRUE], on=.(sample, fraction), intensity := NA]
+  
+  # add NA for missing fractions
+  .addMissingFractions <- function(subDT){
+    subMat <- dcast(subDT, protein~fraction, value.var='intensity') %>% 
+      as.matrix(rownames='protein')
+    
+    if (!all(colnames(subMat) == fractionOrder)){
+      message('Some fractions are missing and/or not in correct order\nFilling in missing fractions with NA...')
+      message('Missing fractions:\n', setdiff(fractionOrder, colnames(subMat)))
+      subMat <- subMat[, match(fractionOrder, colnames(subMat)), drop=FALSE] #missing fractions assigned an NA col. drop=FALSE to avoid collapsing to vector
+      colnames(subMat) <- fractionOrder
+    }
+    return(subMat)
+  }
+  
+  .interpolateOutlierFractions <- function(subMat, sampleOI){
+    # interpolate all values rowwise
+    interpMat <- apply(subMat, 1, function(x) zoo::na.approx(x, na.rm=F, maxgap=1)) %>% 
+      t()
+    # fractions to update
+    fractionsOI <- c(qc.dt[sample == sampleOI & isOutlier == TRUE, unique(fraction)],
+                     setdiff(fractionOrder, sec.dt[sample == sampleOI, unique(fraction)])
+                     )
+    
+    print(fractionsOI)
+    colsToupdate <- colnames(subMat) %in% fractionsOI
+    
+    # now apply the values from the interpolated matrix to the original
+    subMat[, colsToupdate] <- interpMat[, colsToupdate]
+    subdt <- reshape2::melt(subMat)
+    setnames(subdt, new=c('protein', 'fraction', 'intensity'))
+    return(subdt)
+  }
+
+  # handling missing/outlir fractions
+  sec.list <- lapply(split(sec.dt, sec.dt$sample), .addMissingFractions)
+  
+  # interpolate missing values
+  message('interpolating missing values...')
+  interp.list <- lapply(names(sec.list), function(n){.interpolateOutlierFractions(subMat = sec.list[[n]], sampleOI = n)}) 
+  names(interp.list) <- names(sec.list)
+  interp.dt <- rbindlist(interp.list, idcol='sample')
+  
+  # now combine the dt with the treatment, replicate and ori intensity and return
+  print(nrow(interp.dt))
+  interp.dt <- merge(x=interp.dt, y=sec.dt[,.(protein, sample,fraction, ori.intensity)], by=c('protein', 'sample', 'fraction'), all.x=T, all.y=F) 
+  print(nrow(interp.dt))
+
+  return(interp.dt)
+}
+```

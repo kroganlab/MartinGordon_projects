@@ -1,0 +1,872 @@
+---
+title: "ciliaAssocProteins_investigation"
+author: "Martin Gordon"
+date: "2024-07-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Overview
+APEX_MS GPCR study in Cilia cells
+
+Following previous meeting catch-up, Aaron has supplied a list of cilia proteins that we can consider a 'gold standard' in the field
+The first question we want to answer is; 
+i) do these ciliated proteins seperate the two groups of cells (+/- cilia)
+ii) do these proteins distinguish between the contrasts we are focusing on?
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clusterin∂ƒg of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+library(viridis)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+```
+
+Read in our protein quant data and the output from all MSS contrasts
+
+```{r}
+p.quant <- fread('./062424_PWComparisons_data/2024_06_26_ProteinLevelQuant.renorm.csv')
+p.quant[, LogIntensities := newLogInts]
+p.quant[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+
+# add other annotation information
+p.quant[, cilia_present := ifelse(grepl('[-]cilia', GROUP), 'No', 'Yes')]
+p.quant[, ligand_present := ifelse(grepl('_ag|_In', GROUP), 'Yes', 'No')]
+p.quant[, probe := gsub("[-+]{1}cilia_|_ag{1}$|_In{1}$$",'', GROUP)]
+
+# looks good
+p.quant[, .(GROUP, probe, ligand_present, cilia_present)] %>% unique()
+```
+Now read in the annotated cilia proteins Aaron has returned 
+
+```{r}
+# read in mouse to hu mapping table; will use this to collect all possible mappings from human to filter our results by
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+cilia.AM <- c('INPP5E', 'LCA5', 'PRKAR1A', 'ARL13B', 'SMO', 'EVC2', 'EVC', 'PKD2', 'TTC21B', 'PKHD1', 'IFT88', 'NPHP4', 'EFCAB7', 'CYS1')
+
+cilia.Consensus <- c('Pdap1','Cep131','Cep41','Ift122','Ift172','Ift52','Ift57','Ift74','Ift81','Ift88','Cfap97','Lca5','Cemip2','Wdr35',
+                     'Arl13b','Arl3','Inpp5e','Nme7','Kif3a','Kif3b','Kifap3','Ywhaz','Cys1','Evc2','Ttc21b','Ift56')
+
+# "Kiaa1430" "Ttc26"  not found in my mappings
+# alias on ncbi: Cfap97 & IFT56
+cilia.Consensus[!cilia.Consensus %in% unique(mh_mappings$Symbol.mouse)]
+
+# all found
+cilia.AM.prots <- mh_mappings[Symbol.human %in% cilia.AM, SWISS_PROT_IDs.mouse]
+cilia.Consensus.prots <- mh_mappings[Symbol.mouse %in% cilia.Consensus, SWISS_PROT_IDs.mouse]
+```
+
+convert our data to wide format and look at a heatmap of these how well does both these sets seperate conditions?
+
+```{r}
+p.mat <- dcast(p.quant, Protein~paste0(GROUP,'.', SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+# subset to the proteins we are interested in
+submat <- p.mat[rownames(p.mat) %in% c(cilia.AM.prots, cilia.Consensus.prots),]
+
+# lots of zeros in matrix, so dont think median scaling is appropriate
+# convert to linear and NAs to 0, then get difference to row max
+submat <-  2^submat
+submat[is.na(submat)] <-  0
+
+submat <-  sweep(submat, 1, apply(submat, 1, max), FUN='/')
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+hm <- Heatmap(submat,
+        col=viridis(100),
+        border = T,
+        column_split = ifelse(grepl('[+]', colnames(submat)), 'ciliated cells', 'non-ciliated cells'),
+        column_names_gp = gpar(fontsize=5),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(submat))
+
+dim(submat)
+
+BackupAsPDF(hm, 'consensusCiliaProts.cellLineSplit.heatmap')
+```
+Lets try another view of these ciliated proteins; split by group
+
+Pth2r (maybe), GPR161 w/wo ag, SMO w/wo ag
+ARL13B not being recovered in basically any of the samples (?!)
+
+```{r}
+col.ann <- data.table(cilia_present=ifelse(grepl('[+]cilia', colnames(submat)), 'yes', 'no'))
+colAnn <- HeatmapAnnotation(df=col.ann, col=list('cilia_present' = c('yes'='#4477AA', 'no'='#CCBB44')))
+
+hm <- Heatmap(submat,
+        col=viridis(100),
+        border = T,
+        top_annotation = colAnn,
+        name='Ints/Max Ints',
+        cluster_column_slices = T,
+        cluster_columns = F,
+        show_column_names = F,
+        column_split=gsub('^[+-]cilia_|[.][0-9]$','', colnames(submat)),
+        column_names_gp = gpar(fontsize=5),
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(submat))
+
+hm
+BackupAsPDF(hm, 'consensusCiliaProts.probeSplit.heatmap', dimensions=c(11,6))
+```
+Also try visualise these proteins as a median sweep; perhaps these are just highly expressed outliers in the SMO group
+
+```{r}
+# subset to the proteins we are interested in
+submat <- p.mat[rownames(p.mat) %in% c(cilia.AM.prots, cilia.Consensus.prots),]
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+submat <-  sweep(submat, 1, apply(submat, 1, median, na.rm=T), FUN='-')
+
+hm <- Heatmap(submat,
+        border = T,
+        top_annotation = colAnn,
+        name='log2 Ints/median(Ints)',
+        cluster_column_slices = T,
+        col=colorRamp2(breaks=c(4,2,0,-2,-4), colors =redbluColpal),
+        cluster_columns = F,
+        show_column_names = F,
+        column_split=gsub('^[+-]cilia_|[.][0-9]$','', colnames(submat)),
+        column_names_gp = gpar(fontsize=5),
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(submat))
+
+hm
+BackupAsPDF(hm, 'consensusCiliaProts.probeSplit.medianScaled.heatmap', dimensions=c(11,6))
+```
+Drop the non ciliated cells (and GPR135 where samples may have been switched/incorrectly prepared??) and rescale
+```{r}
+# subset to the proteins and proteins we are interested in
+submat <- p.mat[rownames(p.mat) %in% c(cilia.AM.prots, cilia.Consensus.prots), 
+                grep('[+]cilia', grep('GPR135', colnames(p.mat), invert = T, value = T), value=T)]
+
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+rownames(submat)[rownames(submat) =='Q9QXL8'] <- 'Nme7'
+
+submat <-  sweep(submat, 1, apply(submat, 1, median, na.rm=T), FUN='-')
+
+hm <- Heatmap(submat,
+        border = T,
+       # top_annotation = colAnn,
+        name='log2 Ints/median(Ints)',
+        cluster_column_slices = T,
+        col=colorRamp2(breaks=c(3,1.5,0,-1.5,-3), colors =redbluColpal),
+        cluster_columns = F,
+        show_column_names = F,
+        column_split=gsub('^[+-]cilia_|[.][0-9]$','', colnames(submat)),
+        column_names_gp = gpar(fontsize=5),
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(submat))
+
+hm
+BackupAsPDF(draw(hm, column_title='Cilia assoc. proteins in ciliated cells'), 'consensusCiliaProts.probeSplit.medianScaled.ciliaOnly.heatmap', dimensions=c(10,6))
+```
+Replot with the linear scale
+This plot looks good; we can see that the agonist activation seems to have an effect on GPCR signalling (increasing with agonist addition, indicating SMO is moving internally)
+
+```{r}
+# subset to the proteins and proteins we are interested in
+submat <- p.mat[rownames(p.mat) %in% c(cilia.AM.prots, cilia.Consensus.prots), 
+                grep('[+]cilia', grep('GPR135', colnames(p.mat), invert = T, value = T), value=T)]
+
+# lots of zeros in matrix, so dont think median scaling is appropriate
+# convert to linear and NAs to 0, then get difference to row max
+submat <-  2^submat
+submat[is.na(submat)] <-  0
+
+submat <-  sweep(submat, 1, apply(submat, 1, max), FUN='/')
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+rownames(submat)[rownames(submat) =='Q9QXL8'] <- 'Nme7'
+
+hm <- Heatmap(submat,
+        col=viridis(100),
+        border = T,
+        name='Ints/Max Ints',
+        cluster_column_slices = T,
+        cluster_columns = F,
+        show_column_names = T,
+        column_split=gsub('^[+-]cilia_|[.][0-9]$','', colnames(submat)),
+        column_names_gp = gpar(fontsize=5),
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(submat))
+
+hm
+BackupAsPDF(draw(hm, column_title='Cilia assoc. proteins in ciliated cells'), 'consensusCiliaProts.probeSplit.MaxScaled.ciliaOnly.heatmap', dimensions=c(10,6))
+```
+Need to plot barplot of some gold standards; can we see differnece in acitvation across the ag/ih groups? More fine-scaled than heatmap
+GS proteins
+
+ARL13B, Prkar1a, Smo, Gli3, Pkd2, Kifap3
+
+```{r}
+#subsetting our data to these groups OI
+groups.oi <-  gsub('[.][0-9]', '', colnames(submat)) %>% 
+  grep('GPR161|SMO|Pth2r',., value=T)
+
+prots.oi <- c('Arl13b', 'Prkar1a', 'Smo', 'Gli3', 'Pkd2', 'Kifap3')
+
+g <- ggplot(p.quant[gene %in% prots.oi & GROUP %in% groups.oi,], aes(x=probe,y=LogIntensities, fill=ligand_present)) +
+  geom_boxplot() +
+  geom_point(aes(fill = ligand_present), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge()) +
+  scale_fill_manual(values=c('Yes'='#FF4242', 'No'='#47abd8')) +
+  facet_wrap(~gene, scales='free_y') +
+  ggtitle('log2 Ints. cilia assoc. proteins') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+g
+
+BackupAsPDF(g, 'gsCiliaprots.boxplots', dimensions=c(9,6))
+
+
+#linear scale
+g <- ggplot(p.quant[gene %in% prots.oi & GROUP %in% groups.oi,], aes(x=probe,y=2^LogIntensities, fill=ligand_present)) +
+  geom_boxplot() +
+  geom_point(aes(fill = ligand_present), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge()) +
+  scale_fill_manual(values=c('Yes'='#FF4242', 'No'='#47abd8')) +
+  facet_wrap(~gene, scales='free_y') +
+  ggtitle('Ints. cilia assoc. proteins') +
+  ylab('Intensities') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+g
+BackupAsPDF(g, 'gsCiliaprots.linearScale.boxplots', dimensions=c(9,6))
+```
+
+Take these genes and produce barplots of each of the groups
+
+Want to just plot the average and plot the w/wo agonist beside each other in linear and log scale
+```{r}
+summary.dt <- p.quant[gene %in% prots.oi, .(gene, probe, ligand_present, stdDev=sd(newLogInts, na.rm=T), meanLogInts=mean(newLogInts, na.rm=T)), by=.(GROUP, Protein)] %>% 
+  unique()
+
+g <- ggplot(summary.dt[GROUP %in% c(groups.oi),], aes(x=probe, y=meanLogInts, fill=ligand_present)) +
+  geom_bar(position="dodge", stat='Identity') +
+ # geom_errorbar(aes(ymin=meanLogInts-stdDev, ymax=meanLogInts+stdDev, width=.2, position_dodge=0.6)) + 
+#  scale_fill_manual(values=c('Yes'='#FF4242', 'No'='#47abd8')) +
+  ggtitle('Cilia assoc. proteins expression') +
+  facet_wrap(~gene, scales='free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+BackupAsPDF(g, 'gsCiliaprots.logScale.barplot', dimensions=c(9,6))
+
+
+summary.dt <- p.quant[gene %in% prots.oi, .(gene, probe, ligand_present, stdDev=sd(2^newLogInts, na.rm=T), meanInts =mean(2^LogIntensities, na.rm=T)), by=.(GROUP, Protein)] %>% 
+  unique()
+
+g <- ggplot(summary.dt[GROUP %in% c(groups.oi),], aes(x=probe, y=meanInts, fill=ligand_present)) +
+  geom_bar(position="dodge", stat='Identity') +
+  scale_fill_manual(values=c('Yes'='#FF4242', 'No'='#47abd8')) +
+  ylab('Intensity') +
+  ggtitle('Cilia assoc. proteins expression') +
+  facet_wrap(~gene, scales='free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+BackupAsPDF(g, 'gsCiliaprots.linearScale.barplot', dimensions=c(9,6))
+
+
+mss.dt[gene == 'Smo' & Label == '+cilia_SMO_ag vs +cilia_SMO',]
+```
+
+Revisit the differential expresison analysis of ligands vs no ligands in the individual groups
+
+```{r}
+contrasts.oi <- c("+cilia_GPR161_ag vs +cilia_GPR161", "+cilia_SMO_ag vs +cilia_SMO", "+cilia_Pth2r_ag vs +cilia_Pth2r")
+
+sub.dt <- mss.dt[Label %in% contrasts.oi,]
+
+sub.dt[, sig := 'not']
+sub.dt[pvalue < 0.005, sig := ifelse(log2FC>0, 'up', 'down')]
+sub.dt[sig != 'not', .N, by=Label]
+
+sub.dt[, lab := ifelse(Protein %in% cilia.Consensus.prots, 'cilia markers', sig)]
+
+g <- ggplot(sub.dt[!is.infinite(-log10(adj.pvalue)),], aes(x=log2FC, y=-log10(pvalue), col=lab, label=gene)) +
+  geom_point(alpha=0.8) + 
+  geom_point(data=sub.dt[Protein %in% c(cilia.Consensus.prots),]) +
+  ylab('-log10 p-value') +
+  ggrepel::geom_text_repel(data=sub.dt[sig != 'not' & !is.infinite(-log10(adj.pvalue)),], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  ggtitle(paste0('Impact of ligand binding on cilia protein localization')) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#D01B1B', 'down'='#47abd8', 'not'='grey', 'cilia markers'='#5ec962')) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+g
+BackupAsPDF(g, 'ligandContrasts.volcanoplot', dimensions=c(12,5))
+```
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='BP', keyType='UNIPROT')
+```
+
+Speak to Ben tomorrow about this; not sure what to do with this data, asides from maybe clustering the proteins 
+```{r}
+# define the universe, the total set of identified genes in our study
+universe <- as.character(unique(p.quant$Protein))
+
+sub.dt[, enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(sub.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp', max_pAdjust = 0.1)
+simp.enrich$simplified
+
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified,
+                                groupColumn = 'enrich.grp', 
+                                title=paste0(x, ' GO Cellular Component'), 
+                                row_names_gp = gpar(fontsize = 7), 
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+```
+
+No significant enrichment and very few hits when dropping thresholds. Maybe need to look at clustering..
+First try rerunning DE analysis with reduced subset of the samples
+```{r}
+p.quant <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_26_ProteinLevelQuant.renorm.csv')
+dp.out <- readRDS('./062424_PWComparisons_data/2024_06_24_dp.out.rds')
+f.quant <- setDT(dp.out$FeatureLevelData)
+
+# add other annotation information
+p.quant[, cilia_present := ifelse(grepl('[-]cilia', GROUP), 'No', 'Yes')]
+p.quant[, ligand_present := ifelse(grepl('_ag|_In', GROUP), 'Yes', 'No')]
+p.quant[, probe := gsub("[-+]{1}cilia_|_ag{1}$|_In{1}$$",'', GROUP)]
+p.quant[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+
+
+# control for batch
+p.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+p.quant[, LogIntensities := newLogInts]
+f.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+
+
+groups.oi <- c("+cilia_SMO_ag", "+cilia_SMO", "+cilia_GPR161", "+cilia_GPR161_ag", "+cilia_Pth2r","+cilia_Pth2r_ag" )
+
+dp.out$FeatureLevelData <- f.quant[GROUP %in% groups.oi,]
+dp.out$ProteinLevelData <- p.quant[GROUP %in% groups.oi,]
+```
+
+Lets try subset the dp out results and rerun the differential testing. Failing that, we could convert to linear scale and perform clustering to identify genes with specific trends across these agonist groups?
+
+
+```{r}
+contrasts.list <- list('+cilia_Pth2r_ag vs +cilia_Pth2r' = data.table(V1="+cilia_Pth2r_ag", V2="+cilia_Pth2r"), # this is our general cilia probe
+                       '+cilia_SMO_ag vs +cilia_SMO' = data.table(V1='+cilia_SMO_ag', V2='+cilia_SMO'),
+                       '+cilia_GPR161_ag vs +cilia_GPR161' = data.table(V1='+cilia_GPR161_ag', V2='cilia_GPR161'))
+
+# looks good each row sums to 0
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(dp.out$ProteinLevelData$GROUP), 
+                               labels = names(contrasts.list))
+```
+
+Run the comparisons w/wo agonists
+
+```{r}
+# run msstats correcting for batch 
+mss <- groupComparison(contrast.matrix=contrasts.mat, 
+                       verbose=T,
+                       data=dp.out)
+
+
+mss.dt <- setDT(mss$ComparisonResult)
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=Label]
+mss.dt[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+
+mss.dt[, sig := 'not']
+mss.dt[pvalue < 0.005, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+
+fwrite(mss.dt, ScriptAndDatedFileName('mssLigand.pwcomparisons.csv'))
+fwrite(dcast(mss.dt, Protein+gene~Label, value.var = c('log2FC', 'pvalue', 'p.adj')), ScriptAndDatedFileName('mssligand.pwcomparisons.wide.csv'))
+```
+
+
+```{r}
+mss.dt[, label := ifelse(Protein %in% cilia.Consensus.prots, 'cilia markers', sig)]
+
+g <- ggplot(mss.dt[!is.infinite(-log10(adj.pvalue)),], aes(x=log2FC, y=-log10(pvalue), col=label, label=gene)) +
+  geom_point(alpha=0.8) + 
+  geom_point(data=mss.dt[Protein %in% c(cilia.Consensus.prots),]) +
+  ylab('-log10 p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[sig != 'not' & !is.infinite(-log10(adj.pvalue)),], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  ggtitle(paste0('Impact of ligand binding on cilia protein localization')) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#D01B1B', 'down'='#47abd8', 'not'='grey', 'cilia markers'='#5ec962')) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'ligandContrasts.repeat.volcanoplot', dimensions=c(12,5))
+```
+Lets try GO enrichment on this set of genes 
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='BP', keyType='UNIPROT')
+```
+
+```{r}
+mss.dt[, enrich.grp := interaction(Label,sig)]
+
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('GO.BP.ligandContrasts.csv'))
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp', max_pAdjust = 0.1)
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified,
+                                groupColumn = 'enrich.grp', 
+                                title=paste0('GO Biological Processes'), 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', colnames(simp.enrich$simplified), value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+
+BackupAsPDF(ht, 'GOBP.ligandBinder.heatmaps')
+```
+Other key question; can we use these samples to detect our GProteins from the analysis 
+First thing to do; look at all groups quickly, then subset to the specific groups we are looking at
+I also think I need to regenerate the barplots of these groups with the nex SE bars included
+```{r}
+summary.dt <- p.quant[gene %in% prots.oi, .(gene, probe, ligand_present, stdDev=sd(newLogInts, na.rm=T), meanLogInts=mean(newLogInts, na.rm=T)), by=.(GROUP, Protein)] %>% 
+  unique()
+
+g <- ggplot(summary.dt[GROUP %in% c(groups.oi),], aes(x=probe, y=meanLogInts, fill=ligand_present)) +
+  geom_bar(position="dodge", stat='Identity') +
+  geom_errorbar(aes(ymin=meanLogInts-stdDev, ymax=meanLogInts+stdDev), width=.2, position=position_dodge(.9)) + 
+  scale_fill_manual(values=c('Yes'='#FF4242', 'No'='#47abd8')) +
+  ggtitle('Cilia assoc. proteins expression') +
+  facet_wrap(~gene, scales='free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'gsCiliaprots.logScale.errBar.barplot', dimensions=c(9,6))
+
+
+# same plot in linear scale
+g <- ggplot(summary.dt[GROUP %in% c(groups.oi),], aes(x=probe, y=2^meanLogInts, fill=ligand_present)) +
+  geom_bar(position="dodge", stat='Identity') +
+  geom_errorbar(aes(ymin=2^(meanLogInts-stdDev), ymax=2^(meanLogInts+stdDev)), width=.2, position=position_dodge(.9)) + 
+  ylab('Intensity') +
+  scale_fill_manual(values=c('Yes'='#FF4242', 'No'='#47abd8')) +
+  ggtitle('Cilia assoc. proteins expression') +
+  facet_wrap(~gene, scales='free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'gsCiliaprots.linearScale.errBar.barplot', dimensions=c(9,6))
+
+# maybe a better selection
+new.prots.oi <- c('Prkaca', 'Pkd2', 'Arl3',  "Gli3", "Smo", "Arl13b")
+
+
+# maybe add a new set of proteins
+summary.dt <- p.quant[gene %in% new.prots.oi, .(gene, probe, ligand_present, stdDev=sd(newLogInts, na.rm=T), meanLogInts=mean(newLogInts, na.rm=T)), by=.(GROUP, Protein)] %>% 
+  unique()
+
+g <- ggplot(summary.dt[GROUP %in% c(groups.oi),], aes(x=probe, y=meanLogInts, fill=ligand_present)) +
+  geom_bar(position="dodge", stat='Identity') +
+  geom_errorbar(aes(ymin=meanLogInts-stdDev, ymax=meanLogInts+stdDev), width=.2, position=position_dodge(.9)) + 
+  scale_fill_manual(values=c('Yes'='#FF4242', 'No'='#47abd8')) +
+  ggtitle('Cilia assoc. proteins expression') +
+  facet_wrap(~gene, scales='free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'NewgsCiliaprots.logScale.errBar.barplot', dimensions=c(9,6))
+
+
+# same plot in linear scale
+g <- ggplot(summary.dt[GROUP %in% c(groups.oi),], aes(x=probe, y=2^meanLogInts, fill=ligand_present)) +
+  geom_bar(position="dodge", stat='Identity') +
+  geom_errorbar(aes(ymin=2^(meanLogInts-stdDev), ymax=2^(meanLogInts+stdDev)), width=.2, position=position_dodge(0.9)) + 
+  ylab('Intensity') +
+  scale_fill_manual(values=c('Yes'='#FF4242', 'No'='#47abd8')) +
+  ggtitle('Cilia assoc. proteins expression') +
+  facet_wrap(~gene, scales='free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'NewgsCiliaprots.linearScale.errBar.barplot', dimensions=c(9,6))
+```
+The goal here will be to determine G protein subunit enrichment vs de-enrichment in cilium. So far it looks like GNAS is de-enriched relative to GNAI3 (which is present but not obviously enriched).
+First lets look at:
+i) Heterotrimeric G protein subunits (GNXX in uniprot)
+ii) Downstream proteins of these GProtein interactions (maybe covered above, or do Aaron and Max need to provide some input on the returned list)
+
+Quick glance at the volcanoplots; no evidence of DE
+```{r}
+#"G protein-coupled receptor signaling pathway" 
+p.quant[grep('^Gn.+$', gene), unique(gene)]
+gp.subunits  <- c("Gnai2","Gna11","Gnaq","Gna12","Gna13", 'Gnl1', 'Gnb1', "Gnb2","Gnas", 'Gng5', 'Gnl3l', "Gns","Gnl3", "Gnl2", 'Gng12', 'Gnai3')
+
+
+mss.dt[, label := ifelse(Protein %in% cilia.Consensus.prots, 'cilia markers', 
+                         ifelse(gene %in% gp.subunits, 'G protein subunit', sig))]
+
+mss.dt$label %>%  unique() 
+
+g <- ggplot(mss.dt[!is.infinite(-log10(adj.pvalue)),], aes(x=log2FC, y=-log10(pvalue), col=label, label=gene)) +
+  geom_point(alpha=0.8) + 
+  geom_point(data=mss.dt[Protein %in% c(cilia.Consensus.prots) | gene %in% c(gp.subunits),]) +
+  ylab('-log10 p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[sig != 'not' & !is.infinite(-log10(adj.pvalue)),], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  ggtitle(paste0('Impact of ligand binding on cilia protein localization')) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#D01B1B', 'down'='#47abd8', 'not'='grey', 'cilia markers'='#5ec962', 'G protein subunit'='#414487FF')) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'ligandContrasts.repeat.volcanoplot', dimensions=c(12,5))
+```
+
+Now lets plot the heatmaps of these Gproteins in cilia+ samples
+
+```{r}
+p.quant$GROUP %>% unique()
+
+p.mat <- dcast(p.quant[!GROUP %like% 'GPR135', ], gene~paste0(GROUP,'.', SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='gene')
+
+p.quant[, probe := gsub("[-+]{1}cilia_|_ag{1}$|_In{1}$$",'', GROUP)]
+
+
+col.ann <- data.table(probe=gsub("[-+]{1}cilia_|[.]batch[.][1-5]$",'', colnames(submat)))
+colAnn <- HeatmapAnnotation(df=col.ann)
+
+
+# subset to the proteins we are interested in
+submat <- p.mat[rownames(p.mat) %in% gp.subunits, grepl('[+]cilia', colnames(p.mat))]
+colnames(submat) <- gsub("[.]batch", "", colnames(submat))
+# lots of zeros in matrix, so dont think median scaling is appropriate
+# convert to linear and NAs to 0, then get difference to row max
+submat <-  2^submat
+submat[is.na(submat)] <-  0
+
+submat <-  sweep(submat, 1, apply(submat, 1, max), FUN='/')
+
+
+hm <- Heatmap(submat,
+        col=viridis(100),
+        border = T,
+      #  top_annotation = colAnn,
+        name='Ints/Max Ints',
+        cluster_column_slices = T,
+        cluster_columns = F,
+        show_column_names = F,
+        column_split=gsub('^[+-]cilia_|[.][0-9]$','', colnames(submat)),
+        column_names_gp = gpar(fontsize=5),
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(submat))
+
+hm
+
+BackupAsPDF(draw(hm, column_title='G-protein expression profiles in ciliated cells'), 'Gproteins.cellLineSplit.heatmap', dimensions = c(11,6))
+```
+Not a lot of activity here in the groups we are interested in.. 
+Lets try another view of these ciliated proteins; split by group
+
+Look at all proteins;
+Not recovering evidence of Gprotein subunit expression
+```{r}
+p.mat <- dcast(p.quant[!GROUP %like% 'GPR135',], gene~paste0(GROUP,'.', SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='gene')
+
+col.ann <- data.table(cilia_present=ifelse(grepl('[+]cilia', colnames(p.mat)), 'yes', 'no'))
+colAnn <- HeatmapAnnotation(df=col.ann, col=list('cilia_present' = c('yes'='#4477AA', 'no'='#CCBB44')))
+
+# subset to the proteins we are interested in
+submat <- p.mat[rownames(p.mat) %in% gp.subunits,]
+colnames(submat) <- gsub("[.]batch", "", colnames(submat))
+# lots of zeros in matrix, so dont think median scaling is appropriate
+# convert to linear and NAs to 0, then get difference to row max
+submat <-  2^submat
+submat[is.na(submat)] <-  0
+
+submat <-  sweep(submat, 1, apply(submat, 1, max), FUN='/')
+
+hm <- Heatmap(submat,
+        col=viridis(100),
+        border = T,
+        top_annotation = colAnn,
+        name='Ints/Max Ints',
+        cluster_column_slices = T,
+        cluster_columns = F,
+        show_column_names = F,
+        column_split=gsub('^[+-]cilia_|[.][0-9]$','', colnames(submat)),
+        column_names_gp = gpar(fontsize=5),
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(submat))
+
+hm
+BackupAsPDF(draw(hm, column_title='G-protein expression profiles in all cells'), 'Gproteins.AllcellLineSplit.heatmap', dimensions = c(11,6))
+```
+Maybe look at some effectors of GPCR signalling; look at GO terms extract genes belonging to these GO terms and plot these genes as a heatmap
+
+Redo the barplots with the individual points; need to add the geom_point with the p.quant datatable
+
+```{r}
+summary.dt <- p.quant[gene %in% prots.oi, .(gene, probe, ligand_present, stdDev=sd(newLogInts, na.rm=T), meanLogInts=mean(newLogInts, na.rm=T), LogIntensities), by=.(GROUP, Protein)] %>% 
+  unique()
+
+# same plot in linear scale
+g <- ggplot(summary.dt[GROUP %in% c(groups.oi),], aes(x=probe, y=2^meanLogInts, fill=ligand_present)) +
+  geom_bar(position="dodge", stat='Identity', alpha=0.5) +
+  geom_point(aes(x=probe, y=2^LogIntensities), position=position_dodge(0.9), shape=21) +
+  scale_fill_manual(values=c('Yes'='#FF4242', 'No'='#47abd8')) +
+  ggtitle('Cilia assoc. proteins expression') +
+  ylab('Intensities') +
+  facet_wrap(~gene, scales='free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'gsCiliaprots.linearScale.IncPoints.barplot', dimensions=c(9,6))
+
+# maybe a better selection
+new.prots.oi <- c('Prkaca', 'Pkd2', 'Arl3',  "Gli3", "Smo", "Arl13b")
+
+# maybe add a new set of proteins
+summary.dt <- p.quant[gene %in% new.prots.oi, .(gene, probe, ligand_present, stdDev=sd(newLogInts, na.rm=T), meanLogInts=mean(newLogInts, na.rm=T), LogIntensities), by=.(GROUP, Protein)] %>% 
+  unique()
+
+# same plot in linear scale
+g <- ggplot(summary.dt[GROUP %in% c(groups.oi),], aes(x=probe, y=2^meanLogInts, fill=ligand_present)) +
+  geom_bar(position="dodge", stat='Identity') +
+  geom_point(aes(x=probe, y=2^LogIntensities), position=position_dodge(0.9), shape=21) +
+  scale_fill_manual(values=c('Yes'='#FF4242', 'No'='#47abd8')) +
+  ggtitle('Cilia assoc. proteins expression') +
+  ylab('Intensities') +
+  facet_wrap(~gene, scales='free') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'NewgsCiliaprots.linearScale.IncPoints.barplot', dimensions=c(9,6))
+```
+Query the proteins downstream of Gproteins; PKA and Gli
+
+```{r}
+dwnstr.effectors <- c("Gli2","Gli3","Prkar2b","Prkar1a", "Prkaca")
+# pull these proteins out of the expression matrix
+
+mss.dt[, label := ifelse(Protein %in% cilia.Consensus.prots, 'cilia markers', 
+                         ifelse(gene %in% gp.subunits, 'G protein subunit', 
+                                ifelse(gene %in% dwnstr.effectors, 'PKA/Gli protein', sig)))]
+
+#Label these things in the volcano plot
+g <- ggplot(mss.dt[!is.infinite(-log10(adj.pvalue)),], aes(x=log2FC, y=-log10(pvalue), col=label, label=gene)) +
+  geom_point(alpha=0.8) + 
+  geom_point(data=mss.dt[Protein %in% c(cilia.Consensus.prots) | gene %in% c(gp.subunits),]) +
+  ylab('-log10 p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[(sig != 'not' & !is.infinite(-log10(adj.pvalue))) | label %in% c('cilia markers','G protein subunit','PKA/Gli protein'),], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  ggtitle(paste0('Impact of ligand binding on cilia protein localization')) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#D01B1B', 'down'='#47abd8', 'not'='grey', 'cilia markers'='#5ec962', 'G protein subunit'='#414487FF', 'PKA/Gli protein'='#FDE725FF' )) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+g
+BackupAsPDF(g, 'ligandContrasts.allAnno.volcanoplot', dimensions=c(16,7))
+```
+
+Pth2r (maybe), GPR161 w/wo ag, SMO w/wo ag
+ARL13B not being recovered in basically any of the samples (?!)
+
+```{r}
+# subset to the proteins we are interested in
+submat <- p.mat[rownames(p.mat) %in% c(cilia.AM.prots, cilia.Consensus.prots),]
+
+# lots of zeros in matrix, so dont think median scaling is appropriate
+# convert to linear and NAs to 0, then get difference to row max
+submat <-  2^submat
+submat[is.na(submat)] <-  0
+
+submat <-  sweep(submat, 1, apply(submat, 1, max), FUN='/')
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+```
+
+
+Mark request: plot  ADCY proteins (ADCY1-9) and GNAL
+
+```{r}
+gene.oi <- c('Golf', 'Hg1o', 'Gna10','Galphaolf','2610011C15Rik', '9630020G10Rik')
+p.quant[gene %in% gene.oi]
+
+p.quant[grep('Adc', gene), unique(gene)]
+p.quant[Protein == 'P38405']
+
+
+p.quant$Protein %>%  unique() %>%  length
+
+p.quant[Protein == 'P38405',]
+
+p.quant[gene == 'Adcy6', .(meanInts = mean(newLogInts, na.rm=T), newLogInts, GROUP,SUBJECT), by=.(Protein,GROUP)]
+
+p.quant[, meanInts := mean(newLogInts, na.rm=T), by=.(Protein,GROUP)]
+
+g <- ggplot(p.quant[gene == 'Adcy6',], aes(x=GROUP, y=newInts, color=cilia_present, shape=ligand_present)) +
+  geom_point(aes(x=GROUP, y=newLogInts)) +
+  theme_classic() +
+  ggtitle('Adcy6') +
+  ylab('logIntensities') +
+  facet_wrap(~probe, scales='free') +
+  theme(axis.text.x = element_text(angle=90))
+g     
+BackupAsPDF(g, 'Adcy6.plot',dimensions=c(12,9))    
+```
+
+## 160924 
+remaining Mark plot requests
+ would you mind looking also for ADRBK1 and ADRBK2 (also called GRK2 and GRK3)?
+We would expect to see ADRBK2 and / or 3 to increase in Smo + agonist. I wonder if that is evident...
+Might be worth checking for other GRKs too, thy are a small family.  GRK1 - GRK7 I think
+```{r}
+genes.oi <- c('GRK2', 'GRK3', 'GRK1', 'GRK4', 'GRK5', 'GRK6', 'GRK6', 'ADRBK1', 'ADRBK2')
+prots.oi <- mh_mappings[Symbol.human %in% genes.oi, SWISS_PROT_IDs.mouse]
+
+p.quant[Protein %in% prots.oi, unique(Protein)]
+
+p.quant
+
+g <- ggplot(p.quant[gene == 'Grk2',], aes(x=GROUP, y=newLogInts, color=cilia_present, shape=ligand_present)) +
+  geom_point(aes(x=GROUP, y=newLogInts), size=2) +
+  theme_classic() +
+  scale_color_brewer(type='qual') +
+  ggtitle('Grk2') +
+  ylab('logIntensities') +
+  facet_wrap(~probe, scales='free') +
+  theme(axis.text.x = element_text(angle=90))
+g 
+BackupAsPDF(g, 'Grk2.plot',dimensions=c(12,9))   
+
+
+
+
+g <- ggplot(p.quant[gene == 'Grk2',], aes(x=GROUP, y=2^newLogInts, color=cilia_present, shape=ligand_present)) +
+  geom_point(aes(x=GROUP, y=2^newLogInts), size=2) +
+  theme_classic() +
+  scale_color_brewer(type='qual') +
+  ggtitle('Grk2') +
+  ylab('logIntensities') +
+  facet_wrap(~probe, scales='free') +
+  theme(axis.text.x = element_text(angle=90))
+g 
+BackupAsPDF(g, 'Grk2.plot',dimensions=c(12,9))  
+```
+
+
+I think based on the expression of these proteins, we can consider the following groups interesting: SMO, SMO_ag, Pth2r, Pth2r_ag, GPR161, GPR161_ag
+
+
+Not used..
+I repeated the analysis subsetting to the ligand groups and the standard error (calculated rowwise I guess on the input matrix?) is much lower in the ligand subset, 
+I think this is ok as we dont want noise from the other samples impacting the SE calculation and thrashing the Pval recoveries
+```{r}
+mss.dt <- fread('./070224_newPWComparisons_data/2024_07_03_all.mss.pwComparisons.csv')
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+
+agContrasts <- c("+cilia_SMO_ag vs +cilia_SMO", "+cilia_GPR161_ag vs +cilia_GPR161", "+cilia_Pth2r_ag vs +cilia_Pth2r")
+
+
+
+# ony 2-3 pass thresholds and these are quite low..
+
+
+# guess we need to drop the thresholds; try FC 50% and p.adj 0.1 tomorrow
+
+
+
+#complicated fitlering. basically if present in boht and passes threholds or passes threshold and absent in one condition its significant,  
+mss.dt[Label %in% agContrasts & ((p.adj < 0.05 & abs(log2FC) > log2(1.5)) | issue == 'oneConditionMissing' & (denominatorCounts == 3 | numeratorCounts ==3)),  sig := ifelse(log2FC > 0, 'up', 'down')]
+mss.dt[Label %in% agContrasts & ((p.adj < 0.05 & abs(log2FC) > log2(1.5)) | issue == 'oneConditionMissing' & (denominatorCounts == 3 | numeratorCounts ==3)), ]
+
+```
+Need to plot barplot of some gold standards: ARL13B and some other clear standouts above
+Also, lets plot the above heatmaps
+
+
+Look at the outputs of the two plots
+
+```{r}
+mss.dt <- fread('./070224_newPWComparisons_data/2024_07_03_all.mss.pwComparisons.csv')
+
+g <- ggplot(mss.dt[!is.infinite(-log10(adj.pvalue)),], aes(x=log2FC, y=-log10(pvalue), col=sig, label=gene)) +
+  geom_point(alpha=0.8) +
+  ylab('-log10 p-value') +
+  #ggrepel::geom_text_repel(data=mss.dt[sig != 'not' & !is.infinite(-log10(adj.pvalue)),], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  ggtitle(paste0('Impact of ligand binding on cilia protein localization')) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#D01B1B', 'down'='#47abd8', 'not'='grey', 'cilia markers'='#5ec962')) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+g
+
+
+mss.dt
+
+mss.dt[gene =='Ift88' & Label =='+cilia_SMO_ag vs +cilia_SMO',]
+```
+

@@ -1,0 +1,701 @@
+---
+title: "070824_NMFdeconvolution"
+author: "Martin Gordon"
+date: "2024-07-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+A clear issue with the dataset I'm looking at is the signal is dominated by ER stress response... suggests many of the proteins we find DE are localized to the ER, perhaps due to misfolding...
+My aim here is to identify interesting proteins that remain after NMF detrending for this ER response. I would like to supply DE genes from previous DE analysis for 'guided' NMF to find factor(s) that correlate with this, and subtract this from our ori Matrix, rerun the DE analysis and see if we detect more cilia related proteins
+
+Setting r here to define the number of local communities we think exist in the data (32 is definitely too much.. do we expect the different probes in non-ciliated cells to have different community or a 'random' one?, maybe more accurate is the number of probes +/- ligand)
+
+
+
+
+Can think of W here as our metaGenes
+
+# load relevant libraries
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(ggrepel)
+library(RColorBrewer)
+library(scales)
+library(cluster) # pam clustering of genes\
+library(NMF)
+
+#source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("../../utils/bp_utils/LinearModels.R") #linear models for testing the coefficients
+
+source ("../../utils/bp_utils/NMF_Helpers.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+Read in the p.quant data (renormalized)
+
+```{r}
+p.quant <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_26_ProteinLevelQuant.renorm.csv')
+
+p.mat <- dcast(p.quant, Protein~paste0(GROUP,'.',SUBJECT), value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+# add other annotation information
+p.quant[, cilia_present := ifelse(grepl('[-]cilia', GROUP), 'No', 'Yes')]
+p.quant[, ag_present := ifelse(grepl('_ag|_In', GROUP), 'Yes', 'No')]
+p.quant[, probe := gsub("[-+]{1}cilia_|_ag{1}$|_In{1}$$",'', GROUP)]
+
+p.quant[,.N, by=.(ag_present, cilia_present, probe,GROUP)]
+```
+
+## Preprocess our expression data
+
+For now trying the BP functions: convert to linear scale and remove proteins with less than 50% completeness
+```{r}
+linear.mat <- PrepareProteinLinearMat(p.quant,
+                        dcast.formula = Protein~paste0(GROUP,'.',SUBJECT), logIntColumn  = "newLogInts")
+
+
+View(PrepareProteinLinearMat)
+```
+
+Heatmap of the input matrix
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(k=12)
+
+# create annotation df
+ann <- data.table(group = colnames(linear.mat))
+ann[, cilia_present := ifelse(grepl('-cilia', group), 'No', 'Yes')]
+ann[, ligand_present := ifelse(grepl('_In[.][0-9]{1}$|_ag[.][0-9]{1}$', group), 'Yes', 'No')]
+ann[, probe := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', group)]
+ann[, batch := str_extract(group, '[0-9]$')]
+
+# uniqu col palette
+names(col.pal) <- unique(ann$probe)  
+
+
+colours <- list('cilia_present' = c('Yes' = '#4477AA', 'No'="#CCBB44"),
+                'ligand_present' = c('Yes' = '#EE6677', 'No'='#228833'),
+                'batch' = c('1'=muted('green'), '2'=muted('yellow'), '3'=muted('pink'), '4'=muted('orange')),
+                'probe' = col.pal)
+      
+colAnn <- HeatmapAnnotation(df = ann[,.(probe,cilia_present, ligand_present,batch)], col= colours)
+
+hm <- Heatmap(linear.mat, 
+        show_row_names = F,
+        top_annotation = colAnn,
+        row_title = sprintf('%s proteins', nrow(linear.mat)),
+        name='Ints/max Ints',
+        column_names_gp = gpar(fontsize=6),
+        col = c("white", "#5ec962"))
+
+hm
+#BackupAsPDF(hm, 'input.linear.matrix', dimensions = c(10,8))
+```
+Goal is to capture the factors explaining the ER localization. From our DE results, lets identify proteins associated with ER stress response, and see if we can remove this
+
+Get the ER and cilia gene sets
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+cilia.go <- gmt.go[ont == 'cilium', unique(gene)]
+
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='BP', keyType='UNIPROT')
+ER.go <- gmt.go[ont %like% 'response to endoplasmic reticulum stress', unique(gene)]
+
+# read in our sig results
+mss.dt <- fread('./070224_newPWComparisons_data/2024_07_03_all.mss.pwComparisons.csv')
+
+# good at least there isnt a lot of overlap in the gene sets... hopefully a different trend across the samples
+
+# high moving ER stress associated genes. I want to use these genes as a subset to 'fit' to 
+ER.assoc <- mss.dt[(abs(log2FC) > 1 & p.adj < 0.05 & Protein %in% ER.go), unique(Protein)]
+
+# this is our truth set. We want to keep these in our data
+cilia.assoc <- mss.dt[(abs(log2FC) > 1 & p.adj < 0.05 & Protein %in% cilia.go), unique(Protein)]
+
+# couple of overlapping prots: in the sets. Remove these
+ER.assoc <- ER.assoc[which(!ER.assoc %in% cilia.assoc)]
+
+```
+
+Now we have our high Conf gene sets, annotate our heatmap with these genes
+At a quick glance this looks ok; seems that the 
+```{r}
+
+# adjust the heatmap annotation
+colAnn <- HeatmapAnnotation(df = ann[,.(cilia_present)], col= colours, annotation_name_side = "left")
+
+# creating our annotation heatmaps
+cilia_bar <- rownames(linear.mat) %in% cilia.assoc
+ER_bar <- rownames(linear.mat) %in% ER.assoc
+names_bar <- rownames(linear.mat) %in% c(cilia.assoc, ER.assoc)
+
+hm <- Heatmap(linear.mat, 
+        show_row_names = F,
+        show_column_names = F,
+        cluster_columns = F,
+        cluster_column_slices = F,
+        top_annotation = colAnn,
+        row_title = sprintf('%s proteins', nrow(linear.mat)),
+        name='Ints/max Ints',
+        column_split = list(gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(submat))),
+        column_title_gp = gpar(fontsize=10, fontface='bold'),
+        col = c("white", "firebrick")) +
+  # barplot annotations
+   Heatmap(cilia_bar + 0, name = "Cilium proteins", col = c("0" = "white", "1" = '#5ec962'), border=T,
+        show_heatmap_legend = FALSE, width = unit(4, "mm"), column_names_gp = gpar(fontsize=8, fontface='bold'), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm"))  +
+    Heatmap(ER_bar + 0, name = "Response to ER stress", col = c("0" = "white", "1" = '#414487FF'), border=T,
+        show_heatmap_legend = FALSE, width = unit(4, "mm"), column_names_gp = gpar(fontsize=8, fontface='bold'), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), # gives row index of the items in names_bar
+                                  labels = multiUniprots2multiGenes(rownames(linear.mat)[names_bar], species='MOUSE'),
+                                  labels_gp = gpar(fontsize = 5.5), padding = unit(0.1, "mm"))) 
+
+BackupAsPDF(hm, 'input.linear.anno.matrix', dimensions = c(15,13))
+
+
+# look at all proteins in both geneSets; do they tend to cluster seperately?
+cilia_bar <- rownames(linear.mat) %in% cilia.go
+ER_bar <- rownames(linear.mat) %in% ER.go
+names_bar <- rownames(linear.mat) %in% c(cilia.go, ER.go)
+
+hm <- Heatmap(linear.mat, 
+        show_row_names = F,
+        show_column_names = F,
+        row_title = sprintf('%s proteins', nrow(linear.mat)),
+        name='Ints/max Ints',
+        column_split = list(gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(submat)),
+                                grep('[+-]{1}cilia', gsub('[_].+$','', colnames(submat)), value = T ) ),
+        column_title_gp = gpar(fontsize=6),
+        col = c("white", "firebrick")) +
+  # barplot annotations
+   Heatmap(cilia_bar + 0, name = "Cilium proteins", col = c("0" = "white", "1" = '#5ec962'), border=T,
+        show_heatmap_legend = FALSE, width = unit(4, "mm"), column_names_gp = gpar(fontsize=10, fontface='bold'), column_gap = unit(0.01, "cm"), gap = unit(0.1, "cm"))  +
+    Heatmap(ER_bar + 0, name = "Response to ER stress", col = c("0" = "white", "1" = '#414487FF'), border=T,
+        show_heatmap_legend = FALSE, width = unit(4, "mm"), column_names_gp = gpar(fontsize=10, fontface='bold'), column_gap = unit(0.01, "cm"), gap = unit(0.1, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), # gives row index of the items in names_bar
+                                  labels = multiUniprots2multiGenes(rownames(linear.mat)[names_bar], species='MOUSE'),
+                                  labels_gp = gpar(fontsize = 4), padding = unit(0.1, "mm"))) 
+
+hm
+BackupAsPDF(hm, 'input.linear.allGOanno.matrix', dimensions = c(14,10))
+```
+Check out submats that look at both seperately
+
+```{r}
+# drop batch not interesting
+colAnn <- HeatmapAnnotation(df = ann[,.(probe,cilia_present, ligand_present)], col= colours)
+
+submat <- linear.mat[rownames(linear.mat) %in% ER.go,]
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+hm <- Heatmap(submat, 
+        show_row_names = T,
+        clustering_distance_rows = 'pearson',
+        top_annotation = colAnn,
+        row_title = sprintf('%s proteins', nrow(submat)),
+        name='Ints/max Ints',
+        column_names_gp = gpar(fontsize=7),
+        row_names_gp = gpar(fontsize=5),
+        column_title_gp = gpar(fontsize=6), 
+        column_split = list(gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(submat)),
+                                grep('[+-]{1}cilia', gsub('[_].+$','', colnames(submat)), value = T ) ),
+        col = c("white", "firebrick"))
+
+BackupAsPDF(draw(hm,column_title='ER stress associated protein profiles'), 'ERstress.assoc.heatmap',  dimensions=c(15,13))
+
+submat <- linear.mat[rownames(linear.mat) %in% cilia.go,]
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+
+
+hm <- Heatmap(submat, 
+        show_row_names = T,
+        cluster_columns = F,
+        cluster_column_slices = F,
+        top_annotation = colAnn,
+        show_column_names = F,
+        clustering_distance_rows = 'pearson',
+        row_title = sprintf('%s proteins', nrow(submat)),
+        name='Ints/max Ints',
+        column_split = list(gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(submat))),
+        row_names_gp = gpar(fontsize=7),
+        column_names_gp = gpar(fontsize=7),
+        column_title_gp = gpar(fontsize=10, fontface='bold'),
+        col = c("white", "firebrick"))
+
+BackupAsPDF(draw(hm,column_title='cilium associated proteins'), 'cilia.assoc.heatmap', dimensions=c(15,13))
+```
+Run NMF on our input matrix
+# key points are we need to filter out rows with lots of missingness and we need (??) to handle rows with little variance (to reduce runtime)
+# not enough rank to accurately recapture the trends in the data
+
+```{r}
+View(doParallelNMF_BG)
+nmf.out <- doParallelNMF_BG(linear.mat, ranks=1:32, numIterations = 24, numProc = 12)
+# check if process is running... 
+nmf.res <- nmf.out$get_result()
+```
+save the NMF output to file
+```{r}
+#saveRDS(nmf.res, ScriptAndDatedFileName("nmf.firstPass.rds"))
+```
+
+# read in the NMF results tomorrow and visualize the output, find the factor that explains the ER stress response and subtract(?) from the input matrix
+
+```{r}
+nmf.out <- readRDS('~/Documents/projects/061324_XFang_Cilia_GPCR/070824_NMFdeconvolution_data/2024_07_09_nmf.firstPass.rds')
+```
+
+plot the heatmaps from the NMF output
+Plot the heatmaps of the NMF output and see if we can find a rank r that acts as a good fit, but doesn't overfit the data (ie fit to noise..)
+
+```{r}
+for (i in 1:32){
+  hm <- PlotNMFHeatmap(nmf.out[[i]], originalMatrix = linear.mat, 
+                       column_names_gp = gpar(fontsize=7),
+                       column_title_gp = gpar(fontsize=6), 
+                       column_split = list(gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(linear.mat)),
+                                grep('[+-]{1}cilia', gsub('[_].+$','', colnames(linear.mat)), value = T ) ))
+  hc <- row_dend( draw(hm))
+  
+  hm
+  # we do this to get the clustering of the 'full' matrix
+  hm <- PlotNMFHeatmap(nmf.out[[i]], originalMatrix = NULL, 
+                       column_names_gp = gpar(fontsize=7),
+                       column_title_gp = gpar(fontsize=6), 
+                       show_row_names=F,column_split = list(gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(linear.mat)),
+                                grep('[+-]{1}cilia', gsub('[_].+$','', colnames(linear.mat)), value = T ) ), cluster_rows= hc)
+
+  BackupAsPDF(draw(hm), sprintf('%s.basisVec.heatmap', i), dimensions = c(20,16))
+}
+```
+
+Looking at this its clear we have 
+```{r}
+# fitted model
+nmf.out[[1]]@fit
+
+#fitted matrix
+Heatmap(fitted(nmf.out[[8]])) + Heatmap(fitted(nmf.out[[3]]))
+```
+
+
+How to determine a suitable r? 
+
+plot the residuals of NMF output and look for the elbow
+Seems I've greatly overestimated the number of ranks needed to fit the data; less than 10 seems suitable
+
+```{r}
+res.dt <- sapply(seq_along(nmf.out), function(x){
+  res.vec <-  nmf.out[[x]]@residuals
+  names(res.vec) = sprintf('%s.rank', x)
+  return(res.vec)
+}) %>% as.data.table(., keep.rownames=T)
+
+g <- ggplot(res.dt, aes(x=fct_inorder(rn), y=res.vec)) +
+  geom_bar(stat='Identity') +
+  ylab('residuals') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+```
+
+Write function to extract NMF QC metrics for each run and store as a datatable
+
+```{r}
+nmf.qual.dt <- sapply(seq_along(nmf.out), function(x){
+  return(summary(nmf.out[[x]], target=linear.mat)) # provide target for additional summary metrics
+}) %>% 
+  t() %>% 
+  reshape2::melt(., id.vars ='rank') %>% 
+  as.data.table()
+
+g <- ggplot(nmf.qual.dt[!Var2 %in% c('nrun', 'cpu.all', 'cpu', 'rank') ], aes(x=Var1, y=value, color=Var2)) +
+  geom_point() +
+  geom_line(aes(group = Var2)) +
+  facet_wrap(~Var2, scales='free_y') +
+  scale_x_continuous(breaks=seq(1,32, 1)) +
+  theme_bw()
+
+g
+```
+To calculate the quality metrics, lets rerun NMF, using nmfEstimate rank 
+```{r}
+# run in parallel with 8 cores (fails if not possible)
+estim.r <- nmfEstimateRank(linear.mat, 2:12, nrun=10, .opt='8')
+
+BackupAsPDF(plot(estim.r), 'rank.qc.metric.linechart', dimensions=c(12,10))
+```
+Going with ranks 4-6 based on cophenetic cor best score and rss elbow
+
+Now, check out the best looking ranks, regenerate the heatmaps, identify what the basis vectors are associated with (GSEA ranked by metagene contribution)
+For this we want to plot the fitted mat beside the ori and preserve the clustering order and annotate the rows with the geneSets of interest
+
+
+```{r}
+colAnn <- HeatmapAnnotation(df = ann[,.(probe,cilia_present, ligand_present)], col= colours)
+
+# creating our annotation heatmaps; all genes annotated to these sites
+cilia_bar <- rownames(linear.mat) %in% cilia.go
+ER_bar <- rownames(linear.mat) %in% ER.go
+names_bar <- rownames(linear.mat) %in% c(cilia.go, ER.go)
+
+
+# create the ori heatmap
+ori.hm <-  Heatmap(linear.mat, 
+             show_row_names = F,
+             show_column_names = F,
+             cluster_columns = F,
+             cluster_column_slices = F,
+             column_title_gp=gpar(fontsize=6),
+             row_title = sprintf('%s proteins', nrow(linear.mat)),
+             name='Ints/max Ints',
+             column_split = list(gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(linear.mat)),
+                                grep('[+-]{1}cilia', gsub('[_].+$','', colnames(linear.mat)), value = T ) ),
+             col = colorRamp2(c(0,1), c("white", "firebrick"))) +
+                # add anno heatmaps
+             Heatmap(cilia_bar + 0, name = "Cilium proteins", col = c("0" = "grey", "1" = '#5ec962'), border=T,
+                    show_heatmap_legend = FALSE, width = unit(4, "mm"), column_names_gp = gpar(fontsize=8, fontface='bold'), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm"))  +
+             Heatmap(ER_bar + 0, name = "Response to ER stress", col = c("0" = "grey", "1" = '#414487FF'), border=T,
+                    show_heatmap_legend = FALSE, width = unit(4, "mm"), column_names_gp = gpar(fontsize=8, fontface='bold'), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm")) +
+             rowAnnotation(link = anno_mark(at = which(names_bar), # gives row index of the items in names_bar
+                                  labels = multiUniprots2multiGenes(rownames(linear.mat)[names_bar], species='MOUSE'),
+                                  labels_gp = gpar(fontsize = 4), padding = unit(0.1, "mm"))) 
+
+hc <- row_dend(draw(ori.hm))
+chc <- column_dend(draw(ori.hm))
+
+```
+Check out the W (metagene matrix- basis vec) and H matrices (coef matrix)
+
+```{r}
+extractNMFFeatures <- function(oriMat=linear.mat, nmfObj){
+  
+  # extract featureScores (main contributors to the metaGene)
+  featScores <- extractFeatures(nmfObj)
+  
+  # name list components
+  names(featScores) <- sprintf('%s.metaGene', seq_along(featScores))
+  
+  # create a dt of each feature names of each big contributor to the metagene
+  lapply(names(featScores), function(i){
+  
+  dt = data.table(metaGene=i,
+                  rowID=featScores[[i]],
+                  rowFeatures=rownames(oriMat)[featScores[[i]] ])
+  return(dt)
+  # combine as a dt
+  }) %>%  rbindlist()
+}
+```
+
+extract the genes contributing to the metagenes
+Why so few genes contributing? some summary stat over rows of basis vectors I guess?
+Maybe not a good method to extract...
+Keep simple; just take the basis matrix, order by gene contribution and run GSEA on this
+```{r}
+lapply(seq_along(nmf.out), function(x){
+  
+  s = featureScore(nmf.out[[x]])
+  summary(s)
+  
+  s = extractFeatures(nmf.out[[x]])
+  return(Reduce(rbind,s))
+})
+
+seq(1:ncol(test))
+```
+
+plot a heatmap of the rank6 metagene enrichment
+
+Lets go with 4 first and select the 
+```{r}
+for (i in 4:10){
+  
+  hm <- PlotNMFHeatmap(nmf.out[[i]], originalMatrix = NULL, 
+                       column_names_gp = gpar(fontsize=3),
+                       column_title_gp = gpar(fontsize=6), 
+                       cluster_rows=hc,
+                       show_row_names=F,
+                       show_column_names=F,
+                       column_split = list(gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(linear.mat)),
+                                grep('[+-]{1}cilia', gsub('[_].+$','', colnames(linear.mat)), value = T ) ))
+    
+  BackupAsPDF(draw(hm + ori.hm), sprintf('%s.rank.MmoothvsOri.heatmap', i), dimensions=c(40,18))
+  
+}
+
+#subplot of just the interesting protein groups
+
+for (i in 4:10){
+  
+  hm <- PlotNMFHeatmap(nmf.out[[i]], originalMatrix = NULL, 
+                       column_names_gp = gpar(fontsize=3),
+                       column_title_gp = gpar(fontsize=6), 
+                       cluster_rows=hc,
+                       show_row_names=F,
+                       show_column_names=F,
+                       column_split = list(gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(linear.mat)),
+                                grep('[+-]{1}cilia', gsub('[_].+$','', colnames(linear.mat)), value = T ) ))
+    
+  BackupAsPDF(draw(hm + ori.hm), sprintf('%s.rank.MmoothvsOri.heatmap', i), dimensions=c(40,18))
+  
+}
+
+```
+
+Lets go with the 6 metagene basis vector on principal of inflection point on rss 
+
+Identify if any of the metagenes are enriched for cilia
+Looks like metagene 6 may be enriched for cilia, but much more heavily enriched for plasma membrane... try more basis vectors
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType = 'UNIPROT')
+
+test <- nmf.out[[6]]@fit@W
+colnames(test) <- sprintf('%s.metaGene', seq(1:ncol(test)))
+
+rank6.enrich <- matrixFGSEA(test, sets=gmt.go)
+
+rank12.enrich[group == '6.metaGene' & padj,][order(padj)]
+
+View(simplifyEnrichBySimilarUniverseMembership)
+
+simplifyEnrichBySimilarUniverseMembership(rank6.enrich[,-c('Count')], 
+                                          groupColumn = 'group',
+                                          gmt=gmt.go)
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = rank6.enrich, 
+                                groupColumn = 'group', 
+                                topN = 8,
+                                title=paste0(x, ' GO Cellular Component'), 
+                                row_names_gp = gpar(fontsize = 7), 
+                              # negCols=unique(grep('down', simp.enrich$simplified[Label %in% labels.oi, enrich.grp], value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+# BackupAsPDF(ht, paste0(x, '.GOCC.enrich.allprots.heatmap'), dimensions = c(11,12))
+```
+
+Assessed a couple of vectors 4-6 seem most promising..
+```{r}
+test <- nmf.out[[5]]@fit@W
+colnames(test) <- sprintf('%s.metaGene', seq(1:ncol(test)))
+
+rank5.enrich <- matrixFGSEA(test, sets=gmt.go)
+
+
+# group 2 with cell projection and cilia the dominant componenets; seems to be PM region
+rank4.enrich[pathway %like% 'cili' & padj < 0.05,]
+rank4.enrich[group == '2.metaGene' & padj < 0.05,][order(padj)]
+
+
+rank6.enrich[group == '6.metaGene' & padj < 0.05,][order(padj)]
+
+rank5.enrich[group == '2.metaGene' & padj < 0.05,][order(padj)]
+```
+
+Identify if any of the metagenes are enriched for cilia
+Looks like metagene 6 may be enriched for cilia
+Ranks 4-6 enriched. Go with 5 for now as more sig terms than 6
+
+Lets simplify the enrichment membership and plot these enrichments
+
+```{r}
+setnames(rank5.enrich, old=c('pathway','padj'), new=c('ID','p.adjust'), skip_absent = T)
+
+rank5.enrich[, geneID := gsub(',','/',leadingEdge)]
+rank5.enrich
+
+simplified.dt <- simplifyEnrichBySimilarUniverseMembership(rank5.enrich, 
+                                          groupColumn = 'group',
+                                          gmt=gmt.go)
+
+
+rank5.enrich[ID %like% 'cili' & p.adjust < 0.05,]
+
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simplified.dt$simplified, 
+                                groupColumn = 'group', 
+                                topN = 8,
+                                title=paste0(x, ' GO Cellular Component'), 
+                                row_names_gp = gpar(fontsize = 7), 
+                              # negCols=unique(grep('down', simp.enrich$simplified[Label %in% labels.oi, enrich.grp], value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+# BackupAsPDF(ht, paste0(x, '.GOCC.enrich.allprots.heatmap'), dimensions = c(11,12))
+```
+Write out the enrichment results
+
+```{r}
+#fwrite(rank4.enrich, ScriptAndDatedFileName('rank4.GOCC.enrichment.csv'))
+#fwrite(rank5.enrich, ScriptAndDatedFileName('rank5.GOCC.enrichment.csv'))
+#fwrite(rank6.enrich, ScriptAndDatedFileName('rank6.GOCC.enrichment.csv'))
+```
+Read in enrichment output and lets see if we can recover the enrichment results
+
+Todo: Write a function to visualize GSEA heatmaps
+
+```{r}
+rank4.enrich <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/070824_NMFdeconvolution_data/2024_07_11_rank4.GOCC.enrichment.csv')
+rank5.enrich <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/070824_NMFdeconvolution_data/2024_07_11_rank5.GOCC.enrichment.csv')
+rank6.enrich <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/070824_NMFdeconvolution_data/2024_07_11_rank6.GOCC.enrichment.csv')
+
+rank4.enrich[, geneID := gsub('[|]', ',', leadingEdge)]
+# need a count of 'hits' in the geneSet... for now, use size of the leading edge set
+rank4.enrich[, Count := length(unlist(strsplit(geneID, ','))),  by=seq_len(nrow(rank4.enrich))]
+rank4.enrich[, c('Description', 'ID') := pathway]
+
+rank4.simplify <- simplifyEnrichBySimilarUniverseMembership(rank4.enrich, gmt=gmt.go, groupColumn = 'group')
+
+rank5.mat <- dcast(rank5.simplify$simplified, ID~group, value.var = 'p.adjust') %>% 
+  as.matrix(rownames='ID')
+colnames(rank5.mat)  <- sprintf('factor %s', seq_along(colnames(rank5.mat)))
+
+rank5.count <- dcast(rank5.simplify$simplified, ID~group, value.var = 'Count') %>% 
+  as.matrix(rownames='ID')
+colnames(rank5.mat)  <- sprintf('factor %s', seq_along(colnames(rank5.mat)))
+
+hm <- Heatmap(-log10(rank5.mat), 
+        border=T,
+        name='-log10(p.adj)',
+        show_column_names = F,
+        column_split = colnames(rank5.mat),
+        row_names_gp=gpar(fontsize=6),
+        column_title_gp = gpar(fontsize=12, fontface='bold'),
+        col=colorRamp2(breaks=c(0,8), colors=c('#2600D1FF', '#D60C00FF')))
+hm
+BackupAsPDF(draw(hm, column_title='Basis vectors GSEA enrichment (GO CC)'), dimensions=c(8,8))
+```
+
+Run lm on the coefficients  
+```{r}
+coef.dt <- reshape2::melt(coefficients(nmf.out[[5]]))
+setnames(coef.dt, new=c('basisVector', 'sample', 'coefficient'))
+
+coef.dt[, ]
+```
+
+
+Todo; try the new NMF package 'supervised NMF' and see if we can provide a strong cilia signal and identify other proteins with a similar signal (annoying as we are kind of finding what we are looking for, but maybe not much else to do at this stage..)
+
+
+
+
+## For tomorrow....
+Find our list of proteins to use for supervised NMF fitting
+
+```{r}
+# lets set an even higher threshold for significance for ER stress response
+submat <- linear.mat[rownames(linear.mat) %in% ER.assoc,]
+
+clust.id <- pam(submat, k=3)$clustering
+
+hm <- Heatmap(linear.mat[rownames(linear.mat) %in% ER.assoc,], 
+        show_row_names = T,
+        clustering_distance_rows = 'pearson',
+        top_annotation = colAnn,
+        name='Ints/max Ints',
+        column_names_gp = gpar(fontsize=7),
+        row_names_gp = gpar(fontsize=5),
+        column_title_gp = gpar(fontsize=6), 
+        row_split = clust.id,
+        col = c("white", "firebrick"))
+hm
+
+# get the proteins to use for the NMF fitting
+fit.prots <- extractClustersfromHeatmap(draw(hm),submat) %>% 
+  .[cluster == '2', unique(feature)]
+```
+
+
+
+
+ok, now just to test lets, run a nmf 'supervised' fit to our ER response proteins
+
+```{r}
+NormalizeToNonEndogenousBiotin(p.quant,
+                               biotin.carboxylases = fit.prots, # fit to our ER response proteins
+                               dcast.formula = Protein~paste0(GROUP,'.',SUBJECT), logIntColumn  = "newLogInts"))
+```
+
+ ### TOdo...
+
+Take the heatmap with the sig associated cilia proteins, cluster, extract prot names from cluster and use this for the 'supervised' NMF
+
+```{r}
+coef.dt <- setDT(reshape2::melt(coefficients(nmf.out[[5]])))
+setnames(coef.dt, new=c('basisVector', 'sample', 'coefficient'))
+
+coef.dt[, c('GROUP', 'SUBJECT') :=  tstrsplit(sample, '[.]', keep = c(1,2))]
+coef.dt[, probe := gsub('[+-]{1}cilia_|[.][0-9]{1}','', GROUP)]
+coef.dt[, cilia_present := ifelse(grepl('[+]cilia', GROUP), 'yes', 'no')]
+coef.dt[, agonist_present := ifelse(grepl('_ag|_Ih', GROUP), 'yes', 'no')]
+coef.dt[, ligand_present := ifelse(grepl('_ag|_In', GROUP), 'yes', 'no')]
+coef.dt[, ligand := ifelse(grepl('_ag|_In', GROUP), str_extract(GROUP,'ag$|In$'), 'no')]
+coef.dt[, bait := gsub('_ag$|_In$', '', probe)]
+
+# new col for input to lm
+coef.dt[, group := ifelse(grepl('[-]c', GROUP), gsub('[-]c', 'negC', GROUP), gsub('[+]c', 'posC', GROUP) )]
+```
+
+linear model on NMF factors
+```{r}
+# lets tidy the names of the different groups 
+lm.out <- linearModelsAllProteins(coef.dt, 
+                        formulaList = list(full=coefficient~group+SUBJECT),
+                        splitColumn ='basisVector',
+                        emmeansFormula = pairwise~group)
+
+openxlsx::write.xlsx(lm.out, ScriptAndDatedFileName("lm.BatchplusGroup.xlsx"))
+```
+
+```{r}
+lm.out$contrast[, c('num', 'denom') := tstrsplit(contrast, ' [-] ', keep=c(1,2))]
+
+# all contrasts; seem to be finding some signifcant comparisons... are most of this significant hits due to probe differences etc?
+ggplot(lm.out$contrast, aes(x=p.t)) + geom_histogram(binwidth = 0.01)
+```
+filter our hits to isolate just the contrasts we want
+
+```{r}
+unique(lm.out$contrast$contrast)
+
+contrasts.oi <- grep('posCilia.+ [-] posCilia_PM$',unique(lm.out$contrast$contrast), value=T)
+contrasts.oi <- grep('_ag|_Ih',contrasts.oi, invert=T, value=T)
+
+
+lm.out$contrast[contrast %in% contrasts.oi & basisVector == 2,]
+
+ggplot(lm.out$contrast[contrast %in% contrasts.oi & basisVector == 2,], aes(x=p.t)) + geom_histogram()
+lm.out$contrast[contrast %in% contrasts.oi & p.t < 0.05,]
+```
+
+
+
+I think we want to rerun this analysis and filter out the negCilia bg... inflating the DF and not sure what this is adding to the analysis... comparisons v similar to the other groups

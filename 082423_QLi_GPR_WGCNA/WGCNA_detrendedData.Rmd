@@ -1,0 +1,953 @@
+---
+title: "WGCNA_detrendedData"
+author: "Martin Gordon"
+date: "2023-10-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## DARPA WGCNA detrended data
+
+Goal is to highlight functional clusters of genes from the detrended data; ideally want to highlight the things interactiing with the receptors rather than just trafficked and detected by the proximity labelling proceedure
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(WGCNA)
+library(magrittr)
+library(preprocessCore) # quantile normalisation
+library(stringr)
+library(readxl)
+library(randomcoloR)
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+
+```
+
+Read in the detrended data and find all the sig sites
+Want sites significant before and after detrending
+
+```{r}
+spatial.detrended <- read_xlsx('./docs/2023_02_03_ElevenReceptorResults_SpatialDetrendWillChange.xlsx', sheet = 2) %>% 
+  as.data.table()
+#spatial.detrended[, adj.pvalue := p.adjust(pvalue, method='BH')]
+
+prots.oi <- spatial.detrended[sigBeforeDetrending != 'not' & pvalue < 0.05 & abs(log2FC) > 0.58, unique(Protein)]
+```
+
+Read in protein intensity data and process as initally performed
+
+```{r}
+# read in exp data
+p.quant <- fread('data/2022_08_17_ProteinLevelData.lib.csv.gz')
+```
+
+
+```{r}
+# fix the groups with an underscore in them MOR_LG and MOR_DAMGO to MOR.DAMGO
+p.quant[, GROUP := gsub ("_([A-Z])", ".\\1", GROUP)]
+# add some new identifier cols
+p.quant[, `:=`(timeStr = str_extract(GROUP,'[0-9]{2}$'),
+               receptor = gsub("_[0-9]{2}$", '', p.quant$GROUP)
+               )]
+```
+
+Does this data need a second round of normalisation?
+Assumption is the data is normalised
+```{r}
+group.noi <- p.quant[!GROUP %like% c("DOR|KOR|MOR|MRX2|MRX4|NK1R|NPFFR1|NPY1R|PTGER1|PTGER4|QRFPR|DOR"),unique(GROUP)]
+group.noi
+
+p.quant <- p.quant[!GROUP %in% group.noi, ]
+p.quant <- p.quant[!GROUP %like% "MOR.LG94",]
+
+p.quant$GROUP %>%  unique()
+p.quant$GROUP %>%  unique()
+
+# change MOR DAMGO to just MOR
+p.quant[GROUP %like% "MOR.DAMGO", GROUP := sub("\\.DAMGO", "", GROUP)]
+```
+
+```{r}
+g <- ggplot(p.quant, aes(x=interaction(GROUP,SUBJECT), y=LogIntensities, fill=receptor)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90))
+g
+#BackupAsPDF(g, 'intensity.boxplots.')
+```
+generate matrix of sig detrended proteins and remove those missing in more than 33% of the data 
+losing about a dozen proteins if filtereing on NA
+```{r}
+p.mat <- dcast(p.quant, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>%  as.matrix(rownames="Protein")
+
+# jsut select the detrended proteins
+p.mat <- p.mat[rownames(p.mat) %in% prots.oi,]
+
+p.mat %>%  dim()
+
+# remove proteins with many missing values
+p.mat <- p.mat[which(rowMeans(!is.na(p.mat)) > 0.66), ] # only keep prots present in 2/3 of the dataset
+
+
+# if filtering here, what are the lost proteins
+dropped.prots <- prots.oi[!prots.oi %in% rownames(p.mat)]
+multiUniprots2multiGenes(dropped.prots)
+```
+
+```{r}
+clusterwNa <- function(mat, na.val=0, ...){
+  
+  mat[is.na(mat)] <- na.val
+  return(hclust(dist(mat)))
+}
+
+hm <- Heatmap(p.mat, cluster_rows = T, cluster_columns = F, na_col = 'darkgrey', column_split = tstrsplit(colnames(p.mat), '_', keep=1), row_title=sprintf('%s sig detrended proteins ', nrow(p.mat)), show_row_names = F, column_names_gp = gpar(fontsize=5), column_title_gp = gpar(fontsize = 8))
+
+hm
+
+BackupAsPDF(draw(hm,column_title=sprintf("%d proteins detrended WGCNA input ", nrow(p.mat)),
+           column_title_gp=grid::gpar(fontsize=16)), 'wgcna.input.', dimensions = c(9,12)) 
+```
+how many proteins have all cases? drop to 508 if we want no missing values of 734 if not allowing missing values..
+
+```{r}
+Heatmap(p.mat.f[complete.cases(p.mat),], cluster_rows = T, cluster_columns = F, na_col = 'grey', column_split = tstrsplit(colnames(p.mat), '_', keep=1), row_title=sprintf('%s proteins', nrow(p.mat[complete.cases(p.mat),])))
+
+sum(rownames(p.mat[complete.cases(p.mat),]) %in% prots.oi)
+```
+
+For WGCNA input Normalise vs T0 and correct for batch 
+
+```{r}
+setorder(p.quant, receptor, Protein, timeStr)
+
+p.quant[, batchControlled := LogIntensities - median(LogIntensities, na.rm = TRUE), by = .(Protein, receptor, SUBJECT)]
+p.quant[, vsTimeZero := batchControlled - mean(batchControlled[timeStr == timeStr[!is.na(batchControlled)][1] ]), by = .(Protein, receptor)]
+
+p.mat <- dcast(p.quant, Protein~GROUP+SUBJECT, value.var = 'vsTimeZero') %>%  as.matrix(rownames="Protein")
+
+p.mat <- p.mat[rownames(p.mat) %in% prots.oi & !rownames(p.mat) %in% dropped.prots,]
+```
+
+```{r}
+hm <- Heatmap(p.mat, cluster_rows = T, cluster_columns = F, na_col = 'darkgrey', column_split = tstrsplit(colnames(p.mat), '_', keep=1), row_title=sprintf('%s proteins', nrow(p.mat)), name='vs T0', show_row_names = F, column_names_gp = gpar(fontsize=3), column_title_gp = gpar(fontsize = 8))
+hm
+
+BackupAsPDF(draw(hm,column_title="Detrended sig proteins vs T0 WGCNA input"), dimensions = c(9,12)) 
+```
+Lets cluster columns and see how the data breaks out
+Seems that timepoint and receptor seem to be key drivers of expression
+
+```{r}
+batch <- str_extract(colnames(p.mat), 'batch.*')
+receptor <- gsub('_[0-9]{2}_batch.[0-9]{2}', '', colnames(p.mat))
+timeStr <- str_extract(colnames(p.mat), '00|30|05|01|10')
+  
+HA <- HeatmapAnnotation(batch = batch, receptor = receptor, time = timeStr)
+
+hm <- ComplexHeatmap::Heatmap(p.mat, 
+                        cluster_rows = clusterwNa(p.mat),
+                        cluster_columns = T,
+                        show_row_names = F,
+                        column_names_gp = gpar(fontsize=4),
+                        top_annotation = HA)
+
+hm
+BackupAsPDF(draw(hm, column_title='clustering of WGCNA input (vs T0, batch corrected)'), '11recept.tmpnorm.noNAs.heatmap', dimensions = c(12,9))
+```
+PCA plot to assess sample clustering. How does this look vs T0
+508 Proteins used as input 
+
+```{r}
+
+log2(10)
+
+subMat <- p.mat[complete.cases(p.mat),]
+#colnames(subMat)[!colnames(subMat) %like% "_00_"]
+# transpose as want to use genes 
+pcaOut <- prcomp(t(subMat))
+
+colInfo <- data.table(colname = colnames(subMat))
+colInfo[,c("receptor", "time", "batch") := tstrsplit(colname, "[_]", keep = c(1,2,3)) ] # v useful fucntion
+
+title <- "PCA"
+
+colInfo
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color=batch, shape=time)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=receptor), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut)))
+p
+#BackupAsPDF(p, "PCA.complete.proteins.batch")
+
+
+#plot first two components
+# looks like PC5 might respond to batch. enough to worry about removign?
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color=receptor, shape=time)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=receptor), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut)))
+p
+#BackupAsPDF(p, "PCA.complete.proteins.receptor")
+
+```
+Remove the T0 points and plot the rest
+
+```{r}
+subMat <- subMat[, !colnames(subMat) %like% "_00_"]
+
+pcaOut <- prcomp(t(subMat))
+
+colInfo <- data.table(colname = colnames(subMat))
+colInfo[,c("receptor", "time", "batch") := tstrsplit(colname, "[_]", keep = c(1,2,3)) ] # v useful fucntion
+
+title <- "PCA"
+
+colInfo
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color=batch, shape=time)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=receptor), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut)))
+p
+#BackupAsPDF(p, "PCA.complete.proteins.vsT0.batch")
+
+
+#plot first two components
+# looks like PC5 might respond to batch. enough to worry about removign?
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color=receptor, shape=time)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=receptor), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut)))
+p
+#BackupAsPDF(p, "PCA.complete.proteins.vsT0.receptor")
+```
+TODO replot with better shapes and colors
+
+
+```{r}
+receptor.pal <- randomcoloR::distinctColorPalette(length(unique(receptor)))
+
+
+#plot first two components
+# looks like PC5 might respond to batch. enough to worry about removign?
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color=receptor, shape=time)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=receptor), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  scale_color_manual(values = receptor.pal) +
+  scale_shape_manual(values = c(21,22,23,24)) +
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut)))
+p
+#BackupAsPDF(p, "PCA.complete.proteins.vsT0.receptor")
+
+
+```
+
+```{r}
+
+#Group data in a dendogram to check outliers
+sampleTree = hclust(dist(t(p.mat)), method = "average")
+
+
+pdf(file = "./GPCR_WGCNA_data/sampleClustering.pdf", width = 12, height = 9); 
+par(cex = 0.6)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering", sub="", xlab="", cex.lab = 1.5, 
+     cex.axis = 1.5, cex.main = 2)
+#Plot a line showing the cut-off
+abline(h = 56, col = "red") #This value of 31000 was chosen based on my data, you need to check the best value to your data
+
+dev.off()
+```
+
+Now that we have looked at the samples, lets checkout the genes we have selected
+```{r}
+gsg <- goodSamplesGenes(t(p.mat))
+summary(gsg)
+gsg$allOK
+```
+```{r}
+net.in <- t(p.mat)
+
+s.thres <- data.table(pickSoftThreshold(net.in)$fitIndices)
+
+s.thres %>%  
+  ggplot(aes(x=Power, y=SFT.R.sq)) + 
+  geom_point() +
+  geom_hline(yintercept = 0.9, color='darkred') +
+  labs(y="Scale Free Topology Model Fit, signed R^2") +
+  theme_classic()
+
+s.thres %>%  
+  ggplot(aes(x=Power, y=mean.k.)) + 
+  geom_point() +
+  labs(y='Mean Connectivity') +
+  theme_classic() 
+
+s.thres
+```
+Raise to power of 6 as R^2 > .8 and seems to level off
+
+```{r}
+softPower = 6 ##R^2 of .8 and highest connectivity,
+adj.mat = adjacency(net.in, power = softPower, corFnc = 'bicor', type = "signed") #Calculating the adjacency matrix
+#help(adjacency )
+
+dim(adj.mat)
+```
+Define the topological overlap matrix
+
+```{r}
+TOM <- TOMsimilarity(adj.mat)
+```
+Generate heatmaps of both modules before proceeding 
+
+```{r}
+Heatmap(adj.mat, cluster_rows = T, cluster_columns=T, column_title = 'adjacency matrix', row_title=sprintf('%s proteins', nrow(p.mat)), show_row_names = F, show_column_names = F)
+#BackupAsPDF(hm, 'adj.mat.st7.')
+Heatmap(TOM, cluster_rows = T, cluster_columns=T, column_title = 'TOM similiary', row_title=sprintf('%s proteins', nrow(p.mat)), show_row_names = F, show_column_names = F)
+#BackupAsPDF(hm, 'tom.mat.st7.')
+```
+
+Generate the modules
+5 Modules recovered 
+
+```{r}
+TOM.dissimilarity <- 1-TOM
+adj.dissimilarity <- 1-adj.mat
+
+#creating the dendrogram 
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average") 
+
+Modules <- cutreeDynamic(dendro = geneTree, distM =TOM.dissimilarity, deepSplit = 4, pamRespectsDendro = FALSE, minClusterSize = 20)
+table(Modules)
+
+# convert the module genes to a character vector
+modules.tom <- as.character(Modules)
+modules.tom 
+```
+
+Module gene heatmap
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(length(unique(modules.tom)))
+
+# add wgcna module annotation
+row_ha <- rowAnnotation(wgcna.modules=modules.tom, col=list(wgcna.modules = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3], '4'=col.pal[4], '5'=col.pal[5])))
+
+# add split order
+split <- factor(modules.tom, levels=c('1','2','3','4','5'))
+split
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+         #show_row_names = FALSE,
+         split = split,
+         right_annotation = row_ha,
+         name = "log2(intensity/\nmean(timeZero))",
+         column_split = tstrsplit(colnames(p.mat), "[_.]")[[1]],
+         na_col = 'darkgrey',
+         row_title =sprintf("%d Proteins",
+                            nrow(p.mat)),
+         row_names_gp = gpar (fontsize= 1),
+         column_names_gp = gpar (fontsize= 3),
+         cluster_row_slices = F,
+         column_title_gp = gpar (fontsize= 7))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+hm
+BackupAsPDF(hm, 'heatmap.wgcna.modules.ordered', dimensions = c(9,12))
+```
+The five clusters do look to have distinct expression patterns (maybe not final cluster as a little more noisy...)
+
+Write out the cluster genes to file
+```{r}
+table(modules.tom)
+
+clust.genes <- extractClustersfromHeatmap(hm, p.mat)
+
+fwrite(clust.genes, './WGCNA_detrendedData_data/wgcna.moduleGenes.csv')
+```
+
+Run enrichment on the clusters
+Using all prots measured in exp as input
+Modules not as well distinguished as previous data
+ 
+```{r}
+# helper functions including script to extract heatmap genes
+source("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+
+# change clusterID to factor and order
+clust.genes[, cluster := factor(cluster, levels=c('1', '2', '3', '4', '5'))]
+clust.genes[, Gene := multiUniprots2multiGenes(feature)]
+
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# our background? only genes used for WGCNA analysis
+#universe <- multiUniprots2multiGenes(rownames(p.mat))
+universe <- p.quant[, multiUniprots2multiGenes(unique(Protein))]
+
+
+enrich.dt <- enricherOnGroups(clust.genes, groupColumns = 'cluster', geneColumn = "Gene", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'cluster')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'cluster.x', topN = 8, title='GO enrichment WGCNA modules', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 8, cluster_columns =F)
+
+
+BackupAsPDF(ht, 'go.enrichment.wgcna.modules.top8', dimensions=c(8,12))
+```
+validate the enrichment results and that these proteins are within the 5 modules.
+ooks quite similiar to earlier run, but maybe more focused? Worth repeating the whole cytoscape enrichment plots?
+
+linecharts of median expression per receptor; also look at Gprotein correlations
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+Can we split the clusters more? Seems pretty robust to this cluster size
+Try rerun with larger power thresholding and allow smmaller module sizes
+
+Using these thresholds we create another module, assess enrichments and plot
+
+```{r}
+softPower = 12 ##R^2 of .8 and highest connectivity,
+adj.mat = adjacency(net.in, power = softPower, corFnc = 'bicor', type = "signed") #Calculating the adjacency matrix
+#help(adjacency )
+
+```
+Define the topological overlap matrix
+
+```{r}
+TOM <- TOMsimilarity(adj.mat)
+```
+```{r}
+Heatmap(adj.mat, cluster_rows = T, cluster_columns=T, column_title = 'adjacency matrix', row_title=sprintf('%s proteins', nrow(p.mat.f)), show_row_names = F, show_column_names = F)
+#BackupAsPDF(hm, 'adj.mat.st7.')
+Heatmap(TOM, cluster_rows = T, cluster_columns=T, column_title = 'TOM similiary', row_title=sprintf('%s proteins', nrow(p.mat.f)), show_row_names = F, show_column_names = F)
+#BackupAsPDF(hm, 'tom.mat.st7.')
+```
+```{r}
+TOM.dissimilarity <- 1-TOM
+adj.dissimilarity <- 1-adj.mat
+
+#creating the dendrogram 
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average") 
+
+Modules <- cutreeDynamic(dendro = geneTree, distM =TOM.dissimilarity, deepSplit = 4, pamRespectsDendro = FALSE, minClusterSize = 15)
+table(Modules)
+
+# convert the module genes to a character vector
+modules.tom <- as.character(Modules)
+modules.tom %>%  table()
+```
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(length(unique(modules.tom)))
+
+# add wgcna module annotation
+row_ha <- rowAnnotation(wgcna.modules=modules.tom, col=list(wgcna.modules = c("0"='grey',"1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3], '4'=col.pal[4], '5'=col.pal[5], '6'=col.pal[6])))
+
+# add split order
+split <- factor(modules.tom, levels=c('0','1','2','3','4','5','6'))
+split
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+         #show_row_names = FALSE,
+         split = split,
+         right_annotation = row_ha,
+         name = "log2(intensity/\nmean(timeZero))",
+         column_split = tstrsplit(colnames(p.mat), "[_.]")[[1]],
+         na_col = 'darkgrey',
+         row_title =sprintf("%d Proteins",
+                            nrow(p.mat)),
+         row_names_gp = gpar (fontsize= 1),
+         column_names_gp = gpar (fontsize= 3),
+         cluster_row_slices = F,
+         column_title_gp = gpar (fontsize= 7))
+
+hm <- draw(hm, column_title="WGCNA clusters (adj.mat threshold = ^12)",
+           column_title_gp=grid::gpar(fontsize=10))
+hm
+BackupAsPDF(hm, 'heatmap.wgcna.modules.adj.matThresh12.', dimensions = c(9,12))
+```
+Extract these cluster geens and plot 
+
+```{r}
+clust.genes <- extractClustersfromHeatmap(hm, p.mat)
+
+#fwrite(clust.genes, './WGCNA_detrendedData_data/wgcna.moduleGenes.csv')
+```
+14-11-23
+----
+Not sure if this is the correct datasets, but prepare for later review
+Want to compare the impact of detrending on the data 
+For the sig genes we used as input for wgcna network construction, create a scatterplot of log2FC values of detrended vs standard
+
+Taking all significant hits in the detrended and non-detrended data
+Look for things that fall off the diagonal
+
+```{r}
+detrended.clust.genes <-  fread('./WGCNA_detrendedData_data/wgcna.moduleGenes.csv')
+detrended.clust.genes[,.N,by=.(cluster)]
+
+# spatially detrended data
+spatial.detrended <- read_xlsx('./docs/2023_02_03_ElevenReceptorResults_SpatialDetrendWillChange.xlsx', sheet = 2) %>% 
+  as.data.table()
+
+detrended.prots.oi <- spatial.detrended[sigBeforeDetrending != 'not' & pvalue < 0.05 & abs(log2FC) > 0.58, unique(Protein)]
+```
+
+Read in the standard dataset ts results
+
+```{r}
+# read in non-detrended
+mss <- fread('data/2022_08_31_NiceFitsPower3.csv')
+```
+
+what are the number of DEGs per receptor?
+
+```{r}
+mss[receptor != 'MOR.LG94' & gene %in% std.prots.oi & pvalue < 0.05 & abs(log2FC) > 0.58, .N, by=.(receptor)] %>% 
+  ggplot(., aes(x=reorder(receptor,-N), y=N, fill = receptor)) + 
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  theme_classic()
+  
+```
+original WGCNA clustering information; extract the sig genes that were used in the clustering, look at their profiles in the detrended data
+
+```{r}
+wgcna.clusters <- fread('./output/wgcna.clustergenes.adjmat.csv')
+setnames(wgcna.clusters, new=c('gene', 'cluster'))
+         
+std.prots.oi <- mss[receptor != "MOR.LG94" & gene %in% wgcna.clusters$gene, unique(gene)]
+
+length(detrended.prots.oi)
+length(std.prots.oi)
+```
+per receptor, plot the log2FC of that data from the trended and detrended for the input proteins in WGCNA
+- split the two datasets per receptor, iterate through them and add the detrended data to the default dt
+
+```{r}
+default.mss.list <- mss[receptor != "MOR.LG94"] %>%  
+  .[receptor == 'MOR.DAMGO', receptor := sub(".DAMGO", "", receptor)] %>% 
+  split(., .$receptor)
+
+detrended.mss.list <-  spatial.detrended[receptor != "MOR.LG94"] %>%  
+  .[receptor == 'MOR.DAMGO', receptor := sub(".DAMGO", "", receptor)] %>% 
+  split(., .$receptor)
+
+# sanity check
+identical(names(detrended.mss.list),names(default.mss.list))
+
+receptors.oi <-  names(default.mss.list)
+
+# add identifier to the two datasets
+comb.mss.list <- lapply(receptors.oi, function(x){
+  
+ comb.dt  <- default.mss.list[[x]][detrended.mss.list[[x]], `:=`(detrended.log2FC = i.log2FC, 
+                                                      detrended.pvalue = i.pvalue), on=c('gene','gene')] 
+ return(comb.dt)
+  
+})
+
+names(comb.mss.list) <-  names(default.mss.list)
+
+# sanity check.. looks good
+#comb.mss.list$DOR[gene %in% c('SNX12', 'SNX3', 'EEA1'), .(gene,log2FC,pvalue, detrended.log2FC, detrended.pvalue)]
+#default.mss.list$DOR[gene %in% c('SNX12', 'SNX3', 'EEA1'), .(gene,log2FC,pvalue)]
+#etrended.mss.list$DOR[gene %in% c('SNX12', 'SNX3', 'EEA1'), .(gene,log2FC,pvalue)]
+```
+
+iterate through the receptors, plotting the log2FC for all sig results per receptor
+
+lable things off the diagonal ; biggest movers
+Label the 30 things with biggest change in input vs detrended data
+These things above the diagonal line are the trafficking-associated proteins, not of interest and want to remove from the dataset
+
+```{r}
+lapply(seq_along(receptors.oi), function(x,y,i){
+  
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <- y[[recept]][receptor == recept & pvalue < 0.05 & abs(log2FC) > 0.58, gene]
+  
+  y[[recept]][receptor == recept & gene %in% genes.oi, delta.log2FC := log2FC-detrended.log2FC]
+  
+  y[[recept]][,lab := '']
+  y[[recept]][order(-abs(delta.log2FC))[1:30], lab := gene]
+  
+  g <- ggplot(data=y[[recept]][receptor == recept & gene %in% genes.oi,], aes(x=detrended.log2FC, y=log2FC, label=gene)) + 
+    geom_point() +
+    geom_density2d() +
+    ggrepel::geom_text_repel(aes(label=lab)) +
+    geom_abline(slope=1, intercept = 0, linetype=3, alpha=0.6) +
+    ggtitle(paste0(recept, ' all significant results')) +
+    theme_bw()
+  
+},x=receptors.oi, y=comb.mss.list)
+
+```
+plot of the significant detrended hits
+
+```{r}
+lapply(seq_along(receptors.oi), function(x,y,i){
+  
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <-  spatial.detrended[receptor == recept & sigBeforeDetrending != 'not' & pvalue < 0.05 & abs(log2FC) > 0.58, unique(gene)]
+  
+  y[[recept]][,lab := '']
+  y[[recept]][order(-abs(delta.log2FC))[1:20], lab := gene]
+  
+  ggplot(data=y[[recept]][receptor == recept & gene %in% genes.oi,], aes(x=detrended.log2FC, y=log2FC, label=gene)) + 
+    geom_point() +
+    geom_density2d() +
+    ggrepel::geom_text_repel(aes(label=gene)) +
+    geom_abline(slope=1, intercept = 0, linetype=3, alpha=0.6) +
+    ggtitle(paste0(recept, ' significant detrended results')) +
+    theme_bw()
+  
+},x=receptors.oi, y=comb.mss.list)
+```
+of these detrended sig results, how many are still related to trafficking?
+lets pull in endosome-trafficking trafficking related genesets for testing
+
+```{r}
+library(msigdbr)
+
+sets.oi <-  c('GOBP_EARLY_ENDOSOME_TO_GOLGI_TRANSPORT', 'GOBP_ENDOSOMAL_TRANSPORT', 'GOBP_ENDOSOME_TO_PLASMA_MEMBRANE_PROTEIN_TRANSPORT', 'GOBP_ENDOSOME_TO_LYSOSOME_TRANSPORT')
+
+endosome.transport.genes <- msigdbr(category='C5', subcategory='GO:BP') %>% 
+  data.table() %>% 
+  .[gs_name %in% sets.oi, unique(human_gene_symbol)]
+```
+
+color by trafficking genes
+Looking at this, seems distributions of trafficking overlap with other
+
+```{r}
+
+lapply(seq_along(receptors.oi), function(x,y,i){
+  
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <-  spatial.detrended[receptor == recept & sigBeforeDetrending != 'not' & pvalue < 0.05 & abs(log2FC) > 0.58, unique(gene)]
+  
+  # aes for plot
+  y[[recept]][,lab := '']
+  y[[recept]][order(-abs(delta.log2FC))[1:20], lab := gene]
+  y[[recept]][, endo.trafficking := ifelse( gene %in% endosome.transport.genes, 'yes', 'no')]
+  
+  g <- ggplot(data=y[[recept]][receptor == recept & gene %in% genes.oi,], aes(x=detrended.log2FC, y=log2FC, label=gene, color=endo.trafficking)) + 
+    geom_point() +
+    geom_density2d() +
+    scale_color_manual(values=c('yes'='darkred', 'no'='black')) +
+    ggrepel::geom_text_repel(aes(label=gene)) +
+    geom_abline(slope=1, intercept = 0, linetype=3, alpha=0.6) +
+    ggtitle(paste0(recept, ' significant detrended results')) +
+    theme_bw()
+  
+  #BackupAsPDF(g, paste0(recept,'.log2FC.detrended.vs.ori.endotrafficking.scatterplots.'))
+  
+},x=receptors.oi, y=comb.mss.list)
+```
+lets color the points by the location specific APEX results
+Find list of location specific protein changes & identify those with a large log2FC in each condition
+
+164 proteins significant in this dataset; presuming this is the 
+think(??) this is FC with location specific APEX relative to bg
+```{r}
+cytoRefs <- fread('https://raw.githubusercontent.com/kroganlab/bp_utils/master/data/2023_08_03_Dar25.28.29_LocationReference_CytoContrasts.csv')
+cytoRefs[, gene := multiUniprots2multiGenes(Protein)]
+cytoRefs
+cols.oi <- c('Cyto - Endo.C19', 'Cyto - GalT', 'Cyto - LAMT', 'Cyto - PM') 
+
+# is this correctly collapsing the remaing parts of the datatable 
+cytoRefs.long <-  cytoRefs[, .(Protein, gene, melt(.SD)), .SDcols = cols.oi]
+
+
+# lets find any location specific large (log FC > 1) movers; 
+#location.prots <-  cytoRefs.long[abs(value) > 1, unique(gene)]
+location.prots <-  cytoRefs[,unique(gene)]
+
+# dont make threshold
+cytoRefs[!gene %in% location.prots, unique(gene)]
+```
+lets color the plots by these location specific trends; are they moving significantly
+
+```{r}
+lapply(seq_along(receptors.oi), function(x,y,i){
+  
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <-  spatial.detrended[receptor == recept & sigBeforeDetrending != 'not' & pvalue < 0.05 & abs(log2FC) > 0.58, unique(gene)]
+  
+  # aes for plot
+  y[[recept]][,lab := '']
+  y[[recept]][order(-abs(delta.log2FC))[1:20], lab := gene]
+  y[[recept]][, location.specific := ifelse( gene %in% location.prots, 'yes', 'no')]
+  
+  g <- ggplot(data=y[[recept]][receptor == recept & gene %in% genes.oi,], aes(x=detrended.log2FC, y=log2FC, label=gene, color=location.specific)) + 
+    geom_point() +
+    #geom_density2d() +
+    scale_color_manual(values=c('yes'='red', 'no'='darkgrey')) +
+    ggrepel::geom_text_repel(aes(label=gene)) +
+    geom_abline(slope=1, intercept = 0, linetype=3, alpha=0.6) +
+    ggtitle(paste0(recept, ' significant detrended results')) +
+    theme_bw()
+  
+    BackupAsPDF(g, paste0(recept,'.log2FC.detrended.vs.ori.locationSpecificHighlighted.scatterplots.'))
+  
+},x=receptors.oi, y=comb.mss.list)
+```
+look at histogram of residuals for the location specific and non-location specific
+
+bland-altman plot: are there systematic biases in the distribution? plot mean log2FC along the x axis and 
+the delta between log2FC on the y: is there systematic bias in the values (high or low more noisy?)
+
+```{r}
+
+```
+
+
+
+what does the absolute difference distribution look like between the log2FC values per receptor?
+For now plot all sig genes
+abs view looks like to could also be direction; lets separate
+```{r}
+lapply(seq_along(receptors.oi), function(x,y,i){
+
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <- y[[recept]][receptor == recept & pvalue < 0.05 & abs(log2FC) > 0.58, gene]
+
+  ggplot(data=y[[recept]][receptor == recept & gene %in% genes.oi,], aes(x=abs(delta.log2FC))) + 
+    geom_histogram(bins=50) +
+    ggtitle(paste0(recept, ' detrended log2FC - log2FC')) +
+    theme_bw()
+  
+},x=receptors.oi, y=comb.mss.list)
+```
+this is the difference in fold change values
+mixture of 3 models? + w detrended, - w detrended, unchanged (interesting!)
+```{r}
+lapply(seq_along(receptors.oi), function(x,y,i){
+
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <- y[[recept]][receptor == recept & pvalue < 0.05 & abs(log2FC) > 0.58, gene]
+
+  
+  ggplot(data=y[[recept]][receptor == recept & gene %in% genes.oi,], aes(x=delta.log2FC)) + 
+    geom_histogram(bins=50) +
+    ggtitle(paste0(recept, ' detrended log2FC - log2FC')) +
+    theme_bw()
+  
+},x=receptors.oi, y=comb.mss.list)
+
+
+
+lapply(seq_along(receptors.oi), function(x,y,i){
+
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <- y[[recept]][receptor == recept & pvalue < 0.05 & abs(log2FC) > 0.58, gene]
+
+  
+  ggplot(data=y[[recept]][receptor == recept & gene %in% genes.oi,], aes(x=delta.log2FC)) + 
+    geom_histogram(bins=50) +
+    ggtitle(paste0(recept, ' detrended log2FC - log2FC')) +
+    theme_bw()
+  
+},x=receptors.oi, y=comb.mss.list)
+```
+
+
+```{r}
+genesOI <-  spatial.detrended[sigBeforeDetrending != 'not' & pvalue < 0.05 & abs(log2FC) > 0.58, unique(gene)]
+receptor.col.pal <-  distinctColorPalette(k=length(receptors.oi))
+
+g <-  rbindlist(comb.mss.list, idcol = T) %>% 
+  .[gene %in% genesOI,] %>% 
+  ggplot(., aes(x=delta.log2FC, fill=.id)) +
+  geom_histogram(bins=40) + 
+  ggtitle('detrended.log2FC vs ori.log2FC') +
+  facet_wrap(~.id, scales='free') +
+  scale_fill_manual(values = c(receptor.col.pal) ) +
+  theme_classic()
+
+BackupAsPDF(g, 'deltaLog2FC.receptors.histogram.', dimensions=c(10,8))
+
+```
+
+Are these data normally distributed?
+kolmogorov-smirnov test for normality - compare the (CDF) of a normal distribution to our data
+Using this non-parametric test as interested in shape of the distirbutions comparison as well as location (mean)
+None of our data (save perhaps one ) is normally distrbuted..
+
+Due to this, I don't want to take SD of the data directly
+
+```{r}
+print(receptors.oi)
+
+lapply(seq_along(receptors.oi), function(x,y,i){
+
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <- y[[recept]][receptor == recept & pvalue < 0.05 & abs(log2FC) > 0.58, gene]
+
+  test.data <-  y[[recept]][receptor == recept & gene %in% genes.oi,delta.log2FC]
+
+  ks.test(test.data, 'pnorm')
+
+},x=receptors.oi, y=comb.mss.list)
+```
+
+
+lm and look at residuals to identify points worth removing
+are we overfitting to points falling off-diagonal? maybe use all shared points or all sig in ori data instead?
+Think this is something BP can contribute to, so don't waste more time and park where it is for now
+
+```{r}
+lapply(seq_along(receptors.oi), function(x,y,i){
+  
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <- y[[recept]][receptor == recept & pvalue < 0.05 & abs(log2FC) > 0.58, gene]
+  
+  qplot(x=y[[recept]][receptor == recept & gene %in% genes.oi,]$detrended.log2FC, y=y[[recept]][receptor == recept & gene %in% genes.oi,]$log2FC) +
+    stat_smooth(method='lm') +
+    ggtitle(recept) +
+    xlab('detrended log2FC') +
+    ylab('log2FC') +
+    theme_classic()
+
+},x=receptors.oi, y=comb.mss.list)
+```
+
+
+histogram of log2FC and detrended log2FC for absolute fold change values
+
+```{r}
+lapply(seq_along(receptors.oi), function(x,y,i){
+
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <- y[[recept]][receptor == recept & pvalue < 0.05 & abs(log2FC) > 0.58, gene]
+
+  
+  ggplot() + 
+    geom_histogram(data=y[[recept]][receptor == recept & gene %in% genes.oi], aes(x=abs(log2FC), fill='pink')) +
+    geom_histogram(data=y[[recept]][receptor == recept & gene %in% genes.oi], aes(x=abs(detrended.log2FC), fill='lightblue', alpha=0.4)) +
+    scale_fill_manual(values=c('lightblue'='lightblue', 'pink'='pink'), labels=c('lightblue'='detrended', 'pink'='original'), name='source')+
+    ggtitle(paste0(recept, ' log2FC histograms')) +
+    theme_bw()
+  
+},x=receptors.oi, y=comb.mss.list)
+```
+
+
+```{r}
+lapply(seq_along(receptors.oi), function(x,y,i){
+
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <- y[[recept]][receptor == recept & pvalue < 0.05 & abs(log2FC) > 0.58, gene]
+
+  
+  ggplot(data=y[[recept]][receptor == recept & gene %in% genes.oi,], aes(x=abs(all.delta.log2FC))) + 
+    geom_histogram(bins=50) +
+    ggtitle(paste0(recept, ' detrended log2FC - log2FC')) +
+    theme_bw()
+  
+},x=receptors.oi, y=comb.mss.list)
+```
+
+
+how to prune results we are not interested in? Find distribution of residuals from line, and drop points > 2+SD from it? Issue is we see that the trafficking related genes are still in the 
+
+
+finding points distant to line, what about creating a linear model 
+```{r}
+lapply(seq_along(receptors.oi), function(x,y,i){
+  
+  recept <-  x[[i]]
+  
+  # extract the sig prots per receptor in the non-detrended, we want to see how these profiles change over time
+  genes.oi <- y[[recept]][receptor == recept & pvalue < 0.05 & abs(log2FC) > 0.58, gene]
+  
+  qplot(x=y[[recept]][receptor == recept,]$detrended.log2FC, y=y[[recept]][receptor == recept,]$log2FC) +
+    stat_smooth(method='lm') +
+    geom_abline(slope=1, intercept = 0, linetype=3, alpha=0.6) +
+    ggtitle(recept) +
+    xlab('detrended log2FC') +
+    ylab('log2FC') +
+    theme_classic()
+
+},x=receptors.oi, y=comb.mss.list)
+```
+
+
+

@@ -1,0 +1,1295 @@
+---
+title: "12-19-24_AB_QCInvestigation"
+author: "Martin Gordon"
+date: "2024-12-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+Issue; cant find  the SARS proteins in the serarch.. check in with Jyoti Monday when returning results
+
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+```
+
+
+Read in the relevant files
+```{r}
+hu.list <- list(msstats=fread('./data/AB_MRC5/MSstats_20241217_164310_JB_MRC5_AB_121224_Report.tsv'),
+             keys=fread('./data/AB_MRC5/JB_MRC5_AB_121024_ConditionSetup.tsv'))
+
+bat.list <-  list(msstats=fread('./data/AB_RFe/MSstats_20241217_164727_JB_RFe_AB_121324_Report.tsv'),
+               keys=fread('./data/AB_RFe/JB_RFe_AB_121324_ConditionSetup.tsv'))
+```
+
+3 viral strains * 3 timepoints + mock (n=3 reps) for human
+3 viral strains * 4 timepoints + mock (n=3 reps) for bat
+
+Goal is to see the difference in the time matched samples, so prepare all the comparisons, but report this first and hold back others for follow up....
+```{r}
+hu.list[[2]][,.N, by=Condition][order(Condition)]
+bat.list[[2]][,.N, by=Condition][order(Condition)]
+```
+
+```{r}
+# bioreps only unique per group
+hu.list[[1]]$Condition %>% unique()
+hu.list[[1]]$Condition %>% unique()
+```
+
+N features per cell-line; recovery seems good
+```{r}
+# MRC5 features
+g <- ggplot(hu.list[[1]][,.N, by=.(Condition,BioReplicate,Run)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('MRC5 Features') +
+  xlab('Condition.Replicate') +
+  ylab('Number of Features') +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90, size=8))
+g
+BackupAsPDF(g, 'MRC5.nFeatures.barplot')
+
+
+#RFe features
+g <- ggplot(bat.list[[1]][,.N, by=.(Condition,BioReplicate,Run)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('RFe Features') +
+  xlab('Condition.Replicate') +
+  ylab('Number of Features') +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90, size=8))
+g
+BackupAsPDF(g, 'RFe.nFeatures.barplot')
+```
+
+This data has already been filtered to remove low intensity... weird, normally we want all the intensity data?
+```{r}
+g <-  ggplot(bat.list[[1]], aes(x=log2(Intensity))) +
+  geom_histogram(bins=50, fill="palegreen2") +
+  ggtitle('RFe feature ints.') +
+  theme_ipsum_rc()
+
+p <- ggplot(hu.list[[1]], aes(x=log2(Intensity))) +
+  geom_histogram(bins=50, fill="#CAB2D6") +
+  ggtitle('MRC5 feature ints.') +
+  theme_ipsum_rc()
+
+BackupAsPDF(p+g, 'feature.intensity.histograms')
+```
+Lets tidy the names of the samples
+
+```{r}
+spec.list <- list('MRC5'=hu.list[[1]],
+                  'Rfe'=bat.list[[1]])
+
+spec.list <- lapply(spec.list, function(x){
+  
+  unique(x$Condition) %>%  print()
+  x[, strain := gsub('_12hpi|_24hpi|_48hpi|_6hpi', '', Condition)]
+  x[, timepoint := ifelse(grepl('Mock', Condition), 'na', str_extract(Condition, '[12468]+hpi'))]
+})
+```
+
+```{r}
+# is this modified in place? yes, no need to overwrite
+lapply(spec.list, function(x){
+
+  x[, `:=`(timepoint = factor(timepoint),
+             strain = factor(strain))]
+})
+
+
+# rm from memory
+rm(bat.list)
+rm(hu.list)
+
+```
+
+
+Check the spec list for the SARS fasta... SARS-COV2 features not found.. generate PCA and sample heatmap anyway
+```{r}
+lapply(spec.list, function(x){
+  
+  
+  fname <- ifelse(any(x$timepoint == '06hpi'), 'RFe','MRC5')
+  print(fname)
+  
+  message('creating matrix...')
+  spec.mat <- dcast(x, paste(ProteinName,PeptideSequence,PrecursorCharge, sep='_')~paste(strain,timepoint,BioReplicate, sep='.'), value.var = 'Intensity') %>% 
+    as.matrix(rownames=1)
+  
+  dim(spec.mat) %>% print()
+  message('Subsetting to complete cases for PCA...')
+  submat <- spec.mat[complete.cases(spec.mat),]
+  
+  submat <- log2(submat)
+
+  pcaOut <- prcomp(t(submat))
+
+  message('Setting up col info')
+  colInfo <- data.table(colname = colnames(spec.mat))
+  colInfo[, c("strain", "timepoint", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2,3)) ]
+
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  
+  #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = strain, shape = timepoint)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(fname, "PCA using",  nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(fname,'.features.strainCol.pca'), dimensions=c(8,6))
+  
+    #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = timepoint, shape = strain)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(fname, "PCA using",  nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(fname,'.features.timepointCol.pca'), dimensions=c(8,6))
+  
+      #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = biorep, shape = strain)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(fname, "PCA using", nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(fname,'.features.biorepCol.pca'), dimensions=c(8,6))
+})
+
+
+
+```
+Basically seems to be asides from MRC5, diffifcult to determine any obvious trends in expression based on the PCA... 
+Run the MSStats summarisation step and regenerate the PCA and leave that for now
+
+```{r}
+lapply(spec.list, function(x){
+  x[, IsotopeLabelType := 'L']
+})
+```
+
+```{r}
+mss.in <- spec.list
+
+dp.out.list <- lapply(mss.in, function(x){
+  
+  dp.out <- MSstats::dataProcess(x, 
+                              MBimpute =  FALSE, 
+                              normalization = 'equalizeMedians',
+                              summaryMethod = "TMP",
+                              featureSubset = 'highQuality',
+                              remove_uninformative_feature_outlier=T)
+
+  return(dp.out)
+})
+```
+
+Write this out to file 
+```{r}
+
+lapply(names(dp.out.list), function(x){
+  
+  
+  #saveRDS(dp.out.list[[x]], file=paste0('./data/',x,'.rds'))
+  fwrite(dp.out.list[[x]]$ProteinLevelData, ScriptAndDatedFileName(x, 'proteinlvl.csv'))
+  fwrite(dp.out.list[[x]]$FeatureLevelData, ScriptAndDatedFileName(x, 'featurelvl.csv'))
+})
+```
+read in the pquant data and produce the volcano plots
+```{r}
+ms.list <- list(MRC5 = readRDS('./data/MRC5.rds'),
+                RFe = readRDS('./data/Rfe.rds'))
+
+```
+look at boxplots of the samples; look good post normalization
+
+```{r}
+names(ms.list) <- c('MRC5', 'Rfe')
+
+lapply(seq_along(names(ms.list)), function(x,n,i){
+   spec <- n[[i]]
+  
+  p.quant <- as.data.table(x[[spec]]$ProteinLevelData)
+  
+  p.mat <- dcast(p.quant, Protein~paste0(GROUP,'.',SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+  
+  p.mat <- p.mat[complete.cases(p.mat),]
+  
+  pcaOut <- prcomp(t(p.mat))
+  colInfo <- data.table(colname = colnames(p.mat))
+  colInfo[, c("group", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+  colInfo[, strain := gsub('_[12468]+hpi', '', group)]
+  colInfo[, timepoint := ifelse(strain == 'Mock', 'na', str_extract(group, '[12468]{1,2}hpi'))]
+
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  
+    p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = strain, shape = timepoint)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+   scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(spec, "PCA using", nrow(p.mat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(spec,'.proteins.strainCol.pca'), dimensions=c(8,6))
+
+},x=ms.list, n=names(ms.list))
+```
+MSstats contrasts
+---
+Run PW contrasts on all groups
+Generate the contrasy matrix
+
+# im thinking lets  just run everything, take the contrasts we want and change sign
+```{r}
+contrast.list <- list(MRC5= makeContrast.AllByAll(ms.list[[1]]),
+                      RFe =  makeContrast.AllByAll(ms.list[[2]]))
+```
+# we want a group comparison
+```{r}
+ms.contrast.list <- lapply(names(contrast.list), function(x,y,i){
+  
+  p.quant <- setDT(x[[i]]$ProteinLevelData)
+  p.quant[, SUBJECT := paste0(GROUP,'.',SUBJECT)]
+  
+  f.quant <- setDT(x[[i]]$FeatureLevelData)
+  f.quant[, SUBJECT := paste0(GROUP,'.',SUBJECT)]
+  
+  x[[i]]$FeatureLevelData <- f.quant
+  x[[i]]$ProteinLevelData <- p.quant
+  
+  message('runnning MS contrasts on ', i)
+  
+  mss <- groupComparison(contrast.matrix=y[[i]], data=x[[i]])
+  mss.dt <- setDT(mss$ComparisonResult)
+  return(mss.dt)
+  
+}, x=ms.list, y=contrast.list)
+
+```
+```{r}
+names(ms.contrast.list) <- c('MRC5', 'RFe')
+```
+
+
+Now pick out the contrasts that we need to run 
+
+```{r}
+lapply(ms.contrast.list, function(x){
+  
+  x[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+  x[, sig := 'not']
+  x[abs(log2FC) > 0.58 & p.adj < 0.05 & !issue %in% c("oneConditionMissing","completeMissing"), sig := ifelse(log2FC > 0, 'up', 'down')]
+})
+```
+subset to just the contrasts we want and change sign and name 
+
+```{r}
+contrast.oi <- c( #vs mock contrasts
+                 "Mock-N_P80T_6hpi","Mock-N_P80T_12hpi","Mock-N_P80T_24hpi","Mock-N_P80T_48hpi",
+                 "Mock-WT_6hpi","Mock-WT_12hpi", "Mock-WT_24hpi","Mock-WT_48hpi",
+                 "9b_T72I_N_P80T_6hpi-Mock", "9b_T72I_N_P80T_12hpi-Mock","9b_T72I_N_P80T_24hpi-Mock","9b_T72I_N_P80T_48hpi-Mock",
+                 #time matched contrasts
+                 "9b_T72I_N_P80T_6hpi-N_P80T_6hpi","9b_T72I_N_P80T_12hpi-N_P80T_12hpi","9b_T72I_N_P80T_24hpi-N_P80T_24hpi","9b_T72I_N_P80T_48hpi-N_P80T_48hpi",
+                 "N_P80T_6hpi-WT_6hpi","N_P80T_12hpi-WT_12hpi","N_P80T_24hpi-WT_24hpi","N_P80T_48hpi-WT_48hpi",
+                 "9b_T72I_N_P80T_6hpi-WT_6hpi","9b_T72I_N_P80T_12hpi-WT_12hpi","9b_T72I_N_P80T_24hpi-WT_24hpi","9b_T72I_N_P80T_48hpi-WT_48hpi"
+                 )
+```
+
+ms contrasts
+
+```{r}
+mss.dt <- rbindlist(ms.contrast.list, idcol='cellline')
+mss.dt <- mss.dt[Label %in% contrast.oi,]
+
+mss.dt[, sig := 'not']
+mss.dt[, c('numerator', 'denominator') := tstrsplit(Label, '-', keep = c(1,2))]
+mss.dt[numerator == 'Mock', log2FC := log2FC*-1]
+mss.dt[numerator == 'Mock', Label := paste(denominator, numerator, sep='-')]
+mss.dt[, gene := multiUniprots2multiGenes(Protein, species='HUMAN')]
+
+mss.dt[abs(log2FC) > 0.58 & p.adj < 0.05 & !issue %in% c("oneConditionMissing","completeMissing"), sig := ifelse(log2FC > 0, 'up', 'down')]
+
+#fwrite(mss.dt, ScriptAndDatedFileName('mss.pwcomparisons.csv'))
+```
+
+read in the data, prepare plots of the contrasts and perform the enrichment contrasts
+
+```{r}
+mss.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/121924_AB_InitialQC_data/2024_12_27_mss.pwcomparisons.csv') 
+```
+
+```{r}
+mss.dt[, timepoint := str_extract(numerator,'[0-9]{1,2}hpi$')]
+col.pal <- getQualitativePalette(n=2)
+
+g <- ggplot(mss.dt[sig != 'not', .N, by=.(`cell-line`, sig, numerator, Label)], aes(x=sig, y=N, fill=`cell-line`)) +
+  geom_bar(stat='Identity', position='dodge') +
+  ggtitle('Number of significant proteins per contrast') +
+  scale_fill_ipsum() +
+  facet_wrap(~Label, scales='free') +
+  #scale_fill_manual(values=c('down'=muted('blue'), 'up'=muted('red'))) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'N.sigHits.perContrast.barplots', dimensions=c(16,10))
+
+
+# plot the N hits per contrast and facet by species
+g <- ggplot(mss.dt[sig != 'not', .N, by=.(`cell-line`, sig, numerator, timepoint, Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity', position='dodge') +
+  ggtitle('Number of significant proteins per contrast') +
+  scale_fill_ipsum() +
+  facet_grid(~`cell-line`, scales='free') +
+  scale_fill_manual(values=c('down'=col.pal[1], 'up'=col.pal[2])) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'N.sigHits.barplots', dimensions=c(11,8))
+```
+volcanoplot of the de genes
+vs Mock contrast
+
+
+```{r}
+levels.oi <- c( #vs mock contrasts
+                 "N_P80T_6hpi-Mock","N_P80T_12hpi-Mock","N_P80T_24hpi-Mock","N_P80T_48hpi-Mock",
+                 "WT_6hpi-Mock","WT_12hpi-Mock", "WT_24hpi-Mock","WT_48hpi-Mock",
+                 "9b_T72I_N_P80T_6hpi-Mock", "9b_T72I_N_P80T_12hpi-Mock","9b_T72I_N_P80T_24hpi-Mock","9b_T72I_N_P80T_48hpi-Mock",
+                 #time matched contrasts
+                 "9b_T72I_N_P80T_6hpi-N_P80T_6hpi","9b_T72I_N_P80T_12hpi-N_P80T_12hpi","9b_T72I_N_P80T_24hpi-N_P80T_24hpi","9b_T72I_N_P80T_48hpi-N_P80T_48hpi",
+                 "N_P80T_6hpi-WT_6hpi","N_P80T_12hpi-WT_12hpi","N_P80T_24hpi-WT_24hpi","N_P80T_48hpi-WT_48hpi",
+                 "9b_T72I_N_P80T_6hpi-WT_6hpi","9b_T72I_N_P80T_12hpi-WT_12hpi","9b_T72I_N_P80T_24hpi-WT_24hpi","9b_T72I_N_P80T_48hpi-WT_48hpi"
+                 )
+
+mss.dt[, Label := factor(Label, levels=levels.oi)]
+```
+
+
+```{r}
+contrasts.oi <- unique(grep('-Mock', mss.dt$Label, value=T))
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi & `cell-line` == 'MRC5' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], aes(x=log2FC, y=-log10(p.adj), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 contrasts vs Mock') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & `cell-line` == 'MRC5' & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+BackupAsPDF(g, 'MRC5.contrasts.vs.mock.volcano', dimensions=c(16,14))
+```
+
+read in bat mapping info
+```{r}
+library(readxl)
+id.mapping.dt <- read_xlsx('../080624_JBatra_SARS2RNAseqHuBat/docs/human_to_RFE_gene_conversion_table_FINAL.xlsx') %>% 
+  as.data.table()
+
+id.dt <- id.mapping.dt[,.(RFE_uniprot_ID, RFE_gene_name, Human_gene_name)] %>% 
+  unique()
+
+# get rid of empty annos 
+id.dt <- id.dt[!(is.na(RFE_gene_name) & is.na(Human_gene_name))]
+
+# just take the first annotation
+id.dt <- id.dt[, head(.SD, 1), by=RFE_uniprot_ID]
+
+
+mss.dt <- merge(x=mss.dt, y=id.dt, by.x='Protein', by.y='RFE_uniprot_ID', all.x=T, all.y=F)
+#set the name
+mss.dt[`cell-line` == 'RFe', gene := ifelse(is.na(RFE_gene_name), gene, RFE_gene_name)]
+
+#fwrite(mss.dt, ScriptAndDatedFileName('mss.pwcomparisons.csv'))
+mss.dt <-  fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/121924_AB_InitialQC_data/2024_12_27_mss.pwcomparisons.csv')
+```
+
+
+
+
+
+plot the vs mock bat cell lines
+
+```{r}
+# plot the bat cell-lines
+g <- ggplot(mss.dt[Label %in% contrasts.oi & `cell-line` == 'RFe' & !issue %in% c("oneConditionMissing","completeMissing")], aes(x=log2FC, y=-log10(p.adj), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('RFe contrasts vs Mock') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & `cell-line` == 'RFe' & sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=4) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+BackupAsPDF(g, 'RFe.contrasts.vs.mock.volcano', dimensions=c(20,14))
+
+# what is this Nan gene?
+mss.dt[gene == 'NaN',]
+
+```
+ plot the contrasts within each strain
+
+```{r}
+contrasts.oi <- unique(grep('-Mock', mss.dt$Label, value=T, invert = T))
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi & `cell-line` == 'MRC5' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], aes(x=log2FC, y=-log10(pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 viral strain contrasts') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & `cell-line` == 'MRC5' & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+ # geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+#  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+BackupAsPDF(g, 'MRC5.contrasts.strains.rawpval.volcano', dimensions=c(16,14))
+```
+now plot the comparisons in bat 
+interesting.. it seems many of the bat genes change at the later timepoint.. looking at PCA, clearer seperation among the groups than MRC5, which seems to be a little noisey
+
+```{r}
+g <- ggplot(mss.dt[Label %in% contrasts.oi & `cell-line` == 'RFe' & !issue %in% c("oneConditionMissing","completeMissing")], aes(x=log2FC, y=-log10(p.adj), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('RFe viral strain contrasts') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & `cell-line` == 'RFe' & sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=4) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+BackupAsPDF(g, 'RFe.contrasts.vs.viralstrains.volcano', dimensions=c(20,14))
+```
+
+*Enrichment Analaysis*
+
+Run enrichment on the different genesets; lets look at the top terms recovered for each 
+
+Important note: 
+https://www.biostars.org/p/204939/
+The data source of KEGG was from NCBI. A rule of thumb for the ‘kegg’ ID is entrezgene ID for eukaryote species and Locus ID for prokaryotes.
+Rule of thumb is KEGG uses entrezID as kegg ID for eukaryotes and Locus ID for prokaryotes.
+BUT this is not guaranteed and KEGG can use different ID types (see post above) The kegg ID can be entrezgene (as in your example) or Locus or other types. Different species may use different type. We don't make assumption of it and keyType = "ENTREZID" is not accepted.
+
+Get the orgDB from `AnnotaitonHUb`
+```{r}
+library(AnnotationDbi)
+library(AnnotationHub) #provides access to large collections of publicly available whole genome resources, e.g,. ENSEMBL genome fasta or gtf files, UCSC chain resources, ENCODE data tracks at UCSC, etc.
+
+# create anno hu object
+ah <- AnnotationHub()
+dm <- query(ah, c("TxDb", "Ensembl", "Rhinolophus ferrumequinum"))
+
+# if all you know is species name etc, you can recover this record, get metadata and search
+# Find an orgDB for this exotic species and retrieve specific info
+dm <- query(ah, c("Rhinolophus ferrumequinum"))
+
+# get the metadata cols and grep to find file tpyes you want
+mcols(dm) %>% as.data.table(keep.rownames=T) %>% 
+  .[grep('OrgDb', rdataclass), rn] # id AH108239
+
+# dowload the file; use double brackets notation
+org.rt.db <- dm[['AH108239']] # orgDB
+
+```
+
+```{r}
+# get human DBs ready
+gmt.hs.go.bp <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+gmt.hs.go.cc <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='CC', keyType='SYMBOL')
+gmt.hs.kegg <-  loadKegg(organism='hsa', keyType = 'kegg') # map to entrez ID
+
+# human kegg to symbol and can merge these tables and
+hsKeggMap.dt <- clusterProfiler:::bitr(gmt.hs.kegg$gene, fromType='ENTREZID', toType='SYMBOL', OrgDb='org.Hs.eg.db')
+gmt.hs.kegg <- merge(x=gmt.hs.kegg, y=hsKeggMap.dt, by.x="gene", by.y="ENTREZID", all.x=T)
+gmt.hs.kegg <- gmt.hs.kegg[, .(ont, gene = ifelse(SYMBOL == '', gene, SYMBOL), ont.id)]
+
+# get bat DBs ready
+# two approaches; load the terms directly from GO for that species (using bioMart)
+# or map bat/hu gene Ids and filter the human Go annotations
+# i think the first approach safer; not assuming homolgy and function are equivalent?
+gmt.bat.kegg <-  loadKegg(organism='rfq', keyType = 'kegg') 
+
+# convert kegg/entrez ID to gene
+# issue iwth this anno DB; seems mapping to SYMBOL is broken, so use alias, collapse and simplify
+batMap.dt <- data.table(clusterProfiler:::bitr(gmt.bat.kegg$gene, fromType='ENTREZID', toType='ALIAS', OrgDb=org.rt.db)) %>% 
+  .[, .(SYMBOL =  paste(ALIAS,collapse=';')), by=ENTREZID] %>%   # simplify names
+  .[, SYMBOL := ifelse(grepl(';', SYMBOL), gsub('[;].+','', SYMBOL), SYMBOL)]
+
+gmt.bat.kegg <- merge(x=gmt.bat.kegg, y=batMap.dt, by.x="gene", by.y="ENTREZID", all.x=T)
+gmt.bat.kegg <- gmt.bat.kegg[, .(ont = gsub('\\s[-].+', '', ont), gene = ifelse(SYMBOL == '', gene, SYMBOL), ont.id)]
+
+# previously created for another project...
+bat.GO.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/080824_PWcomparisons_data/2024_08_09_rferrumequinumGOpathways.csv')
+```
+
+tidy the bat GO gmt files
+```{r}
+gmt.bat.go.cc <- bat.GO.dt[ontology == 'cellular_component', .(ont=description, gene, ont.id=go.id)]
+gmt.bat.go.bp <-bat.GO.dt[ontology == 'biological_process', .(ont=description, gene, ont.id=go.id)]
+```
+
+enrichment function to supply a dt and a enrichment group
+```{r}
+runEnrichment <- function(dt, ont, keepCl='MRC5', title, isKEGG=F){
+  
+  sub.dt <-dt[`cell-line`==keepCl, ]
+  print(sub.dt)
+  
+  # pull out bg
+  universe <-  unique(sub.dt$gene)
+  
+  # create enrichment groups
+  sub.dt[, enrich.grp := interaction(Label, sig)]
+  
+  # run GO enrichment on each group seperately
+  enrich.dt <- enricherOnGroups(sub.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = ont, 
+                              universe = universe)
+  
+  if (isKEGG) {
+    
+    return(list(
+              enrich=enrich.dt))
+    
+  } else {
+    simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                           gmt=ont, 
+                                                           groupColumn = 'enrich.grp',
+                                                           max_pAdjust = 0.1)
+    
+    return(list(
+              enrich=enrich.dt,
+              simpenrich=simp.enrich))
+  }
+}
+```
+
+enrichment results pretty poor...lets try dropping lfc thresholds and see if we can recover better Monday..
+Not too bad for human, but for virus we have an issue... seems the bg ratio is also quite low  (~50/8k) for bat; is the annotation poor? should I try another type of annotation (ensembl etc?) or try map our bat gene homologs to the human gmt?
+Try Monday, maybe reach out to Ben
+
+I think for now, stay suspecious of the bat enrichments, focus on the human set and see if these behave differently in bat also; highlight these in the volcano plot
+```{r}
+# 
+hm.bp <- runEnrichment(mss.dt, ont=gmt.hs.go.bp, keepCl ='MRC5', title='GO Biological Process', isKEGG=F)
+hm.cc <- runEnrichment(mss.dt, ont=gmt.hs.go.cc, keepCl='MRC5', title='GO Biological Process', isKEGG=F)
+hm.kegg <- runEnrichment(mss.dt, ont=gmt.hs.kegg, keepCl='MRC5', title='GO KEGG Pathways', isKEGG = T) 
+
+fwrite(hm.bp$enrich, ScriptAndDatedFileName('human.GO.BP.enrichment.csv'))
+fwrite(hm.bp$simpenrich$simplified, ScriptAndDatedFileName('human.GO.BP.enrichment.simplified.csv'))
+fwrite(hm.cc$enrich, ScriptAndDatedFileName('human.GO.CC.enrichment.csv'))
+fwrite(hm.cc$simpenrich$simplified, ScriptAndDatedFileName('human.GO.CC.enrichment.simplified.csv'))
+fwrite(hm.kegg$enrich, ScriptAndDatedFileName('human.KEGG.enrichment.csv'))
+# find out what is happening with the kegg enrichment
+
+bat.bp <- runEnrichment(mss.dt, ont=gmt.bat.go.bp, keepCl='RFe', title='GO Biological Process', isKEGG=F)
+bat.cc <- runEnrichment(mss.dt, ont=gmt.bat.go.cc, keepCl='RFe', title='GO Biological Process', isKEGG=F)
+bat.kegg <- runEnrichment(mss.dt, ont=gmt.bat.kegg, keepCl='RFe', title='GO KEGG Pathways', isKEGG = T) 
+
+fwrite(bat.bp$enrich, ScriptAndDatedFileName('bat.GO.BP.enrichment.csv'))
+fwrite(bat.bp$simpenrich$simplified, ScriptAndDatedFileName('bat.GO.BP.enrichment.simplified.csv'))
+fwrite(bat.cc$enrich, ScriptAndDatedFileName('bat.GO.CC.enrichment.csv'))
+fwrite(bat.cc$simpenrich$simplified, ScriptAndDatedFileName('bat.GO.CC.enrichment.simplified.csv'))
+fwrite(bat.kegg$enrich, ScriptAndDatedFileName('bat.KEGG.enrichment.csv'))
+```
+
+function to plot the heatmaps
+maybe plot the mock and viral strain sets seperately?
+
+```{r}
+test <- c(paste0(levels.oi, '.up'), paste0(levels.oi, '.down'))
+test <- bat.bp$simpenrich$simplified
+
+
+test[, enrich.grp := gsub('_6hpi', '_06hpi', enrich.grp)]
+
+str_extract(test, '[0-9]{1,2}hpi')
+
+plotHeatmap <- function(dt, keepCl='MRC5', pThresh=8, nTerms=4){
+  
+  subDT <- copy(dt) # create cp for modifying
+  enrich.grp.lvls <- c(paste0(levels.oi, '.up'), paste0(levels.oi, '.down'))
+  
+  if (keepCl == 'MRC5'){
+    
+      subDT[, enrich.grp := factor(enrich.grp, levels=grep('06hpi', enrich.grp.lvls, value=T, invert=T))]
+    
+  } else {
+    
+        subDT[, enrich.grp := factor(enrich.grp, levels=enrich.grp.lvls)]  
+  }
+  
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = subDT,
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  #column_split=str_extract(levels(subDT$enrich.grp),'down|up'),
+                                  #column_split=list(str_extract(levels(subDT$enrich.grp), '[0-9]{1,2}hpi'),
+                                  #                  str_extract(levels(subDT$enrich.grp),'down|up')),
+                                  negCols=unique(grep('down', subDT$enrich.grp, value=T)),
+                                  topN=nTerms,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6), 
+                                  upperThreshold = pThresh)
+  
+  return(ht)
+}
+
+View(enrichHeatmapBestPerGroup)
+```
+
+plot the heatmaps for each of the sets in human
+```{r}
+BackupAsPDF(plotHeatmap(hm.bp$simpenrich$simplified, keepCl = 'MRC5'),'human.GO.BP.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.cc$simpenrich$simplified, keepCl = 'MRC5'),'human.GO.CC.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.kegg$enrich, keepCl = 'MRC5'),'human.kegg.heatmap', dimensions = c(9,6))
+```
+
+These enrichment results are v strange. no really strong infection signal...
+
+```{r}
+# 
+levels.oi <-  gsub('_6hpi', '_06hpi', levels.oi)
+
+bat.bp$simpenrich$simplified[, enrich.grp :=  gsub('_6hpi', '_06hpi', enrich.grp)]
+bat.cc$simpenrich$simplified[, enrich.grp :=  gsub('_6hpi', '_06hpi', enrich.grp)]
+bat.kegg$enrich[, enrich.grp :=  gsub('_6hpi', '_06hpi', enrich.grp)]
+
+BackupAsPDF(plotHeatmap(bat.bp$simpenrich$simplified, keepCl = 'RFe', pThresh=4),'bat.GO.BP.heatmap', dimensions = c(11,8))
+BackupAsPDF(plotHeatmap(bat.cc$simpenrich$simplified, keepCl = 'RFe',  pThresh=4),'bat.GO.CC.heatmap', dimensions = c(11,8))
+BackupAsPDF(plotHeatmap(bat.kegg$enrich, keepCl = 'RFe',  pThresh=4), 'bat.kegg.heatmap', dimensions = c(11,8))
+```
+Seperate out the vs mock and vs strain sets
+
+```{r}
+BackupAsPDF(plotHeatmap(hm.bp$simpenrich$simplified[grepl('-Mock', enrich.grp),], keepCl = 'MRC5'),'human.GO.BP.vsMock.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.cc$simpenrich$simplified[grepl('-Mock', enrich.grp),], keepCl = 'MRC5'),'human.GO.CC.vsMock.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.kegg$enrich[grepl('-Mock', enrich.grp),], keepCl = 'MRC5'),'human.kegg.vsMock.heatmap', dimensions = c(9,6))
+
+BackupAsPDF(plotHeatmap(bat.bp$simpenrich$simplified[grepl('-Mock', enrich.grp),], keepCl = 'RFe'),'bat.GO.BP.vsMock.heatmap', dimensions = c(11,6))
+BackupAsPDF(plotHeatmap(bat.cc$simpenrich$simplified[grepl('-Mock', enrich.grp),], keepCl = 'RFe'),'bat.GO.CC.vsMock.heatmap', dimensions = c(11,6))
+BackupAsPDF(plotHeatmap(bat.kegg$enrich[grepl('-Mock', enrich.grp),], keepCl = 'RFe'),'bat.kegg.vsMock.heatmap', dimensions = c(11,6))
+```
+now plot the strain heatmaps
+
+```{r}
+hm.bp$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T),]
+
+BackupAsPDF(plotHeatmap(hm.bp$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T),], keepCl = 'MRC5'),'human.GO.BP.vsStrains.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.cc$simpenrich$simplified[grep('-Mock', enrich.grp, invert = T),], keepCl = 'MRC5'),'human.GO.CC.vsStrains.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.kegg$enrich[grep('-Mock', enrich.grp, invert=T),], keepCl = 'MRC5'),'human.kegg.vsStrains.heatmap', dimensions = c(9,6))
+
+BackupAsPDF(plotHeatmap(bat.bp$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T),], keepCl = 'RFe'),'bat.GO.BP.vsStrains.heatmap', dimensions = c(11,6))
+BackupAsPDF(plotHeatmap(bat.cc$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T),], keepCl = 'RFe'),'bat.GO.CC.vsStrains.heatmap', dimensions = c(11,6))
+BackupAsPDF(plotHeatmap(bat.kegg$enrich[grep('-Mock', enrich.grp, invert=T),], keepCl = 'RFe'),'bat.kegg.vsStrains.heatmap', dimensions = c(11,6))
+```
+plot the ISGs for each; look at the distribtutions and also a heatmap
+
+```{r}
+isGenes <- fread('/Users/martingordon/Documents/projects/022624_AViDD_AB_PH_data/docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+
+mss.dt[grep('SARS', Protein)]
+
+ms.list <- list(MRC5 = readRDS('./data/MRC5.rds'),
+                RFe = readRDS('./data/Rfe.rds'))
+
+rm(ms.list)
+p.quant <- rbind(setDT(ms.list[[1]]$ProteinLevelData) %>% 
+                   .[, `cell-line` := 'MRC5'], 
+                 setDT(ms.list[[2]]$ProteinLevelData) %>% 
+                   .[, `cell-line` := 'RFe'])
+rm(ms.list)
+```
+
+first, create a boxplot of the distributions of ISGs in each sample
+
+```{r}
+p.quant[, gene := multiUniprots2multiGenes(Protein)]
+p.quant <- merge(x=p.quant, y=id.dt, by.x='Protein', by.y='RFE_uniprot_ID', all.x=T, all.y=F)
+
+p.quant[, strain := gsub('_[0-9]{1,2}hpi$','', GROUP)]
+p.quant$strain %>%  unique()
+
+#set the name
+mss.dt[`cell-line` == 'RFe', gene := ifelse(is.na(RFE_gene_name), gene, RFE_gene_name)]
+
+g <- ggplot(p.quant[gene %in% isGenes| Human_gene_name %in% isGenes], aes(x=paste0(GROUP,SUBJECT), y=LogIntensities)) +
+    geom_boxplot() +
+   geom_point(aes(color=strain)) +
+   #scale_fill_manual(values=col.pal) +  
+    ggtitle(paste0(' normalized intensities')) +
+    scale_color_ipsum() +
+    facet_grid(~`cell-line`) +
+    theme_ipsum_rc(grid = "XY") +
+    theme(axis.text.x = element_text(angle=90, size=7),
+      panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+
+```
+Heatmaps of ISGs
+
+```{r}
+gsub('_[0-9]{1,2}hpi.[123]','', colnames(hu.submat))
+
+hu.mat <- dcast(p.quant[`cell-line` == 'MRC5' & gene %in% isGenes,], gene~paste0(GROUP,'.', SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='gene')
+
+bat.mat <- dcast(p.quant[`cell-line` == 'RFe' & Human_gene_name %in% isGenes,], hu_gene~paste0(GROUP,'.', SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='hu_gene')
+
+
+# get submat
+hu.submat <- sweep(hu.mat, 1, apply(hu.mat, 1, median, na.rm=T), FUN='-')
+bat.submat <- sweep(bat.mat, 1, apply(bat.mat, 1, median, na.rm=T), FUN='-')
+
+hm <- Heatmap(hu.submat,
+        column_title_gp = gpar(fontsize=7),
+       # cluster_column_slices = F, 
+      #  cluster_columns = F,
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=6),
+        column_split = list(gsub("_[0-9]{1,2}hpi+", "", gsub('.[123]$','', colnames(hu.submat))),
+                            str_extract(colnames(hu.submat), '[0-9]{1,2}hpi')),
+        col = colorRamp2(breaks=c(-3,0,3), colors=c('blue','white','red')),
+        name='log2 Ints.\n/median',
+        border=T,
+        show_row_names = T)
+  
+
+BackupAsPDF(draw(hm, column_title='MRC5 ISGs'), 'human.ISG.medianScaled.Clust.heatmap', dimensions=c(14,6))
+
+
+
+hm <- Heatmap(bat.submat,
+        column_title_gp = gpar(fontsize=6),
+       # cluster_column_slices = F, 
+      #  cluster_columns = F,
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=6),
+        column_split = list(gsub("_[0-9]{1,2}hpi+", "", gsub('.[123]$','', colnames(bat.submat))),
+                            str_extract(colnames(bat.submat), '[0-9]{1,2}hpi')),
+        col = colorRamp2(breaks=c(-3,0,3), colors=c('blue','white','red')),
+        name='log2 Ints.\n/median',
+        border=T,
+        show_row_names = T)
+  
+
+BackupAsPDF(draw(hm, column_title='RFe ISGs'), 'bat.ISG.medianScaled.Clust.heatmap', dimensions=c(14,6))
+```
+Quick other test; plot a heatmap of a subsample of proteins for both datasets, to check for bioreplicate variability. If samples look pretty similiar, try adjusting the pvalue threshold for the human strains and rerun the analysis (volcanoplot, enrichment etc.)
+
+First look at a heatmap of the samples, then 
+```{r}
+ms.list
+
+lapply(seq_along(names(ms.list)), function(x,n,i){
+  spec <- n[[i]]
+  
+  p.quant <- as.data.table(x[[spec]]$ProteinLevelData)
+  
+  p.mat <- dcast(p.quant, Protein~paste0(GROUP,'.',SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+  
+  #p.mat <- p.mat[sample(rownames(p.mat),3000),]
+  p.mat <- p.mat[complete.cases(p.mat),]
+  
+  submat <- sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T))
+  submat <- submat[sample(rownames(submat), 2000),]
+  
+  hm <- Heatmap(submat,
+          border=T,
+          name='log2(Ints)/\nMedian',
+          show_row_names = F,
+          cluster_columns = F,
+          column_title_gp = gpar(fontsize=8),
+          column_names_gp = gpar(fontsize=7),
+          col=colorRamp2(colors=c("dodgerblue2","white","#E31A1C"), breaks=c(-1,0,1)),
+          row_title = sprintf('%s sampled proteins', nrow(submat)),
+          column_split = list(str_extract(colnames(submat), '[0-9]{1,2}hpi'),
+                              gsub('_[0-9]{1,2}hpi', '', gsub('[.][123]', '', colnames(submat)))
+                              )
+          )
+  
+  BackupAsPDF(draw(hm, column_title=paste0(spec)), paste0(spec, '.subsample.medScale.heatmap'), dimensions = c(12,8), format='png')
+  
+},x=ms.list, n=names(ms.list))
+
+```
+Renormalize using tmp the MRC5 set
+
+```{r}
+mrc5.msout <- ms.list[['MRC5']]
+mrc5.pQuant <- setDT(mrc5.msout$ProteinLevelData)
+mrc5.pQuant[, sample := paste0(GROUP,'.',SUBJECT)]
+
+p.mat <- dcast(mrc5.pQuant, Protein~paste0(GROUP,'.',SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+tmp <-  medpolish(p.mat, na.rm=T)
+
+tmp.dt <- data.table(sample=names(tmp$col),
+                     offSet=tmp$col)
+
+mrc5.pQuant <- merge(mrc5.pQuant, tmp.dt, by='sample')
+mrc5.pQuant[, newLogIntensities := LogIntensities - offSet]
+```
+
+look at the boxplots; looks better after renormalization
+
+```{r}
+ggplot(mrc5.pQuant, aes(x=sample, y=newLogIntensities, fill=GROUP)) +
+  geom_boxplot()
+
+ggplot(mrc5.pQuant, aes(x=sample, y=LogIntensities, fill=GROUP)) +
+  geom_boxplot()
+```
+look at the PCA to see if we get improved sample clustering
+
+```{r}
+p.mat <- dcast(mrc5.pQuant, Protein~sample, value.var = 'newLogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+p.mat <- p.mat[complete.cases(p.mat),]
+
+
+pcaOut <- prcomp(t(p.mat))
+
+colInfo <- data.table(colname = colnames(p.mat))
+colInfo[, c("group", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+colInfo[, strain := gsub('_[12468]+hpi', '', group)]
+colInfo[, timepoint := ifelse(strain == 'Mock', 'na', str_extract(group, '[12468]{1,2}hpi'))]
+
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = strain, shape = timepoint)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+   scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("MRC5 renormalized PCA using", nrow(p.mat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'mrc5.renormalized.strainCol.pca', format='png', dimensions=c(8,6))
+
+```
+Rerun the PW comparisons between the strains, plot volcanoplots, reduce thresholds if necessary and run the enrichment 
+
+```{r}
+mrc5.contrasts <- contrast.list[['MRC5']]
+
+mrc5.pQuant[, SUBJECT := paste0(GROUP,'.',SUBJECT)]
+mrc5.pQuant[, oriIntensities := LogIntensities]
+mrc5.pQuant[, LogIntensities := newLogIntensities]
+mrc5.msout$ProteinLevelData <- mrc5.pQuant
+
+mrc5.fQuant <- setDT(mrc5.msout$FeatureLevelData)
+mrc5.fQuant[, SUBJECT := paste0(GROUP,'.', SUBJECT)]
+mrc5.msout$FeatureLevelData <- mrc5.fQuant
+
+mrc5.mss <- groupComparison(contrast.matrix=mrc5.contrasts, data=mrc5.msout)
+mss.dt <- setDT(mrc5.mss$ComparisonResult)
+```
+subset to the contrasts we are interested in 
+```{r}
+contrast.oi <- c( #vs mock contrasts
+                 "Mock-N_P80T_6hpi","Mock-N_P80T_12hpi","Mock-N_P80T_24hpi","Mock-N_P80T_48hpi",
+                 "Mock-WT_6hpi","Mock-WT_12hpi", "Mock-WT_24hpi","Mock-WT_48hpi",
+                 "9b_T72I_N_P80T_6hpi-Mock", "9b_T72I_N_P80T_12hpi-Mock","9b_T72I_N_P80T_24hpi-Mock","9b_T72I_N_P80T_48hpi-Mock",
+                 #time matched contrasts
+                 "9b_T72I_N_P80T_6hpi-N_P80T_6hpi","9b_T72I_N_P80T_12hpi-N_P80T_12hpi","9b_T72I_N_P80T_24hpi-N_P80T_24hpi","9b_T72I_N_P80T_48hpi-N_P80T_48hpi",
+                 "N_P80T_6hpi-WT_6hpi","N_P80T_12hpi-WT_12hpi","N_P80T_24hpi-WT_24hpi","N_P80T_48hpi-WT_48hpi",
+                 "9b_T72I_N_P80T_6hpi-WT_6hpi","9b_T72I_N_P80T_12hpi-WT_12hpi","9b_T72I_N_P80T_24hpi-WT_24hpi","9b_T72I_N_P80T_48hpi-WT_48hpi"
+                 )
+```
+
+ms contrasts
+
+```{r}
+mss.dt <- mss.dt[Label %in% contrast.oi,]
+
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=Label]
+mss.dt[, sig := 'not']
+mss.dt[, c('numerator', 'denominator') := tstrsplit(Label, '-', keep = c(1,2))]
+mss.dt[numerator == 'Mock', log2FC := log2FC*-1]
+mss.dt[numerator == 'Mock', Label := paste(denominator, numerator, sep='-')]
+
+mss.dt[, gene := multiUniprots2multiGenes(Protein, species='HUMAN')]
+mss.dt[abs(log2FC) > 0.58 & p.adj < 0.05 & !issue %in% c("oneConditionMissing","completeMissing"), sig := ifelse(log2FC > 0, 'up', 'down')]
+
+#fwrite(mss.dt, ScriptAndDatedFileName('mrc5.renormalized.mss.pwcomparisons.csv'))
+```
+```{r}
+levels.oi <- c( #vs mock contrasts
+                 "N_P80T_6hpi-Mock","N_P80T_12hpi-Mock","N_P80T_24hpi-Mock","N_P80T_48hpi-Mock",
+                 "WT_6hpi-Mock","WT_12hpi-Mock", "WT_24hpi-Mock","WT_48hpi-Mock",
+                 "9b_T72I_N_P80T_6hpi-Mock", "9b_T72I_N_P80T_12hpi-Mock","9b_T72I_N_P80T_24hpi-Mock","9b_T72I_N_P80T_48hpi-Mock",
+                 #time matched contrasts
+                 "9b_T72I_N_P80T_6hpi-N_P80T_6hpi","9b_T72I_N_P80T_12hpi-N_P80T_12hpi","9b_T72I_N_P80T_24hpi-N_P80T_24hpi","9b_T72I_N_P80T_48hpi-N_P80T_48hpi",
+                 "N_P80T_6hpi-WT_6hpi","N_P80T_12hpi-WT_12hpi","N_P80T_24hpi-WT_24hpi","N_P80T_48hpi-WT_48hpi",
+                 "9b_T72I_N_P80T_6hpi-WT_6hpi","9b_T72I_N_P80T_12hpi-WT_12hpi","9b_T72I_N_P80T_24hpi-WT_24hpi","9b_T72I_N_P80T_48hpi-WT_48hpi"
+                 )
+
+mss.dt[, Label := factor(Label, levels=levels.oi)]
+```
+
+Read in the renormalized set, subset to the vs strain groups and plot the volcanoplots of the time-matched strain comparisons
+```{r}
+mss.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/121924_AB_InitialQC_data/2024_12_30_mrc5.renormalized.mss.pwcomparisons.csv')
+
+contrasts.oi <- unique(grep('-Mock', mss.dt$Label, value=T, invert = T))
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], aes(x=log2FC, y=-log10(pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 viral strain contrasts') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+BackupAsPDF(g, 'mrc5.renormalized.contrasts.strains.rawpval.volcano', dimensions=c(16,14), format = 'png')
+```
+Adjust the thresholds, replot the sig hits, then run enrichment using this sig group and see if anything interesting comes up
+Setting pval < 0.005
+```{r}
+mss.dt[, sig := 'not']
+mss.dt[pvalue < 0.005 & abs(log2FC) > 0.58, sig := ifelse(log2FC > 0.58, 'up', 'down')]
+
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], aes(x=log2FC, y=-log10(pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 viral strain contrasts') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+
+BackupAsPDF(g, 'mrc5.renormalized.contrasts.strains.pval0.005.volcano', dimensions=c(16,14), format = 'png')
+```
+Ok, now that we have this set, lets run enrichment on the output and see if we can find any interesting patterns in the output
+
+```{r}
+mss.dt[, `cell-line` := 'MRC5']
+
+mrc5.hm.bp <- runEnrichment(mss.dt, ont=gmt.hs.go.bp, keepCl ='MRC5', title='GO Biological Process', isKEGG=F)
+mrc5.hm.cc <- runEnrichment(mss.dt, ont=gmt.hs.go.cc, keepCl='MRC5', title='GO Biological Process', isKEGG=F)
+mrc5.hm.kegg <- runEnrichment(mss.dt, ont=gmt.hs.kegg, keepCl='MRC5', title='GO KEGG Pathways', isKEGG = T)
+
+# nothing passes significance...no common enrichment terms
+mrc5.hm.bp$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T)] %>% 
+  .[qvalue < 0.05]
+```
+plot the heatmaps.. nothing found really.. write out the results
+
+```{r}
+fwrite(mrc5.hm.bp$simpenrich$simplified, ScriptAndDatedFileName('mrc5.renormalized.GO.BP.enrichment.simplified.csv'))
+fwrite(mrc5.hm.cc$simpenrich$simplified, ScriptAndDatedFileName('mrc5.renormalized.GO.CC.enrichment.simplified.csv'))
+fwrite(mrc5.hm.kegg$enrich, ScriptAndDatedFileName('mrc5.renormalized.KEGG.enrichment.simplified.csv'))
+```
+
+```{r}
+plotHeatmap(mrc5.hm.bp$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T),], keepCl = 'MRC5')
+plotHeatmap(mrc5.hm.cc$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T),], keepCl = 'MRC5')
+plotHeatmap(mrc5.hm.kegg$enrich[grep('-Mock', enrich.grp, invert=T),], keepCl = 'MRC5')
+
+mrc5.hm.kegg$enrichd
+
+# nothing significant in the human set
+mrc5.hm.kegg$enrichd[grep('-Mock', enrich.grp, invert=T),] %>% 
+  .[qvalue < 0.05]
+```
+
+
+02-01-24
+Write the data in wide format for Jyoti; read in the first pass and the renormalized p.quant data
+# read in the standard and renormalized p.quant data and
+
+```{r}
+
+mss.dt <- fread('/Users/martingordon/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/121924_AB_InitialQC_data/2024_12_27_mss.pwcomparisons.csv')
+mss.dt %>% colnames()
+
+
+# write out the first pass results
+#fwrite(dcast(mss.dt[`cell-line` == 'RFe',], Protein+Human_gene_name+RFE_gene_name~Label, value.var = c('log2FC', 'pvalue', 'adj.pvalue')), ScriptAndDatedFileName('RFE_AB_pwcomparisons.wide.csv'))
+#fwrite(dcast(mss.dt[`cell-line` == 'MRC5',], Protein+gene~Label, value.var = c('log2FC', 'pvalue', 'adj.pvalue')),  ScriptAndDatedFileName('MRC5_AB_pwcomparisons.wide.csv'))
+```
+now write out the protein quantification data, and also the renormalized data
+```{r}
+ms.list <- list(MRC5 = readRDS('./data/MRC5.rds'),
+                RFe = readRDS('./data/Rfe.rds'))
+
+
+# get the gene names of both and write out the quantification information
+p.quant <- setDT(ms.list[['MRC5']]$ProteinLevelData)
+p.quant[, gene := multiUniprots2multiGenes(Protein, species='HUMAN')]
+
+p.quant[, sample := paste0(GROUP,'.',SUBJECT)]
+
+p.mat <- dcast(p.quant, Protein~paste0(GROUP,'.',SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+tmp <-  medpolish(p.mat, na.rm=T)
+
+tmp.dt <- data.table(sample=names(tmp$col),
+                     offSet=tmp$col)
+
+p.quant <- merge(p.quant, tmp.dt, by='sample')
+p.quant[, renormalized_LogIntensities := LogIntensities - offSet]
+
+fwrite(dcast(p.quant, Protein+gene~paste0(GROUP,'.',SUBJECT), value.var = c('LogIntensities', 'renormalized_LogIntensities')), ScriptAndDatedFileName('MRC5.protein.quant.csv'))
+```
+Now, write out the RFe p.quant data. 
+Merge with the id table to ensure we are using correct gene names etc.
+
+```{r}
+p.quant <- setDT(ms.list[['RFe']]$ProteinLevelData)
+
+library(readxl)
+id.mapping.dt <- read_xlsx('../080624_JBatra_SARS2RNAseqHuBat/docs/human_to_RFE_gene_conversion_table_FINAL.xlsx') %>% 
+  as.data.table()
+
+id.dt <- id.mapping.dt[,.(RFE_uniprot_ID, RFE_gene_name, Human_gene_name)] %>% 
+  unique()
+
+# get rid of empty annos 
+id.dt <- id.dt[!(is.na(RFE_gene_name) & is.na(Human_gene_name))]
+
+# just take the first annotation
+id.dt <- id.dt[, head(.SD, 1), by=RFE_uniprot_ID]
+
+p.quant <- merge(x=p.quant, y=id.dt, by.x='Protein', by.y='RFE_uniprot_ID', all.x=T, all.y=F)
+#fwrite(dcast(p.quant, Protein+RFE_gene_name+Human_gene_name~paste0(GROUP,'.',SUBJECT), value.var = c('LogIntensities')), ScriptAndDatedFileName('RFE.protein.quant.csv'))
+```
+
+
+
+
+
+
+```{r}
+tmp <-  medpolish(p.mat, na.rm=T)
+tmp.dt <- data.table(sample=names(tmp$col),
+                     offSet=tmp$col)
+
+
+
+
+mrc5.pQuant <- merge(mrc5.pQuant, tmp.dt, by='sample')
+mrc5.pQuant[, newLogIntensities := cor.LogIntensities - offSet]
+
+
+p.quant
+#subset to the proteins in the tmp normalizewd dataset
+prots.oi <- unique(p.quant$Protein)
+```
+```
+
+
+
+*not used..*
+
+pca plot of the protein level intensities
+```{r}
+lapply(seq_along(names(ms.list)), function(x,n,i){
+   spec <- n[[i]]
+  
+  p.quant <- x[[spec]]$ProteinLevelData
+  
+  g <- ggplot(p.quant, aes(x=paste0(GROUP,SUBJECT), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot() +
+   scale_fill_manual(values=col.pal) +  
+    ggtitle(paste0(spec, ' normalized intensities')) +
+    #scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") +
+    theme(axis.text.x = element_text(angle=90, size=7),
+      panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+  g
+  BackupAsPDF(g, paste0(spec,'.protein.ints.boxplot'), dimensions = c(8,8))
+},x=ms.list, n=names(ms.list))
+
+```
+
+
+# we have peptide level information; proceed like a normal AB MS run
+```{r}
+hu.list[[1]][,.N, by=.(Run,ProteinName)]
+hu.list[[1]][ProteinName == 'A0A0B4J2D5;P0DPI2' & Run == 'exD007334.raw']
+
+
+```
+

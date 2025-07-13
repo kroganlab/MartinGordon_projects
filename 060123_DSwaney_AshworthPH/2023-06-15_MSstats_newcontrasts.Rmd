@@ -1,0 +1,153 @@
+---
+title: "2023_06_15_msstats_newcontrasts"
+author: "Martin Gordon"
+date: "2023-06-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Need to rerun msstats on PH AVIDD data 
+
+## Packages
+
+```{r packages}
+library(data.table)
+library(MSstats)
+library(magrittr)
+library(ggplot2)
+
+#source Bens utility scripts
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+```
+```{r functions}
+#function to read in keys and spec file overwrite spec Condition and BioReplicate cols with keys file values
+preprocessSpec <- function(spec_f,keys_f){
+
+  #fread stores as data.table by default
+  spec <- fread(spec_f)
+  keys <- fread(keys_f)
+
+  # apply Condition, BioReplicate from keys to spec
+  spec[keys , Condition := i.Condition , on = c(Run = "RawFile")] #overwrite condition col w values from keys file, match run col in spec to rawfile col in keys
+  spec[keys , BioeReplicate := i.BioReplicate , on = c(Run = "RawFile")]
+  
+  return(spec)
+  setnames(spec) = dat_name
+}
+```
+
+
+```{r load-data}
+getwd()
+specs <- './data/MSstats_PH.txt'
+keys <- './data/keys.txt'
+
+spec <- preprocessSpec(specs,keys)
+str(spec)
+
+```
+
+Check each biorep has a unique identifier for MSstats processing
+```{r}
+#remove keys biorep column
+spec[,10] <- NULL
+spec[,.N, by=.(Condition)]
+spec[, .N, by=.(Condition,BioReplicate)]
+```
+
+Remove likely artifacts
+
+```{r}
+
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram(bins = 100)
+
+spec <- spec[log2(Intensity) >5,]
+
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram(bins = 100)
+
+```
+Confirm that each detected peptide occurs once per run/charge
+False indicates each peptide detected only once per run
+```{r n-ids}
+any(spec[, .N, by=.(PeptideSequence,PrecursorCharge,Run)]$N) > 1
+```
+No fasta file specified, so just run with the canonical list of UNIProt proteins prepared by Ben & available on the Krogan github
+
+```{r}
+#function belwo takes path to fasta reference
+fasta <- './data/human_all_proteins_canonical_uniprot-proteome_UP000005640.fasta.gz'
+
+spec.ph <- sitifyProteins_SpectronautFile(spec, fastaFile = fasta, site = "PH") 
+```
+Remove records with no PH from the file
+
+```{r}
+spec.ph[!is.na(oldProteinName),]
+```
+
+
+## MSstats normalisation, outlier removal and protein summarisation
+
+MSstats likes missing values to be explicitly labelled 'NA'. 
+
+```{r msstats-formatting}
+ph.mss <- specFileToCompleteMSstats(spec.ph)
+ph.mss[, IsotopeLabelType := 'L'] #label free
+setDF(ph.mss)  # convert to DF for msstats processing
+```
+
+```{r mss-dataproc}
+
+dp.out <- MSstats::dataProcess(ph.mss,
+                               normalization = 'equalizeMedians',
+                               summaryMethod="TMP",
+                               featureSubset = "highQuality",
+                               remove_uninformative_feature_outlier = TRUE,
+                               MBimpute = FALSE )
+```
+
+Differential Expression Analysis
+------
+
+Perform DEA with provided contrasts
+Generate a contrast matrix for requested pairwise comparisons:
+
+```{r}
+
+#MSstatsContrastMatrix("pairwise", unique(dp.out$ProteinLevelData$GROUP))
+
+## create contrast matrix
+WTpos_N10t20pos <- matrix(c(0,-1,0,0,1),nrow=1)
+WTpos_EVpos <- matrix(c(-1,0,0,0,1),nrow=1)
+EVpos_WTpos <- matrix(c(1,0,0,0,-1),nrow=1)
+
+dp.contrasts <- rbind(WTpos_EVpos, WTpos_N10t20pos, EVpos_WTpos)
+
+# using names from the ranseq file
+#fread('~/Library/CloudStorage/Box-Box/Mac1_omics_data/CellLines_RNAseq/core_table_gene.xls.gz')
+
+row.names(dp.contrasts)<-c("WT_IFNg-vs-EV_IFNg","WT_IFNg-vs-ND_IFNg","EV_IFNg-vs-WT_IFNg")
+colnames(dp.contrasts) <- c('EV+', 'N10t20+', 'PAR+', 'PAR-', 'WT+')
+dp.contrasts
+```
+Perform the desired pairwise comparisons & writeout file
+```{r}
+test.mss <- groupComparison(contrast.matrix=dp.contrasts, data=dp.out)
+test.mss.all <- setDT(test.mss$ComparisonResult)
+
+# adjust p values using the Benjamini Hochberg method, which estimates False Discovery Rate
+test.mss.all[, fdr := p.adjust(pvalue, method = "BH")] 
+#get gene names
+test.mss.all[, gene_symbol := multiUniprots2multiGenes(as.character(Protein), simplify = TRUE, allowDups = FALSE)]
+
+
+fwrite(test.mss.all, ScriptAndDatedFileName("ph-mssstats_groupcomparisons_newcontrasts.csv.gz"))
+```

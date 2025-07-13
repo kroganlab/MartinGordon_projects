@@ -1,0 +1,364 @@
+---
+title: "160424_annotateVariants.Rmd"
+author: "Martin Gordon"
+date: "2024-04-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Read in our VEP results, annotate our variants and 
+
+```{r}
+library(readxl)
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(ggrepel)
+library(Biostrings) # for pw alignments of sequences
+library(stringi)
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+read in the vep and sgRNA tables
+
+VEP maps variants to a reference genome (GRCH38) and identifies all overlapping ensembl transcripts
+Asigns a conseequence term to each allele/transcript combo absed on sequence ontology terms (SO)
+Each allele may have a different impact on a different transcript
+
+This approach is applied to all germline variants and somatic mutations stored in the Ensembl databases. The resulting consequence type calls, along with information determined as part of the process, such as the cDNA and CDS coordinates, and the affected codons and amino acids in coding transcripts, are stored in the Ensembl Variation database and displayed on our website. For human and mouse variants any overlap with regulatory features is also displayed. For structural variants consequence terms are calculated on the fly for display on our website or API access. You can use this pipeline to annotate your own data via VEP. 
+By default, VEP will include upstream and downstream annotations for variants within 5kb of a nearby feature, see --distance in VEP options.
+
+```{r}
+abe8e.vep <- fread('./output/vep_out/abe8e.vep.txt')
+setnames(abe8e.vep, old='#Uploaded_variation', new='Name')
+
+bemax.vep <- fread('./output/vep_out/bemax.vep.txt')
+setnames(bemax.vep, old='#Uploaded_variation', new='Name')
+
+
+abe8e.vep[,.N, by=.(Name,Consequence,Feature)]
+abe8e.vep[,.N, by=.(Feature)]
+```
+
+Filtering variants
+----
+Keep variants that only map to our genes of interest
+Filter to keep only feautures that map to transcripts;
+
+```{r}
+genes.oi <- c('MTOR', 'PPP3CB','MCOLN1', 'MITF', 'AKT1', 'TFEB', 'TFEC', 'TFE3')
+
+# transcript IDs Ronald is interested in 
+transcripts.oi <- c('ENST00000264079.11', 'ENST00000352241.9', 'ENST00000373033.6', 'ENST00000361445.9', 'ENST00000315869.8',
+                    'ENST00000265440.12', 'ENST00000360663.10','ENST00000265440.12', 'ENST00000649815.2')
+
+
+vep.list <-  list(abe8e = abe8e.vep,
+                  bemax = bemax.vep)
+
+# get clean list
+vep.list <- lapply(vep.list, function(x){
+    return(x[Feature_type == 'Transcript' & SYMBOL %in% genes.oi,])
+})
+
+
+clean.vep.list <- lapply(vep.list, function(x){
+  x[SYMBOL %in% genes.oi,]
+})
+
+# Also other genes these sgRNA are mapping to
+# need to ensure these mutants are also mapping where we expect; compare hte list of sgRNA between the two sets and find which are abs
+offtarget.vep.list <- lapply(vep.list, function(x){
+  x[!SYMBOL %in% genes.oi,]
+})
+
+# ok good; none of the transcripts in the off-target set are absent from genes oi; these just seem to be matching to multiple transcripts in the DB
+# maybe need to investigate a little more but for now proceeed
+clean.vep.list[[1]][,unique(Name)][!offtarget.vep.list[[1]][,unique(Name)] %in% clean.vep.list[[1]][,unique(Name)]] %>%  length()
+clean.vep.list[[2]][,unique(Name)][!offtarget.vep.list[[2]][,unique(Name)] %in% clean.vep.list[[2]][,unique(Name)]] %>%  length()
+```
+
+Filter by mutation severity
+------
+Rank variants by most severe consequences (descending),collapse each transcript/variant combo to most severe impact
+These rankings are obtained from the VEP website: https://useast.ensembl.org/info/genome/variation/prediction/predicted_data.html#consequences
+
+
+First thing to note is some variants have multiple possible annotations
+these are ordered by VEP by default, so for these we need simplify to the most impactful variant
+
+```{r}
+lapply(clean.vep.list, function(x){
+  x[, Consequence := ifelse(grepl(',', Consequence), gsub(',.+', '', Consequence), Consequence)]
+})
+```
+
+```{r}
+# ranks based on ensembl Sequence Ontology consequence terms info: https://useast.ensembl.org/info/genome/variation/prediction/predicted_data.html#consequences
+variant.severity <- data.table(Consequence =c('splice_acceptor_variant',
+                        'splice_donor_variant',
+                        'stop_gained',
+                        'frameshift_variant',
+                        'stop_lost',
+                        'start_lost',
+                        'transcript_amplification',
+                        'inframe_insertion',
+                        'inframe_deletion',
+                        'missense_variant',
+                        'protein_altering_variant',
+                        'splice_donor_5th_base_variant',
+                        'splice_region_variant',
+                        "splice_donor_region_variant",
+                         "splice_polypyrimidine_tract_variant",
+                        'incomplete_terminal_codon_variant',
+                        'start_retained_variant',
+                        'stop_retained_variant',
+                        'synonymous_variant',
+                        'coding_sequence_variant',
+                        'mature_miRNA_variant',
+                        '5_prime_UTR_variant',
+                        '3_prime_UTR_variant',
+                        'non_coding_transcript_exon_variant',
+                        'intron_variant',
+                        'NMD_transcript_variant',
+                        'non_coding_transcript_variant',
+                        'upstream_gene_variant',
+                        'downstream_gene_variant',
+                        'TFBS_ablation',
+                        'TFBS_amplification',
+                        'TF_binding_site_variant',
+                        'regulatory_region_ablation',
+                        'regulatory_region_amplification',
+                        'feature_elongation',
+                        'regulatory_region_variant',
+                        'feature_truncation',
+                        'intergenic_variant',
+                        '-'))
+# severity ranking
+variant.severity[, rank := .I]
+
+# merge with the vep output
+abe8e.vep <-merge(x=clean.vep.list[[1]], y=variant.severity, by='Consequence', all.x=T)
+bemax.vep <- merge(x=clean.vep.list[[2]], y=variant.severity, by='Consequence', all.x=T)
+
+nrow(abe8e.vep)
+# subset records to the most severe mutations per feature sgRNA combo
+abe8e.vep.collapse <- abe8e.vep[, .SD[which.min(rank)], by=.(Name,Feature)]
+bemax.vep.collapse <- bemax.vep[, .SD[which.min(rank)], by=.(Name,Feature)]
+```
+
+# find the rows that differ between these two groups
+dplyr has an anti-join function; returns rows in first absent from the second
+
+
+```{r}
+setcolorder(abe8e.vep, colnames(abe8e.vep.collapse))
+setcolorder(bemax.vep, colnames(bemax.vep.collapse))
+
+diff.set <- fsetdiff(bemax.vep, bemax.vep.collapse)
+diff.set %>%  nrow()
+```
+
+Doesnt remove many as most features dont have multiple impacts (although afew do..)
+
+```{r}
+reduced.vep.list <- lapply(clean.vep.list, function(dt){
+  
+  merged.dt <- merge(x=dt, y=variant.severity, by='Consequence', all.x=T)
+  # reduce to most significant mutants
+  reduced.dt <- merged.dt[, .SD[which.min(rank)], by=.(Name,Feature)]
+  return(reduced.dt)
+})
+```
+Lets try this two ways: 
+- subset to the canonical transcripts 
+- subset to transcripts with highest clinical impact
+
+```{r}
+canonical.vep.list <- lapply(reduced.vep.list, function(dt){
+  # just take the canonical set
+  return(dt[Feature %in% transcripts.oi,])
+})
+
+# looks good; maps to only 1 transcript
+lapply(canonical.vep.list, function(x){
+  print(x[,.N,by=Name][order(-N)])
+  print(x[,.N,by=Name][order(-N)])
+})
+```
+write out the canonical transcripts
+```{r}
+lapply(seq_along(canonical.vep.list), function(x,n,i){
+  
+  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'canonicalVEPAnnotations.txt')))
+},x=canonical.vep.list, n=names(canonical.vep.list))
+```
+Get the most high-impact trancripts and check their mutational consequence
+
+```{r}
+impact.vep.list <- lapply(reduced.vep.list, function(dt){
+  # just take the highest impact set
+  return(dt[, .SD[which.min(rank)], by=.(Name)])
+})
+
+# looks good; maps to only 1 transcript
+lapply(impact.vep.list, function(x){
+  print(x[,.N,by=Name][order(N)])
+  print(x[,.N,by=Name][order(N)])
+})
+```
+write out the high impact variant table 
+```{r}
+lapply(seq_along(impact.vep.list), function(x,n,i){
+  
+  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'highestImpactVEPAnnotations.txt')))
+},x=canonical.vep.list, n=names(canonical.vep.list))
+```
+
+
+
+Not used...
+-----
+VEP strand mapping...
+The allele col is the revComp of the variant we reported... seems good
+```{r}
+reduced.vep.list[[1]][Name == "ATTCGCTAACAAGTGTGCTC__T:C_4",]
+```
+ For first pass, lets just keep the transcipts that Ronald is interested in
+ Mention that we have subset the variant group to these canonical transcript set
+```{r}
+canonical.vep.list <- lapply(reduced.vep.list, function(dt){
+  # just take the canonical set
+  return(dt[Feature %in% transcripts.oi,])
+})
+```
+Write out the results for the canonical VEP 
+```{r}
+lapply(seq_along(canonical.vep.list), function(x,n,i){
+  
+  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'canonicalVEPAnnotations.txt')))
+},x=canonical.vep.list, n=names(canonical.vep.list))
+```
+For the 'full set', collapse all transcripts per sgRNA to the most severe mutational consequence, then rank by annotation source
+
+```{r}
+collapsed.vep.list <- lapply(reduced.vep.list, function(dt){
+  # reduce to most significant mutants
+  reduced.dt <- dt[, .SD[which.min(rank)], by=.(Name)]
+  return(reduced.dt)
+})
+
+lapply(collapsed.vep.list, function(X){
+  
+  X[,.N, by=Name][order(N)]
+})
+
+```
+
+
+The remaining transcripts were then ranked based on their “Source annotation” (HGNC > EntrezGene > Clone_based_ensembl_gene), APPRIS annotation and TSL.
+```{r}
+abe8e.vep[SYMBOL_SOURCE != '-',]
+abe8e.vep[Consequence != '-' & SYMBOL_SOURCE == '-',]
+
+abe8e.vep[Feature_type %in% c("MotifFeature","RegulatoryFeature"),]
+abe8e.vep[Feature_type %in% c("MotifFeature","RegulatoryFeature"),]
+
+
+abe8e.vep[Name == 'AATATGACTTGCCCCAGGTC__T:C_2']
+bemax.vep
+bemax.vep[SYMBOL_SOURCE != '-',]
+```
+First filter the features to the transcripts that Ronald has mentioned (does this make sense? is a non-canonical transcript not also interesting?)
+Not the first thing to do; first just filter rows (group by Name, Featurem Consequence) to keep most consequental mutants
+
+```{r}
+
+```
+
+
+```{r}
+transcripts.oi <- c('ENST00000264079.11', 'ENST00000352241.9', 'ENST00000373033.6', 'ENST00000361445.9', 'ENST00000315869.8',
+                    'ENST00000265440.12', 'ENST00000360663.10','ENST00000265440.12', 'ENST00000649815.2')
+
+abe8e.vep[,.N, by=.(Name, Feature, Consequence)][order(-N)]
+```
+
+```{r}
+getMostSevereConsequence <- function(dt){
+  
+  # order of mutation consequence
+  mut_consequence = c('splice_acceptor_variant',
+                        'splice_donor_variant',
+                        'stop_gained',
+                        'frameshift_variant',
+                        'stop_lost',
+                        'start_lost',
+                        'transcript_amplification',
+                        'inframe_insertion',
+                        'inframe_deletion',
+                        'missense_variant',
+                        'protein_altering_variant',
+                        'splice_region_variant',
+                        'incomplete_terminal_codon_variant',
+                        'start_retained_variant',
+                        'stop_retained_variant',
+                        'synonymous_variant',
+                        'coding_sequence_variant',
+                        'mature_miRNA_variant',
+                        '5_prime_UTR_variant',
+                        '3_prime_UTR_variant',
+                        'non_coding_transcript_exon_variant',
+                        'intron_variant',
+                        'NMD_transcript_variant',
+                        'non_coding_transcript_variant',
+                        'upstream_gene_variant',
+                        'downstream_gene_variant',
+                        'TFBS_ablation',
+                        'TFBS_amplification',
+                        'TF_binding_site_variant',
+                        'regulatory_region_ablation',
+                        'regulatory_region_amplification',
+                        'feature_elongation',
+                        'regulatory_region_variant',
+                        'feature_truncation',
+                        'intergenic_variant')
+  
+  for (i in mut_consequence){
+    
+      return(dt[Consequence == i,.SDcols=c('Name', 'Consequence','Feature')])
+    }
+    
+    
+}
+
+abe8e.vep
+```
+
+From the Hannah et al paper
+
+"To pick one relevant transcript annotation for each guide, we first obtained all the transcripts whose “consequence terms” matched the “most severe consequence” for that input. The remaining transcripts were then ranked based on their “Source annotation” (HGNC > EntrezGene > Clone_based_ensembl_gene), APPRIS annotation and TSL."
+
+```{r}
+
+```
+

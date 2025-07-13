@@ -1,0 +1,962 @@
+---
+title: "012425_ciliaAPEX_rerun"
+author: "Martin Gordon"
+date: "2025-01-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Rerun of a subset of conditions from earlier Cilia APex project (previous work available at `061324_XFang_Cilia_GPCR`)
+In this instance the cilia+ and cilia- cells are derived from the same parental cell-line (siRNA ko) so should be a more similar background and favourable comparison
+In this case the primary focus will be comparing the localizations of the different probes in the presence/absence of agonist
+
+Before this, we need to run a quick QC inspection of the data; focus on run quality and recovery of cilia markers in the presence of +cilia and absence in -cilia cell-lines
+
+**Conditions**
+"GPR135_-Cilia"
+"GPR135_+Cilia"
+"SMO_-Cilia_-Agonist"
+"SMO_-Cilia_+Agonist"
+"SMO_+Cilia_-Agonist"  
+"SMO_+Cilia_+Agonist"
+"PTH2R_-Cilia_-Agonist"
+"PTH2R_-Cilia_+Agonist"
+"PTH2R_+Cilia_-Agonist"
+"PTH2R_+Cilia_+Agonist"
+
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(showtext)
+library(readxl)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/NMF_Helpers.R")
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_ipsum_rc() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+```
+
+
+read in the output files and lets take a look at the number of conditions, identifications, clustering, pca etc.
+Would be good to do a quick pass of the differential testing today but may be for next week
+
+```{r}
+spec <- fread('./data/CR2/20250115_CR2_SMO_APEX_Report.tsv')
+keys <- fread('./data/CR2//CR2_SMO_APEX_01152025_ConditionSetup.tsv')
+```
+Look at intensity distributions 
+
+```{r}
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram()
+# cut off the poor left hand side of the plot
+ggplot(spec[log2(Intensity) > 5,], aes(x=log2(Intensity))) +
+  geom_histogram()
+
+g <- ggplot(spec[log2(Intensity) > 4,], aes(x=log2(Intensity))) +
+  geom_histogram() + 
+  customTheme
+
+BackupAsPDF(g, 'intensityDistribution.histogram')
+
+spec <- spec[log2(Intensity) > 4,]
+```
+
+Any features eluting in more than one peak? If not we can just count rows for feature/peptide IDs
+```{r}
+# False, so nofeatures recovered more than once per run
+spec[,.N,by=.(Run, PeptideSequence, PrecursorCharge)][N > 1,]
+```
+quick plot of the number of features per run
+Clear quality issues with this sample, seems to carry over between runs 
+
+```{r}
+spec[, .N, by=.(Condition, BioReplicate)]
+
+g <- ggplot(spec[, .N, by=.(RunID=gsub('exD00|[.]raw','', Run),Condition, BioReplicate)], aes(x=paste0(Condition,'.',BioReplicate), y=N, fill=Condition)) +
+  geom_bar(stat='identity', position='dodge') +
+  ggtitle('N features detected per run') +
+  scale_fill_manual(values=col.pal) +
+  customTheme
+g
+BackupAsPDF(g, 'NfeaturesDetected.colByCondition.barplot')
+
+g <- ggplot(spec[, .N, by=.(RunID=gsub('exD00|[.]raw','', Run),Condition, BioReplicate)], aes(x=RunID, y=N, group = Condition, fill=as.factor(BioReplicate))) +
+  geom_bar(stat='identity', position='dodge') +
+  ggtitle('N features detected per run') +
+  scale_fill_manual(values=col.pal) +
+  customTheme
+g
+BackupAsPDF(g, 'NfeaturesDetected.runOrder.barplot')
+
+# color by group
+g <- ggplot(spec[, .N, by=.(RunID=gsub('exD00|[.]raw','', Run),Condition, BioReplicate)], aes(x=RunID, y=N, group = Condition, fill=as.factor(Condition))) +
+  geom_bar(stat='identity', position='dodge') +
+  ggtitle('N features detected per run') +
+  scale_fill_manual(values=col.pal) +
+  customTheme
+g
+BackupAsPDF(g, 'NfeaturesDetected.runOrder.groupCol.barplot')
+```
+Plot boxplots to check out the intensity distributions in groups
+
+```{r}
+g <- ggplot(spec, aes(x=paste0(Condition,'.',BioReplicate), y=log2(Intensity),fill=Condition)) +
+  geom_boxplot() +
+  ggtitle('Peptide intensity distributions') +
+  scale_fill_manual(values=unname(col.pal)) +
+  customTheme
+g
+BackupAsPDF(g, 'intensityDistribtutions.boxplot', dimensions = c(9,6), format='png')
+```
+Quick look at sample clustering; take a random subset of 3000 proteins and see how the samples cluster
+
+```{r}
+col.pal <- getQualitativePalette(n=10)
+names(col.pal) <- unique(spec$Condition)
+
+spec.mat <- dcast(spec, paste(ProteinName,PeptideSequence,PrecursorCharge, sep='_')~paste(Condition, BioReplicate, sep='.'), value.var = 'Intensity') %>% 
+  as.matrix(rownames=1)
+  
+submat <- spec.mat[sample(rownames(spec.mat), 3000),]
+submat <- log2(submat)
+
+# do a sweep to see run to run differences
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+
+column_ha = HeatmapAnnotation(group = gsub('[.][123]$', '', colnames(submat)),
+                              ciliaStatus = ifelse(grepl('[+]Cilia', colnames(submat)), 'cilia', 'na'), 
+                              agonistStatus= ifelse(grepl('[+]Agonist', colnames(submat)), 'agonist', 'na'), 
+                              rep = str_extract(colnames(submat), '[.][123]$'),
+                              nPeptides = anno_barplot(apply(spec.mat, 2, function(x){ sum(!is.na(x))})),
+                              col=list(group=col.pal, ciliaStatus=c('cilia'='darkgreen', 'na'='grey'), agonistStatus=c('agonist'='darkred', na='grey'), rep=c('.1'='red' , '.2'='green', '.3'='blue'))
+                              )
+
+hm <- Heatmap(submat,
+        show_row_names = F,
+        border=T,
+        top_annotation = column_ha,
+        row_title = sprintf('%s peptides', nrow(submat)),
+        name='log2 Ints./median',
+        col=colorRamp2(breaks=c(-4,0,4), colors=c(col.pal[1], 'white', col.pal[2])),
+        cluster_rows=clusterWNA(submat),
+        na_col = 'grey')
+hm
+BackupAsPDF(hm, 'peptideSample.3k.heatmap', dimensions=c(10,8), format='png')
+```
+Huge amount of variance explained by the first principal component
+```{r}
+message('Subsetting to complete cases for PCA...')
+submat <- spec.mat[complete.cases(spec.mat),]
+
+dim(spec.mat) %>% 
+  print()
+
+submat <- log2(submat)
+
+dim(submat) %>% 
+  print()
+
+pcaOut <- prcomp(t(submat))
+
+message('Setting up col info')
+colInfo <- data.table(colname = colnames(spec.mat))
+
+colInfo[, c("group", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+colInfo[, c("agonist", "cilia") := .(ifelse(grepl('[+]Agonist', group), 'agonist', 'na'),  ifelse(grepl('[+]Cilia', group), 'cilia', 'na')) ]
+
+
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_manual(values=col.pal) +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using",  nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('peptides.groupCol.pca'), dimensions=c(8,6))
+  
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = cilia, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using",  nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('peptides.ciliaCol.pca'), dimensions=c(8,6))
+  
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = biorep, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_viridis_d() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using", nrow(submat), "peptides (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('biorep.agonistCol.pca'), dimensions=c(8,6))
+```
+Summarize to protein level and replot these QC plots. DE analysis Monday....
+Maybe this evening lets plot the cilia GS proteins to see how we recover these
+
+```{r}
+spec[, IsotopeLabelType := 'L']
+
+dp.out <- MSstats::dataProcess(spec, 
+                              MBimpute =  FALSE, 
+                              normalization = 'equalizeMedians',
+                              summaryMethod = "TMP",
+                              featureSubset = 'highQuality',
+                              remove_uninformative_feature_outlier=T)
+```
+save the output
+```{r}
+#saveRDS(dp.out, ScriptAndDatedFileName('mss.dataProc.rds'))
+dp.out <- readRDS('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/012425_ciliaAPEX_firstLook_data/2025_01_24_mss.dataProc.rds')
+
+p.quant <- setDT(dp.out$ProteinLevelData)
+
+g <- ggplot(p.quant[NumMeasuredFeature == 1, .(nSinglePeptideProteins=.N, RunID=gsub('exD00|[.]raw','', originalRUN)), by=.(GROUP,SUBJECT)], aes(x=paste0(GROUP, '.', SUBJECT), y=nSinglePeptideProteins, fill=GROUP)) +
+  geom_bar(stat='identity') +
+  ggtitle('N single peptide proteins') +
+  scale_fill_manual(values=unname(col.pal)) +
+  customTheme
+
+BackupAsPDF(g, 'NsinglePeptideProteins.barplot')
+```
+
+ok, repeat the, QC plots to see how things now look
+
+```{r}
+g <- ggplot(p.quant, aes(x=paste0(GROUP,'.',SUBJECT), y=adjLogIntens,fill=GROUP)) +
+  geom_boxplot() +
+  ggtitle('Protein intensity distributions') +
+  scale_fill_manual(values=unname(col.pal)) +
+  customTheme
+g
+BackupAsPDF(g, 'proteinDistribtutions.firstRoundNorm.boxplot', dimensions = c(9,6), format='png')
+```
+Try a second round of tmp normalization
+
+```{r}
+lm.out <- lm(LogIntensities~interaction(GROUP,SUBJECT), data=p.quant)
+
+offSet.dt <- data.table(sample=names(lm.out$coefficients),
+                        offset=lm.out$coefficients)
+
+offSet.dt <- offSet.dt[sample != '[(]Intercept[)]', sample := gsub('interaction[(]GROUP[,] SUBJECT[)]', '', sample)]
+p.quant[,sample := paste0(GROUP,'.',SUBJECT)]
+p.quant[offSet.dt, offset := i.offset, on=c(sample = 'sample')]
+
+p.quant[, adjLogIntensities := LogIntensities - offset]
+p.quant[offSet.dt, offset := i.offset, on=c(sample = 'sample')]
+
+```
+
+Adjusted intensities using lm:
+```{r}
+g <- ggplot(p.quant, aes(x=paste0(GROUP,'.',SUBJECT), y=adjLogIntensities,fill=GROUP)) +
+  geom_boxplot() +
+  ggtitle('Protein intensity distributions') +
+  scale_fill_manual(values=unname(col.pal)) +
+  customTheme
+g
+BackupAsPDF(g, 'proteinDistribtutions.lmNorm.boxplot', dimensions = c(9,6), format='png')
+```
+Adjust intensites using TMP
+```{r}
+p.mat <- dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+tmp <-  medpolish(p.mat, na.rm=T)$col
+tmp.dt <- data.table(sample=names(tmp), tmp)
+
+p.quant[tmp.dt, tmp.offset := i.tmp, on=c(sample = 'sample')]
+p.quant[,.(sample, tmp.offset)][order(sample)] %>% unique()
+
+tmp.dt <- data.table(sample=names(tmp), tmp)
+tmp.dt[order(sample)]
+```
+```{r}
+p.quant[, tmpAdjLogIntensities := LogIntensities - tmp.offset]
+
+g <- ggplot(p.quant, aes(x=paste0(GROUP,'.',SUBJECT), y=tmpAdjLogIntensities,fill=GROUP)) +
+  geom_boxplot() +
+  ggtitle('Protein intensity distributions') +
+  scale_fill_manual(values=unname(col.pal)) +
+  customTheme
+g
+BackupAsPDF(g, 'proteinDistribtutions.tmpNorm.boxplot', dimensions = c(9,6), format='png')
+```
+
+```{r}
+# scatterplots of differences.. scale too small
+g <- ggplot(unique(p.quant[, .(sample, Protein, adjLogIntensities, tmpAdjLogIntensities)]), aes(x=adjLogIntensities, y=tmpAdjLogIntensities)) +
+  geom_point() +
+  ggtitle('lm vs tmp normalization methods') +
+  facet_wrap(~sample)
+BackupAsPDF(g, 'normalizationMethods.scatterplots', dimensions = c(12,12))
+
+g <- ggplot(unique(p.quant[, .(sample, GROUP, offset, tmp.offset)]), aes(x=offset, y=tmp.offset, label=sample)) +
+  geom_point(aes(color=GROUP)) +
+  geom_smooth(method='lm') +
+  geom_text_repel() +
+  scale_color_manual(values=col.pal) +
+  ggtitle('lm vs tmp normalization methods') +
+  labs(x='lm coef', y='tmp offset') +
+  customTheme 
+g
+BackupAsPDF(g, 'normalizationMethods.offSet.scatterplots', dimensions = c(10,8))
+```
+quick plot of the nProteins, PCA, and heatmap
+
+
+```{r}
+g <- ggplot(p.quant[, .N, by=.(RunID=gsub('exD00|[.]raw','', originalRUN),GROUP, SUBJECT)], aes(x=paste0(GROUP,'.',SUBJECT), y=N, fill=GROUP)) +
+  geom_bar(stat='identity', position='dodge') +
+  ggtitle('N proteins detected per run') +
+  scale_fill_manual(values=col.pal) +
+  customTheme
+g
+BackupAsPDF(g, 'NproteinasDetected.colByCondition.barplot')
+```
+Generate heatmap of the different samples
+```{r}
+#Get matrix
+p.quant %>% colnames()
+
+p.mat <- dcast(p.quant, Protein~paste(GROUP, SUBJECT, sep='.'), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+```
+
+```{r}
+# do a sweep to see run to run differences
+submat <- sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T))
+
+str_extract()
+
+column_ha = HeatmapAnnotation(#group = gsub('[.][123]$', '', colnames(submat)),
+                              probe = str_extract(colnames(submat), 'SMO|PTH2R|GPR135'),
+                              ciliaStatus = ifelse(grepl('[+]Cilia', colnames(submat)), 'cilia', 'na'), 
+                              agonistStatus= ifelse(grepl('[+]Agonist', colnames(submat)), 'agonist', 'na'), 
+                              rep = str_extract(colnames(submat), '[.][123]$'),
+                              nProteins = anno_barplot(apply(p.mat, 2, function(x){ sum(!is.na(x))})),
+                              col=list(group=col.pal, ciliaStatus=c('cilia'='darkgreen', 'na'='grey'), agonistStatus=c('agonist'='darkred', na='grey'), rep=c('.1'='red' , '.2'='green', '.3'='blue'),
+                                       probe=c('SMO'='purple', 'PTH2R'='orange', 'GPR135'='turquoise'))
+                              )
+
+hm <- Heatmap(submat,
+        show_row_names = F,
+        border=T,
+        top_annotation = column_ha,
+        row_title = sprintf('%s proteins', nrow(submat)),
+        name='log2 Ints./median',
+        col=colorRamp2(breaks=c(-2,0,2), colors=c(col.pal[1], 'white', col.pal[2])),
+        cluster_rows=clusterWNA(submat),
+        na_col = 'grey')
+hm
+BackupAsPDF(hm, 'proteinSample.3k.heatmap', dimensions=c(10,8), format='png')
+```
+Do the pca, 
+```{r}
+#fwrite(p.quant, ScriptAndDatedFileName('ProteinlvlQuant.2ndRoundNorm.csv'))
+p.quant <- fread('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/012425_ciliaAPEX_firstLook_data/2025_01_24_ProteinlvlQuant.2ndRoundNorm.csv')
+
+submat <- p.mat[complete.cases(p.mat),]
+
+pcaOut <- prcomp(t(submat))
+
+message('Setting up col info')
+colInfo <- data.table(colname = colnames(p.mat))
+colInfo[, c("group", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+colInfo[, c("agonist", "cilia") := .(ifelse(grepl('[+]Agonist', group), 'agonist', 'na'),  ifelse(grepl('[+]Cilia', group), 'cilia', 'na')) ]
+
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+pcaDT[, probe := str_extract(rn, 'GPR135|PTH2R|SMO')]
+```
+
+plot the PCA to look at main drivers of variation
+```{r}
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_manual(values=col.pal) +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using",  nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.groupCol.pca'), dimensions=c(8,6))
+  
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = cilia, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using",  nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.ciliaCol.pca'), dimensions=c(8,6))
+  
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = biorep, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_viridis_d() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using", nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.biorep.agonistCol.pca'), dimensions=c(8,6))
+
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = probe, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_viridis_d() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using", nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.probe.agonistCol.pca'), dimensions=c(8,6))
+```
+Clear separation of the different probes on the PCA, can we see if this is also driven by Npeptides (a proxy for carryOver perhaps?)
+
+```{r}
+# read in the 
+dp.out <- readRDS('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/012425_ciliaAPEX_firstLook_data/2025_01_24_mss.dataProc.rds')
+p.quant <-  fread('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/012425_ciliaAPEX_firstLook_data/2025_01_24_ProteinlvlQuant.2ndRoundNorm.csv')
+```
+
+look at boxplots of tmp normalized data; do they look comparable within each group
+```{r}
+g <- ggplot(p.quant, aes(x=paste0(GROUP,'.',SUBJECT), y=tmpAdjLogIntensities,fill=GROUP)) +
+  geom_boxplot() +
+  ggtitle('Protein intensity distributions') +
+  scale_fill_manual(values=unname(col.pal)) +
+  customTheme
+g
+BackupAsPDF(g, 'proteinDistribtutions.tmpNorm.boxplot', dimensions = c(9,6), format='png')
+```
+Looking at boxplots, the original normalization looks best... 
+
+```{r}
+p.mat <- dcast(p.quant, Protein~paste(GROUP, SUBJECT, sep='.'), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- p.mat[complete.cases(p.mat),]
+
+pcaOut <- prcomp(t(submat))
+
+message('Setting up col info')
+colInfo <- data.table(colname = colnames(p.mat))
+colInfo[, c("group", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+colInfo[, c("agonist", "cilia") := .(ifelse(grepl('[+]Agonist', group), 'agonist', 'na'),  ifelse(grepl('[+]Cilia', group), 'cilia', 'na')) ]
+
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+pcaDT[, probe := str_extract(rn, 'GPR135|PTH2R|SMO')]
+
+# get n proteins per sum
+nProts <- apply(p.mat,2, function(x) {sum(!is.na(x))})
+
+pcaDT <- merge(pcaDT, data.table(rn=names(nProts), nProts), by='rn')
+```
+
+
+Last QC plot is probably to plot the proteins in cilia markers and see how they distinguish the groups
+If we run a PCA on this subset of proteins do we get cilia group seperation?
+
+
+plot with the original normalization,the we can look at tmp to see if it looks better
+
+```{r}
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = nProts, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+   scale_fill_viridis_c() +
+    scale_shape_manual(values = c(21:27)) +
+  #  scale_fill_viridis_d() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using", nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+
+BackupAsPDF(p, paste0('proteins.nProtsCol.pca'), dimensions=c(8,6))
+```
+
+```{r}
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_manual(values=col.pal) +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using",  nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.groupCol.pca'), dimensions=c(8,6))
+  
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = cilia, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using",  nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.ciliaCol.pca'), dimensions=c(8,6))
+  
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = biorep, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_viridis_d() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using", nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.biorep.agonistCol.pca'), dimensions=c(8,6))
+
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = probe, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_viridis_d() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using", nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.probe.agonistCol.pca'), dimensions=c(8,6))
+```
+
+Recreate the matrix with the tmp normalized results
+
+```{r}
+p.mat <- dcast(p.quant, Protein~paste(GROUP, SUBJECT, sep='.'), value.var = 'tmpAdjLogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- p.mat[complete.cases(p.mat),]
+
+pcaOut <- prcomp(t(submat))
+
+message('Setting up col info')
+colInfo <- data.table(colname = colnames(p.mat))
+colInfo[, c("group", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+colInfo[, c("agonist", "cilia") := .(ifelse(grepl('[+]Agonist', group), 'agonist', 'na'),  ifelse(grepl('[+]Cilia', group), 'cilia', 'na')) ]
+
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+pcaDT[, probe := str_extract(rn, 'GPR135|PTH2R|SMO')]
+
+pcaDT <- merge(pcaDT, data.table(rn=names(nProts), nProts), by='rn')
+```
+
+```{r}
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_manual(values=col.pal) +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using",  nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.groupCol.tmpNorm2ndRound..pca'), dimensions=c(8,6))
+  
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = cilia, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using",  nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.ciliaCol.tmpNorm2ndRound.pca'), dimensions=c(8,6))
+  
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = biorep, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_viridis_d() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using", nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.biorepCol.tmpNorm2ndRound.pca'), dimensions=c(8,6))
+
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = probe, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_viridis_d() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using", nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, paste0('proteins.probe.agonistCol.tmpNorm2ndRound.pca'), dimensions=c(8,6))
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = nProts, shape = biorep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+   scale_fill_viridis_c() +
+    scale_shape_manual(values = c(21:27)) +
+  #  scale_fill_viridis_d() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste("PCA using", nrow(submat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+
+BackupAsPDF(p, paste0('proteins.probe.nProtsCol.tmpNorm2ndRound.pca'), dimensions=c(8,6))
+```
+
+```{r}
+ggplot(p.quant, aes(x=paste0(GROUP,'.',SUBJECT), y=LogIntensities)) +
+  geom_boxplot() +
+  geom_boxplot(data=p.quant, aes(x=paste0(GROUP,'.',SUBJECT), y=tmpAdjLogIntensities), color='red', alpha=0.7)
+p.quant[,.(LogIntensities, tmpAdjLogIntensities)]
+```
+I think the final NB QC plot is the ciliated proteins heatmap; lets see if we see cilia in non-ciliated samples
+
+get cilia markers 
+```{r}
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+cilia.AM <- c('INPP5E', 'LCA5', 'PRKAR1A', 'ARL13B', 'SMO', 'EVC2', 'EVC', 'PKD2', 'TTC21B', 'PKHD1', 'IFT88', 'NPHP4', 'EFCAB7', 'CYS1')
+
+cilia.Consensus <- c('Pdap1','Cep131','Cep41','Ift122','Ift172','Ift52','Ift57','Ift74','Ift81','Ift88','Cfap97','Lca5','Cemip2','Wdr35',
+                     'Arl13b','Arl3','Inpp5e','Nme7','Kif3a','Kif3b','Kifap3','Ywhaz','Cys1','Evc2','Ttc21b','Ift56')
+
+cilia.Consensus[!cilia.Consensus %in% unique(mh_mappings$Symbol.mouse)]
+
+# all found
+cilia.AM.prots <- mh_mappings[Symbol.human %in% cilia.AM, SWISS_PROT_IDs.mouse]
+cilia.Consensus.prots <- mh_mappings[Symbol.mouse %in% cilia.Consensus, SWISS_PROT_IDs.mouse]
+```
+
+
+```{r}
+p.mat <- dcast(p.quant, Protein~paste(GROUP, SUBJECT, sep='.'), value.var = 'tmpAdjLogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+# subset to the proteins we are interested in
+submat <- p.mat[rownames(p.mat) %in% c(cilia.AM.prots, cilia.Consensus.prots),]
+```
+# convert to linear and get relative to max intensity per row we want to see how 
+```{r}
+submat <-  2^submat
+submat[is.na(submat)] <-  0
+submat <-  sweep(submat, 1, apply(submat, 1, max), FUN='/')
+
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+hm <- Heatmap(submat,
+        col=viridis(100),
+        border = T,
+        column_split = ifelse(grepl('[+]Cilia', colnames(submat)), 'ciliated cells', 'non-ciliated cells'),
+        column_names_gp = gpar(fontsize=5),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(submat))
+hm
+BackupAsPDF(hm, 'consensusCiliaProts.cellLineSplit.heatmap')
+```
+```{r}
+col.ann <- data.table('cilia present'=ifelse(grepl('[+]Cilia', colnames(submat)), 'yes', 'no'))
+
+colAnn <- HeatmapAnnotation(df=col.ann, 
+                            `N detected proteins` =anno_barplot(nProts),
+                            col=list('cilia present' = c('yes'='#4477AA', 'no'='#CCBB44')))
+
+
+colnames(submat)
+hm <- Heatmap(submat,
+        col=viridis(100),
+        border = T,
+        top_annotation = colAnn,
+        name='Ints/Max Ints',
+        cluster_column_slices = T,
+        cluster_columns = F,
+        show_column_names = T,
+        column_split=gsub('[+-]Cilia.+$','', colnames(submat)),
+        column_names_gp = gpar(fontsize=5),
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(submat))
+
+hm
+BackupAsPDF(hm, 'consensusCiliaProts.probeSplit.heatmap', dimensions=c(11,6))
+```
+look at distributions of the ciliated proteins in each group; boxplots of the cilia proteins and label the individual points 
+
+```{r}
+cilia.pal <- c('ciliated'='#4477AA', 'non-ciliated'='#CCBB44')
+
+p.quant[, ciliaMarker := '']
+p.quant[Protein %in% c(cilia.AM.prots, cilia.Consensus.prots), ciliaMarker := 'yes']
+p.quant[, probe := str_extract(GROUP, 'PTH2R|SMO|GPR135')]
+p.quant[, c("agonist", "cilia") := .(ifelse(grepl('[+]Agonist', GROUP), 'agonist', 'no-agonist'),  ifelse(grepl('[+]Cilia', GROUP), 'ciliated', 'non-ciliated')) ]
+
+
+# create a summary datatab
+summary.dt <- p.quant[, .(gene, probe, agonist, cilia, meanLogIntensities=mean(LogIntensities, na.rm=T), ciliaMarker), by=.(Protein, GROUP)] %>% 
+  unique()
+
+#draw a line between the groups to see 
+g <- ggplot(summary.dt[ciliaMarker == 'yes',], aes(x=probe, y=meanLogIntensities, color=cilia)) + 
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill =  cilia), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('cilia marker profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='probe', y=expression(log[2]~"Intensities")) +
+  scale_fill_manual(values=cilia.pal) +
+  scale_color_manual(values=cilia.pal) +
+  theme_ipsum_rc() +
+  facet_wrap(~agonist, scales='free_x') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'consensusCiliaProts.boxplots',  dimensions=c(8,6))
+```
+Plot the heatmap with mediaSweep of each individual probe
+
+```{r}
+lapply(unique(p.quant$probe), function(x){
+  
+  
+  submat <- p.mat[rownames(p.mat) %in% c(cilia.AM.prots, cilia.Consensus.prots), grepl(x, colnames(p.mat))]
+  submat <-  2^submat
+  submat[is.na(submat)] <-  0
+  submat <-  sweep(submat, 1, apply(submat, 1, max), FUN='/')
+  
+  rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+  
+  hm <- Heatmap(submat,
+        col=viridis(100),
+        border = T,
+        name='Ints/Max Ints',
+        cluster_column_slices = T,
+        cluster_columns = F,
+        show_column_names = T,
+        column_split=list(str_extract(colnames(submat), '[+-]Cilia'),
+                          str_extract(colnames(submat), '[+-]Agonist')),
+        column_names_gp = gpar(fontsize=5),
+        column_title_gp = gpar(fontsize=7, fontface='bold'),
+        row_names_gp = gpar(fontsize=6),
+        cluster_rows = clusterWNA(submat))
+
+  BackupAsPDF(draw(hm,  column_title=paste(x, 'samples cilia assoc. proteins')), paste0(x,'.intsVsmax.heatmap'))
+})
+```
+I think for now this QC is fine.. lets see if we can use NMF to capture the carryover signal and remove
+
+

@@ -1,0 +1,685 @@
+---
+title: "020325_msstatsDEanalysis"
+author: "Martin Gordon"
+date: "2025-02-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(showtext)
+library(readxl)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/NMF_Helpers.R")
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_ipsum_rc() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+```
+```{r}
+spec <- fread('./data/CR2/20250115_CR2_SMO_APEX_Report.tsv')
+keys <- fread('./data/CR2//CR2_SMO_APEX_01152025_ConditionSetup.tsv')
+```
+Look at intensity distributions 
+
+```{r}
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram()
+# cut off the poor left hand side of the plot
+ggplot(spec[log2(Intensity) > 5,], aes(x=log2(Intensity))) +
+  geom_histogram()
+
+g <- ggplot(spec[log2(Intensity) > 4,], aes(x=log2(Intensity))) +
+  geom_histogram() + 
+  customTheme
+
+BackupAsPDF(g, 'intensityDistribution.histogram')
+
+spec <- spec[log2(Intensity) > 4,]
+```
+process the 3 datqsets seperately and look at boxplots of the distributions before running the differential analysis comparisons
+```{r}
+spec[, probe := str_extract(Condition, 'GPR135|SMO|PTH2R')]
+
+spec.list <- split(spec, spec$probe)
+
+dp.out.list <- lapply(names(spec.list), function(x){
+
+  spec.list[[x]][, IsotopeLabelType := 'L']
+  
+  dp.out <- MSstats::dataProcess(spec.list[[x]], 
+                                 MBimpute =  FALSE, 
+                                 normalization = 'equalizeMedians',
+                                 summaryMethod = "TMP",
+                                 featureSubset = 'highQuality',
+                                 remove_uninformative_feature_outlier=T)
+  
+  saveRDS(dp.out, ScriptAndDatedFileName(paste0(x, 'dp.out.rds')))
+})
+```
+read in the dataprocess objects
+
+```{r}
+dp.list <- list(SMO = readRDS('./020325_msstatsDEanalysis_data/2025_02_03_SMOdp.out.rds'),
+                PTH2R = readRDS('./020325_msstatsDEanalysis_data/2025_02_03_PTH2Rdp.out.rds'),
+                GPR135 = readRDS('./020325_msstatsDEanalysis_data/2025_02_03_GPR135dp.out.rds'))
+```
+
+fix SUBJECT field for group comparison
+
+```{r}
+lapply(dp.list, function(x){
+  
+  p.quant <- setDT(x$ProteinLevelData)
+  p.quant[, SUBJECT := paste0(GROUP,'.',SUBJECT)]
+  p.quant[, GROUP := factor(GROUP)]
+  
+  x$ProteinLevelData <- p.quant
+  return(x)
+})
+
+```
+
+
+```{r}
+lapply(dp.list, function(x){
+  
+  p.quant <- x$ProteinLevelData
+  probe <- unique(str_extract(p.quant$GROUP, 'SMO|GPR135|PTH2R'))
+  
+  g <- ggplot(p.quant, aes(x=paste0(GROUP,SUBJECT), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot() +
+    ggtitle(probe) +
+    scale_fill_ipsum() +
+    customTheme
+  g
+  BackupAsPDF(g, paste0(probe,'.protein.ints.boxplots'))
+})
+```
+PW comparisons between groups
+
+```{r}
+contrasts.list <- list('+cilia_SMO_ag vs +cilia_SMO' = data.table(V1='SMO_+Cilia_+Agonist', V2='SMO_+Cilia_-Agonist'),
+                       '+cilia_SMO vs -cilia_SMO' = data.table(V1='SMO_+Cilia_-Agonist', V2='SMO_-Cilia_-Agonist'),
+                       '+cilia_PTH2R_ag vs +cilia_PTH2R' = data.table(V1='PTH2R_+Cilia_+Agonist', V2='PTH2R_+Cilia_-Agonist'),
+                       '+cilia_PTH2R vs -cilia_PTH2R' = data.table(V1='PTH2R_+Cilia_-Agonist', V2='PTH2R_-Cilia_-Agonist'),
+                       '+cilia_GPR135 vs -cilia_GPR135' = data.table(V1='GPR135_+Cilia', V2='GPR135_-Cilia'))
+
+
+
+rownames(contrasts.mat)
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(p.quant$GROUP), 
+                               labels = names(contrasts.list))
+
+```
+
+Run lm on each of the groups, just want a standard lm for group comparison
+```{r}
+contrasts.mat[grepl('PTH2R', rownames(contrasts.mat)), grepl('PTH2R', colnames(contrasts.mat))]
+contrasts.mat[grepl('SMO', rownames(contrasts.mat)), grepl('SMO', colnames(contrasts.mat))]
+contrasts.mat[grepl('GPR135', rownames(contrasts.mat)), grepl('GPR135', colnames(contrasts.mat))]
+
+# rbind the rows from the different groups
+mss <- groupComparison(contrast.matrix=contrasts.mat[grepl('PTH2R', rownames(contrasts.mat)), grepl('PTH2R', colnames(contrasts.mat))],
+                       verbose=F,
+                       data=dp.list[['PTH2R']])
+pth2r.mss <- setDT(mss$ComparisonResult)
+
+mss <- groupComparison(contrast.matrix=contrasts.mat[grepl('SMO', rownames(contrasts.mat)), grepl('SMO', colnames(contrasts.mat))],
+                       verbose=F,
+                       data=dp.list[['SMO']])
+smo.mss <- setDT(mss$ComparisonResult)
+
+
+gpcr.mat <- matrix(contrasts.mat[grepl('GPR135', rownames(contrasts.mat)), grepl('GPR135', colnames(contrasts.mat))], nrow=1)
+rownames(gpcr.mat) <- '+cilia_GPR135 vs -cilia_GPR135'
+colnames(gpcr.mat) <- c('GPR135_+Cilia','GPR135_-Cilia')
+
+# rbind the rows from the different groups
+mss <- groupComparison(contrast.matrix=gpcr.mat,
+                       verbose=F,
+                       data=dp.list[['GPR135']])
+gpr.mss <- setDT(mss$ComparisonResult)
+
+```
+adjust the pvalues globally across all levels of the contrasts; also try the 
+
+```{r}
+mss.dt <- rbind(gpr.mss, smo.mss, pth2r.mss)
+# recal padj to account for the global MTC
+mss.dt[, padj := p.adjust(pvalue, method='BH'), by=(Label)]
+mss.dt[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+mss.dt[, c('numerator','denominator') := tstrsplit(Label, ' vs ', keep=c(1,2))]
+mss.dt[, sig := 'not']
+mss.dt[abs(log2FC) > 0.58 & pvalue < 0.005, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+
+# save the results to file 
+fwrite(mss.dt, ScriptAndDatedFileName('pwcomparisons.probelvlgrouping.csv.gz'))
+```
+
+set significance at LFC 50% and pval < 0.005
+```{r}
+mss.dt <- fread('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/020325_msstatsDEanalysis_data/2025_02_03_pwcomparisons.probelvlgrouping.csv.gz')
+```
+Ok, we can also run the analysis on the combined dataset and see if that recovers a greater number of hits
+Whatever works best, we will then try to use fishers method to combine p-values from the two seperate experiments
+
+First lets test with first round of normalization
+
+```{r}
+dp.out <- readRDS('./012425_ciliaAPEX_firstLook_data/2025_01_24_mss.dataProc.rds')
+p.quant <- fread('012425_ciliaAPEX_firstLook_data/2025_01_24_ProteinlvlQuant.2ndRoundNorm.csv')
+
+
+p.quant[, GROUP := factor(GROUP)]
+p.quant[, SUBJECT := paste0(GROUP,'.', SUBJECT)] # to enforce lm for group comparisons
+
+#p.quant[, LogIntensities := tmpAdjLogIntensities]
+
+dp.out$ProteinLevelData  <- p.quant
+```
+
+
+```{r}
+mss <- groupComparison(contrast.matrix=contrasts.mat,
+                       verbose=F,
+                       data=dp.out)
+
+mss.out <- setDT(mss$ComparisonResult)
+
+mss.out[, padj := p.adjust(pvalue, method='BH'), by=(Label)]
+mss.out[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+mss.out[, c('numerator','denominator') := tstrsplit(Label, ' vs ', keep=c(1,2))]
+mss.out[, sig := 'not']
+mss.out[abs(log2FC) > 0.58 & padj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+# this is with one round normalization
+firstPass.dt <- mss.out[sig != 'not', .N, by=Label]
+#tmpPass.dt <- mss.out[sig != 'not', .N, by=Label]
+#lmPass.dt <- mss.out[sig != 'not', .N, by=Label]
+
+firstPass.dt
+tmpPass.dt
+```
+Looking at this output, I think we want to run another round of normalization, but lets try the global median approach
+
+```{r}
+p.mat <- dcast(p.quant, Protein~paste0(GROUP,'.',SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+
+
+# like 1147 proteins shared
+sharedProts <-  p.mat[complete.cases(p.mat),] %>% 
+  rownames()
+
+
+p.quant %>% colnames()
+ggplot(p.quant[Protein %in% sharedProts,], aes(x=interaction(GROUP,SUBJECT), y=tmpAdjLogIntensities, fill=GROUP)) +
+  geom_boxplot() +
+  customTheme
+
+```
+
+*not used*
+Just proceed with the tmp normalization data
+
+```{r}
+dp.out <- readRDS('./012425_ciliaAPEX_firstLook_data/2025_01_24_mss.dataProc.rds')
+p.quant <- fread('012425_ciliaAPEX_firstLook_data/2025_01_24_ProteinlvlQuant.2ndRoundNorm.csv')
+
+p.quant[, GROUP := factor(GROUP)]
+p.quant[, SUBJECT := paste0(GROUP,'.', SUBJECT)] # to enforce lm for group comparisons
+
+p.quant[, LogIntensities := tmpAdjLogIntensities]
+
+dp.out$ProteinLevelData  <- p.quant
+
+
+# try with global median norm
+p.quant <- fread('020325_msstatsDEanalysis_data/2025_02_04_proteinlevelquant.renorm.csv')
+
+p.quant[, GROUP := factor(GROUP)]
+p.quant[, LogIntensities := medianNormInts]
+
+dp.out$ProteinLevelData  <- p.quant
+```
+
+```{r}
+mss <- groupComparison(contrast.matrix=contrasts.mat,
+                       verbose=F,
+                       data=dp.out)
+
+mss.out <- setDT(mss$ComparisonResult)
+
+mss.out[, padj := p.adjust(pvalue, method='BH'), by=(Label)]
+mss.out[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+mss.out[, c('numerator','denominator') := tstrsplit(Label, ' vs ', keep=c(1,2))]
+mss.out[, sig := 'not']
+mss.out[abs(log2FC) > 0.58 & padj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+mss.out[, probe := str_extract(Label, 'SMO|PTH2R|GPR135')]
+mss.out[, label := sig]
+mss.out[Protein %in% c(cilia.AM.prots, cilia.Consensus.prots), label := 'cilia assoc.']
+
+
+mss.out[sig != 'not',.N, by=Label]
+#fwrite(mss.out, ScriptAndDatedFileName('mss.pwcomparisons.allGroups.TMPrenormData.csv.gz'))
+
+mss.out <- fread('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/020325_msstatsDEanalysis_data/2025_02_04_mss.pwcomparisons.allGroups.csv.gz')
+#mss.out <- fread('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/020325_msstatsDEanalysis_data/2025_02_04_mss.pwcomparisons.allGroups.TMPrenormData.csv.gz')
+```
+
+barplot of number of significant hits in each group
+produce all the standard plots (volcanoplot, de heatmap, enrichment etc) and tables and return results by end of day
+Try fishers method to combine p-values from the two datasets
+
+Volcanoplots of the different tests
+```{r}
+mss.out[, label := factor(label,levels=c('not', 'down', 'up', 'cilia assoc.'))]
+mss.out <- mss.out[order(label)]
+
+g <- ggplot(mss.out, aes(y=-log10(padj), x=log2FC, color=label, label=gene)) +
+  geom_point(size=1.5) +
+  geom_text_repel(data=mss.out[label != 'not',]) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  labs(x=expression(log[2]~'FoldChange'), y=expression(-log[10]~'adj.pvalue')) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'cilia assoc.'='green4', 'not'='grey')) +
+  facet_wrap(~Label, scales='free', ncol=2) +
+  customTheme +
+  theme(strip.text.x = element_text(face='bold', size=12))
+
+g
+#BackupAsPDF(g, 'allContrasts.ajdpval.volcanoplots', dimensions = c(16,14))
+```
+pull out the agonist comparisons and plot them seperately
+
+```{r}
+contrast.oi <- c("+cilia_SMO_ag vs +cilia_SMO", "+cilia_PTH2R_ag vs +cilia_PTH2R")
+
+lapply(unique(mss.dt$Label), function(x){
+  
+  g <- ggplot(mss.out[Label == x,], aes(y=-log10(padj), x=log2FC, color=label, label=gene)) +
+  geom_point(size=1.5) +
+  geom_text_repel(data=mss.out[Label == x & label != 'not',]) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  ggtitle(paste0(x, ' comparison')) +
+  labs(x=expression(log[2]~'FoldChange'), y=expression(-log[10]~'adj.pvalue')) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'cilia assoc.'='green4', 'not'='grey')) +
+  customTheme 
+  g
+  #BackupAsPDF(g, paste0(x,'.ajdpval.volcanoplots'), dimensions = c(10,8))
+})
+```
+for the agonist comparisons, the pvalues are again quite high...
+reduce the significance threshold and try those labels
+
+```{r}
+mss.out[, reduced.sig := 'not']
+mss.out[abs(log2FC) >= 1 & pvalue < 0.005, sig := ifelse(log2FC > 0, 'up', 'down')]
+mss.out[, reduced.label := reduced.sig]
+mss.out[Protein %in% c(cilia.AM.prots, cilia.Consensus.prots), reduced.label := 'cilia assoc.']
+mss.out[, reduced.label := factor(label,levels=c('not', 'down', 'up', 'cilia assoc.'))]
+mss.out <- mss.out[order(reduced.label)]
+```
+
+
+```{r}
+lapply(unique(mss.dt$Label), function(x){
+  
+  g <- ggplot(mss.out[Label == x,], aes(y=-log10(pvalue), x=log2FC, color=reduced.label, label=gene)) +
+  geom_point(size=1.5) +
+  geom_text_repel(data=mss.out[Label == x & label != 'not',]) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  ggtitle(paste0(x, ' comparison')) +
+  labs(x=expression(log[2]~'FoldChange'), y=expression(-log[10]~'raw pvalue')) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'cilia assoc.'='green4', 'not'='grey')) +
+  customTheme 
+  g
+  BackupAsPDF(g, paste0(x,'.rawpval.volcanoplots'), dimensions = c(10,8))
+})
+```
+Enrichment analysis 
+```{r}
+g <- ggplot(mss.out[sig != 'not',.N, by=.(sig,Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='identity') +
+  scale_fill_manual(values=c('up'=col.pal[2], 'down'=col.pal[1])) +
+  ggtitle('Overview of comparisons') +
+  labs(x='Contrast', y=expression('N sig hits ('~log[2]~'FC & padj < 0.05)')) +
+  customTheme + 
+  theme(axis.text.x = element_text(size=8))
+
+BackupAsPDF(g, 'nSighits.barplot', dimensions = c(5,5))
+```
+run enrichment analysis of the results
+
+Run enrichment of these proteins 
+
+GO CC enrichment first
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+```
+
+```{r}
+# define the universe, the total set of identified genes in our study
+universe <- as.character(unique(p.quant$Protein))
+
+mss.out[, enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.out[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('pwContrasts.GO.CC.enrichments.csv'))
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('pwContrasts.GO.CC.simplified.enrichments.csv'))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, 
+                                groupColumn = 'enrich.grp', 
+                                topN = 10,
+                                title='GO Cellular Component', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'pwcontrast.GOCC.enrichments.heatmap', dimensions=c(6,7))
+```
+Run GO BP enrichment
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='BP', keyType='UNIPROT')
+```
+
+```{r}
+# define the universe, the total set of identified genes in our study
+
+enrich.dt <- enricherOnGroups(mss.out[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+# this is a very small set, just save the output
+# cant simplify further...
+fwrite(enrich.dt, ScriptAndDatedFileName('pwcontrast.GO.BP.enrichments.csv'))
+```
+
+```{r}
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('pwcontrasts.GO.BP.simplified.enrichments.csv'))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, 
+                                groupColumn = 'enrich.grp', 
+                                topN = 12,
+                                title='GO Biological Process', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'agonistContrast.GOCC.enrichments.heatmap', dimensions=c(10,10))
+```
+I think we want to take the normalized counts (tmp) and add these to the msstats data table
+Do we want to look at heatmaps of the differentially expressed proteins? Possibly, just add in anyways so we can visualize.
+```{r}
+p.mat <- dcast(p.quant, Protein~SUBJECT, value.var='tmpAdjLogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+sigProts <- mss.out[label != 'not', unique(Protein)]
+
+submat <- p.mat[rownames(p.mat) %in% sigProts, !grepl('[-]Cilia_[+]Agonist', colnames(p.mat))]
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+# 260 proteins in total that move, but larger number of contrasts
+submat <- sweep(submat, 1, apply(submat,1, median, na.rm=T))
+
+
+# get the sig genes and contrasts they are sig in 
+sigGenes.dt <- unique(mss.out[label != 'not',.(gene, Label, label)])
+sigGenes.dt <- sigGenes.dt[, lapply(.SD, function(x) paste(x, collapse='\n')), .SDcols=c('Label', 'label'), by=gene]
+
+# tidy names to remove duplicates in collapse (how doe we get them? different protein same genename)
+sigGenes.dt[Label == '+cilia_SMO_ag vs +cilia_SMO']
+sigGenes.dt
+
+
+mss.out[gene %in% c('Wasl','Tnks1bp1') & sig != 'not',]
+# its a merge; merging names but just want the Label col in the order of the rownames
+splitGenes <- sigGenes.dt[rownames(submat), Label, on='gene']
+
+
+column_ha = HeatmapAnnotation(
+                              ciliaStatus = ifelse(grepl('[+]Cilia', colnames(submat)), 'cilia', 'na'), 
+                              agonistStatus= ifelse(grepl('[+]Agonist', colnames(submat)), 'agonist', 'na'), 
+                              col=list(ciliaStatus=c('cilia'='darkgreen', 'na'='white'), agonistStatus=c('agonist'='darkred', na='white')),
+                              border=T
+                              )
+
+hm <- Heatmap(submat, 
+        name='Ints/\nmedian',
+        top_annotation = column_ha,
+        row_split = splitGenes,
+        cluster_columns = F,
+        column_split = list(str_extract(colnames(submat), 'SMO|PTH2R|GPR135')),
+        col=colorRamp2(breaks=c(-3,0,3), colors = c(col.pal[1], 'white', col.pal[2])),
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=5),
+        row_title_gp = gpar(fontsize=8),
+        border=T,
+        row_title_rot = 0
+        )
+
+hm
+BackupAsPDF(hm, 'sigGenes.onlyTestedConditions.heatmap', dimensions=c(13,17))
+```
+Check out the gene profiles we see; run enrichment andfigure out what they are enriched for 
+
+```{r}
+genes.oi <- c('Arpc3', 'Arpc4', 'Arpc1b', 'Actr3', 'Actb', 'Dbn1', 'Tpm3', 'Actg1', 'Tip1', 'Ocin', 'Tip2', 'Capzb', 'Myh14', 'Tpm4')
+fwrite(data.table(genes.oi), ScriptAndDatedFileName('geneslist.csv'))
+
+test.dt <- data.table(gene=genes.oi, 
+                      enrich.grp='genes.oi'
+                      )
+
+universe <- mss.out$gene
+
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='SYMBOL')
+enrich.dt <- enricherOnGroups(test.dt, groupColumns = 'enrich.grp', geneColumn='gene',universe = universe, term2gene.gmt=gmt.go)
+fwrite(enrich.dt, ScriptAndDatedFileName('proteinsOI.enrich.GO.BP.csv'))
+```
+
+Rerun the analysis with a term for batch/subject
+```{r}
+mss.out[, c('numerator', 'denominator') := tstrsplit(Label, ' vs ', keep=c(1,2))]
+mss.out
+
+
+p.quant.wide <- dcast(p.quant, Protein~GROUP, value.var='tmpAdjLogIntensities', fun.aggregate = function(x){ paste0(x, collapse='|')})
+colnames(p.quant.wide) <- paste0(colnames(p.quant.wide), '__normalizedLog2Intensities')
+setnames(p.quant.wide, old='Protein__normalizedLog2Intensities', new='Protein')
+
+p.quant.wide[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+p.quant.wide %>% colnames()
+
+p.quant.wide <- p.quant.wide[,.(Protein, gene, `GPR135_-Cilia__normalizedLog2Intensities`, `GPR135_+Cilia__normalizedLog2Intensities`, 
+                `PTH2R_-Cilia_-Agonist__normalizedLog2Intensities`,`PTH2R_-Cilia_+Agonist__normalizedLog2Intensities`, `PTH2R_+Cilia_-Agonist__normalizedLog2Intensities`,`PTH2R_+Cilia_+Agonist__normalizedLog2Intensities`,
+                `SMO_-Cilia_-Agonist__normalizedLog2Intensities`, `SMO_-Cilia_+Agonist__normalizedLog2Intensities`,`SMO_+Cilia_-Agonist__normalizedLog2Intensities`, `SMO_+Cilia_+Agonist__normalizedLog2Intensities`)]
+
+
+mss.out <- merge(mss.out[,.(Protein,gene, Label, log2FC, SE, pvalue, padj)], p.quant.wide, by=c('Protein', 'gene'))
+fwrite(mss.out, ScriptAndDatedFileName('mss.pwcomparisons.firstPass.wIntensities.csv.gz'))
+```
+
+Look at the counts matrix
+```{r}
+mss.out
+submat <- sweep(p.mat, 1, apply(p.mat,1, median, na.rm=T))
+
+Heatmap(submat,
+        border=T,
+        cluster_rows = clusterWNA(submat),
+        row_title = sprint()
+        column_split = list(str_extract(colnames(submat), 'SMO|PTH2R|GPR135')),
+        col=colorRamp2(breaks=c(-3,0,3), colors = c(col.pal[1], 'white', col.pal[2])),
+        show_row_names = F
+        )
+```
+
+
+
+
+
+
+```{r}
+
+ "green4"      "#6A3D9A"     "#FF7F00"     "black"       "gold1"       "skyblue2"    "#FB9A99"     "palegreen2"  "#CAB2D6"     "#121111"     "gray70" 
+```
+
+
+
+
+run another round of median normalzation on the data
+
+Calculate the median value of each sample
+Determine a refence value( dan be the median of all samples or user-defined) 
+Divide each datapoint by the samples median and multiply it by reference value
+```{r}
+calMedianNormalization <- function(protDT){
+  
+  p.mat <- dcast(protDT, Protein~SUBJECT, value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+  
+  sample.median <- apply(p.mat, 2, median, na.rm=T)
+  global.ref <- median(sample.median, na.rm=T)
+
+  norm.mat <- apply(p.mat, MARGIN = 1, function(x){ (x/sample.median)*global.ref })
+  
+  norm.dt <- setDT(reshape2::melt(norm.mat))
+  setnames(norm.dt, c('sample', 'Protein', 'medianNormInts'))
+
+  
+  #norm.dt[, c('GROUP','SUBJECT') := tstrsplit(sample, '[.]', keep=c(1,2))]
+  message('returning normalized values...')
+  print(head(norm.dt))
+  
+  out.dt <- merge(x=protDT, y=norm.dt, by.x=c('Protein','SUBJECT'), by.y=c('Protein','sample'))
+  return(out.dt)
+}
+```
+
+compare the output of this comparison withe tmp adjusted
+
+```{r}
+dp.out <- readRDS('./012425_ciliaAPEX_firstLook_data/2025_01_24_mss.dataProc.rds')
+p.quant <- fread('012425_ciliaAPEX_firstLook_data/2025_01_24_ProteinlvlQuant.2ndRoundNorm.csv')
+
+p.quant[,GROUP := factor(GROUP)]
+p.quant[,SUBJECT := paste0(GROUP,'.', SUBJECT)]
+
+p.quant <- calMedianNormalization(p.quant)
+#fwrite(p.quant, ScriptAndDatedFileName('proteinlevelquant.renorm.csv'))
+p.quant <- fread('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/020325_msstatsDEanalysis_data/2025_02_04_proteinlevelquant.renorm.csv')
+```
+
+```{r}
+
+g <- ggplot(p.quant, aes(x=SUBJECT, y=medianNormInts, fill=GROUP)) +
+  geom_boxplot() +
+  ggtitle('Normalized protein intensity distributions') +
+  scale_fill_manual(values=unname(col.pal)) +
+  customTheme
+g
+
+p.quant[, LogIntensities := medianNormInts]
+
+dp.out$ProteinLevelData  <- p.quant
+```
+
+
+```{r}
+mss <- groupComparison(contrast.matrix=contrasts.mat,
+                       verbose=F,
+                       data=dp.out)
+
+mss.out <- setDT(mss$ComparisonResult)
+
+mss.out[, padj := p.adjust(pvalue, method='BH'), by=(Label)]
+mss.out[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+mss.out[, c('numerator','denominator') := tstrsplit(Label, ' vs ', keep=c(1,2))]
+mss.out[, sig := 'not']
+mss.out[abs(log2FC) > 0.58 & padj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+
+mss.out[sig != 'not', .N, by=Label]
+# this is with one round normalization
+medianNormPass.dt <- mss.out[sig != 'not', .N, by=Label]
+medianNormPass.dt[order(-N)]
+
+g <- ggplot(p.quant[Protein %in% sharedProts,], aes(x=SUBJECT, y=tmpAdjLogIntensities, fill=GROUP)) +
+  geom_boxplot() +
+  ggtitle('Normalized protein intensity distributions') +
+  scale_fill_manual(values=unname(col.pal)) +
+  customTheme
+g
+```
+I think we take the renormalized set and got for
+
+```{r}
+mss.out
+```
+

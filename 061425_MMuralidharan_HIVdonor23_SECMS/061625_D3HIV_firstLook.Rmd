@@ -1,0 +1,283 @@
+---
+title: "061625_D3HIV_CCprofiler"
+author: "Martin Gordon"
+date: "2025-06-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Now we have the D3 data, try run CCprofiler on this sample to see the complexes we recover (and the differential analysis results)
+Will start from protein traces object, to allow fairest comparability to the other datasets.
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(CCprofiler)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+```
+read in the processed peptide level data and generate. a CCprofiler traces file. Look at the example data workup
+```{r}
+msin.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_D3_MSstatsSmmarization_data/2025_06_16_hiv.d3.peptide.ints.long.csv.gz')
+msin.dt[!is.na(intensity) & org == "Human immunodeficiency virus type 1" & decoy != TRUE, .N, by=sample]
+
+
+msin.dt[!is.na(intensity) & org == "Human immunodeficiency virus type 1", ] %>% 
+  .[sample == 'D3-Uninfected']
+```
+Look at histograms of HIV peptide intensities 
+```{r}
+g <- ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE], aes(x=log2(intensity), fill=sample)) +
+  geom_density(alpha=0.6)
+g
+
+```
+
+
+```{r}
+g <- ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE], aes(x=-log10(qvalue), fill=sample)) +
+  geom_density(alpha=0.6) +
+  geom_vline(xintercept = -log10(0.01)) +
+  coord_cartesian(xlim=c(0,20)) +
+  facet_wrap(sample~., scales='free', nrow=3) +
+  theme_bw()
+g
+```
+```{r}
+g <- ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True'], aes(x=-log10(qvalue), fill=sample)) +
+  geom_density(alpha=0.6) +
+  geom_vline(xintercept = -log10(0.01)) +
+  coord_cartesian(xlim=c(0,20)) +
+  facet_wrap(sample~., scales='free', nrow=3) +
+  theme_bw()
+g
+
+g <- ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01, .N, by=.(gene,sample)] , aes(x=sample, y=N, fill=gene)) +
+  labs(title='Detected donor 3 viral peptides', subtitle = 'Q-value < 0.01') +
+  geom_bar(stat='identity', position='stack') +
+  scale_fill_brewer(type='qual') +
+  theme_bw()
+g
+BackupAsPDF(g, 'nviralpeptides.qval0.01.barplot')
+```
+now look at the intensity and qvalue distributions for these peptides
+
+```{r}
+ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01, ], aes(x=log2(intensity), fill=sample)) +
+  geom_density(alpha=0.6)
+
+ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01, ], aes(x=-log10(qvalue), fill=sample)) +
+  geom_density(alpha=0.6) +
+  coord_cartesian(xlim=c(0,10))
+
+
+g <- ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01, ] , aes(x=fraction,y=log2(intensity),color=gene)) +
+  geom_point() +
+  geom_line(aes(group=precursor)) +
+  labs(title='Detected donor 3 viral peptides', subtitle = 'Q-value < 0.01') +
+  scale_color_brewer(type='qual') +
+  facet_grid(sample~.) +
+  theme_bw()
+
+g
+
+-log10(0.0001)
+```
+
+```{r, boxplot, fig.width=10, fig.height=7}
+# get N unique peptides 
+msin.dt[, peptide := gsub('[.][0-9]{1}$', '', precursor)]
+
+
+g <- ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01, ] , aes(x=as.factor(fraction), y=-log10(qvalue), color=sample)) +
+  geom_boxplot(outliers=F) +
+  geom_point(data=msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01, 
+                          .(length(unique(peptide))) , by=.(fraction, sample)], aes(x=as.factor(fraction), y=V1), color='red') +
+  scale_color_brewer(type='qual', palette=2) +
+  facet_grid(sample~., scales='free') +
+  #coord_cartesian(ylim=c(0,100)) +
+  theme_bw()
+
+BackupAsPDF(g, 'qval.distributions.npeptides.overlaid.boxplots')
+
+
+
+Reduce(intersect, hiv.ids)
+```
+find the N runs peptides are identified in 
+```{r}
+plot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01, 
+             .N, by=.(precursor)][order(-N)], aes(x=order(precursor, -N), y=N)) +
+  geom_point()
+
+ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01, 
+             .N, by=.(precursor)], aes(x=N)) +
+  geom_histogram() +
+  geom_vline(xintercept=72, color='red') 
+
+```
+```{r}
+
+g <- ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01, ] , aes(x=as.factor(fraction), y=-log10(qvalue), color=sample)) +
+  geom_boxplot(outliers=F) +
+  geom_point(data=msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01, 
+                          .(length(unique(peptide))) , by=.(fraction, sample)], aes(x=as.factor(fraction), y=V1), color='red') +
+  scale_color_brewer(type='qual', palette=2) +
+  facet_grid(sample~., scales='free') +
+  #coord_cartesian(ylim=c(0,100)) +
+  theme_bw()
+```
+
+
+
+Look at the msstats file and compare intensities to teh 
+
+```{r}
+allFiles <- dir('./data/HIV_Infection_CD4T_cells/Donor-3-061125/D3_Stringent_Spectronaut_Parameters_061225/', full.names = T, include.dirs = T, recursive = T)
+allFiles
+d3.mss <- fread(allFiles[13])
+```
+
+```{r}
+msin.dt[sample == 'D3-Uninfected' & protein == 'Q9HCS7' & !is.na(intensity)] %>% 
+  .[order(fraction, precursor), .(protein, fraction, precursor, intensity)]
+
+
+ggplot(msin.dt[!is.na(intensity), length(unique(protein)), by=.(sample, fraction)],  aes(x=fraction, y=V1, fill=sample)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~sample, ncol=1)
+
+
+ggplot(msin.dt[sample == 'D3-Uninfected' & !is.na(intensity) & qvalue < 0.01, length(unique(protein)), by=.(sample, fraction)],  aes(x=fraction, y=V1, fill=sample)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~sample, ncol=1)
+```
+```{r}
+ggplot(d3.mss[!is.na(Intensity), length(unique(ProteinName)), by=.(Condition, Run)],  aes(x=Run, y=V1, fill=Condition)) +
+  geom_bar(stat='identity')
+
+
+d3.mss[!is.na(Intensity) & ProteinName == 'A0A075B6N2'][order(Run)][order(PeptideSequence), .(PeptideSequence, Run, Intensity)] 
+```
+check the intensity values of the peptides
+```{r}
+msin.dt[sample == 'D3-Uninfected' & !is.na(intensity) & qvalue <= 0.01 & protein == 'A0A075B6N2'][order(fraction)][order(precursor), .(precursor, fraction, intensity)]
+
+
+ggplot(msin.dt[!is.na(intensity) & qvalue < 0.01, .N, by=.(sample, org)], aes(x=sample, y=log10(N), color=org)) +
+  geom_point()
+```
+
+```{r}
+hq.msin <- msin.dt[!is.na(intensity) & qvalue < 0.01]
+
+# drop m
+hq.msin[!grepl(';', protein), length(unique(precursor)) != 1, by=.(gene, org,sample)][V1 == TRUE][, .N, by=.(sample, org)]
+```
+```{r}
+hq.msin[org != 'Homo sapiens', .N, by=precursor]
+
+
+hq.msin$sample %>% unique(0)
+hiv.ids <- list('uninfected' = hq.msin[sample == 'D3-Uninfected' & org == 'Human immunodeficiency virus type 1', unique(precursor)],
+                'infected' =hq.msin[sample == 'D3-Challenged_Infected' & org == 'Human immunodeficiency virus type 1', unique(precursor)],
+                'challenged' =hq.msin[sample == 'D3-Challenged_Uninfected' & org == 'Human immunodeficiency virus type 1', unique(precursor)])
+                
+
+
+g <- plot(eulerr::venn(hiv.ids), quantities = T)
+g
+Backup
+
+hq.msin[sample == 'D3-Uninfected' & org == 'Human immunodeficiency virus type 1']
+hq.msin[sample == 'D3-Uninfected' & org == 'Human immunodeficiency virus type 1', unique(prec)]
+```
+
+replot the intersected proteins and see how they look
+
+```{r}
+
+allsamples <- Reduce(intersect, hiv.ids)
+
+g <- ggplot(msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01 & precursor %in% allsamples, ] , aes(x=as.factor(fraction), y=-log10(qvalue), color=sample)) +
+  geom_boxplot(outliers=F) +
+  labs(title='high confidence viral peptides found in all samples') +
+  geom_point(data=msin.dt[org == "Human immunodeficiency virus type 1" & !is.na(intensity) & decoy != TRUE & pg_specific == 'True' & qvalue < 0.01 & precursor %in% allsamples, 
+                          .(length(unique(peptide))) , by=.(fraction, sample)], aes(x=as.factor(fraction), y=V1), color='red') +
+  scale_color_brewer(type='qual', palette=2) +
+  facet_grid(sample~., scales='free') +
+  #coord_cartesian(ylim=c(0,100)) +
+  theme_bw()
+g
+BackupAsPDF(g, 'qval.distributions.npeptides.overlaid.intersectViralprots.boxplots')
+```
+
+
+Now look at the msstats report
+
+```{r}
+p.quant <- fread("./data/HIV_Infection_CD4T_cells/Donor-3-061125/D3_Stringent_Spectronaut_Parameters_061225//D3-Uninfected_061225/20250616_115716_D3_CD4_Uninfecetd_061125_Prot_Report_Recent.tsv")
+
+p.quant <- melt(p.quant, id.vars = c("PG.ProteinGroups", "PG.MolecularWeight"))
+setnames(p.quant, old=c('variable', 'value'), new=c('sample', 'intensity'))
+
+
+# test prtoein
+p.quant[!is.na(intensity), .N, by=PG.ProteinGroups]
+plot(p.quant[PG.ProteinGroups == 'O00299',]$intensity)
+
+
+plot(p.quant[PG.ProteinGroups == 'O00299' & !is.na(intensity),]$intensity)
+plot(p.quant[PG.ProteinGroups == 'O00299' & !is.na(intensity),]$intensity)
+length(p.quant[PG.ProteinGroups == 'O00299' & !is.na(intensity),]$intensity)
+
+
+```
+H
+```{r}
+plot(d3.mss[!is.na(Intensity) & ProteinName == 'O00299', sum(Intensity), by=.(Condition, Run)]$V1) 
+length(d3.mss[!is.na(Intensity) & ProteinName == 'O00299', sum(Intensity), by=.(Condition, Run)]$V1)
+
+
+
+
+d3.mss[!is.na(Intensity) & ProteinName == 'O00299', mean(Intensity), by=.(Condition, Run)][order(Run)]
+```
+
+Safest comparison between the files is an all by all protein correlation; just sum the intensities inhte peptide file 
+
+```{r}
+library(stringr)
+
+p.quant[, c('fraction', 'fraction2') := as.list(str_extract_all(sample, '[0-9]+', simplify = T)), by=.I]
+p.quant <- p.quant[, .(protein=PG.ProteinGroups, fraction, intensity)]
+pep.sum <- d3.mss[, .(intensity=sum(Intensity, na.rm=T)), by=.(Run, ProteinName, Condition)][,.(protein=ProteinName, fraction=as.character(Run), sum_intensity=intensity)]
+
+p.quant
+pep.sum
+p.quant[!is.na(intensity)]
+
+comb.dt <- merge(p.quant[!is.na(intensity)], pep.sum, by=c('protein','fraction'))
+
+
+g <- ggplot(comb.dt[, cor(intensity, sum_intensity), by=.(protein)], aes(V1)) +
+  geom_density(fill='cornflowerblue') +
+  theme_bw()
+
+g
+
+as.list(str_extract_all('[1] 1.PG.Quantity', '[0-9]+', simplify = T))
+str_extract_all()
+
+
+```
+
+
+

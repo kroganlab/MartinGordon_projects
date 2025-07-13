@@ -1,0 +1,203 @@
+---
+title: "Squid-PTM-Analysis"
+author: "Martin Gordon"
+date: "2023-05-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Packages & Dependencies
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library(tidyverse)
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+Functions
+
+```{r preprocess-func}
+preprocessSpec <- function(spec_f,keys_f){
+
+  #fread stores as data.table by default
+  spec <- fread(spec_f)
+  keys <- fread(keys_f)
+
+  #add semicolon if required 
+  spec[, ProteinName := gsub ("(?<![_>])PAC", ";PAC", ProteinName, perl = TRUE)] #uses perl regex v with negative lookbehind to negate -/> characters 
+
+
+  # for some reason the '>' was kep in the protein names here.  Remove those:
+  spec[, ProteinName := gsub (">", "", ProteinName)]
+
+  # apply Condition, BioReplicate from keys to spec
+  spec[keys , Condition := i.Condition , on = c(Run = "RawFile")] #overwrite condition col w values from keys file, match run col in spec to rawfile col in keys
+  spec[keys , BioeReplicate := i.BioReplicate , on = c(Run = "RawFile")]
+  
+  return(spec)
+  setnames(spec) = dat_name
+}
+
+```
+
+
+Config paths
+
+```{r setup}
+#path to files
+path <- "/Users/martingordon/Documents/projects/050523_JMoen_SquidPTM/docs/SquidPTM"
+
+#fasta_old <- paste0(path, "/dorPea_CDS_AA_All_Edits_noDup.fasta") 
+fasta_new <- paste0(path,'/2023-05-08_dorPea_CDS_AA_Single_Tryptic_noDup.fasta')  #use this as dups removed
+
+f_input <- dir(path = paste0(path, '/2023-05-09-noimput'), pattern = "*.xls", recursive = FALSE, full.names = TRUE) 
+k_input <- dir(path = path, pattern = "keys.txt", recursive = FALSE, full.names = TRUE)
+
+input <- data.frame(f_input,k_input)
+
+rm(f_input)
+input <- input %>% 
+  mutate(ptm_type=as.factor(str_extract(f_input, pattern="AcK|MeK|PH|UB"))) %>% 
+  arrange(ptm_type)
+
+rm(f_input)
+rm(k_input)
+```
+
+```{r make-contrast-matrix}
+contrasts <- scan(paste0(path,"/contrasts.txt"), what = "character")
+contrasts
+```
+
+```{r run-preprocesing}
+#apply to each row of df and name after val in third column
+resuls_list <- setNames(apply(input, 1,function(row) {
+  spec=row[1]
+  keys=row[2]
+  preprocessSpec(spec,keys) }), input$ptm_type)
+
+DiM <- resuls_list[['MeK']] 
+TriM <- resuls_list[['MeK']]
+
+resuls_list <- append(resuls_list, c(list(DiM),list(TriM)))
+names(resuls_list) <- c("AcK", "MeK", "PH"  ,"UB",  "DiMeK",  "TriMeK") 
+
+rm(DiM)
+rm(TriM)
+```
+
+Spectronaut data trim left tail which is obviously garbage,
+what is the left shoulder peak? Try plot just the PTM peptides and observe if peak is still there
+
+```{r plot-hist}
+
+#decide on cutoffs
+
+lapply(resuls_list, function(dt){
+  
+  ggplot(data=dt, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+
+} )
+
+
+# specify threshold
+resuls_list$PH <- resuls_list$PH[Intensity > 2^5]
+resuls_list$MeK <- resuls_list$MeK[Intensity > 2^4]
+resuls_list$AcK <- resuls_list$AcK[Intensity > 2^4]
+resuls_list$UB  <- resuls_list$UB[Intensity > 2^4]
+resuls_list$DiMeK <- resuls_list$DiMeK[Intensity > 2^4]
+resuls_list$TriMeK <- resuls_list$TriMeK[Intensity > 2^4]
+
+
+lapply(resuls_list, function(dt){
+  
+  ggplot(data=dt, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+
+} )
+
+```
+
+```{r simplifyprots}
+
+#run each individually w specific settings and make list to plot
+sitifyProteins_SpectronautFile(resuls_list[['PH']], fastaFile = fasta_new, site = "PH") 
+sitifyProteins_SpectronautFile(resuls_list[['AcK']], fastaFile = fasta_new, site = "KAC") 
+sitifyProteins_SpectronautFile(resuls_list[['MeK']], fastaFile = fasta_new, site = "MMET")
+sitifyProteins_SpectronautFile(resuls_list[['DiMeK']], fastaFile = fasta_new, site = "DMET") 
+sitifyProteins_SpectronautFile(resuls_list[['TriMeK']], fastaFile = fasta_new, site = "TMET") 
+sitifyProteins_SpectronautFile(resuls_list[['UB']], fastaFile = fasta_new, site = "UB")
+
+```
+
+```{r filter dts}
+
+resuls_list <- lapply(resuls_list, function(dt){
+  dt <- dt[!is.na(dt$oldProteinName)]
+  return(dt)
+} )
+
+lapply(resuls_list, function(dt){
+  
+  ggplot(data=dt, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+
+} )
+
+```
+
+
+```{r run-msstats}
+# make contrasts
+#put in function
+
+runMSStats <- function(spec_in){
+
+  # required column for MSstats
+  spec_in[, IsotopeLabelType := "L"]
+
+  dp.out <- MSstats::dataProcess(spec_in, MBimpute = FALSE, featureSubset = "highQuality", remove_uninformative_feature_outlier = TRUE)
+  return(dp.out)
+}
+
+# run msstats on each list element
+msstats_proc <- lapply(resuls_list, function(dt) {
+  runMSStats(dt)
+})
+
+# write out files to output directory
+imap(msstats_proc, function(dt, idt) {
+  fwrite(dt$ProteinLevelData, ScriptAndDatedFileName(paste0(idt,"-ProteinLevelData.csv")))
+  fwrite(dt$FeatureLevelData, ScriptAndDatedFileName(paste0(idt,"-FeatureLevelData.csv")))
+})
+
+# MSStats Differential Expression
+msdiff_list <- lapply(msstats_proc, function(dt) {
+  contrast.mat <- makeContrast.regEx(dt, contrasts)
+  gc.out <- MSstats::groupComparison(contrast.mat, dt)
+  return(gc.out)
+})
+
+# write out differential expression results to file
+imap(msdiff_list, function(dt, idt) {
+  fwrite(dt$ComparisonResult, ScriptAndDatedFileName(paste0(idt,"-diff-results.txt")))
+})
+
+
+
+```
+
+
+

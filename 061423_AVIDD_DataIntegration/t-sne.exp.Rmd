@@ -1,0 +1,330 @@
+---
+title: "T-SNE_exp"
+author: "Martin Gordon"
+date: "2023-07-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## packages 
+
+```{r}
+library("RColorBrewer") 
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(RcppCNPy) #R/W support to import numpy objects into R
+library(VennDiagram)
+library(pbapply) #apply functions with progress bar
+library(eulerr)
+
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/bp_utils/PPINetworkModularized.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+source ("../../utils/bp_utils/NetworkPropagation.R")
+
+
+# Attach the `umap` library
+library(umap)
+
+library(cluster) #k-mediod clustering
+library(factoextra) #estimate optimal k
+```
+
+
+## Repeat of the method used to visualise the output of the network propagation 
+Take signinficant genes in each condition in each dataset and run DSD clusterinfg
+
+Read in the clean data, cn also plot SAINT data and include in the analysis but do this first
+
+```{r}
+
+# read in the clean omics files
+rna.ab.clean <- fread('./output/rna_ab.clean.csv.gz')
+rna.ab.clean[, omics :='rna']
+rna.ab.clean[, adj.pvalue := p.adjust(pvalue, method = 'BH')]
+
+prot.ab.clean <- fread('./output/prot_ab.clean.csv.gz')
+prot.ab.clean[, omics := 'p.ab']
+prot.ph.clean <- fread('./output/prot_ph.clean.csv.gz')
+prot.ph.clean[, omics := 'p.ph']
+
+omics.clean <- list(rna_ab = rna.ab.clean,
+                    prot_ab = prot.ab.clean,
+                    prot_ph = prot.ph.clean)
+```
+
+
+filter the data to only include significant genes 
+
+```{r}
+sig.omics <-lapply(omics.clean, function(x){
+  x[adj.pvalue < 0.05 & abs(log2FC) > log2(1.5),]
+})
+```
+
+For the DSD clustering on the STRING network, we need to map to string ID's. For phospho, collapse to gene level and take the instance with highest scoring geom.mean of log2FC and pvalue
+
+```{r}
+ 
+
+sig.omics[['prot_ph']][, uniprot := gsub("_[STY][0-9]+", "", Protein) %>% #strip phosphosite info
+          strsplit (";") %>%  #split multiprots; creates a list of vectors of each element
+          lapply (unique) %>% #removes any duplicate elements in list
+          lapply (paste, collapse = ";") %>% #colapses back to unique prot names
+          unlist]
+
+
+sig.omics[['prot_ph']] <- sig.omics[['prot_ph']][!grepl(";", uniprot),] #only select rows w/o multiuniprots
+
+
+#only taking record with best gm score
+sig.omics[['prot_ph']] <- sig.omics[['prot_ph']][,  .SD[which.min(gm.lfc.fdr)], by=.(Label, uniprot)]
+sig.omics[['prot_ph']][,gene := translateUniprot2GeneName(uniprot)]
+```
+
+Extract significant gene names stringIDs and contrasts/labels
+(same format as NP to run functions)
+
+```{r}
+sig.omics.genes <- lapply(sig.omics, function(x){
+  x <- x[, .(string = translateGene2String(gene, species='HUMAN'),symbol = gene,Label)]
+  x[, .(gene = string, Label, symbol)]
+})
+
+```
+
+
+```{r}
+
+
+
+#combinethe netprop sig results & take the unique gene list
+sig.df <- rbindlist(sig.omics.genes, idcol = 'omics')
+
+
+sig.WT.ND.df <- rbindlist(sig.omics.genes, idcol = 'omics') %>% 
+  .[Label == 'WT_IFNg-vs-ND_IFNg',]
+
+sigfeatures.WT.ND <- unique(sig.WT.ND.df$symbol)
+
+
+
+# get string subnetwork for each contrast
+string.net.list <- lapply(contrasts.OI, function(i){
+  
+  sigfeatures <- sig.df[Label == i, unique(symbol)]
+  stringMapping <- GetStringIDMapping(sigfeatures, stringAliasFile='./data/9606.protein.aliases.v11.5.txt.gz')
+  
+  stringsOI <- c(setdiff(sigfeatures, stringMapping$alias), stringMapping$string)
+  stringEdges <- GetStringSubNetwork(stringsOI,  oneHopConnections = TRUE, stringFile = './data/9606.protein.links.detailed.v11.5.txt.gz' ) #includes 1 hop connectors
+
+  })
+# add names to the dataset
+names(string.net.list) <- contrasts.OI
+
+
+
+lapply(seq_along(string.net.list), function(x,n,i){
+  
+  fwrite(x[[i]], paste0("./data/", n[[i]], "expdata.StringSubNetwork.1hop.txt"), sep = "\t", col.names=FALSE)
+  },x=string.net.list, n=names(string.net.list))
+
+```
+### DSD in external python script
+
+```{r, eval=FALSE}
+# run this in CL
+#conda activate python2.7
+# -c confidence values in ppi as edge weights
+# -s 20 steps in random walk
+
+#for i in EV_IFNg-vs-WT_IFNg WT_IFNg-vs-ND_IFNg; do echo " running DSD on $i"; python ./scripts/capDSD-src/DSD.py ./data/${i}expdataStringSubNetwork.1hop.txt ./data/${i}expdataStringSubNetwork.1hop; done
+
+```
+
+
+```{r, fig.width = 12, fig.height = 12}
+dsd.ev.wt <- fread ("./data/EV_IFNg-vs-WT_IFNgexpdata.StringSubNetwork.1hop.dsd")
+dsd.wt.nd <-fread('./data/WT_IFNg-vs-ND_IFNgexpdata.StringSubNetwork.1hop.dsd')
+
+dsd.list <- list("EV_IFNg-vs-WT_IFNg" = dsd.ev.wt,
+                 "WT_IFNg-vs-ND_IFNg" = dsd.wt.nd)
+
+#convert to matrix
+dsd.list <- lapply(dsd.list, function(x){x <- as.matrix(x, rownames='V1')})
+
+# create subnet distance mat 
+string.dist.list <- lapply(contrasts.OI, function(x,y,i){
+  
+  sigfeatures <- y[Label == i, unique(symbol)]
+  stringMapping <- GetStringIDMapping(sigfeatures, stringAliasFile='./data/9606.protein.aliases.v11.5.txt.gz') # convert to string
+  # get interesting strings
+  stringsOI <- c(setdiff(sigfeatures, stringMapping$alias), stringMapping$string) #return elements unique in sigfeatures not in str$aliad
+  
+  #remove the 1 hop connectors
+  stringsInMat <- intersect(rownames(x[[i]]), c(stringsOI))
+  submat <- x[[i]][stringsInMat, stringsInMat]
+  
+  },x=dsd.list, y=sig.df)
+
+names(string.dist.list) <- contrasts.OI
+
+
+lapply(seq_along(string.dist.list), function(x,n,i){
+  
+  #get distance matrix for clustering
+  dist.mat <- as.dist(x[[i]])
+  ddr <- hclust(dist.mat, method= "average") %>% 
+    as.dendrogram()
+
+  hm <- Heatmap(x[[i]], show_row_names = FALSE, show_column_names = FALSE, cluster_rows = ddr, cluster_columns = ddr)
+  BackupAsPDF(draw(hm),paste0(n[[i]],'dissimilarity-matrix.pdf'))
+
+  
+}, x=string.dist.list, n=names(string.dist.list))
+
+```
+### tsne based on DSD
+
+For visualizing the modularization later
+
+```{r, fig.width = 6, fig.height =  6}
+
+tsne.list <- lapply(seq_along(string.dist.list), function(x,n,i){
+
+ dist.mat <- as.dist(x[[i]])
+ t <- Rtsne::Rtsne(dist.mat, is.distance = TRUE, theta = 0.0 ) # exact tsne when theta = 0.0
+
+ tsne.dt <- as.data.table(t$Y)
+ tsne.dt$string <- attr(dist.mat, "Labels")
+ return(tsne.dt)
+
+}, x= string.dist.list, n=names(string.dist.list))
+
+
+names(tsne.list) <- contrasts.OI
+
+lapply(tsne.list, function(x){ 
+  ggplot(x, aes(x=V1, y=V2)) + geom_point()})
+```
+# modularization
+
+Going to use k-medoid clustering (more robust than k-means)
+
+
+First use the `factoextra` package to estimate otpimal number of clusters
+Weighted sum of squares suggests that 5~6 clusters works for both
+
+```{r}
+
+names(string.dist.list)
+
+lapply(string.dist.list, function(x){
+  fviz_nbclust(x, kmeans,method='gap_stat') #5-7
+})
+
+names(string.dist.list)
+```
+Plot the T-SNE modules
+```{r, fig.width = 6, fig.height =  6}
+
+# cluster.dt <- defineModulesFromDistance("/Users/ben/UCSF/kroganlab/BenPolacco/roche/2023_06_02_RSV_NetProp_HeatDiffusion_data/2023_06_05_StringSubNetwork.Preys.1hop.dsd",geneNamesOI = stringsOI, deepSplit = 0.8)
+# tsne.dt[cluster.dt, c("clusterID", "cluster") := .(i.clusterID, i.cluster), on = c(string = "gene")]
+
+
+lapply(contrasts.OI, function(x,y,i){
+  
+  pam.out <- cluster::pam(x[[i]],diss = TRUE, k = 9)
+  y[[i]][names(pam.out$clustering), clusterID := pam.out$clustering, on = "string"]
+
+  y[[i]][, cluster := sprintf("clust.%02d", clusterID)]
+  y[[i]][, c("x", "y") := .(V1, V2)]
+
+  y[[i]][, .N, by=cluster]
+  
+ p <- ggplot(y[[i]], aes (x = x, y = y,)) +
+  #geom_segment(data = edgeView.dt, aes(xend = xend, yend = yend),  alpha = 0.2, linewidth = 0.1) +
+ geom_point(aes( color = cluster)) +
+ #scale_size_manual(values = c(bait = 4, prey = 0.5)) +
+ #scale_shape_manual(values = c(bait = 23, prey = 1)) +
+ coord_fixed() + theme_void()
+p
+
+}, x=string.dist.list, y=tsne.list)
+
+```
+
+## enrich and label the modules
+```{r}
+gmt <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+```
+
+```{r}
+
+lapply(seq_along(tsne.list), function(x,n,i){
+  x[[i]][, gene := translateString2Gene(string, species = "HUMAN")]
+  geneToCluster <- x[[i]][,.(gene = gene, cluster = cluster)]
+  
+  #label each of the modules by enrichment results
+  enrichNames.out <- labelModulesByEnrichment(cluster.dt = geneToCluster, gmt = gmt, numProcessors = 8)
+  
+  # choose a naming scheme
+ clusterNames.dt <- enrichNames.out$clusterNames.dt[, .(cluster, name = termScore.name, go = termScore.go)]
+ enrich.dt <- enrichNames.out$enrich.dt
+ 
+ x[[i]][clusterNames.dt, c("name", "go" ) := .( i.name, i.go), on = "cluster"]
+ x[[i]][gmt, nameMatch := TRUE, on = c(gene = "gene", go = "ont") ]
+ x[[i]][nameMatch == TRUE, nameMatchCluster := cluster]
+  
+ 
+ p <- ggplot(x[[i]], aes (x = x, y = y,)) +
+  #geom_segment(data = edgeView.dt, aes(xend = xend, yend = yend),  alpha = 0.2, linewidth = 0.1) +
+  geom_point(aes( color = name  )) +
+   ggtitle(paste0(n[[i]], ' enrichment' )) +
+  #scale_size_manual(values = c(bait = 4, prey = 0.5)) +
+  #scale_shape_manual(values = c(bait = 23, prey = 1)) +
+  coord_fixed() + theme_void()
+p
+
+#BackupAsPDF(p, paste0(n[[i]],'exp.k5.tsne.enrichment.pdf'))
+
+}, x=tsne.list, n=names(tsne.list))
+
+
+#on plot: gene ratio 19/23 # ratio of the number of genes within a given gene set that are present in the input gene list
+#bg ratio 22/215 #null set what you would expect by chance. 22 here respents count in the universe/background set
+```
+
+Get the enrichment tables
+
+```{r}
+lapply(seq_along(tsne.list), function(x,n,i){
+  x[[i]][, gene := translateString2Gene(string, species = "HUMAN")]
+  geneToCluster <- x[[i]][,.(gene = gene, cluster = cluster)]
+  
+  #label each of the modules by enrichment results
+  enrichNames.out <- labelModulesByEnrichment(cluster.dt = geneToCluster, gmt = gmt, numProcessors = 8)
+  # choose a naming scheme
+  clusterNames.dt <- enrichNames.out$clusterNames.dt[, .(cluster, name = termScore.name, go = termScore.go)]
+ # print(clusterNames.dt)
+ fwrite(clusterNames.dt, paste0('./output/',n[[i]], '-t-SNE.k9.cluster.go.enrichment.csv.gz'))
+
+
+}, x=tsne.list, n=names(tsne.list))
+```
+

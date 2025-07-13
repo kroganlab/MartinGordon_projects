@@ -1,0 +1,748 @@
+---
+title: "biomarker.identification"
+author: "Martin Gordon"
+date: "2023-08-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library("RColorBrewer") 
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(RcppCNPy) #R/W support to import numpy objects into R
+library(VennDiagram)
+library(pbapply) #apply functions with progress bar
+library(eulerr)
+library(circlize)
+library(DESeq2)
+library(ggrepel)
+library(ggbeeswarm)
+library(clusterProfiler)
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+source ("../../utils/bp_utils/NetworkPropagation.R")
+```
+
+## Biomarker Identification
+Want to rank the genes we have identified
+First plot log2FC for protein vs log2FC RNAseq
+Volcano plot on x and y axis
+
+
+Matrices of the expression data
+
+```{r}
+p.ab.quant <- fread('~/Documents/projects/051623_DSwaney/2023_05_16_DSwaney_AA08_AB_data/2023_05_25_ProteinLevelData.csv.gz') 
+p.ph.quant <- fread('~/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_protein-lvl-data.csv.gz')
+rna.quant <- fread('~/Library/CloudStorage/Box-Box/Mac1_omics_data/CellLines_RNAseq/Expression/gene_expression.xls')
+
+box.loc <- '~/Library/CloudStorage/Box-Box/Mac1_omics_data/'
+rna.ab.core <- fread(paste0(box.loc, 'CellLines_RNAseq/core_table_gene.xls.gz'), fill=T)
+
+cols.OI <- grep("^read_count|gene_symbol",colnames(rna.ab.core), value=T)
+
+rna.mat <- rna.ab.core[, colnames(rna.ab.core) %in% cols.OI, with=F] %>% 
+  .[,-25, with=F] %>% #rm dup gene_symbol
+  as.matrix(rownames='gene_symbol')
+
+```
+
+```{r}
+p.ph.mat <- dcast(p.ph.quant, Protein~paste0(GROUP,"_",SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+p.ab.mat <- dcast(p.ab.quant, Protein~paste0(GROUP, "_", SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+colnames(rna.mat) <- gsub('read_count_','',colnames(rna.mat))
+
+# set up colnames to match rna-seq dataset
+colnames(p.ph.mat) <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "Par_IFNg_A", "Par_IFNg_B",  "Par_IFNg_C", "Par_IFNg_D", "Par_ctrl_A",  "Par_ctrl_B",  "Par_ctrl_C",  "Par_ctrl_D", "WT_IFNg_A",   "WT_IFNg_B",   "WT_IFNg_C", "WT_IFNg_D") 
+
+colnames(p.ab.mat) <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "Par_ctrl_A", "Par_ctrl_B",  "Par_ctrl_C", "Par_ctrl_D", "Par_IFNg_A",  "Par_IFNg_B",  "Par_IFNg_C",  "Par_IFNg_D", "WT_IFNg_A",   "WT_IFNg_B",   "WT_IFNg_C", "WT_IFNg_D") 
+
+#keep only conditions of interest
+p.cond.OI <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "WT_IFNg_A",   "WT_IFNg_B",  "WT_IFNg_C", "WT_IFNg_D")
+rna.cond.OI <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "WT_IFNg_A", "WT_IFNg_B",  "WT_IFNg_C")
+
+rna.mat <- rna.mat[, rna.cond.OI]
+p.ab.mat <- p.ab.mat[, p.cond.OI]
+p.ph.mat <- p.ph.mat[, p.cond.OI]
+
+
+#prefilter low count genes
+rna.mat <- rna.mat[rowSums(rna.mat) >= 10,]
+#rna.mat <- log2(rna.mat + 1)
+
+```
+
+
+Normalise the RNA input
+
+```{r}
+
+design.mat <- data.frame(replicate=as.factor(c(rep(c('A','B','C'),3))),
+                         condition=as.factor(str_extract(colnames(rna.mat), 'IFNg|ctrl')), 
+                         celltype=as.factor(str_extract(colnames(rna.mat),'EV|ND|WT')))
+
+
+design.mat$contrast <- as.factor(paste0(design.mat$celltype,"_", design.mat$condition))
+#assign rownames from the colnames of count matrix
+rownames(design.mat) <- colnames(rna.mat)
+```
+
+Run DEseq2 to normalize library & extract variance stabilised counts
+```{r}
+# only accepts integers
+rna.mat <- round(rna.mat)
+
+dds <- DESeqDataSetFromMatrix(countData = rna.mat,
+                              colData = design.mat,
+                              design = ~ contrast)
+
+
+#maybe use log2 as more gaussian? Let look again after feature selection
+# vst handles the transformation of the data better than log2 + pseudocount, so proceed with this
+vsd <- rlog(dds)
+rna.mat <- assay(vsd)
+
+#using log2 transformed counts instead as more Gaussian
+#rna.mat <- log2(assay(dds) + 1)
+```
+
+```{r}
+mat.list <- list(
+                 p.ab = p.ab.mat,
+                 rna = rna.mat)
+
+# 
+# #simplify ph rownames
+# rownames(mat.list[['p.ph']])  <- gsub("_[STY][0-9]+", "", rownames(mat.list[['p.ph']])) %>% #strip phosphosite info
+#           strsplit (";") %>%  #split multiprots; creates a list of vectors of each element
+#           lapply (unique) %>% #removes any duplicate elements in list
+#           lapply (paste, collapse = ";") %>% #colapses back to unique prot names
+#           unlist
+
+#rownames(mat.list[['p.ph']]) <- multiUniprotSites2multiGeneSites(rownames(mat.list[['p.ph']]))
+rownames(mat.list[['p.ab']]) <- translateUniprot2GeneName(rownames(mat.list[['p.ab']]))
+```
+have the mat list; lets plot
+
+Write the mat list to file so we can inspect again
+#no row names preserved
+```{r}
+lapply(seq_along(mat.list), function(x,n,i){
+  
+  x[[i]] <- cbind(x[[i]], rownames(x[[i]]))
+  fwrite(x[[i]], paste0(n[[i]], '.matrix.clean.csv.gz'))
+  }, x=mat.list, n=names(mat.list))
+
+
+
+
+```
+
+Sanity check; data looks good
+
+```{r}
+# read in the data
+lfc.list <- list(
+  rna = fread('./output/rna_ab.1907.clean.csv.gz'),
+  p.ab = fread('./output/prot_ab.1907.clean.csv.gz')
+)
+
+
+# new labels num-denom as easier to read
+lapply(lfc.list, function(x){
+  
+  print(x[gene %in%  'ASS1',])
+  x[,  c("denominator", "numerator") := tstrsplit(Label, "-vs-", fixed=TRUE, keep = c(1,2)) ]
+  x[, new.label := paste0(numerator, '-', denominator)]
+})
+
+
+lapply(mat.list, function(x){
+  
+  print(x[rownames(x) %in%  'ASS1',])
+})
+
+```
+extract the exp genes
+
+```{r}
+#read in sig genes
+exp.sig <- fread('./output/17.06.experimental-omics-sig-genes.csv')
+exp.sig[, .N, by=omics]
+
+genes.oi <- exp.sig[omics %in% c('all.sig','rna.ab.sig'),gene] %>% unique()
+genes.oi
+exp.sig[gene == 'S100P']
+
+```
+
+filter the dataset to remove the extreme values
+
+```{r}
+lfc.list[['rna']][, adjust.pvalue := p.adjust(pvalue, method='BH'), by=Label] # local correction for both
+lfc.list[['p.ab']][, adjust.pvalue := p.adjust(pvalue, method='BH'), by=Label] 
+
+cols.oi <- c('Label', 'new.label', 'gene', 'pvalue', 'log2FC', 'adjust.pvalue') #, 'gm.lfc.pval')
+
+lfc.list <- lapply(lfc.list, function(x){
+  x <- x[, ..cols.oi]
+})
+```
+
+
+scatterplot of log2FC/mag.sig.scores values/sig for each dataset
+
+```{r}
+# comb list
+lfc.comb <- rbindlist(lfc.list, idcol = 'omics')
+lfc.comb[, sig := 'Not']
+lfc.comb[abs(log2FC) > log2(1.5) & adjust.pvalue < 0.05, sig := ifelse(log2FC > 0, 'Up', 'Down')]
+
+# define minimal list of genes in both datasets
+ev.wt.genes <- intersect(lfc.comb[omics == 'rna' & Label == "EV_IFNg-vs-WT_IFNg", gene], lfc.comb[omics == 'p.ab' & Label == "EV_IFNg-vs-WT_IFNg", gene])
+wt.nd.genes <- intersect(lfc.comb[omics == 'rna' & Label == "WT_IFNg-vs-ND_IFNg", gene], lfc.comb[omics == 'p.ab' & Label == "WT_IFNg-vs-ND_IFNg", gene])
+
+# comb and split on label
+lfc.list <- rbindlist(lfc.list, idcol = 'omics') %>% 
+  split(.$new.label)
+
+
+# subset each to be the mininal set
+lfc.list$`WT_IFNg-EV_IFNg` <- lfc.list$`WT_IFNg-EV_IFNg`[gene %in% ev.wt.genes,]
+lfc.list$`ND_IFNg-WT_IFNg` <- lfc.list$`ND_IFNg-WT_IFNg`[gene %in% wt.nd.genes,]
+
+
+# spread each dataset to
+log2fcs <- lapply(lfc.list, function(x){
+  x <- dcast(x, gene~omics, value.var = c('log2FC')
+  x[, genes.oi :=  ifelse(gene %in% genes.oi, 'yes', 'no')]
+  return(x)
+})
+
+  
+lfc.list
+```
+
+
+```{r}
+genes.oi <- exp.sig[omics %in% c('all.sig','rna.ab.sig') & Label, gene] %>% unique()
+genes.oi
+
+exp.sig
+
+log2fcs
+
+lapply(seq_along(log2fcs), function(x,n,i){
+ g <-  ggplot(x[[i]], aes(x=rna, y=p.ab, color=-log10(adj.pval))) +
+    geom_point() +
+    geom_point(data=x[[i]][genes.oi == 'yes',],aes(x=rna, y=p.ab, color='darkred')) +
+    geom_vline(xintercept = 0, linetype='dotdash', alpha=0.3) +
+    geom_hline(yintercept =0,  linetype='dotdash', alpha=0.3)  +
+    geom_abline(intercept = 0, slope = 1, alpha=0.6, color='darkred') +
+    geom_text_repel(data=x[[i]][genes.oi == 'yes',], aes(label=gene), size = 2, max.overlaps = 10) +
+    ggtitle(n[[i]]) +
+    xlab('rna Log2FC') +
+    ylab('p.ab Log2FC') +
+    coord_cartesian() +
+    theme_bw() +
+      theme(
+    legend.position = 'none'
+  )
+ #BackupAsPDF(g, paste0(n[[i]], 'p.ab-rna.log2fc.scatteplot'))
+  
+},x=log2fcs, n=names(log2fcs))
+
+
+
+wt.nd.rank <- fread("./output/wt.nd.rank.order.genes.csv")
+ev.wt.rank <- fread("./output/ev.wt.rank.order.genes.csv")
+```
+
+
+```{r}
+
+#cast to wide format and col merge
+lfc.wide <- lapply(seq_along(lfc.list), function(x,n,i){
+  
+x[[i]] <- dcast(x[[i]], gene~Label, value.var=c('adjust.pvalue', 'log2FC'))
+colnames(x[[i]]) <- paste0(n[[i]], '_', colnames(x[[i]]))
+return(x[[i]])
+}, x=lfc.list, n=names(lfc.list))
+
+names(lfc.wide) <- names(lfc.list)
+
+lfc.comb[gene == ]
+
+
+g <- ggplot(lfc.comb[omics == 'rna' & gene %in% ev.wt.genes & gene %in% genes.oi & Label == 'EV_IFNg-vs-WT_IFNg'], aes(x=lfc.comb[omics == 'rna' & gene %in% ev.wt.genes  & gene %in% genes.oi & Label == 'EV_IFNg-vs-WT_IFNg']$log2FC, y=lfc.comb[omics == 'p.ab' & gene %in% ev.wt.genes  & gene %in% genes.oi & Label == 'EV_IFNg-vs-WT_IFNg']$log2FC, label=gene) ) +
+  geom_point(alpha=0.8, color='darkred') + 
+  #add all data as bg
+ # geom_point(data=lfc.comb[omics == 'rna' & gene %in% ev.wt.genes & Label == 'EV_IFNg-vs-WT_IFNg'], aes(x=lfc.comb[omics == 'rna' & gene %in% ev.wt.genes & Label == 'EV_IFNg-vs-WT_IFNg', log2FC], y=lfc.comb[omics == 'p.ab' & gene %in% ev.wt.genes & Label == 'EV_IFNg-vs-WT_IFNg',log2FC], alpha=0.2)) +
+  ggtitle('EV_IFNg-vs-WT_IFNg') +
+  geom_vline(xintercept = 0, linetype='dotdash', alpha=0.3) +
+  geom_hline(yintercept =0,  linetype='dotdash', alpha=0.3)  +
+  geom_abline(intercept = 0, slope = 1, alpha=0.6) +
+ # geom_density2d(data=lfc.comb[omics == 'rna' & gene %in% ev.wt.genes & Label == 'EV_IFNg-vs-WT_IFNg'], aes(x=lfc.comb[omics == 'rna' & gene %in% ev.wt.genes & Label == 'EV_IFNg-vs-WT_IFNg', log2FC], y=lfc.comb[omics == 'p.ab' & gene %in% ev.wt.genes & Label == 'EV_IFNg-vs-WT_IFNg',log2FC])) +
+  geom_text_repel(aes(label = gene), size = 2, max.overlaps = 20) +
+  xlab('rna Log2FC') +
+  ylab('p.ab Log2FC') +
+ # xlim(-4,4) + 
+#  ylim(-4,4) +
+  coord_cartesian() +
+  theme_bw() + 
+  theme(
+    legend.position = 'none'
+  )
+
+g
+BackupAsPDF(g, 'ev-wt.ori.scale.scatterplot.genes.oi')
+
+
+#other condition
+
+g <- ggplot(lfc.comb[omics == 'rna' & gene %in% wt.nd.genes & gene %in% genes.oi & Label == "WT_IFNg-vs-ND_IFNg"], aes(x=lfc.comb[omics == 'rna' & gene %in% wt.nd.genes  & gene %in% genes.oi & Label == "WT_IFNg-vs-ND_IFNg", log2FC], y=lfc.comb[omics == 'p.ab' & gene %in% wt.nd.genes  & gene %in% genes.oi & Label == "WT_IFNg-vs-ND_IFNg",log2FC], label=gene) ) +
+  geom_point(alpha=0.8, color='darkred') + 
+  #add all data as bg
+  geom_point(data=lfc.comb[omics == 'rna' & gene %in% wt.nd.genes & Label == "WT_IFNg-vs-ND_IFNg"], aes(x=lfc.comb[omics == 'rna' & gene %in% wt.nd.genes & Label == "WT_IFNg-vs-ND_IFNg", log2FC], y=lfc.comb[omics == 'p.ab' & gene %in% wt.nd.genes & Label == "WT_IFNg-vs-ND_IFNg",log2FC], alpha=0.2)) +
+  geom_density2d(data=lfc.comb[omics == 'rna' & gene %in% wt.nd.genes & Label == "WT_IFNg-vs-ND_IFNg"], aes(x=lfc.comb[omics == 'rna' & gene %in% wt.nd.genes & Label == "WT_IFNg-vs-ND_IFNg", log2FC], y=lfc.comb[omics == 'p.ab' & gene %in% wt.nd.genes & Label == "WT_IFNg-vs-ND_IFNg",log2FC], alpha=0.2)) +
+  ggtitle("WT_IFNg-vs-ND_IFNg") +
+  geom_vline(xintercept = 0, linetype='dotdash', alpha=0.3) +
+  geom_hline(yintercept =0,  linetype='dotdash', alpha=0.3)  +
+  geom_abline(intercept = 0, slope = 1, alpha=0.6) +
+  geom_text_repel(aes(label = gene), size = 2, max.overlaps = 20) +
+  xlab('rna Log2FC') +
+  ylab('p.ab Log2FC') +
+ # xlim(-4,4) + 
+#  ylim(-4,4) +
+  coord_cartesian() +
+  theme_bw() + 
+  theme(
+    legend.position = 'none'
+  )
+g
+
+lfc.comb[omics == 'p.ab' & gene %in% wt.nd.genes & gene %in% genes.oi & Label == "WT_IFNg-vs-ND_IFNg"][gene == 'S100P']
+
+BackupAsPDF(g, 'wt-nd.ori.scale.scatterplot.genes.oi')
+```
+
+ev wt order the genes by Log2FC and plot
+```{r}
+g <- lfc.comb[omics == 'p.ab' & Label == 'EV_IFNg-vs-WT_IFNg',] %>% 
+  .[order(log2FC)] %>% 
+  
+ ggplot(aes(x=reorder(gene,-log2FC), y=log2FC, label=gene)) +
+  geom_point(size=1) +
+  geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+  xlab('genes') +
+  coord_cartesian(clip='off') +  # Adjust expand and xlim
+  theme_classic() +
+  ggtitle('p.ab EV_IFNg-vs-WT_IFNg') +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        ) +
+  geom_text_repel(data=lfc.comb[omics == 'p.ab' & Label == 'EV_IFNg-vs-WT_IFNg' & gene %in% genes.oi], size = 2, max.overlaps = 20)
+
+BackupAsPDF(g, 'p.ab.ev-wt.orderlog2FC.')
+
+
+g <- lfc.comb[omics == 'rna' & Label == 'EV_IFNg-vs-WT_IFNg',] %>% 
+  .[order(log2FC)] %>% 
+  
+ ggplot(aes(x=reorder(gene,-log2FC), y=log2FC, label=gene)) +
+  geom_point(size=1) +
+  geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+  xlab('genes') +
+  coord_cartesian(clip='off') +  # Adjust expand and xlim
+  theme_classic() +
+  ggtitle('rna EV_IFNg-vs-WT_IFNg') +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        ) +
+  geom_text_repel(data=lfc.comb[omics == 'p.ab' & Label == 'EV_IFNg-vs-WT_IFNg' & gene %in% genes.oi], size = 2, max.overlaps = 20)
+
+BackupAsPDF(g, 'rna.ev-wt.orderlog2FC.')
+
+```
+```{r}
+g <- lfc.comb[omics == 'p.ab' & Label == 'WT_IFNg-vs-ND_IFNg',] %>% 
+  .[order(log2FC)] %>% 
+  
+ ggplot(aes(x=reorder(gene,-log2FC), y=log2FC, label=gene)) +
+  geom_point(size=1) +
+  geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+  xlab('genes') +
+  coord_cartesian(clip='off') +  # Adjust expand and xlim
+  theme_classic() +
+  ggtitle('p.ab WT_IFNg-vs-ND_IFNg') +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        ) +
+  geom_text_repel(data=lfc.comb[omics == 'p.ab' & Label == 'WT_IFNg-vs-ND_IFNg' & gene %in% genes.oi], size = 2, max.overlaps = 20)
+
+BackupAsPDF(g, 'p.ab.wt-nd.orderlog2FC.')
+
+
+g <- lfc.comb[omics == 'rna' & Label == 'WT_IFNg-vs-ND_IFNg',] %>% 
+  .[order(log2FC)] %>% 
+  
+ ggplot(aes(x=reorder(gene,-log2FC), y=log2FC, label=gene)) +
+  geom_point(size=1) +
+  geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+  xlab('genes') +
+  coord_cartesian(clip='off') +  # Adjust expand and xlim
+  theme_classic() +
+  ggtitle('rna WT_IFNg-vs-ND_IFNg') +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        ) +
+  geom_text_repel(data=lfc.comb[omics == 'p.ab' & Label == 'WT_IFNg-vs-ND_IFNg' & gene %in% genes.oi], size = 2, max.overlaps = 20)
+
+BackupAsPDF(g, 'rna.wt-nd.orderlog2FC.')
+
+```
+combined rank sum method
+combined rank; take rank of abs(log2FC) and pval; then sum the values from two omics scores and take lowest scores
+we only rank genes with scores in both datasets
+```{r}
+# subset to genes in both datasets
+filtered.lfc.comb <- lfc.comb[(gene %in% wt.nd.genes & gene %in% ev.wt.genes)]
+
+
+
+# Add a small constant to p-values to prevent taking the log of zero
+epsilon <- 1e-10
+filtered.lfc.comb[, pval := ifelse(pvalue < epsilon, epsilon, pvalue)]
+##scale center subtracts mean, scale
+filtered.lfc.comb[!is.infinite(gm.lfc.pval), comb.z := sum(scale(log2FC), scale(-log10(pvalue))), by=.(omics,Label)]
+# calculate avg
+filtered.lfc.comb[, avg.comb.z := mean(comb.z), by=.(Label,gene) ]
+
+
+#The rank sum method ranks genes based on log2FC and p-value within each dataset and then sums the ranks across datasets. 
+
+filtered.lfc.comb[, comb.rank := rank(-abs(log2FC)) + rank(pvalue), by=.(omics,Label)]
+filtered.lfc.comb[, sum.comb.rank := sum(comb.rank), by=.(gene,Label)]
+
+```
+
+Volcano plot/dot plot of combined rank sum methods
+```{r}
+
+log2(12/15)
+# Ranked List Plot
+g<- ggplot(filtered.lfc.comb[omics == 'rna' & Label == 'WT_IFNg-vs-ND_IFNg' & order(sum.comb.rank)], aes(x = reorder(gene, -sum.comb.rank), y = sum.comb.rank, label=gene)) +
+  geom_bar(stat = "identity") +
+    geom_bar(data=filtered.lfc.comb[omics == 'rna' & Label == 'WT_IFNg-vs-ND_IFNg' & order(sum.comb.rank) & gene %in% genes.oi], stat = "identity", color='darkred') +
+  labs(title = "'WT_IFNg-vs-ND_IFNg Ranked List Plot", x = "Genes", y = "Combined Rank Sum") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+#  facet_wrap(~ Label) + 
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        ) +
+  geom_text_repel(data=filtered.lfc.comb[omics == 'rna' & Label == 'WT_IFNg-vs-ND_IFNg' & gene %in% genes.oi][order(sum.comb.rank)][1:10], size = 2.5, max.overlaps = 20)
+
+BackupAsPDF(g, 'wt.nd.comb.rank.all')
+
+# Ranked List Plot
+g <- ggplot(filtered.lfc.comb[omics == 'rna' & Label == 'EV_IFNg-vs-WT_IFNg' & order(sum.comb.rank)], aes(x = reorder(gene, -sum.comb.rank), y = sum.comb.rank, label=gene)) +
+  geom_bar(stat = "identity") +
+  geom_bar(data=filtered.lfc.comb[omics == 'rna' & Label == 'EV_IFNg-vs-WT_IFNg' & order(sum.comb.rank) & gene %in% genes.oi], stat = "identity", color='darkred') +
+  labs(title = "EV_IFNg-vs-WT_IFNg Ranked List Plot", x = "Genes", y = "Combined Rank Sum") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+#  facet_wrap(~ Label) + 
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        ) +
+  geom_text_repel(data=filtered.lfc.comb[omics =='rna' & Label == 'EV_IFNg-vs-WT_IFNg' & gene %in% genes.oi][order(sum.comb.rank)][1:10], size = 2.5, max.overlaps = 20)
+
+BackupAsPDF(g, 'ev.wt.comb.rank.all')
+
+
+```
+
+Plot of cumulative rank
+
+```{r}
+#beeswarm plot of the rnak sums with labels
+g <- ggplot(filtered.lfc.comb[omics == 'rna',], aes(x=Label, y=sum.comb.rank, fill=Label, label=gene)) +
+    geom_beeswarm(aes(color=Label), size=0.6, cex=0.5) +
+    ylab('Combined Rank Sum') +
+    ggrepel::geom_text_repel(data=filtered.lfc.comb[omics =='rna',][order(sum.comb.rank)][1:20], size = 2.5, max.overlaps = 20) +
+    theme_classic()
+  
+BackupAsPDF(g, 'rank.sum.beeswarm')
+
+```
+log2FC plot of the sig genes
+
+```{r}
+
+up.genes.oi <- c('ASS1','S100P', 'L1CAM', 'CPS1', 'ITPR1', 'CLDN2', 'MUC13', 'SLC30A1', 'CEACAM5', 'GLDC', 'CD46', 'RHOB', 'PGM2L1', 'NNMT', 'NRP2', 'PTGES', 'SDSL', 'VIL1', 'ANPEP', 'UPK1B')
+
+g <- ggplot(filtered.lfc.comb[gene %in% up.genes.oi], aes(x=gene, y=log2FC, color=omics)) + 
+  geom_point() + 
+  geom_hline(yintercept=log2(10), alpha=0.8, linetype='dashed') + 
+  annotate("text", x=5, y=log2(10)+0.2,size=3, label="log2(10)") +
+  geom_hline(yintercept=0, alpha=0.4, linetype='dotted') + 
+  facet_wrap(~Label) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=90))
+
+
+BackupAsPDF(g, 'dotplot.log2FC.upreg.genes.oi')
+
+```
+Better way to visualise: combine to the same plot, shape by omics and color by contrasts. Put a mean line through both groups
+
+```{r}
+g <- ggplot(filtered.lfc.comb[gene %in% up.genes.oi], aes(x=gene, y=log2FC, color=Label, shape=omics)) + 
+  geom_point() + 
+  geom_hline(yintercept=log2(10), alpha=0.8, linetype='dashed') + 
+  annotate("text", x=5, y=log2(10)+0.2,size=3, label="log2(10)") +
+  geom_hline(yintercept=0, alpha=0.4, linetype='dotted') + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=90))
+g
+
+BackupAsPDF(g, 'dotplot.log2FC.upreg.genes.oi.comb')
+```
+Look at the earlier enrichment analysis output
+
+```{r}
+
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+universe <- unique(filtered.lfc.comb$gene)
+  
+enrich.dt <- enricherOnGroups(filtered.lfc.comb[gene %in% up.genes.oi,], groupColumns = 'Label', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+  
+g <- ggplot(enrich.dt[p.adjust < 0.05,], aes(x=reorder(ID, -p.adjust), y=-log10(p.adjust), fill=p.adjust)) + geom_bar(stat='Identity') +
+  theme_bw() +
+  coord_flip() +
+  labs(title = "GO enrichment (adj.pval < 0.05)", x = "GO Pathways", y = "-log10(p.adjust)") +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+
+BackupAsPDF(g, 'go.enrichment.genes.oi')
+```
+Look at interestin genes
+
+```{r}
+filtered.lfc.comb[Label == 'WT_IFNg-vs-ND_IFNg'] %>% 
+  dcast(gene+sum.comb.rank~omics, value.var = c("log2FC","pvalue","adjust.pvalue")) %>% 
+  .[order(sum.comb.rank)] #%>% 
+ # fwrite("./output/wt.nd.rank.order.genes.csv")
+
+filtered.lfc.comb[Label == 'EV_IFNg-vs-WT_IFNg'] %>% 
+  dcast(gene+sum.comb.rank~omics, value.var = c("log2FC","pvalue","adjust.pvalue")) %>% 
+  .[order(sum.comb.rank)] #%>% 
+ #fwrite("./output/ev.wt.rank.order.genes.csv")
+
+
+wt.nd.rank <- fread("./output/wt.nd.rank.order.genes.csv")
+ev.wt.rank <- fread("./output/ev.wt.rank.order.genes.csv")
+  
+```
+
+
+091123
+----
+Want to produce a new version of the scatterplots, but color on a grandient by combined rank sum
+*lower value the better*
+per dataset, add the rank  of pval and log2FC, then sum the score for AB and RNAseq data 
+
+read in lfc data 
+
+```{r}
+# read in the data
+lfc.list <- list(
+  rna = fread('./output/rna_ab.1907.clean.csv.gz'),
+  p.ab = fread('./output/prot_ab.1907.clean.csv.gz')
+)
+
+
+# new labels num-denom as easier to read
+lapply(lfc.list, function(x){
+  
+  print(x[gene %in%  'ASS1',])
+  x[,  c("denominator", "numerator") := tstrsplit(Label, "-vs-", fixed=TRUE, keep = c(1,2)) ]
+  x[, new.label := paste0(numerator, '-', denominator)]
+})
+```
+
+filter the dataset to remove the extreme values
+
+```{r}
+lfc.list[['rna']][, adjust.pvalue := p.adjust(pvalue, method='BH'), by=Label] # local correction for both
+lfc.list[['p.ab']][, adjust.pvalue := p.adjust(pvalue, method='BH'), by=Label] 
+
+cols.oi <- c('Label', 'new.label', 'gene', 'pvalue', 'log2FC', 'adjust.pvalue') #, 'gm.lfc.pval')
+
+lfc.list <- lapply(lfc.list, function(x){
+  x <- x[, ..cols.oi]
+})
+```
+
+get the exp data with the identifed sig genes previously
+
+```{r}
+
+#read in sig genes
+exp.sig <- fread('./output/17.06.experimental-omics-sig-genes.csv')
+exp.sig[, .N, by=omics]
+
+genes.oi <- exp.sig[omics %in% c('all.sig','rna.ab.sig'),gene] %>% unique()
+```
+
+dt for scatterplot
+
+
+```{r}
+# comb list
+lfc.comb <- rbindlist(lfc.list, idcol = 'omics')
+lfc.comb[, sig := 'Not']
+lfc.comb[abs(log2FC) > log2(1.5) & adjust.pvalue < 0.05, sig := ifelse(log2FC > 0, 'Up', 'Down')]
+
+# define minimal list of genes in both datasets
+ev.wt.genes <- intersect(lfc.comb[omics == 'rna' & Label == "EV_IFNg-vs-WT_IFNg", gene], lfc.comb[omics == 'p.ab' & Label == "EV_IFNg-vs-WT_IFNg", gene])
+wt.nd.genes <- intersect(lfc.comb[omics == 'rna' & Label == "WT_IFNg-vs-ND_IFNg", gene], lfc.comb[omics == 'p.ab' & Label == "WT_IFNg-vs-ND_IFNg", gene])
+
+# comb and split on label
+lfc.list <- rbindlist(lfc.list, idcol = 'omics') %>% 
+  split(.$new.label)
+
+
+# subset each to be the mininal set
+lfc.list$`WT_IFNg-EV_IFNg` <- lfc.list$`WT_IFNg-EV_IFNg`[gene %in% ev.wt.genes,]
+lfc.list$`ND_IFNg-WT_IFNg` <- lfc.list$`ND_IFNg-WT_IFNg`[gene %in% wt.nd.genes,]
+
+
+# spread each dataset to
+log2fcs <- lapply(lfc.list, function(x){
+  x <- dcast(x, gene~omics, value.var = c('log2FC'))
+  x[, genes.oi :=  ifelse(gene %in% genes.oi, 'yes', 'no')]
+  return(x)
+})
+
+
+
+```
+
+scatterplots for the differentially expressed genes
+
+```{r}
+
+
+lapply(seq_along(log2fcs), function(x,n,i){
+ g <-  ggplot(x[[i]], aes(x=rna, y=p.ab)) +
+    geom_point() +
+    geom_point(data=x[[i]][genes.oi == 'yes',],aes(x=rna, y=p.ab, color='darkred')) +
+    geom_vline(xintercept = 0, linetype='dotdash', alpha=0.3) +
+    geom_hline(yintercept =0,  linetype='dotdash', alpha=0.3)  +
+    geom_abline(intercept = 0, slope = 1, alpha=0.6, color='darkred') +
+    geom_text_repel(data=x[[i]][genes.oi == 'yes',], aes(label=gene), size = 2, max.overlaps = 10) +
+    ggtitle(n[[i]]) +
+    xlab('rna Log2FC') +
+    ylab('p.ab Log2FC') +
+    coord_cartesian() +
+    theme_bw() +
+      theme(
+    legend.position = 'none'
+  )
+ #BackupAsPDF(g, paste0(n[[i]], 'p.ab-rna.log2fc.scatteplot'))
+  
+},x=log2fcs, n=names(log2fcs))
+
+```
+
+
+read in the cumulative ranks data. We will use a continuous scale to color the points
+merging to our log2fcs dataset
+
+```{r}
+wt.nd.rank <- fread("./output/wt.nd.rank.order.genes.csv")
+ev.wt.rank <- fread("./output/ev.wt.rank.order.genes.csv")
+
+
+wt.nd.rank[gene %in% genes.oi]
+ev.wt.rank[gene %in% genes.oi]
+
+log2fcs$`ND_IFNg-WT_IFNg`[wt.nd.rank, combined.rank.score := i.sum.comb.rank, on=c('gene', 'gene')]
+log2fcs$`WT_IFNg-EV_IFNg`[ev.wt.rank, combined.rank.score := i.sum.comb.rank, on=c('gene', 'gene')]
+
+
+
+log2fcs
+```
+
+scatterplots for the differentially expressed genes
+
+```{r}
+log2fcs$`ND_IFNg-WT_IFNg`[,ordered.rank := rank(combined.rank.score)]
+log2fcs$`WT_IFNg-EV_IFNg`[,ordered.rank := rank(combined.rank.score)]
+
+
+scale_color_gradient_colorRamp2 <- function (colors, breaks, ...){
+  if(length(colors) != length(breaks))
+    warning("length of colors and breaks differ...expect the unexpected\n")
+  scale_color_gradientn( colors = colors,
+                         values = c(scales::rescale(breaks)),
+                         limits = range(breaks),
+                         oob = scales::squish, #sqishes out of bound values into range
+                         ...)
+}
+
+log2fcs$`WT_IFNg-EV_IFNg`$ordered.rank %>%  summary()
+
+lapply(seq_along(log2fcs), function(x,n,i){
+  
+  col.lim <-  nrow(x[[i]])
+  
+ g <-  ggplot(x[[i]], aes(x=rna, y=p.ab, color=ordered.rank)) +
+    geom_point() +
+    geom_vline(xintercept = 0, linetype='dotdash', alpha=0.3) +
+    geom_hline(yintercept =0,  linetype='dotdash', alpha=0.3)  +
+    geom_abline(intercept = 0, slope = 1, alpha=0.6, color='darkred') +
+    #scale_colour_viridis_c(option = "inferno", direction=1, values=c(scales::rescale(100,4000)), oob=scales::squish) +
+    scale_color_gradient_colorRamp2(breaks=c(4000,200,1), colors= c("#FDE725ff","#22A884FF","#440154FF")) +
+    geom_text_repel(data=x[[i]][genes.oi == 'yes',], aes(label=gene), size = 2, max.overlaps = 10) +
+    ggtitle(n[[i]]) +
+    xlab('rna Log2FC') +
+    ylab('p.ab Log2FC') +
+    coord_cartesian() +
+    theme_bw() +
+      theme(
+    #legend.position = 'none'
+  )
+ #BackupAsPDF(g, paste0(n[[i]], 'p.ab-rna.log2fc.rankSumCol.scatteplot'))
+  
+},x=log2fcs, n=names(log2fcs))
+
+
+
+
+
+log2fcs$`ND_IFNg-WT_IFNg` %>%  nrow()
+```
+
+Important thing is the DEG list looks good, but why are the rankings in the color off?

@@ -1,0 +1,1050 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Project: Analysis of PH data generated from the Ashworth Lab
+
+## Date: 06-01-23
+## Contact: Danielle Swaney, Jack Moen
+## Details: 
+- Perform standard phospho analysis (Detect phospoylated sites)
+- Differential Expression Analysis (Comparing abundance with phospho)
+- Kinase Enrichment (Enrihcment & Kinase Enrichment Analysis)
+
+```{r packages}
+library("RColorBrewer") 
+library(data.table)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(MSstats)
+library(OmnipathR)
+library(VennDiagram)
+
+# load bens util scripts for the analysis
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../..//utils/bp_utils/MSstats_Helper_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/KinaseActivityScores.R")
+
+WriteSessionInfo()
+WriteInstalledPackages()
+
+```
+
+```{r functions}
+#function to read in keys and spec file overwrite spec Condition and BioReplicate cols with keys file values
+preprocessSpec <- function(spec_f,keys_f){
+
+  #fread stores as data.table by default
+  spec <- fread(spec_f)
+  keys <- fread(keys_f)
+
+  # apply Condition, BioReplicate from keys to spec
+  spec[keys , Condition := i.Condition , on = c(Run = "RawFile")] #overwrite condition col w values from keys file, match run col in spec to rawfile col in keys
+  spec[keys , BioeReplicate := i.BioReplicate , on = c(Run = "RawFile")]
+  
+  return(spec)
+  setnames(spec) = dat_name
+}
+```
+
+
+```{r load-data}
+
+specs <- './data/MSstats_PH.txt'
+keys <- './data/keys.txt'
+
+spec <- preprocessSpec(specs,keys)
+str(spec)
+
+```
+
+Check each biorep has a unique identifier for MSstats processing
+```{r}
+#remove keys biorep column
+spec[,10] <- NULL
+spec[,.N, by=.(Condition)]
+spec[, .N, by=.(Condition,BioReplicate)]
+```
+
+Remove likely artifacts
+
+```{r}
+
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram(bins = 100)
+
+spec <- spec[log2(Intensity) >5,]
+
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram(bins = 100)
+
+```
+Confirm that each detected peptide occurs once per run/charge
+False indicates each peptide detected only once per run
+```{r n-ids}
+any(spec[, .N, by=.(PeptideSequence,PrecursorCharge,Run)]$N) > 1
+```
+
+Number of peptides detected per run
+Counts pretty stable between runs
+
+```{r n-peptides}
+
+p <- ggplot(spec[,.N, by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)),y=N, fill=Condition)) +
+    geom_col() +
+    ggtitle('Peptide counts per run') +
+    labs(x = 'Condition.BioReplicate', y='N Peptides') +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(p, 'peptide-counts-barplot')
+```
+Count the number of proteins detected per run. Again v consistent
+```{r n-proteins}
+
+p <-  ggplot(spec[,.N, by=.(Condition,BioReplicate,ProteinName)][,.(nproteins = length(N)),by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)), y=nproteins, fill=Condition)) +
+      geom_col() +
+      ggtitle('Protein counts per run') +
+      labs(x='Condition.BioReplicate', y='N Proteins') +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(p, 'protein-counts-barplot')
+
+
+```
+Boxplots of raw peptide intensities. Intensities seem to vary quite significantly between runs
+
+```{r}
+p <- ggplot(spec, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition)) + 
+     geom_boxplot() + 
+     theme_classic() +
+     theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(p, 'raw-intensities-boxplot')
+```
+
+No fasta file specified, so just run with the canonical list of UNIProt proteins prepared by Ben & available on the Krogan github
+
+```{r}
+#function belwo takes path to fasta reference
+fasta <- './data/human_all_proteins_canonical_uniprot-proteome_UP000005640.fasta.gz'
+
+spec.ph <- sitifyProteins_SpectronautFile(spec, fastaFile = fasta, site = "PH") 
+```
+
+Remove records with no PH from the file and plot
+
+```{r}
+spec.ph[!is.na(oldProteinName),]
+```
+```{r}
+ggplot(data=spec.ph, aes(x=log2(Intensity))) +
+         geom_histogram(bins=100)
+```
+
+## MSstats normalisation, outlier removal and protein summarisation
+
+MSstats likes missing values to be explicitly labelled 'NA'. 
+
+```{r msstats-formatting}
+ph.mss <- specFileToCompleteMSstats(spec.ph)
+ph.mss[, IsotopeLabelType := 'L'] #label free
+setDF(ph.mss)  # convert to DF for msstats processing
+```
+```{r mss-dataproc}
+
+dp.out <- MSstats::dataProcess(ph.mss,
+                               normalization = 'equalizeMedians',
+                               summaryMethod="TMP",
+                               featureSubset = "highQuality",
+                               remove_uninformative_feature_outlier = TRUE,
+                               MBimpute = FALSE )
+```
+Write out results
+```{r}
+#protein-lvl & feature-lvl data
+fwrite(dp.out$ProteinLevelData, ScriptAndDatedFileName("protein-lvl-data.csv.gz"))
+fwrite(dp.out$FeatureLevelData, ScriptAndDatedFileName("feature-lvl-data.csv.gz"))
+```
+
+Read in protein level data from file 
+```{r}
+p.quant <- fread("./060123_DSwaney_AshworthPH_data/2023_06_01_protein-lvl-data.csv.gz")
+```
+
+Boxplots of normalised protein level data
+
+```{r}
+p <- ggplot(data=p.quant, aes(x=reorder(interaction(GROUP,SUBJECT)),y=LogIntensities, fill=GROUP)) +
+    geom_boxplot() + 
+    ggtitle('MSstats Normalized Protein Intensities') +
+    labs(y = 'Log2 Intensities', x= 'Condition.BioReplicate' ) +
+    theme_classic() +
+    theme(
+      axis.text.x = element_text(angle=90))
+
+BackupAsPDF(p, 'normalized-intensities-boxplot')
+
+```
+Convert Uniprot IDs to genes
+
+```{r uniprot-2-gene}
+
+p.quant[, gene := multiUniprots2multiGenes(gsub("_[STY][0-9]+", "",Protein))] #removes ph mod from the protein name to  recover gene names
+
+```
+Exploratory data analysis: generate heatmaps and PCA plots for the samples
+
+```{r}
+# create matrix
+p.quant.mat <- dcast(p.quant, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+```
+Heatmap of log2 Intensity values
+
+```{r}
+#sub in 0 for NA val
+rowClusterWithNA <- function(mat, na.value = 0, ...){
+  mat[is.na(mat)] <- na.value
+  hclust(dist(mat), ...) #euclidean
+}
+
+subMat <- p.quant.mat[sample.int(nrow(p.quant.mat), 2000),]
+
+#create heatmap annotation col
+type <- gsub("_[0-9]{1,2}", "", colnames(subMat))
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col=list(type=c("EV+" = "green", "WT+" = "yellow", "PAR-" = "blue", "PAR+" = "red", "N10t20+" = "orange")))
+
+hm <- Heatmap(subMat,
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(subMat)),
+        name = "Log2 Int.")
+
+hm
+BackupAsPDF(draw(hm), 'heatmap_subsample_log2intensities')
+
+```
+Broadly seems to be pretty good separation. EV+, & PAR groups form distinct clusters. Gene clusters dominated by Intensity signal, sweep median peptide intensities to better visualise run-to-run trends.
+
+```{r}
+#row median - median prot exp value across experiment
+
+# sweep subtracts a vector of values from either rows (dimension = 1) or columns (dimension = 2)
+# apply applies a function (median here) to each row (dimension = 1 )
+# used together here we are subtracting row medians
+scaled.intensity.mat <- sweep(p.quant.mat, 1, apply(p.quant.mat, 1, median, na.rm = TRUE))
+
+scaled.subMat <- scaled.intensity.mat[sample.int(nrow(scaled.intensity.mat), 2000),]
+
+hm <- Heatmap(scaled.subMat,
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(scaled.subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(scaled.subMat)),
+        name = "Log2 Int\nvs Median")
+
+hm
+BackupAsPDF(draw(hm), 'heatmap_subsample_scaled')
+```
+Clear clusters of EV, PAR. Nt10t20 & WT seem to share similiar expression profiles. One of the WT samples looks pretty noisy compared to the others.
+
+Heatmap of all proteins (no NA's):
+
+```{r allprot-heatmap}
+# pca requires no missing values.  Function complete.cases finds rows with no missing values
+complete.scaled.mat <- scaled.intensity.mat[complete.cases(scaled.intensity.mat),]
+complete.mat <- p.quant.mat[complete.cases(p.quant.mat),]
+
+hm <- Heatmap(complete.scaled.mat,
+       top_annotation = ha,
+       row_title = sprintf ("%d complete proteins", nrow(complete.scaled.mat)),
+       name = "Log2 Int\nvs Median",
+       show_row_names = FALSE,
+       cluster_columns = FALSE)
+hm
+BackupAsPDF(hm, 'heatmap_allprots_scaled')
+```
+EV+ BioRep 15 has a different profile to other members of the group, inspect comparison results first before considering dropping.
+
+
+PCA plot
+
+```{r pca}
+
+pcaOut <- prcomp(t(complete.mat))
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaDT[, mainGroup := tstrsplit(rn, "_")[[1]]] #transpose & split
+
+pcaDT
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color = mainGroup )) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA using %d proteins (log intensity)", nrow(complete.mat))) 
+p
+
+
+BackupAsPDF(p, "PCA_Complete_Proteins")
+```
+WT seem to be more dispersed than the treatment groups
+
+## Differential Expression Analysis
+
+Assuming Danielle wants me to perform DEA with the PH data, using same contrasts as supplied previously
+
+Generate a contrast matrix for pairwise comparisons:
+
+```{r mk-contrasts}
+
+#create list of required contrasts
+contrast_list <- list('EVpos-PARpos' = list('EV+','PAR+'),
+                      "PARneg vs PARpos" = list('PAR-','PAR+'),
+                      "WTpos vs EVpos" = list('WT+','EV+'),
+                      "WTpos vs N10t20pos" = list('WT+','N10t20+'),
+                      "WTpos vs PARpos" = list('WT+','PAR+'))
+
+contrasts <- MSstatsContrastMatrix(contrast_list, unique(p.quant$GROUP))
+
+contrasts
+```
+```{r grp-comparisons}
+contrasts
+gc.mss <- groupComparison(contrast.matrix=contrasts, data=dp.out)
+gc.mss <- setDT(gc.mss$ComparisonResult)
+
+# adjust p values using the Benjamini Hochberg method, which estimates False Discovery Rate
+gc.mss[, fdr := p.adjust(pvalue, method = "BH")] 
+#get gene names
+#gc.mss[, gene := gsub(";.*$","",multiUniprots2multiGenes(gsub("_[STY][0-9]+", "", Protein), simplify = FALSE, allowDups = FALSE))]
+gc.mss[, gene := multiUniprotSites2multiGeneSites(Protein)]
+fwrite(gc.mss, ScriptAndDatedFileName("msstats_groupcomparisons.csv.gz"))
+```
+Table of DEP results 
+
+```{r}
+gc.mss[order(Label), .(n.proteins= .N), by=.(Label,sig)]
+```
+Generate volcano plots of the analysis 
+
+```{r volcano-plots}
+## add sig column to the data
+gc.mss[, sig := 'not']
+gc.mss[ fdr < 0.05 & abs(log2FC) > log2(1.5), sig := ifelse(log2FC <0, "down", "up")]
+gc.mss[, sig := factor(sig, levels= c("up", "not", "down"))]
+gc.mss[, gm.lfc.fdr := .(sqrt(fdr*abs(log2FC)))]
+
+
+lapply(unique(gc.mss$Label), function(lab){
+ p<-ggplot(gc.mss[Label %in% lab,], aes(x=log2FC, y=-log10(fdr), color=sig, label=gene)) +
+    geom_point() +
+    scale_color_manual(values = c(not = "gray", down = "blue", up = "red")) +
+    ggrepel::geom_text_repel(data = gc.mss[Label %in% lab,][order(gm.lfc.fdr)][1:30],  size = 2, max.overlaps = 20) +
+    coord_cartesian(xlim=c(-7,7)) +
+    ggtitle(lab) +
+    theme_classic()
+
+ BackupAsPDF(p, paste0(gsub(" ", ".",lab),'-volcanoplots'))
+})
+```
+
+```{r volcano-plots-all}
+## add sig column to the data
+gc.mss[, sig := 'not']
+gc.mss[ fdr < 0.05 & abs(log2FC) > log2(1.5), sig := ifelse(log2FC <0, "down", "up")]
+gc.mss[, gm.lfc.fdr := .(sqrt(fdr*abs(log2FC)))]
+
+ p<-ggplot(gc.mss, aes(x=log2FC, y=-log10(fdr), color=sig, label=gene)) +
+    geom_point() +
+    scale_color_manual(values = c(not = "gray", down = "blue", up = "red")) +
+    ggrepel::geom_text_repel(data = gc.mss[order(gm.lfc.fdr)][1:30],  size = 2, max.overlaps = 20) +
+    coord_cartesian(xlim=c(-7,7)) +
+  #  ggtitle(Label=Label) +
+    theme_classic() + 
+    facet_wrap(~Label)
+
+ 
+ BackupAsPDF(p, 'all-volcanoplots')
+```
+Counts of up and down reg proteins per groups
+
+```{r}
+summaryData <- gc.mss[, .(count = length(unique(Protein))), by = .(Label, sig) ]
+
+setorder(summaryData, Label, -sig)
+summaryData[, textY := cumsum(count), by = Label]
+summaryData[, textY := textY - count/2] # move down to center of bar part
+
+p <- ggplot(summaryData, aes (x = Label, fill = sig, y = count, label = count))  +
+  scale_fill_manual(values = c(down= "blue", not = "gray", up = "red")) +
+  geom_col() +
+  geom_label(aes(y = textY), color = "white")  +
+  ggtitle('DE breakdown per condition') +
+  theme_bw()
+
+BackupAsPDF(p, 'DEA_breakdown_barplot_')
+
+```
+
+
+```{r}
+gc.mss[order(Label), .(count=(length(unique(Protein)))), by= .(Label,sig)]
+gc.mss[order(Label), .(n.proteins= .N), by=.(Label,sig)]
+```
+
+
+## Enrichment Analysis
+
+Perform GO enrichment analysis for each of the comparisons
+
+```{r}
+
+# multiproteins will be excluded from enrichment by the enrichment process itself 
+# because (e.g.) the string "A0A0B4J2F2;P57059" does not match any uniprot exactly (likewise for genes)
+gc.mss[, uniprot := strsplit(gsub( "_[STY][0-9]+(;|$)", "\\1",  Protein),";") |> #\1 means return first capture group (in parenthesis)
+          lapply(FUN = unique) |> #REMOVE DUPS
+          sapply(FUN = paste, collapse = ";")] #collapse with ; seperared vals
+
+
+#groups are the unique proteins
+universe <- gc.mss$uniprot |> unique()
+
+# all go ontology genes (biological process, cellular componetn & metabolic function) for enrichment analysis
+gmt.go <- loadGmtFromBioconductor(dbName = "org.Hs.eg.db", ontology = "ALL", keyType = "UNIPROT")
+
+# failing on simplifytab step..
+#enpl.out <- enrichmentOnGroupsPL(groupTable = gc.mss, geneColumn = "uniprot", groupColumns = c("Label", "sig"), gmt = gmt.go, universe = universe)
+
+
+# perform enrichment on significant genes for all groups
+enrich.dt <- enricherOnGroups(gc.mss[gc.mss$sig != 'not'], geneColumn = "uniprot", groupColumns = c("Label", "sig"), term2gene.gmt = gmt.go, universe = universe)
+
+#simplify enrich results to remove redundant GO terms
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = "Label.sig")
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'Label.sig', topN = 15, negCols =unique(simp.enrich$simplified$Label.sig[grep('.down', simp.enrich$simplified$Label.sig)]), row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 7))  # compare enrichment in the top 10 terms per group
+BackupAsPDF(ht, "heatmap_go_enrichment")
+```
+## Kinase Enrichment Analysis
+
+Load kinase data
+
+```{r}
+#db of ppi, kinase-subtrate info
+kinaseData <- loadKinaseDataOmniPath(species = 'HUMAN')
+
+gc.mss
+# convert to single site info based on gene names
+singleSiteResults <- prepare_AMSS_ResultsFile(gc.mss, column = 'gene')
+
+labels <- unique(singleSiteResults$Label)
+
+kinActList <- lapply (labels, FUN=function(lab){kinaseActivity(singleSiteResults[Label == lab & representative==TRUE],
+                                                               plots = FALSE,
+                                                               kinaseData = kinaseData)})
+names(kinActList) <- labels
+
+
+kinActFull.scores <- rbindlist(lapply(kinActList, FUN = function(x)x$scores), idcol="Label") #bind the score dts together, creating a label id column
+kinActFull.mapped <- rbindlist(lapply(kinActList, FUN = function(x)x$kinaseMapped)) # Label is already in these tables
+
+
+fwrite(kinActFull.scores, ScriptAndDatedFileName("kinaseSummaryScores.csv"))
+fwrite (kinActFull.mapped, ScriptAndDatedFileName("kinaseSubstrateData.csv"))
+```
+
+## Heatmap of Significant Kinases
+
+```{r kinase heatmaps}
+sigKinases <-  kinActFull.scores[fdr.BH < 0.05 & N >= 2, unique(CTRL_GENE_NAME)] #signiicant enrichment & at least 2 targets?
+
+
+
+sigKinase.mat.z <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "Z"),
+                              rownames = "CTRL_GENE_NAME")
+
+sigKinase.mat.N <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "N"),
+                                  rownames = "CTRL_GENE_NAME")
+
+
+hm <- Heatmap (sigKinase.mat.z, 
+         cluster_columns=TRUE, 
+         name = "Kinase Z Score",
+         column_split = tstrsplit(colnames(sigKinase.mat.z), split="[_. ]")[[1]],
+         #column_split = colnames(sigKinase.mat.z),
+         col = circlize::colorRamp2(breaks = c(-3, 0, 0, 3), colors = c("blue", "gray", "gray", "red")),  # two midpoints in case you want to have a wider gray bar around 0
+         row_names_gp = gpar(fontsize = 7),
+         cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=7, col="white")) #if value is not NA, grid.text adds the value in the mat to the cell
+                                  }
+                                })
+hm
+
+BackupAsPDF(hm, prefix = "Heatmap_SigKinases")
+
+hm <- Heatmap (sigKinase.mat.z, 
+         cluster_columns=FALSE, 
+         name = "Kinase Z Score",
+         #column_split = colnames(sigKinase.mat.z),
+         column_split = tstrsplit(colnames(sigKinase.mat.z), split="[ ]")[[1]],
+         col = circlize::colorRamp2(breaks = c(-3, 0, 0, 3), colors = c("blue", "gray", "gray", "red")),  # two midpoints in case you want to have a wider gray bar around 0
+         row_names_gp = gpar(fontsize = 7),
+         cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){ #if value is not NA, grid.text adds the value in the mat to the cell
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=7, col="white"))
+                                  }
+                                })
+
+BackupAsPDF(hm, prefix = "Heatmap_SigKinases_noColCluster")
+
+```
+
+## plots of individual kinase substrates (Dont include)
+
+```{r}
+p <- BarplotKinaseActivities(kinActFull.scores, kinActFull.mapped, sigKinases = sigKinases)
+p
+
+BackupAsPDF(p, "SigKinaseSites_BoxPlots_ByLabel_")
+
+p <- BarplotKinaseActivities(kinActFull.scores, kinActFull.mapped, sigKinases = sigKinases, reverse=TRUE)
+p
+BackupAsPDF(p, "SigKinaseSites_BoxPlots_ByKinase_")
+
+```
+
+## Reformatting msstats results
+
+```{r}
+gc.mss.wide <- dcast(gc.mss, Protein+gene+adj.pvalue~Label,value.var = 'log2FC')
+str(gc.mss.wide)
+fwrite(gc.mss.wide, ScriptAndDatedFileName("msstats_groupcomparisons_wideformat.csv.gz"))
+```
+
+## Reformatting msstats dataproc results
+
+```{r}
+#rows as proteins, and then columns are gene, and the log2 intensity value in each condition.
+p.quant.wide <- dcast(p.quant, Protein~GROUP+SUBJECT, value.var = "LogIntensities")
+fwrite(p.quant.wide, ScriptAndDatedFileName("log2intensities_wideformat.csv.gz"))
+```
+```{r}
+#combine the datasets on common id using merge (inner merge; only want proteins where phospho was detected)
+# indication on sites where protein abundance strsdy but PH changes: subtract phospho log2fc from abundance log2fc: indication of change in phospho level relative to change in abundance 
+#  focus on sites where abundance is constant but phospho changes, filter DT by no significance in abu. but significant in 
+colnames(gc.mss)
+
+gc.mss <- gc.mss[, t.dist.pval := pt(abs(log2FC)/SE, DF, lower.tail = FALSE) * 2]
+head(gc.mss)
+
+pt (abs(log2FC)/SE, df, lower.tail = FALSE) * 2
+#t-tatistic num:logFC/SE
+
+#pt(t-stat, DF, lower.tail = F) * 2 
+
+log=t-stat/SE
+
+#adjust_dend_by_x(
+  
+  #give a venn diagram to see where things overlap
+  # scatterplot:
+  #log2FC phospho vs abundance #should be weakly correlated but a cloud - lts of
+
+```
+
+Combining abundance and phospho data to look at what changes 
+if you have more protein you will probably get more phospho, so any sites where abundance stays the same or decreases while phospho changes would be interesting
+
+Questions:
+i) Summarise all Phospho LFC values by protein? take median to compare?
+ii) t-tests; take delta and do a one-sample t-test (HA is difference greater than 0; good for looking at magnitude and direction) or two sample t-test (compare means of two different groups). Are we comparing log2 fc values between two different groups, or 
+
+# Merging AB & PH datatables
+```{r merge}
+# I think for this we need to read in both datasets
+ #first lets read in the 
+gc.mss.ab <- fread('/Users/martingordon/Documents/projects/051623_DSwaney/2023_05_16_DSwaney_AA08_AB_data/2023_05_18_msstats_groupcomparisons.csv.gz')
+gc.mss.ph <- fread('/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_msstats_groupcomparisons.csv.gz')
+
+
+
+#merge the two datasets; we have simplified uniprot ids in the uniprot col to manage this
+# inner join (default) as we only want shared proteins between the datasets
+
+gc.mss.ph[,Label := gsub('\\+', 'pos', Label)]
+gc.mss.ph[,Label := gsub('\\-', 'neg', Label)]
+
+# multiproteins will be excluded from enrichment by the enrichment process itself 
+# because (e.g.) the string "A0A0B4J2F2;P57059" does not match any uniprot exactly (likewise for genes)
+gc.mss.ph[, uniprot := strsplit(gsub( "_[STY][0-9]+(;|$)", "\\1",  Protein),";") |> #\1 means return first capture group (in parenthesis)
+          lapply(FUN = unique) |> #REMOVE DUPS
+          sapply(FUN = paste, collapse = ";")] #collapse with ; seperared vals
+
+#sanity check
+any(!gc.mss.ph$Label %in% gc.mss.ab$Label)
+
+## inner join: only proteins found in both datatables
+merge.gc.mss <- merge(x=gc.mss.ph, y=gc.mss.ab, by.x=c('uniprot', 'Label'), by.y=c('Protein', 'Label'))
+
+
+gc.mss.ph[,exp := 'ph']
+gc.mss.ab[,exp := 'ab']
+gc.mss.ab[,uniprot := Protein]
+
+gc.mss.rbind <- rbind(gc.mss.ph, gc.mss.ab, fill=TRUE)
+
+
+# 30
+gc.mss.ph[, .N, by=.(Label, unique(uniprot))]
+```
+
+
+```{r}
+#change in log2fc
+merge.gc.mss[, delta.log2fc :=  log2FC.x - log2FC.y ]
+
+# paired t-test to assess difference in log2FC results from both conditions 
+
+merge.gc.mss[, lfc.tstat := abs((log2FC.x - log2FC.y) / sqrt((SE.x)^2/DF.x + (SE.y)^2/DF.y)) ]
+merge.gc.mss[, lfc.pval := 2 * pt(lfc.tstat, DF.x + DF.y, lower.tail = FALSE)]
+
+# correct for multiple testing using BH
+merge.gc.mss[, lfc.pval.fdr := p.adjust(lfc.pval, method = 'BH')]
+
+# add some annotation
+merge.gc.mss[, sig.x := paste0('ph.',sig.x)]
+merge.gc.mss[, sig.y := tolower(paste0('ab.',sig.y))]
+#combine col
+merge.gc.mss[, sig.ab.ph := interaction(sig.y,sig.x)]
+
+# add gene info
+merge.gc.mss[, gene := multiUniprotSites2multiGeneSites(Protein)]
+
+```
+
+
+```{r}
+#maybe create a lollipop chart to show or barchart
+merge.gc.mss[order(Label), length(unique(uniprot)), by=.(sig.x,sig.y, Label)]
+merge.gc.mss[lfc.pval.fdr < 0.05,  & sig.y != 'not', .N, by=.(sig.x, Label)]
+```
+
+Venn Diagram of the sig upregulated PH proteins
+
+```{r ggvenn-up}
+#sets needed: all shared genes (unique)
+# all upreg, downreg and not in AB and PH dataset
+# all upreg in PH and not in AB, all downreg in PH and not in AB
+
+
+
+# split on grouping
+merge.gc.list <- split(merge.gc.mss, by='Label')
+
+merge.gc.list
+lapply(seq_along(merge.gc.list), function(x,n,i){
+  #collect the prot lists 
+  print(n[[i]])
+  uni <- x[[i]][,unique(uniprot)]
+  up.ab <- x[[i]][sig.y == 'ab.up', unique(uniprot)]
+  down.ab <- x[[i]][ sig.y == 'ab.down', unique(uniprot)]
+  up.ph <- x[[i]][sig.x == 'ph.up', unique(uniprot)]
+  down.ph <- x[[i]][sig.x == 'ph.up', unique(uniprot)]
+  
+  venn.data <- list(All.proteins=uni,
+                    AB.up=up.ab,
+                    AB.down=down.ab,
+                    PH.up=up.ph)
+# draw plots
+  vd <- ggvenn(venn.data,
+         fill_color = c("#868686FF","#0073C2FF", "#EFC000FF", "#CD534CFF",'#21908dff'),
+         show_elements = F,
+         stroke_size = 0.5, set_name_size = 3.5, text_size = 2.5)
+  vd<- vd + ggtitle(n[[i]])
+ # BackupAsPDF(vd, paste0(n[[i]], '-ph-up-venn-log2fc-ttest'))
+
+}, x=merge.gc.list, n=names(merge.gc.list))
+```
+
+# Enrichment Analysis on only phospho sites that are up (and down) regulated while abundance is unchanged
+
+
+
+```{r}
+
+#groups are the unique proteins
+merge.universe <- merge.gc.mss$uniprot |> unique()
+
+# all go ontology genes (biological process, cellular componetn & metabolic function) for enrichment analysis
+gmt.go <- loadGmtFromBioconductor(dbName = "org.Hs.eg.db", ontology = "ALL", keyType = "UNIPROT")
+
+# failing on simplifytab step..
+#enpl.out <- enrichmentOnGroupsPL(groupTable = gc.mss, geneColumn = "uniprot", groupColumns = c("Label", "sig"), gmt = gmt.go, universe = universe)
+
+# perform enrichment on significant ph-up genes 
+merge.enrich.dt <- enricherOnGroups(merge.gc.mss[merge.gc.mss$sig.x != 'ph.not' & merge.gc.mss$sig.y == 'ab.not'], geneColumn = "uniprot", groupColumns = c("Label", "sig.x", 'sig.y'), term2gene.gmt = gmt.go, universe = universe)
+
+#simplify enrich results to remove redundant GO terms
+merge.simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = merge.enrich.dt, gmt=gmt.go, groupColumn = "Label.sig.x.sig.y")
+
+# simplify labelling 
+merge.simp.enrich$simplified[, Label.sig.x.sig.y := gsub('.ab.not', '', Label.sig.x.sig.y)]
+
+htm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = merge.simp.enrich$simplified, NULL, groupColumn = 'Label.sig.x.sig.y', topN = 20, negCols =unique(merge.simp.enrich$simplified$Label.sig.x.sig.y[grep('.down', merge.simp.enrich$simplified$Label.sig.x.sig.y)]), row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 7))  # compare enrichment in the top 10 terms per group
+
+BackupAsPDF(htm, "sig-ph-heatmap_go_enrichment-")
+
+```
+
+Perform kinase enrichment on differentially phosphorylated sets
+
+Load kinase data
+
+```{r}
+#db of ppi, kinase-subtrate info
+kinaseData <- loadKinaseDataOmniPath(species = 'HUMAN')
+
+# list of phospho sites that are up-down reg w/o sig change in abundance
+filtering.criteria <- merge.gc.mss[ sig.x != 'ph.not' & sig.y == 'ab.not', Protein,  by=Label]
+
+
+#filter for the significant PH proteins w/o sig AB changes
+gc.mss.ph.filter <- gc.mss.ph[ Protein %in% filtering.criteria$Protein & Label %in% filtering.criteria$Label,]
+
+
+# convert to single site info based on gene names
+singleSiteResults <- prepare_AMSS_ResultsFile(gc.mss.ph.filter, column = 'gene')
+
+labels <- unique(singleSiteResults$Label)
+
+singleSiteResults
+kinActList <- lapply (labels, FUN=function(lab){kinaseActivity(singleSiteResults[Label == lab & representative==TRUE],
+                                                               plots = FALSE,
+                                                               kinaseData = kinaseData)})
+names(kinActList) <- labels
+
+
+kinActFull.scores <- rbindlist(lapply(kinActList, FUN = function(x)x$scores), idcol="Label") #bind the score dts together, creating a label id column
+kinActFull.mapped <- rbindlist(lapply(kinActList, FUN = function(x)x$kinaseMapped)) # Label is already in these tables
+
+
+fwrite(kinActFull.scores, ScriptAndDatedFileName("sig-ph-kinaseSummaryScores.csv"))
+fwrite (kinActFull.mapped, ScriptAndDatedFileName("sig-ph-kinaseSubstrateData.csv"))
+
+
+```
+
+```{r kinase heatmaps}
+sigKinases <-  kinActFull.scores[fdr.BH < 0.05 & N >= 2, unique(CTRL_GENE_NAME)] #signiicant enrichment & at least 2 targets?
+
+
+
+sigKinase.mat.z <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "Z"),
+                              rownames = "CTRL_GENE_NAME")
+
+sigKinase.mat.N <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "N"),
+                                  rownames = "CTRL_GENE_NAME")
+
+
+hm <- Heatmap (sigKinase.mat.z, 
+         cluster_columns=TRUE, 
+         name = "Kinase Z Score",
+         column_split = tstrsplit(colnames(sigKinase.mat.z), split="[_. ]")[[1]],
+         #column_split = colnames(sigKinase.mat.z),
+         col = circlize::colorRamp2(breaks = c(-3, 0, 0, 3), colors = c("blue", "gray", "gray", "red")),  # two midpoints in case you want to have a wider gray bar around 0
+         row_names_gp = gpar(fontsize = 7),
+         cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=7, col="white")) #if value is not NA, grid.text adds the value in the mat to the cell
+                                  }
+                                })
+hm
+
+BackupAsPDF(hm, prefix = "Sig-PH-Heatmap_SigKinases")
+
+hm <- Heatmap (sigKinase.mat.z, 
+         cluster_columns=FALSE, 
+         name = "Kinase Z Score",
+         #column_split = colnames(sigKinase.mat.z),
+         column_split = tstrsplit(colnames(sigKinase.mat.z), split="[ ]")[[1]],
+         col = circlize::colorRamp2(breaks = c(-3, 0, 0, 3), colors = c("blue", "gray", "gray", "red")),  # two midpoints in case you want to have a wider gray bar around 0
+         row_names_gp = gpar(fontsize = 7),
+         cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){ #if value is not NA, grid.text adds the value in the mat to the cell
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=7, col="white"))
+                                  }
+                                })
+
+BackupAsPDF(hm, prefix = "Sig-PH-Heatmap_SigKinases_noColCluster")
+```
+
+Heatmap of all upreg PH
+
+```{r}
+
+p.quant.filter <- p.quant[Protein %in% filtering.criteria$Protein,]
+
+p.quant.filter.mat <- dcast(p.quant.filter, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+p.quant.filter.mat[1:10,]
+nrow(p.quant.filter.mat)
+
+scaled.pquant.filter.mat <- sweep(p.quant.filter.mat, 1, apply(p.quant.filter.mat, 1, median, na.rm = TRUE))
+
+scaled.subMat <- scaled.intensity.mat[sample.int(nrow(scaled.intensity.mat), 2000),]
+
+hm <- Heatmap(scaled.subMat,
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(scaled.subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(scaled.subMat)),
+        name = "Log2 Int\nvs Median")
+
+
+```
+
+
+
+```{r venn.diagram plot, eval=FALSE}
+# split on grouping
+
+lapply(seq_along(merge.gc.list), function(x,n,i){
+  #collect the prot lists 
+  uni <- x[[i]][,unique(uniprot)]
+  up.ab <- x[[i]][sig.y == 'Up', unique(uniprot)]
+  down.ab <- x[[i]][sig.y == 'Down', unique(uniprot)]
+  up.ph <- x[[i]][sig.x == 'up', unique(uniprot)]
+  down.ph <- x[[i]][sig.x == 'down', unique(uniprot)]
+  
+  venn.data <- list(shared.prots=uni,
+                    AB.up=up.ab,
+                    AB.down=down.ab,
+                    PH.up=up.ph,
+                    PH.down=down.ph)
+    #draw plots
+  vd <- venn.diagram(x=venn.data,
+                     filename=paste0(n[[i]],'-test.png'),
+                     output=TRUE,
+                     
+                             
+                     # Output features
+                     imagetype="png" ,
+                     #height = 480 , 
+                     #idth = 480 , 
+                     #resolution = 300,
+                     #compression = "lzw",
+                     
+                     #circles 
+                     lwd = 2,
+                     lty = 'blank',
+                     fill = c("#868686FF","#0073C2FF", "#EFC000FF", "#CD534CFF",'#21908dff'),
+                      
+                     # Numbers
+                     cex = .2,
+                     fontface = "bold",
+                     fontfamily = "sans",
+        
+                    # Set names
+                    cat.cex = 0.5,
+                    cat.fontface = "bold",
+                    cat.default.pos = "outer",
+                 #   cat.pos = c(-27, 27, 135),
+                  #  cat.dist = c(0.055, 0.055, 0.085),
+                    cat.fontfamily = "sans"
+                #    rotation = 1
+)             
+  return(vd)                  
+  
+}, x=merge.gc.list, n=names(merge.gc.list))
+
+```
+
+## scatterplots
+
+```{r}
+#remove NA values & constrain Inf to 0
+merge.gc.mss <- merge.gc.mss[!is.na(delta.log2fc),]
+merge.gc.mss <- merge.gc.mss[ abs(delta.log2fc) != Inf,]
+
+merge.gc.mss[Label %in% c('ab.not.ph.down','ab.not.ph.up','ab.down.ph.not', 'ab.up.ph.not'),]
+
+
+g <- ggplot(merge.gc.mss, aes(x=delta.log2fc, y=log2FC.y, color=sig.ab.ph, label=gene)) +
+  geom_point(alpha=0.7) + 
+  scale_color_manual(values = c(ab.down.ph.down = 'grey', ab.not.ph.down ='blue', ab.up.ph.down='grey', ab.down.ph.not='lightblue', ab.not.ph.not ='grey',  ab.up.ph.not = 'pink', ab.not.ph.up ='red', ab.down.ph.up = 'grey')) +
+ ggrepel::geom_text_repel(data = merge.gc.mss[sig.ab.ph %in% c('ab.not.ph.down','ab.not.ph.up','ab.down.ph.not', 'ab.up.ph.not'),][order(lfc.pval.fdr)][1:20],  size = 2, max.overlaps = 20) +
+  coord_cartesian(xlim=c(-7,7)) +
+  geom_abline(alpha=0.2) + 
+  ylab('AB Log2FC') +
+  xlab('PH-AB Log2FC') +
+  facet_wrap(~Label)
+g
+BackupAsPDF(g, 'ab.ph-comb-log2fc-scatterplot', dimensions=c(8, 8))
+
+
+colnames(merge.gc.mss)
+(merge.gc.mss$lfc.pval.fdr)[1:10]
+# one of each
+lapply(unique(merge.gc.mss$Label), function(lab){
+p <- ggplot(merge.gc.mss, aes(x=delta.log2fc, y=log2FC.y, color=sig.ab.ph, label=gene)) +
+     geom_point(alpha=0.4) + 
+     scale_color_manual(values = c(ab.down.ph.down = 'grey', ab.not.ph.down ='blue', ab.up.ph.down='grey', ab.down.ph.not='lightblue',
+                                   ab.not.ph.not ='grey',  ab.up.ph.not = 'pink', ab.not.ph.up ='red', ab.down.ph.up = 'grey')) +
+     ggrepel::geom_text_repel(data = merge.gc.mss[sig.ab.ph %in% c('ab.not.ph.down','ab.not.ph.up','ab.down.ph.not', 'ab.up.ph.not'),][order(lfc.pval.fdr)][1:30],
+                              size = 2, max.overlaps = 20) +
+     coord_cartesian(xlim=c(-7,7)) +
+     ylab('AB Log2FC') +
+     xlab('PH-AB Log2FC') +
+     ggtitle(lab) +
+     theme_classic()
+ p
+BackupAsPDF(p, paste0(gsub(" ", ".",lab),'-log2fc-scatterplot'))
+})
+
+
+range(merge.gc.mss$delta.log2fc)
+
+ggplot(merge.gc.mss, aes(x=delta.log2fc, y=-log10(lfc.pval.fdr), color=sig.ab.ph, label=gene)) +
+    geom_point(alpha=0.4) +
+  scale_color_manual(values = c(ab.down.ph.down = 'grey', ab.not.ph.down ='blue', ab.up.ph.down='grey', ab.down.ph.not='lightblue', ab.not.ph.not ='grey',  ab.up.ph.not = 'pink', ab.not.ph.up ='red', ab.down.ph.up = 'grey')) +
+    ggrepel::geom_text_repel(data = merge.gc.mss[order(delta.log2fc)][1:10],  size = 2, max.overlaps = 20) +
+  #  ggtitle(Label=Label
+    theme_classic() + 
+    facet_wrap(~Label)
+
+## add sig column to the data
+merge.gc.mss[, compar.sig := 'not']
+merge.gc.mss[ fdr < 0.05 & abs(log2FC) > log2(1.5), sig := ifelse(log2FC <0, "down", "up")]
+merge.gc.mss[, gm.lfc.fdr := .(sqrt(fdr*abs(log2FC)))]
+```
+
+## check for interferon stimulating gene signatures
+## ISG Heatmap From Nature Medicine "Tumor derived IFN..." https://doi.org/10.1038/s41591-018-0302-5
+
+```{r}
+ISGs <- c("ADAR", "BST2", "CASP1", "CMPK2", "CXCL10", "DDX60", "DHX58", "EIF2AK2", "EPSTI1", "GBP4", "HERC6", 
+         "IFI35", "IFIH1", "IFIT2", "IFIT3", "IRF7", "ISG15", "ISG20", "MX1", "NMI", "OASL", "OGFR", "PARP12", 
+         "PARP14", "PNPT1", "PSME2", "RSAD2", "RTP4", "SAMD9L", "SP110", "STAT2", "TDRD7", "TRAFD1", "TRIM14", 
+         "TRIM21", "TRIM25", "UBE2L6", "USP18")
+
+```
+ISG heatmaps
+
+Enrichment
+```{r}
+# simple uniprot site
+merge.gc.mss[, simplified.gene := multiUniprots2multiGenes(uniprot)]
+
+# extract all rows with 
+isg.merge.gc.mss <- merge.gc.mss[ simplified.gene %in% ISGs,]
+```
+Heatmap of log2FC change values for these genes
+```{r}
+
+isg.mat <- dcast(isg.merge.gc.mss, gene~Label, value.var = 'delta.log2fc') %>%  as.matrix(rownames='gene')
+isg.mat
+
+ha <- HeatmapAnnotation(type = colnames(isg.mat), annotation_name_side = "right", col=list(type=c("EVpos vs PARpos" = "green", "PARneg vs PARpos" = "yellow", "WTpos vs EVpos" = "blue",  "WTpos vs N10t20pos" = "red", "WTpos vs PARpos"  = "orange")))
+
+colnames(isg.mat)
+hm <- Heatmap(isg.mat,
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(isg.mat),
+        show_row_names = TRUE,
+        row_names_gp = gpar(fontsize = 7),
+        name = "PH - AB Log2FC.")
+
+hm
+BackupAsPDF(draw(hm), 'isg.ph.ab.heatmap_log2FC')
+
+```
+No significant GO enrichment for ISG
+
+```{r}
+colnames(isg.merge.gc.mss)
+#groups are the unique proteins
+universe <- isg.merge.gc.mss$uniprot |> unique()
+
+# all go ontology genes (biological process, cellular componetn & metabolic function) for enrichment analysis
+gmt.go <- loadGmtFromBioconductor(dbName = "org.Hs.eg.db", ontology = "ALL", keyType = "UNIPROT")
+
+# failing on simplifytab step..
+#enpl.out <- enrichmentOnGroupsPL(groupTable = gc.mss, geneColumn = "uniprot", groupColumns = c("Label", "sig"), gmt = gmt.go, universe = universe)
+
+# no GO enrichment found for ISG genes...
+merge.enrich.dt <- enricherOnGroups(isg.merge.gc.mss[isg.merge.gc.mss$sig.x != 'ph.not' | isg.merge.gc.mss$sig.y != 'ab.not'], geneColumn = "uniprot", groupColumns = c("Label", 'sig.ab.ph'), term2gene.gmt = gmt.go, universe = universe)
+
+```
+
+Try Kinase enrichment for the ISG set. 
+
+```{r}
+#db of ppi, kinase-subtrate info
+kinaseData <- loadKinaseDataOmniPath(species = 'HUMAN')
+
+# list of phospho sites that are up-down reg w/o sig change in abundance
+filtering.criteria <- isg.merge.gc.mss[ sig.x != 'ph.not', Protein,  by=Label]
+
+
+#filter for the significant PH proteins w/o sig AB changes
+isg.merge.gc.mss.filter <- gc.mss.ph[ Protein %in% filtering.criteria$Protein & Label %in% filtering.criteria$Label,]
+
+# convert to single site info based on gene names
+singleSiteResults <- prepare_AMSS_ResultsFile(isg.merge.gc.mss.filter, column = 'gene')
+
+labels <- unique(singleSiteResults$Label)
+
+kinActList <- lapply (labels, FUN=function(lab){kinaseActivity(singleSiteResults[Label == lab & representative==TRUE],
+                                                               plots = FALSE,
+                                                               kinaseData = kinaseData)})
+names(kinActList) <- labels
+
+
+kinActFull.scores <- rbindlist(lapply(kinActList, FUN = function(x)x$scores), idcol="Label") #bind the score dts together, creating a label id column
+kinActFull.mapped <- rbindlist(lapply(kinActList, FUN = function(x)x$kinaseMapped)) # Label is already in these tables
+```
+
+```{r}
+
+sigKinases <-  kinActFull.scores[fdr.BH < 0.05 & N >= 2, unique(CTRL_GENE_NAME)] #signiicant enrichment & at least 2 targets?
+#no significant kinases found
+#sigKinases
+
+sigKinase.mat.z <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "Z"),
+                              rownames = "CTRL_GENE_NAME")
+
+sigKinase.mat.N <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "N"),
+                                  rownames = "CTRL_GENE_NAME")
+
+
+hm <- Heatmap (sigKinase.mat.z, 
+         cluster_columns=TRUE, 
+         name = "Kinase Z Score",
+         column_split = tstrsplit(colnames(sigKinase.mat.z), split="[_. ]")[[1]],
+         #column_split = colnames(sigKinase.mat.z),
+         col = circlize::colorRamp2(breaks = c(-3, 0, 0, 3), colors = c("blue", "gray", "gray", "red")),  # two midpoints in case you want to have a wider gray bar around 0
+         row_names_gp = gpar(fontsize = 7),
+         cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=7, col="white")) #if value is not NA, grid.text adds the value in the mat to the cell
+                                  }
+                                })
+hm
+
+```
+

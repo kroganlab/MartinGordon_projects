@@ -1,0 +1,224 @@
+---
+title: "111824_AdditionalDESeq2Comparisons"
+author: "Martin Gordon"
+date: "2024-11-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Additional PW comparisons using DESeq; 
+Want to run with the plasmid as background, and also do comparisons of 
+
+```{r}
+library(data.table)
+library(parallel)
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(viridis)
+library(dendextend) # for dendogram modifications
+library(DESeq2)
+library(patchwork)
+library(ggrepel)
+library(tidymodels)
+library(readxl)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+In this script, we want to read in the DESeq2 objects and also the annotations
+When rerunning the PWcomparisons, remove the guides in each set that dont have a target in the edit window; these are just adding noise to our output..
+
+Read in the DESeq2 ojects 
+
+```{r}
+des.obj.list <- list(abe8e=readRDS('161024_PWComparisons_DESeq2_data/abe8e.dds.obj'),
+                     bemax=readRDS('161024_PWComparisons_DESeq2_data/bemax.dds.obj'))
+```
+
+Recreate the metadata
+Use both normalization methods and merge to original data.table
+```{r}
+summary.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgCount.summary.csv')
+
+metadata <- summary.dt[, .(sample=paste(editor,treatment,timepoint,rep, sep='_'), group=paste(editor,treatment,timepoint, sep='_'), editor, treatment, timepoint, rep)] %>% 
+  as.data.table()
+
+# tidy some of the conditions
+metadata[treatment == 'control', treatment := 'DMSO']
+metadata[treatment == 'librep', treatment := 'LibraryRep']
+metadata[, treatment := factor(treatment, levels=c('LibraryRep', 'DMSO', 'Paxalisib', 'Alpelisib'))]
+metadata[, timepoint := factor(timepoint, levels=c('0','7', '22'))]
+  
+# make a new condition group and lets use that for our comparisons
+metadata[, condition := factor(paste0(treatment, '_',timepoint))]
+metadata[, condition := relevel(condition, ref='LibraryRep_0')]
+
+abe8e.meta <- metadata[grepl('abe8', sample),] %>% 
+    as.data.frame(row.names = .$sample)
+bemax.meta <- metadata[grepl('bemax', sample),] %>% 
+  as.data.frame(row.names = .$sample)
+
+
+meta.list <- list('abe8e'= abe8e.meta,
+                 'bemax' = bemax.meta)
+
+meta.list[[1]]$condition %>%  unique()
+meta.list[[1]]$treatment %>%  unique
+```
+
+
+```{r}
+mat.list <- lapply(names(mat.list), function(i){
+  
+  mat.list[[i]] <- mat.list[[i]][, rownames(meta.list[[i]])]
+  return(mat.list[[i]])
+  
+})
+names(mat.list) <- c('abe8e', 'bemax')
+
+# all true
+colnames(mat.list[[1]]) == rownames(meta.list[[1]])
+colnames(mat.list[[2]]) == rownames(meta.list[[2]])
+
+```
+
+
+Read in the output from the annotation process to extract guides with targets
+
+```{r}
+# this is a selection of the guides with edits found in window; subset the datatables to these guides and other non-targeting set 
+#does not include the non targeting set, so create a superset of those and the unique set in each of these
+guides.dt <- fread('110724_annotateCRISPRguides_Functions_data/2024_11_15_guides.mutant.anno.collapsed.txt')
+
+# subset to guides here and the non=targeting set 
+good.abe8e <- guides.dt[editor == 'abe8e', unique(guide)]
+good.bemax <- guides.dt[editor == 'bemax', unique(guide)]
+```
+
+```{r}
+guide.table <- read_xlsx('./docs/PIK3CA pathway base editing.xlsx', sheet=1) %>%  
+  as.data.table()
+
+guide.table[, Gene := toupper(Gene)]
+guide.table[Gene %like% "SGINTERGENIC", Gene := 'INTERGENIC']
+
+# I think we only want to run comparisons on the different
+sgControls <- guide.table[Gene %in% c('NON-TARGETING', 'INTERGENIC'), unique(`Sl No`)]
+
+abe8e.set <- c(guide.table[Guide %in% c(good.abe8e), unique(`Sl No`)], sgControls)
+bemax.set <- c(guide.table[Guide %in% c(good.bemax), unique(`Sl No`)], sgControls) 
+```
+Filter the DESeq2 objects to only keep the 'good' guides and non-targeting/intergenic set
+
+```{r}
+des.obj.list[['abe8e']] <- des.obj.list[['abe8e']][rownames(des.obj.list[['abe8e']]) %in% abe8e.set,]
+des.obj.list[['bemax']] <- des.obj.list[['bemax']][rownames(des.obj.list[['bemax']]) %in% bemax.set,]
+
+
+colData(des.obj.list[['abe8e']])
+```
+
+Rerun the contrasts; we also want to run the contrasts of treatment vs control at tp7 and tp22
+```{r}
+de.list  <- lapply(des.obj.list, function(x){
+  
+  dds <- DESeq(x)
+  
+  print(resultsNames(dds))
+  contrasts.oi<- grep('Intercept', resultsNames(dds), invert=T, value = T)
+  
+  all.res <- lapply(contrasts.oi, function(n){
+    
+    res <- results(dds, name=n) %>% 
+      as.data.table(., keep.rownames=T) %>% 
+      .[, contrast := n]
+  }) %>% rbindlist()
+})
+
+
+de.list[[1]]$contrast %>%  unique()
+```
+```{r}
+colData(des.obj.list[['abe8e']] )
+
+# define the model matrix
+mod_mat <- model.matrix(design(des.obj.list[['abe8e']]), colData(des.obj.list[['abe8e']]))
+mod_mat
+# calculate coefficient vectors for each group
+alp22 <- colMeans(mod_mat[des.obj.list[['abe8e']]$condition == "Alpelisib_22", ])
+alp7 <- colMeans(mod_mat[des.obj.list[['abe8e']]$condition == "Alpelisib_7", ])
+pax22 <- colMeans(mod_mat[des.obj.list[['abe8e']]$condition == "Paxalisib_22", ])
+pax7 <- colMeans(mod_mat[des.obj.list[['abe8e']]$condition == "Paxalisib_7", ])
+dmso22 <- colMeans(mod_mat[des.obj.list[['abe8e']]$condition == "DMSO_22", ])
+dmso7 <- colMeans(mod_mat[des.obj.list[['abe8e']]$condition == "DMSO_7", ])
+ 
+
+# sanity check this matches our calculations running automatically...
+
+de.additionalcontrasts.list <- lapply(des.obj.list, function(x){
+  
+  dds <- DESeq(x)
+  message('Building design matrix..')
+  
+  mod_mat <- model.matrix(design(x), colData(x))
+
+  
+  alp22 <- colMeans(mod_mat[x$condition == "Alpelisib_22", ])
+  alp7 <- colMeans(mod_mat[x$condition == "Alpelisib_7", ])
+  pax22 <- colMeans(mod_mat[x$condition == "Paxalisib_22", ])
+  pax7 <- colMeans(mod_mat[x$condition == "Paxalisib_7", ])
+  dmso22 <- colMeans(mod_mat[x$condition == "DMSO_22", ])
+  dmso7 <- colMeans(mod_mat[x$condition == "DMSO_7", ])
+  d0 <-  colMeans(mod_mat[x$condition == "LibraryRep_0", ])
+
+  # pulling out individual contrasts
+  alp22_d0 <- as.data.table(results(dds, contrast = alp22 - d0), keep.rownames = T)[, contrast := 'Alpelisib_22_vs_LibraryRep_0']
+  alp7_d0 <- as.data.table(results(dds, contrast = alp7 - d0), keep.rownames = T)[, contrast := 'Alpelisib_7_vs_LibraryRep_0']
+  pax22_d0 <- as.data.table(results(dds, contrast = pax22 - d0), keep.rownames = T)[, contrast := 'Paxalisib_22_vs_LibraryRep_0']
+  pax7_d0 <- as.data.table(results(dds, contrast = pax7 - d0), keep.rownames = T)[, contrast := 'Paxalisib_7_vs_LibraryRep_0']
+  dmso22_d0 <- as.data.table(results(dds, contrast = dmso22 - d0), keep.rownames = T)[, contrast := 'DMSO_22_vs_LibraryRep_0']
+  dmso7_d0 <- as.data.table(results(dds, contrast = dmso7 - d0), keep.rownames = T)[, contrast := 'DMSO_7_vs_LibraryRep_0']
+
+  # now get the individual
+  alp22_dmso22 <- as.data.table(results(dds, contrast = alp22 - dmso22), keep.rownames = T)[, contrast := 'Alpelisib_22_vs_DMSO_22']
+  alp7_dmso7 <- as.data.table(results(dds, contrast = alp7 - dmso7), keep.rownames = T)[, contrast := 'Alpelisib_7_vs_DMSO_7']
+  pax22_dmso22 <- as.data.table(results(dds, contrast = pax22 - dmso22), keep.rownames = T)[, contrast := 'Paxalisib_22_vs_DMSO_22']
+  pax7_dmso7 <- as.data.table(results(dds, contrast = pax7 - dmso7), keep.rownames = T)[, contrast := 'Paxalisib_7_vs_DMSO_7']
+  alp22_pax22 <- as.data.table(results(dds, contrast = alp22 - pax22), keep.rownames = T)[, contrast := 'Alpelisib_22_vs_Paxalisib_22']
+  alp7_pax7 <- as.data.table(results(dds, contrast = alp7 - pax7), keep.rownames = T)[, contrast := 'Alpelisib_7_vs_Paxalisib_7']
+
+  all.contrasts <- rbind(alp22_d0, alp7_d0, pax22_d0, pax7_d0, dmso22_d0, dmso7_d0,
+                         alp22_dmso22, alp7_dmso7, pax22_dmso22, pax7_dmso7, alp22_pax22, alp7_pax7)  
+  
+
+  return(all.contrasts)
+})
+
+```
+Save the output of the contrasts and lets combine the two datatables and regenerate the volcanoplots
+
+
+```{r}
+de.newContrasts.dt <- rbindlist(de.additionalcontrasts.list, idcol = 'editor')
+de.newContrasts.dt[, adj.pvalue := p.adjust(pvalue, method = 'BH'), by=.(editor,contrast)]
+
+fwrite(de.newContrasts.dt, ScriptAndDatedFileName('DESeq2.additionalPWcontrasts.txt'))
+```
+

@@ -1,0 +1,1815 @@
+---
+title: "041125_preparePlots"
+author: "Martin Gordon"
+date: "2025-04-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Summary
+
+Preparing plots (elution profiles, heatmaps etc.) for the HARC presentation Wednesday
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+#get col palette
+col.pal <- getQualitativePalette(n=17)
+```
+
+```{r}
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_cd4.inf.1.secms.filtered.csv.gz')
+apms.int <-  fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_yager.ints.toCompare.csv.gz')
+comb.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_combined.scores.wYager.csv.gz')
+
+# all sec-ms scores
+allScores <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_PeakPlusCosSim.csv.gz')
+summary <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_12_PeakSimilarityScores.csv.gz')
+
+# robyn data; use this to create the plots
+robynData <- as.data.table(readxl::read_xlsx('./data/Data_Visualize_SECHIV.xlsx', sheet=1, col_names = T, skip=1))
+```
+
+id mapper
+```{r}
+id.mapper <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_StringGeneProtein.idMapper.csv.gz')
+id.mapper[, simplifiedGene := gsub('[.].+', '', gene)]
+```
+
+geneSets to look at
+
+```{r}
+nucpore <-c('P49790','Q5SRE5','Q8TEM1','O15504', 'Q9UKX7', 'O75694', 'Q92621', 
+             'Q8NFH5', 'Q8N1F7', 'P57740', 'Q8WUM0','Q12769','Q8NFH4','Q8NFH3','Q9BW27',
+             'P52948','P35658','Q99567','Q7Z3B4','Q9BVL2','P37198')
+
+proteomsome.set <- c('P25786','P25787','P25788','P25789','P28066','P60900','O14818','P20618','P40306','P49721','P49720',
+                     'P28070','P28074','P28072','Q99436', 'P28062', 'P28065', 'P62191', 'P35998', 'P17980', 'Q9P2W1', 
+                     'P43686','P62195', 'P62333','Q99460', 'O75832','O00231', 'O00232', 'Q9UNM6', 'O00487', 'Q13200', 
+                     'O43242', 'P55036','Q16401', 'Q15008', 'P51665', 'P48556', 'O00233', 'Q06323', 'Q9UL46', 'P61289',
+                     'Q9GZU8', 'Q14997', 'Q92530P', 'O95456', 'Q969U7', 'Q9BT73', 'Q5JS54')
+```
+
+custom heatmap function
+
+```{r}
+# matric to use 
+normMat <- scaledIntensityMatrices(filtered.dt, scaleDenom = 'max')$CD4_infected_1
+
+# custom mod f Bens function to generate a heatmap 
+customintensityHeatmaps <- function(intMats, 
+                                    intensityName = "Relative Protein Intensity", 
+                                    sample='norm_CD4_infected_1', 
+                                    proteinsOI, 
+                                    split_rows=FALSE,
+                                    topOfColorRange = 0.45,...){
+  denom = 50 / topOfColorRange
+  colorFun <- circlize::colorRamp2(breaks = (0:50)/denom, colors = viridis(51,direction = 1))
+  
+  subMat <- intMats[rownames(intMats) %in% proteinsOI$protein,]
+  print(rownames(subMat))
+  
+  rowgrp <- proteinsOI[match(rownames(subMat), protein), info]
+  # convert names to subset we want
+  #print(rownames(subMat))
+  rownames(subMat) <- comb.mapper[match(gsub('[;].+', '', rownames(subMat)), comb.mapper$protein), simplifiedGene]
+  subMat <- subMat[!is.na(rownames(subMat)),]
+  
+  hml <- Heatmap (subMat,
+                  name = intensityName,
+                  cluster_rows = TRUE,
+                  #row_split = rowgrp,
+                  border=T,
+                  row_dend_reorder = FALSE,
+                  cluster_columns = FALSE,
+                  col = colorFun,
+                  show_row_names = ifelse(nrow(subMat) > 100, FALSE, TRUE),
+                  row_names_side = "left",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_labels = ifelse(as.integer(colnames(subMat)) %% 5 == 0, colnames(subMat), ""),
+                  column_title = sample,
+                  #first only:
+                  show_heatmap_legend = TRUE, 
+                 # row_title = sprintf ("%d Proteins", nrow(subMat)),
+                  ...
+  )
+  return(hml)
+}
+```
+
+heatmap and elution plots for Robyn listed; also the complexes Monita has shared
+
+First work on Robyns
+AGFG1_interactor & REV
+
+```{r}
+p <- ggplot (filtered.dt[protein %in% prot.oi,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  theme_bw()
+p
+BackupAsPDF(p, 'rev.agfg1.complex.elution')
+
+prot.oi <- c('P51809', 'O14526')
+p <- ggplot (filtered.dt[protein %in% prot.oi,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  theme_bw()
+p
+BackupAsPDF(p, 'agfg1.complex.elution')
+```
+```{r}
+meta.info <- robynData[,.(mw=`Mwt (Da)`, protein=PG.ProteinAccessions, gene=Genes, info=Info, group=`Map Category 1`)]
+# tidy
+meta.info[gene=='VAMP7', info := 'AGFG1-Interactor']
+meta.info[grepl('proteoasome-', info), info := gsub('proteoasome', 'proteasome', info)]
+
+# combine this info with our filtered dt
+full.dt <- merge(sec.dt, meta.info, by='protein', all.x=T)
+#full.dt[,gene.y := NULL]
+#full.dt[,gene := gene.x]
+#full.dt[,gene.x := NULL]
+```
+REV-FCHO1
+```{r}
+prot.oi <- meta.info[gene %in% c('FCHO1', 'REV'), protein]
+
+p <- ggplot (filtered.dt[protein %in% prot.oi,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 10) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  theme_bw()
+p
+BackupAsPDF(p, 'rev.fcho1.complex.elution')
+
+hm <- customintensityHeatmaps(normMat, sample = 'REV-FCHO1',intensityName = "Relative Protein Intensity", proteinsOI = prot.oi)
+BackupAsPDF(hm ,'rev.fcho1.heatmap')
+```
+AP complex facet by group and do the same with the heatmap
+```{r}
+prot.oi <- meta.info[grepl('AP[12345]', info), .(protein, gene, info)]
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(info~., scales='free_y') +
+  theme_bw()
+p
+BackupAsPDF(p, 'AP.complexes.elutionplots', dimensions=c(8,11))
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'AP complexes',
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+
+BackupAsPDF(hm ,'ap.complexes.heatmap', dimensions=c(8,11))
+```
+plot the AP/C complex
+
+```{r}
+prot.oi <- meta.info[grepl('APC[/]C', info), .(protein, gene, info)]
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(info~., scales='free_y') +
+  theme_bw()
+p
+BackupAsPDF(p, 'apcc.complexes.elution', dimensions=c(8,9))
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'APC/C complex',
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'apcc.complex.heatmap')
+```
+
+APOBEC complex + VIF
+
+```{r}
+prot.oi <- meta.info[grepl('APOBEC', info), .(protein, gene, info)]
+prot.oi
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(info~., scales='free_y') +
+  theme_bw()
+p
+BackupAsPDF(p, 'apobec.complexes.elution')
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'APOBEC-3D',
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'apobec.complex.heatmap')
+```
+
+```{r}
+prot.oi <- meta.info[grepl('ARISC', info), .(protein, gene, info)]
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(info~., scales='free_y') +
+  theme_bw()
+p
+BackupAsPDF(p, 'arisc.complexes.elution', dimensions = c(6,7))
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'ARISC complex',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'arisc.complex.heatmap', dimensions = c(11,6))
+```
+
+I think lets loop through the list of complexes, grep for the first name ID and then santiy check how the results
+
+```{r}
+complex.oi <- meta.info$info %>% 
+  unique()
+
+complex.simplified <- tstrsplit(complex.oi, ' ', keep=1) %>% 
+  unlist()
+
+# remove NA
+complex.simplified <- complex.simplified[!is.na(complex.simplified)]
+
+# remove the ones we have already looked at 
+complex.simplified <- complex.simplified[!complex.simplified %in% c("AGFG1-Interactor" , "AMBRA1", "AP1", "AP2", "AP3", "AP4", "AP5", "APC/C", "AP2-Associated", "APOBEC3s","ARISC","ARISC/BRISC")]
+```
+
+now iterate over this list of complexes and plot
+
+```{r}
+full.dt
+#elution plot
+lapply(complex.simplified, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- meta.info[grepl(grp, info), .(protein, gene, info)]
+  print(prot.oi)
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(info~., scales='free_y') +
+  theme_bw()
+  p
+  
+  length.out <- ifelse(dim(prot.oi)[2] < 10, 6, dim(prot.oi)[2]*.8)
+  BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(8,length.out))
+})
+
+
+# heatmap
+lapply(complex.simplified, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- meta.info[grepl(grp, info), .(protein, gene, info)]
+  print(prot.oi)
+  
+  if (dim(prot.oi)[1] > 2){
+    
+      hm <- customintensityHeatmaps(normMat, 
+                              sample = paste0(grp, ' complex'),
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+    hm
+    BackupAsPDF(hm ,paste0(grp, '.complex.heatmap'), dimensions = c(10,7))
+  }
+})
+
+```
+
+plot the combined proteosome for both
+```{r}
+prot.oi <- meta.info[grepl('protea', info), .(protein, gene, info)]
+prot.oi
+full.dt[, short.info := gsub('proteasome-', '', info)]
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 6))
+p
+BackupAsPDF(p , 'proteasome.combined.elution', dimensions = c(8,16))
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'Proteasome complexes',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'proteosome.combined.complex.heatmap', dimensions = c(13,8))
+```
+Now, need to go back, check results and plot the same set with viral protein included
+
+plottting the same subset with viral proteins included
+
+
+exocyst + nef
+```{r}
+meta.info[gene == 'NEF']
+prot.oi <- meta.info[grepl('exocyst', info), .(protein, gene, info)]
+prot.oi <- rbind(prot.oi, meta.info[gene == 'NEF', .(protein,gene,info)])
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  #facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 6))
+p
+BackupAsPDF(p , 'exocyst.nef.elution', dimensions = c(8,9))
+
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'NEF & Exocyst complex',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'nef.exocyst.complex.heatmap')
+```
+redo the G2 complex; one alone and one with VPR
+
+```{r}
+full.dt[protein %in% viral.prots, short.info := 'viral']
+meta.info[protein %in% viral.prots, short.info := 'viral']
+
+prot.oi <- meta.info[grepl('G2 arrest', info), .(protein, gene, info)]
+prot.oi <- rbind(prot.oi, meta.info[gene == 'VPR', .(protein,gene,info)])
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 6))
+p
+BackupAsPDF(p , 'g2.vpr.elution')
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'VPR & G2 arrest complex',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'g2.arrest.complex.heatmap', dimensions = c(9,6))
+```
+```{r}
+prot.oi <- meta.info[grepl('G2 arrest', info), .(protein, gene, info)]
+#prot.oi <- rbind(prot.oi, meta.info[gene == 'VPR', .(protein,gene,info)])
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  #facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 6))
+p
+BackupAsPDF(p , 'g2.elution')
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'Exocyst complex',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'g2.exocyst.complex.heatmap')
+```
+H1F-alpha CCC
+
+```{r}
+prot.oi <- meta.info[grepl('HIF|CCC', info), .(protein, gene, info)]
+
+#prot.oi <- rbind(prot.oi, meta.info[gene == 'VPR', .(protein,gene,info)])
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  #facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 6))
+p
+BackupAsPDF(p , 'hif.ccc.elution')
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'CCC & HIF1-alpha complex',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'hif.ccc.complex.heatmap')
+```
+HIV host factor & viral proteins
+
+```{r}
+prot.oi <- meta.info[grepl('HIV Host', info), .(protein, gene, info)]
+prot.oi <- rbind(prot.oi, meta.info[protein %in% viral.prots, .(protein,gene,info)])
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 6))
+p
+BackupAsPDF(p , 'hiv.host.viral.elution')
+```
+```{r}
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'HIV Host Factor & Viral proteins',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'hivhost.viral.complex.heatmap')
+```
+plot the viral proteins
+
+```{r}
+prot.oi <- meta.info[info == '', .(protein, gene, info)]
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 6))
+p
+BackupAsPDF(p , 'viral.elution')
+
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'Viral proteins',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm, 'viral.proteins.heatmap')
+```
+Combine all NPC
+
+```{r}
+prot.oi <- meta.info[grepl('NPC', info), .(protein, gene, info)]
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 5.5))
+p
+BackupAsPDF(p , 'npc.combined.elution', dimensions = c(8,13))
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'NPC complex',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=9),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'npc.combined.complex.heatmap', dimensions = c(12,8))
+```
+Fix PAF1
+```{r}
+meta.info[short.info == 'PAF1 Complex', short.info := 'PAF1 complex']
+#meta.info[gene == 'PAF1', info := 'PAF1 complex']
+full.dt[short.info == 'PAF1 Complex', short.info := 'PAF1 complex']
+
+
+prot.oi <- meta.info[grepl('PAF1 complex', info), .(protein, gene, info)]
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 5.5))
+p
+BackupAsPDF(p , 'paf1.elution', dimensions = c(8,13))
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'PAF1 complex',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=9),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'paf1.complex.heatmap')
+```
+plot REV and RRE_REV 
+this one looks really good
+```{r}
+prot.oi <- meta.info[grepl('RRE_REV', info), .(protein, gene, info)]
+prot.oi <- rbind(prot.oi, meta.info[grepl('REV', gene), .(protein, gene, info)])
+
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 5.5))
+p
+BackupAsPDF(p , 'rre.rev.facet.elution')
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'REV & RRE_REV-Cofactor',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=9),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'rev.rre.complex.heatmap')
+```
+Plot SMC, SWI, Tat, WASH
+
+
+```{r}
+prot.oi <- meta.info[grepl('SMC', info), .(protein, gene, info)]
+prot.oi
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 5.5))
+p
+BackupAsPDF(p , 'smc.elution')
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'SMC-SMC6 complex',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=9),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'smc.complex.heatmap')
+```
+```{r}
+prot.oi <- meta.info[grepl('SWI', info), .(protein, gene, info)]
+prot.oi
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 5.5))
+p
+BackupAsPDF(p , 'swi.snf.elution')
+
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'SWI/SNF complex',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=9),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'swi.snf.complex.heatmap')
+```
+WASH complex
+
+```{r}
+# had to dig out the MW by hand dor this
+full.dt[gene == 'WASH3P', log2MassNumber := log2(fractionMass/49995)] 
+
+prot.oi <- meta.info[grepl('WASH', info), .(protein, gene, info)]
+
+p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(short.info~., scales='free_y') +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 5.5))
+p
+BackupAsPDF(p , 'wash.elution')
+
+#Heatmap with col split 
+hm <- customintensityHeatmaps(normMat, 
+                              sample = 'SWI/SNF complex',
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=9),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+hm
+BackupAsPDF(hm ,'wash.complex.heatmap')
+```
+## Yager et all significant interactors; plot per viral protein
+
+```{r}
+yager.hits <- apms.int[bestMistScore > .75, .(protein1, protein2, gene1, gene2)]
+
+for (i in unique(yager.hits$gene1)){
+  
+  sig.interactors <- yager.hits[gene1 == i, protein2]
+  prot.oi <- rbind(meta.info[protein %in% sig.interactors, .(protein, gene, info)],
+                   meta.info[gene == i,.(protein, gene, info)])
+  
+  print(prot.oi)
+  
+  row.order <- c(i, prot.oi[gene != i, gene])
+  print(length(row.order) == nrow(prot.oi))
+  
+  p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein", limits=rev(row.order)) +
+  labs(title=paste0(i, ' interactors (Jäger et al. 2011)')) +
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 5.5))
+  
+  BackupAsPDF(p, paste0(i,'.yager.apms.siginteractors.elution'),dimensions = c(7,8))
+}
+
+
+full.dt[is.na(short.info), info := '']
+full.dt[is.na(short.info), short.info := '']
+
+# do smae with heatmaps 
+for (i in unique(yager.hits$gene1)){
+  
+  sig.interactors <- yager.hits[gene1 == i, protein2]
+  prot.oi <- rbind(meta.info[protein %in% sig.interactors, .(protein, gene, info)],
+                   meta.info[gene == i,.(protein, gene, info)])
+  
+  prot.oi[, gene := tstrsplit(gene, ';', keep=1)]
+  print(prot.oi)
+  
+  row.order <- c(i, prot.oi[gene != i, gene])
+  
+  #Heatmap with col split 
+  hm <- customintensityHeatmaps(normMat, 
+                              sample = paste0(i, ' interactors (Jäger et al. 2011)'),
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              split_rows = FALSE,
+                              row_title_gp = gpar(fontsize=9),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+  print(hm)
+  BackupAsPDF(hm , paste0(i,'.complex.heatmap'), dimensions=c(7,8))
+}
+```
+Read in monitas list of the de hiv-host porteins and see what overlaps wirh our set
+
+```{r}
+hvi.host.ppi <- fread('./data/HVIDB_PPIs.txt')
+hvi.host.ppi <- hvi.host.ppi[Organism_Interactor_virus == 11676]
+
+hvi.host.ppi[, ppi_ordered := {
+  tmp <- sort(c(Uniprot_human, Uniprot_virus))  # replace col1 and col2 with your actual column names
+  paste(tmp, collapse = "_")
+}, by=.I]
+
+hvi.host.ppi <- hvi.host.ppi[, .(protein1=Uniprot_virus, gene1=tolower(Virus_GeneName), protein2=Uniprot_human, Complex_structure, ppi_ordered)]
+hvi.host.ppi[, gene2 := multiUniprots2multiGenes(protein2, species='HUMAN')]
+```
+Look at the set with a sumloglikilhood ratio > 3 for high confidence viral interactions 
+```{r}
+summary[sumLLRatio > 3,]
+# alphabetically order the PPI, see which of these overlap with 
+summary[, ppi_ordered := {
+  tmp <- sort(c(protein1, protein2))  # replace col1 and col2 with your actual column names
+  paste(tmp, collapse = "_")
+}, by=.I]
+
+summary[, ppi_ordered_gene := {
+  tmp <- sort(c(alias1, alias2))  # replace col1 and col2 with your actual column names
+  paste(tmp, collapse = "_")
+}, by=.I]
+
+# viral prots in 
+summary[protein1 %in% viral.prots,]
+summary[, ppi_name := paste0(gene1, '_', gene2)]
+```
+*Question* 
+Look at the top 4 hits with a 
+Not many hits interesting from the analysis; do I need to rerun
+```{r}
+prots.oi <- summary[protein1 %in% viral.prots & sumLLRatio > 1,]
+row.order <- c(i, prot.oi[gene != i, protein])
+
+
+for (i in c('ENV', 'NEF')){
+  
+  sig.interactors <- c(i, prots.oi[alias1 == i, alias2])
+  print(sig.interactors)
+  print(full.dt[gene %in% sig.interactors,])
+  
+  row.order <- c(i, prot.oi[gene != i, gene])
+
+  p <- ggplot (full.dt[gene %in% sig.interactors,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+  scale_y_discrete(name = "protein") +
+  labs(title=paste0(i, ' interactors')) + 
+  theme_bw() +
+  theme(strip.text.y = element_text(size = 5.5))
+
+  BackupAsPDF(p, paste0(i,'.sec.ms.host.viral.elution'),dimensions = c(7,8))
+}
+```
+
+Look at the HIV set; do any of these look good in our data?
+
+```{r}
+#use viral_name and hu uniprotfor merging 
+hvi.host.ppi[, nameFormerge := paste0(toupper(gene1), '_', protein2)]
+```
+Read in Robyns new data and recreate the plots according to this;
+No dendograms and simple
+
+```{r}
+meta.dt <- data.table(readxl::read_xlsx('./data/Data_Visualize_SECHIV_041325.xlsx', skip=1))
+setnames(meta.dt, old=c('Map Category 1', 'Info', 'PG.ProteinAccessions', 'Genes'), new=c('group', 'info', 'protein', 'gene'))
+
+# remove the
+col.noi <- c('info', 'group', 'short.info')
+full.dt[, c(col.noi) := NULL]
+
+full.dt <- merge(full.dt, meta.dt[, .(protein, info, group)], by='protein')
+
+group.oi <- meta.dt[ grepl('Host', group),  unique(group)]
+```
+
+```{r}
+# loop over host category and create the plots 
+lapply(group.oi, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- meta.dt[grepl(grp, group), .(protein, gene, info)]
+  print(prot.oi)
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot (full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(info~., scales='free_y') +
+  theme_bw()
+  p
+  print(p)
+  length.out <- ifelse(dim(prot.oi)[2] < 10, 6, dim(prot.oi)[2]*.8)
+  BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(8,length.out))
+})
+
+
+# heatmap
+lapply(complex.simplified, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- meta.info[grepl(grp, info), .(protein, gene, info)]
+  print(prot.oi)
+  
+  if (dim(prot.oi)[1] > 2){
+    
+      hm <- customintensityHeatmaps(normMat, 
+                              sample = paste0(grp, ' complex'),
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+    hm
+    BackupAsPDF(hm ,paste0(grp, '.complex.heatmap'), dimensions = c(10,7))
+  }
+})
+```
+
+host1 and host8 host10, host16 need fixing
+
+```{r}
+group.oi <- c("Host-16")
+full.dt[, fix.info := info]
+
+full.dt[group == 'Host-16' & info == 'ARISC complex; G2 arrest (VPR associated)', fix.info := 'ARISC complex\nG2 arrest (VPR associated)']
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- meta.dt[grepl(grp, group), .(protein, gene, info)]
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot(full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(fix.info~., scales='free_y') +
+  theme_bw() #+
+  #theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 7.5, length(unique(prot.oi$protein))*0.4)
+  BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(8,length.out))
+})
+
+full.dt <- merge(full.dt, meta.dt[, .(protein, info, group)], by='protein')
+```
+fix group 10
+
+```{r}
+group.oi <- c("Host-10")
+
+full.dt[group == 'Host-10', unique(.(info))] %>%  unique()
+full.dt[info == 'NPC-p62 complex (also associates with NUP214-NUP88)', fix.info := 'NPC-p62 complex\n(also associates with NUP214-NUP88)']
+full.dt[info == 'NPC-NUP214-NUP88 dimer (also NUP62 associates)', fix.info := 'NPC-NUP214-NUP88 dimer\n(also NUP62 associates)']
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- meta.dt[grepl(grp, group), .(protein, gene, info)]
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot(full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(fix.info~., scales='free_y') +
+  theme_bw() #+
+  #theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 7, length(unique(prot.oi$protein))*0.7)
+  BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(8,length.out))
+})
+```
+group 8 and 1; make longer but also need to iterate over as too many
+
+```{r}
+group.oi <- c("Host-1", "Host-8")
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- meta.dt[grepl(grp, group), .(protein, gene, info)]
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot(full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(fix.info~., scales='free_y') +
+  theme_bw() #+
+  #theme(strip.text.y.right = element_text(angle = 0))
+  #theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 7, length(unique(prot.oi$protein))*0.4)
+  p
+  BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(8,length.out))
+})
+```
+plot group1
+
+```{r}
+lapply(group.oi, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- meta.dt[group == 'Host-1', .(protein, gene, info)]
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot(full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(fix.info~., scales='free_y') +
+  theme_bw() #+
+  #theme(strip.text.y.right = element_text(angle = 0))
+  #theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 6, length(unique(prot.oi$protein))*0.4)
+  p
+  BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(8,length.out))
+})
+```
+Tidy up the proteosome
+```{r}
+group.oi <- meta.dt[group == 'Host-8', unique(info)]
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- meta.dt[group == 'Host-1', .(protein, gene, info)]
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot(full.dt[info == grp,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(fix.info~., scales='free_y') +
+  theme_bw() #+
+  #theme(strip.text.y.right = element_text(angle = 0))
+  #theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 5.5, length(unique(prot.oi$protein))*0.4)
+  #BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(8,length.out))
+})
+```
+
+plot the viral group
+
+```{r}
+group.oi <- c('Nef-1', 'REV','REV-1', 'Vif-1', 'VPR-1', 'VPR-2')
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- meta.dt[grepl(grp, group), .(protein, gene, info)]
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot(full.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(fix.info~., scales='free_y') +
+  theme_bw() #+
+  #theme(strip.text.y.right = element_text(angle = 0))
+  #theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 6, length(unique(prot.oi$protein))*0.4)
+  p
+  BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(8,length.out))
+})
+```
+
+plot complexes with virus
+
+NEF first
+```{r}
+group.oi <- c('Nef-1')
+virus.oi <- c('Q8ADQ4')
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- full.dt[grepl(grp, group), .(protein, gene, info)]
+  print(prot.oi)
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot(full.dt[protein %in% c(virus.oi, prot.oi$protein),], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(fix.info~., scales='free_y') +
+  theme_bw() #+
+  #theme(strip.text.y.right = element_text(angle = 0))
+  #theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 6, length(unique(prot.oi$protein))*0.4)
+  p
+  BackupAsPDF(p , paste0(grp, '.wvirus.complex.elution'), dimensions = c(8,length.out))
+})
+```
+'REV'
+```{r}
+group.oi <- c('REV-1')
+virus.oi <- c('Q8ADQ7')
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- full.dt[grepl(grp, group), .(protein, gene, info)]
+  print(prot.oi)
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot(full.dt[protein %in% c(virus.oi, prot.oi$protein),], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(fix.info~., scales='free_y') +
+  theme_bw() #+
+  #theme(strip.text.y.right = element_text(angle = 0))
+  #theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 6, length(unique(prot.oi$protein))*0.4)
+  p
+  BackupAsPDF(p , paste0(grp, '.wvirus.complex.elution'), dimensions = c(8,length.out))
+})
+```
+VPR1, VPR2
+```{r}
+group.oi <- c('VPR-1', 'VPR-2')
+virus.oi <- c('Q8ADQ9')
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex', grp, '....')
+  prot.oi <- full.dt[grepl(grp, group), .(protein, gene, info)]
+  print(prot.oi)
+  
+  message('Creating elution plots of proteins')
+  p <- ggplot(full.dt[protein %in% c(virus.oi, prot.oi$protein),], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio")+
+  scale_y_discrete(name = "protein") +
+  facet_grid(fix.info~., scales='free_y') +
+  theme_bw() #+
+  #theme(strip.text.y.right = element_text(angle = 0))
+  #theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 6, length(unique(prot.oi$protein))*0.4)
+  p
+  BackupAsPDF(p , paste0(grp, '.wvirus.complex.elution'), dimensions = c(8,length.out))
+})
+```
+plot the heatmaps of all host groups 
+
+```{r}
+group.oi <- meta.dt[ grepl('Host', group),  unique(group)]
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex ' , grp, '....')
+  prot.oi <- full.dt[group == grp, .(protein, gene, info)]
+  print(prot.oi)
+  
+  if (dim(prot.oi)[1] > 2){
+    
+      hm <- customintensityHeatmaps(normMat, 
+                               sample = '',     
+                              #sample = paste0(grp, ' complex'),
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+    plot(hm)
+    #BackupAsPDF(hm ,paste0(grp, '.complex.heatmap'), dimensions = c(8,6))
+  }
+})
+```
+**04-13-25**
+Plot the changing stuff; need to compare infected vs un-infected 
+
+```{r}
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_13_sec.ms.DEanalysisInput.csv')
+mat.list <- readRDS('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_13_unaligned.cd4.maxScaled.mat.list.rds')
+# subset to just uninfected and infected for now so we can
+mat.list$cd4_challenged_1 <- NULL
+
+normMat <- mat.list$cd4_infected_1
+```
+
+Read in Robyns final set of complexes
+
+```{r}
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_13_sec.ms.DEanalysisInput.csv')
+
+complexes.dt <- data.table(readxl::read_xlsx('./data/Data_Visualize_SECHIV_2ndTab_Sundayevening.xlsx', sheet=3, skip=1))
+changes.dt <- data.table(readxl::read_xlsx('./data/Data_Visualize_SECHIV_2ndTab_Sundayevening.xlsx', sheet=2))
+
+cols.oi <- c("Mwt (Da)","PG.ProteinAccessions","Genes","Descriptions",'Map Category 1','Info')
+
+complexes.dt <- complexes.dt[, ..cols.oi]
+changes.dt <- changes.dt[, ..cols.oi]
+
+setnames(complexes.dt, old=c('PG.ProteinAccessions', 'Genes', 'Map Category 1', 'Info'), new=c('protein', 'gene', 'group', 'info'))
+setnames(changes.dt, old=c('PG.ProteinAccessions', 'Genes', 'Map Category 1', 'Info'), new=c('protein', 'gene', 'group', 'info'))
+
+# merge the tables
+sec.dt <- merge(sec.dt, complexes.dt[,.(protein, gene, group, info)], by=c('protein', 'gene'), all.x=T)
+sec.dt <- merge(sec.dt, changes.dt[,.(protein, gene, de=info)], by=c('protein', 'gene'), all.x=T)
+
+
+sec.dt <- sec.dt[!is.na(intensity_totalScaled)]
+#fwrite(sec.dt, ScriptAndDatedFileName('sec.ms.dataToVisualize.csv.gz'))
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041125_preparePlots_data/2025_04_13_sec.ms.dataToVisualize.csv.gz')
+```
+
+First, lets loop through the complex category for the infected set
+For the complexes.oi; focus on the infected
+```{r}
+complexes.oi <- complexes.dt$group %>% 
+  unique()
+```
+
+```{r}
+# custom mod f Bens function to generate a heatmap 
+customintensityHeatmaps <- function(intMats, 
+                                    intensityName = "Relative Protein Intensity", 
+                                    sample='norm_CD4_infected_1', 
+                                    proteinsOI, 
+                                    split_rows=FALSE,
+                                    topOfColorRange = 0.45,...){
+  denom = 50 / topOfColorRange
+  colorFun <- circlize::colorRamp2(breaks = (0:50)/denom, colors = viridis(51,direction = 1))
+  
+  subMat <- intMats[rownames(intMats) %in% proteinsOI$protein,]
+  
+  rowgrp <- proteinsOI[match(rownames(subMat), protein), info]
+  # convert names to subset we want
+  #print(rownames(subMat))
+  rownames(subMat) <- sec.dt[match(gsub('[;].+', '', rownames(subMat)), protein), gene]
+  
+  print(rownames(subMat))
+  # keep same order as excel sheet
+  #subMat <- subMat[match(rownames(subMat), proteinsOI),]
+  hml <- Heatmap (subMat,
+                  name = intensityName,
+                  cluster_rows = FALSE,
+               #   row_split = rowgrp,
+                  cluster_row_slices = F,
+                  border=T,
+                  row_dend_reorder = FALSE,
+                  cluster_columns = FALSE,
+                  col = colorFun,
+                  show_row_names = ifelse(nrow(subMat) > 100, FALSE, TRUE),
+                  row_names_side = "left",
+                  column_names_gp = gpar(fontsize = 10),
+                  column_labels = ifelse(as.integer(colnames(subMat)) %% 5 == 0, colnames(subMat), ""),
+                  column_title = sample,
+                  #first only:
+                  show_heatmap_legend = TRUE, 
+                 # row_title = sprintf ("%d Proteins", nrow(subMat)),
+                  ...
+  )
+  return(hml)
+}
+```
+
+first the host set
+```{r}
+host.oi <- grep('Host', complexes.oi, value=T)
+
+lapply(host.oi, function(grp){
+  
+  message('plotting complex ' , grp, '....')
+  prot.oi <- sec.dt[group == grp, .(protein, gene, info)]
+  print(prot.oi)
+  
+  if (dim(prot.oi)[1] > 2){
+    
+      hm <- customintensityHeatmaps(normMat, 
+                               sample = '',     
+                              #sample = paste0(grp, ' complex'),
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_names_gp = gpar(fontsize=8),
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+    plot(hm)
+    BackupAsPDF(hm, paste0(grp, '.complex.heatmap'), dimensions = c(8,6))
+  }
+})
+```
+plot the host proteins now
+
+```{r}
+host.oi <- 'Host-8'
+
+lapply(host.oi, function(grp){
+  
+  message('plotting complex ' , grp, '....')
+  prot.oi <- sec.dt[group == grp, .(protein, gene, info)]
+  print(prot.oi)
+  
+  if (dim(prot.oi)[1] > 2){
+    
+      hm <- customintensityHeatmaps(normMat, 
+                               sample = '',     
+                              #sample = paste0(grp, ' complex'),
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_names_gp = gpar(fontsize=6),
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+    plot(hm)
+    BackupAsPDF(hm, paste0(grp, '.complex.heatmap'), dimensions = c(13,8))
+  }
+})
+```
+virus complexes
+
+```{r}
+group.oi <- grep('Host', complexes.oi,invert=T,value=T)
+group.oi <- group.oi[!is.na(group.oi)]
+```
+
+```{r}
+group.oi <- c('Nef-1', 'VPR-1')
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex ' , grp, '....')
+  prot.oi <- complexes.dt[group == grp, .(protein, gene, info)]
+  print(prot.oi)
+  
+  if (dim(prot.oi)[1] > 2){
+    
+      hm <- customintensityHeatmaps(normMat, 
+                               sample = '',     
+                              #sample = paste0(grp, ' complex'),
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_names_gp = gpar(fontsize=6),
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+    plot(hm)
+    BackupAsPDF(hm, paste0(grp, '.complex.heatmap'))
+  }
+})
+
+```
+viral proteins 
+```{r}
+group.oi <- c('REV', 'Map with All HIV proteins')
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex ' , grp, '....')
+  prot.oi <-  c(viral.prots, 'Q8ADR1')
+   prot.oi <- complexes.dt[protein %in% prot.oi, .(protein, gene, info)]
+  
+    
+      hm <- customintensityHeatmaps(normMat, 
+                               sample = '',     
+                              #sample = paste0(grp, ' complex'),
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_names_gp = gpar(fontsize=10),
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+    plot(hm)
+    BackupAsPDF(hm, paste0('viralProteins.complex.heatmap'))
+  
+})
+```
+
+```{r}
+group.oi <- c('REV')
+
+lapply(group.oi, function(grp){
+  
+  message('plotting complex ' , grp, '....')
+   prot.oi <- complexes.dt[grepl(grp, group), .(protein, gene, info)]
+  
+    
+      hm <- customintensityHeatmaps(normMat, 
+                               sample = '',     
+                              #sample = paste0(grp, ' complex'),
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_names_gp = gpar(fontsize=10),
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+    plot(hm)
+    BackupAsPDF(hm, paste0('rev.agfg1.complex.heatmap'))
+})
+```
+```{r}
+lapply(group.oi, function(grp){
+  
+  message('plotting complex ' , grp, '....')
+  prot.oi <-  c(viral.prots, 'Q08752')
+   prot.oi <- complexes.dt[protein %in% prot.oi, .(protein, gene, info)]
+  
+    
+      hm <- customintensityHeatmaps(normMat, 
+                               sample = '',     
+                              #sample = paste0(grp, ' complex'),
+                              row_title_rot = 0,
+                              show_row_dend =F,
+                              row_names_gp = gpar(fontsize=10),
+                              row_title_gp = gpar(fontsize=10),
+                              intensityName = "Relative Protein Intensity", 
+                              proteinsOI = prot.oi)
+    plot(hm)
+    BackupAsPDF(hm, paste0('viralProteins.PPID.complex.heatmap'))
+})
+```
+elution plots of the same groups 
+
+```{r}
+#sub.dt <- data.table(sec.dt[sample== 'cd4_infected_1',])
+sec.dt$sample %>% unique()
+p <- ggplot(sec.dt[sample %in% 'cd4_infected_1' & group == 'Host-1',], aes(x = fraction, y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+  scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+  scale_y_discrete(name = "protein") +
+  facet_grid(info~., scales='free_y') +
+  theme_bw() +
+ theme(strip.text.y=element_text(size=6))
+
+p
+
+sec.dt[sample %in% 'cd4_infected_1' & group == 'Host-1', which.max(intensity_totalScaled)]
+
+p <- ggplot(sec.dt[sample %in% 'cd4_infected_1' & group == 'Host-1',], aes(x = as.numeric(fraction), y = gene)) +
+  ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8)
+
+sec.dt[is.na(intensity_totalScaled)]
+
+sec.dt[sample %in% 'cd4_infected_1' & group == 'Host-1',]
+p
+```
+
+
+```{r}
+host.oi <- grep('Host', complexes.oi, value=T)
+host.oi
+lapply(host.oi, function(grp){
+  
+  prot.oi <- complexes.dt[group == grp, .(protein, gene, info)]
+
+  p <- ggplot(sec.dt[sample %in% 'cd4_infected_1' & protein %in% prot.oi$protein], aes(x = fraction, y = gene)) +
+    ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+    scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_y_discrete(name = "protein") +
+    facet_grid(info~., scales='free_y') + 
+    theme_bw() +
+   theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 7, length(unique(prot.oi$protein))*0.3)
+  print(p)
+  BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(8,length.out))
+})
+
+```
+fix 10 and 8
+```{r}
+host.oi <- c('Host-10', 'Host-8')
+
+lapply(host.oi, function(grp){
+  
+  prot.oi <- complexes.dt[group == grp, .(protein, gene, info)]
+
+  p <- ggplot(sec.dt[sample %in% 'cd4_infected_1' & protein %in% prot.oi$protein], aes(x = fraction, y = gene)) +
+    ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+    scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_y_discrete(name = "protein") +
+    facet_grid(info~., scales='free_y') + 
+    theme_bw() +
+   theme(strip.text.y=element_text(size=6))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 7, length(unique(prot.oi$protein))*0.4)
+  print(p)
+  
+  print(p)
+  BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(8,length.out))
+})
+```
+now plot the viral ones
+```{r}
+group.oi <- c('Nef-1', 'VPR-1')
+
+lapply(group.oi, function(grp){
+  
+  prot.oi <- complexes.dt[group == grp, .(protein, gene, info)]
+
+  p <- ggplot(sec.dt[sample %in% 'cd4_infected_1' & protein %in% prot.oi$protein], aes(x = fraction, y = gene)) +
+    ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+    scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_y_discrete(name = "protein") +
+    facet_grid(info~., scales='free_y') + 
+    theme_bw() +
+   theme(strip.text.y=element_text(size=10))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 6, length(unique(prot.oi$protein))*0.4)
+  print(p)
+  
+  print(p)
+  BackupAsPDF(p , paste0(grp, '.complex.elution'), dimensions = c(7,length.out))
+})
+```
+```{r}
+prot.oi <-  c(viral.prots, 'Q08752')
+
+  prot.oi <- complexes.dt[protein %in% prot.oi, .(protein, gene, info)]
+  
+  p <- ggplot(sec.dt[sample %in% 'cd4_infected_1' & protein %in% prot.oi], aes(x = fraction, y = gene)) +
+    ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled, fill = log2MassNumber), scale = 8) +
+    scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_y_discrete(name = "protein") +
+    #facet_grid(info~., scales='free_y') + 
+    theme_bw() +
+   theme(strip.text.y=element_text(size=10))
+
+  #length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 6, length(unique(prot.oi$protein))*0.4)
+  print(p)
+  BackupAsPDF(p , paste0('PPID.viralProteins.complex.elution'))
+```
+
+```{r}
+sub.dt <- sec.dt
+sub.dt[, sample := factor(sample, levels=c('cd4_uninfected_1','cd4_challenged_1', 'cd4_infected_1'))]
+
+group.oi <- changes.dt$info %>% unique()
+
+
+lapply(group.oi, function(grp){
+  
+  prot.oi <- sec.dt[de == grp, .(protein, gene, de)]
+
+  p <- ggplot(sub.dt[protein %in% prot.oi$protein,], aes(x = fraction, y = gene, fill=sample)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.8, scale = 8) +
+    #scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_brewer(type='qual', palette=4) +
+    scale_y_discrete(name = "protein") +
+    facet_grid(.~de, scales='free_y') + 
+    theme_bw() +
+   theme(strip.text.y=element_text(size=10))
+
+  length.out <- ifelse(length(unique(prot.oi$protein)) < 10, 6, length(unique(prot.oi$protein))*0.4)
+  BackupAsPDF(p , paste0(grp, '.complex.overlaid.elution'), dimensions = c(7,length.out))
+})
+```
+plot LCK,CD4, NEF
+```{r}
+sub.dt[gene %in% c('LCK','CD4',"nef"),]
+
+p <- ggplot(sub.dt[gene %in% c('LCK','CD4',"nef"),], aes(x = fraction, y = gene, fill=sample)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.8, scale = 8) +
+    #scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_brewer(type='qual', palette=4) +
+    scale_y_discrete(name = "protein") +
+    #facet_grid(.~de, scales='free_y') + 
+    theme_bw() +
+   theme(strip.text.y=element_text(size=10))
+
+p
+BackupAsPDF(p , paste0('nef.lck.cd4.complex.overlaid.elution'))
+
+# seperate them out by condition
+p <- ggplot(sub.dt[gene %in% c('LCK','CD4',"nef"),], aes(x = fraction, y = gene, fill=sample)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.8, scale = 8) +
+    #scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_brewer(type='qual', palette='Pastel1') +
+    scale_y_discrete(name = "protein") +
+    facet_grid(.~sample, scales='free_y') + 
+    theme_bw() +
+   theme(strip.text.y=element_text(size=10))
+
+p
+BackupAsPDF(p , paste0('nef.lck.cd4.complex.facetbySample.elution'),)
+
+```
+One more plot; plot all the same proteins across all conditions 
+
+```{r}
+
+# read in the xl sheet for the proteins and see if we can plot them correctly
+new.complexes <- data.table(readxl::read_xlsx('./data/SEC_PAF_PTEFB_RNAPII.xlsx', sheet=1, col_names = T))
+new.complexes <- new.complexes[, .(protein=...2, gene=...3, Name, Category)]
+
+```
+
+First plot the heatmap then the elution plots
+
+```{r, fig.height=6, fig.width=8}
+
+# and fix row ordering
+plot.dt <- merge(sub.dt, new.complexes, by=c('protein', 'gene'))
+plot.dt[, protein := factor(protein, levels=new.complexes$protein)]
+plot.dt[, gene := factor(gene, levels=new.complexes$gene)]
+
+p <- ggplot(plot.dt, aes(x = fraction, y=gene, fill=log2MassNumber)) +
+    ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled), alpha=0.8, scale = 8) +
+    scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    #scale_fill_brewer(type='qual', palette=4) +
+    scale_y_discrete(name = "protein", limits=rev(new.complexes$gene)) +
+    facet_grid(.~sample, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10))
+
+p
+BackupAsPDF(p, 'geneSet.conditionComparison.elution')
+
+# subset to just the two 
+p <- ggplot(plot.dt[!grepl('challenged', sample),], aes(x = fraction, y=gene, fill=log2MassNumber)) +
+    ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled), alpha=0.8, scale = 8) +
+    scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    #scale_fill_brewer(type='qual', palette=4) +
+    scale_y_discrete(name = "protein", limits=rev(new.complexes$gene)) +
+    facet_grid(.~sample, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10))
+
+p
+BackupAsPDF(p, 'geneSet.infectedVsuninfected.Comparison.elution')
+
+
+# overlay the infected vs uninfected 
+p <- ggplot(plot.dt[!grepl('challenged', sample),], aes(x = fraction, y=gene, fill=sample)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.8, scale = 8) +
+    #scale_fill(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_brewer(type='qual', palette=4) +
+    scale_y_discrete(name = "protein", limits=rev(new.complexes$gene)) +
+    #facet_grid(.~sample, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10))
+p
+BackupAsPDF(p, 'geneSet.infectedVsuninfected.overlap.elution')
+
+```
+
+```{r, fig.height=10.5, fig.width=7}
+# change order of the facet vaqriables
+plot.dt[, Name := factor(Name, levels=unique(new.complexes$Name))]
+
+# facet the set in to the different groups 
+p <- ggplot(plot.dt[!grepl('challenged', sample),], aes(x = fraction, y=gene, fill=sample)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.8, scale = 8) +
+    #scale_fill(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_brewer(type='qual', palette=4) +
+    scale_y_discrete(name = "protein") +
+    facet_grid(Name~., scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10))
+p
+BackupAsPDF(p, 'geneSet.infectedVsuninfected.overlap.facetGroup.elution')
+
+# split by sample gr
+```
+
+```{r, fig.height=10.5, fig.width=10}
+# change order of the facet vaqriables
+plot.dt[, Name := factor(Name, levels=unique(new.complexes$Name))]
+plot.dt
+# facet the set in to the different groups 
+p <- ggplot(plot.dt[!grepl('challenged', sample),], aes(x = fraction, y=gene, fill=log2MassNumber)) +
+    ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled), alpha=0.8, scale = 8) +
+    scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    #scale_fill_brewer(type='qual', palette=4) +
+    scale_y_discrete(name = "protein") +
+    facet_grid(Name~sample, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10))
+p
+BackupAsPDF(p, 'geneSet.infectedVsuninfected.facetGroup.elution')
+```
+create a euler plot of the different
+```{r, fig.height=5, fig.width=6}
+
+sec.dt[sample=='cd4_infected_1' & intensity != 0, .N, by=.(protein)][,protein]
+proteinIds.list <- list(cd4_infected_1 =   sec.dt[sample=='cd4_infected_1' & intensity != 0, .N, by=.(protein)][, protein],
+                        cd4_uninfected_1 = sec.dt[sample=='cd4_uninfected_1' & intensity != 0, .N, by=.(protein)][, protein],
+                        cd4_challenged_1 = sec.dt[sample=='cd4_challenged_1' & intensity != 0, .N, by=.(protein)][, protein]
+                        )
+g <- ggvenn::ggvenn(proteinIds.list,
+                    set_name_size = 5, text_size = 3) + 
+  scale_fill_brewer(type='qual', palette=2) 
+BackupAsPDF(g, 'proteinidOverlap.venn')
+```
+
+replot the elution profiles with the shared set of genes by Robyn
+```{r, fig.height=6, fig,.width=5}
+genes.oi <- c('nef', 'LCK', 'CD4', 'CD7', 'CD70','CD74', 'CD80', 'CD86', 'MACROH2A1', 'KLHL13')
+proteins.oi <- sec.dt[match(genes.oi, gene), .(gene,protein, info)]
+
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041125_preparePlots_data/2025_04_13_sec.ms.dataToVisualize.csv.gz')
+
+# seperate them out by condition
+p <- ggplot(sub.dt[gene %in% genes.oi,], aes(x = fraction, y = gene, fill=sample)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.8, scale = 8) +
+    #scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_brewer(type='qual', palette=4) +
+    scale_y_discrete(name = "protein", limits=rev(genes.oi)) +
+    #facet_grid(~sample, scales='free_y') + 
+    theme_bw() +
+   theme(strip.text.y=element_text(size=10))
+
+p
+BackupAsPDF(p, '041425_nefAndpossibleChanges.elution')
+```
+
+plot the genesoi in the heatmap
+```{r}
+mat.list <- readRDS('./041325_differentialExpression_data/2025_04_13_unaligned.cd4.maxScaled.mat.list.rds')
+
+hm1 <- customintensityHeatmaps(mat.list[['cd4_uninfected_1']], 
+                               sample = 'cd4_uninfected_1',  
+                               row_order = genes.oi,
+                               row_title_rot = 0,
+                               show_row_dend =F,
+                               row_names_gp = gpar(fontsize=10),
+                               row_title_gp = gpar(fontsize=10),
+                               #intensityName = "Relative Protein Intensity", 
+                               proteinsOI = proteins.oi)
+
+hm2 <- customintensityHeatmaps(mat.list[['cd4_infected_1']], 
+                               sample = 'cd4_infected_1',  
+                               row_order = genes.oi,
+                               row_title_rot = 0,
+                               show_row_dend =F,
+                               row_names_gp = gpar(fontsize=10),
+                               row_title_gp = gpar(fontsize=10),
+                               intensityName = "Relative Protein Intensity", 
+                               proteinsOI = proteins.oi)
+hm_list <- hm1 + hm2
+hm_list
+
+BackupAsPDF(hm_list, paste0('genesOI.infectedAndUninfected.heatmap'), dimensions=c(10,5))
+BackupAsPDF(hm2, paste0('genesOI.infected.heatmap'))
+```
+plot elution plots of the proteins that change in the different clusters
+
+```{r, fig.height=8, fig.width=6}
+sigHits <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_14_sigHits.inClusters.csv.gz')
+
+lapply(unique(sigHits$group), function(grp){
+  
+  proteins.oi <- sigHits[group == grp, unlist(strsplit(protein, ','))]
+  
+  p <- ggplot(sub.dt[protein %in% proteins.oi,], aes(x = fraction, y = gene, fill=sample)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.7, scale = 8) +
+    #scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    scale_fill_brewer(type='qual', palette=4) +
+    scale_y_discrete(name = "protein") +
+    facet_grid(info~., scales='free_y') + 
+    theme_bw() +
+   theme(strip.text.y=element_text(size=10))
+  p
+  BackupAsPDF(p, paste0(grp,'.sigChanges.overlaid.elution'))
+})
+```
+
+plot the viral protein 
+```{r}
+genes.oi <- complexes.dt
+
+viral.prots
+gene <- complexes.dt[protein %in% viral.prots, gene]
+# seperate them out by condition
+
+sub.dt$sample %>% unique()
+p <- ggplot(sub.dt[protein %in% viral.prots & sample %in% c('cd4_infected_1', 'cd4_challenged_1'),], aes(x = fraction, y = gene, fill=sample)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), alpha=0.7, scale = 8) +
+    #scale_fill_gradient2(low = "navy", mid = "gray98", high = "firebrick", midpoint = log2(1), name = "log2 mass ratio") +
+    #scale_fill_brewer(type='qual', palette='Pastel1') +
+    scale_fill_manual(values=c("#B3CDE3","#CCEBC5")) +
+    scale_y_discrete(name = "protein") +
+    labs(title='viral protein elution profiles') +
+    #facet_grid(~sample, scales='free_y') + 
+    theme_bw() +
+   theme(strip.text.y=element_text(size=10))
+p
+BackupAsPDF(p, 'viralProtein.elution')
+
+#plot the log2 intensity of the viral proteins in each sample()
+ggplot(sec.dt[protein %in% viral.prots, ][, .(log2SumInts=log2(sum(intensity, na.rm=T))), by=.(sample, gene)], aes(x=sample, y=log2SumInts, fill=sample)) +
+  geom_bar(stat='identity') +
+  scale_fill_brewer(type='qual', palette='Pastel1') + 
+  facet_grid(~gene, scales='free_x') +
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=90))
+
+ggplot(sec.dt[protein %in% viral.prots, ][, .(log2SumInts=log2(sum(intensity, na.rm=T))), by=.(sample, protein)], aes(x=sample, y=log2SumInts, fill=sample)) +
+  geom_bar(stat='identity') +
+  scale_fill_brewer(type='qual', palette='Pastel1') + 
+  facet_grid(~protein, scales='free_x') +
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=90))
+```
+*04-15-25*
+Heatamp of geneSet condition comparison
+
+```{r}
+genes.oi <- unique(plot.dt$gene)  
+proteins.oi <-  unique(plot.dt$protein)  
+proteins.oi
+
+mat.list <- readRDS('./041325_differentialExpression_data/2025_04_13_unaligned.cd4.maxScaled.mat.list.rds')
+
+hm1 <- customintensityHeatmaps(mat.list[['cd4_uninfected_1']], 
+                               sample = 'cd4_uninfected_1',  
+                               row_order = (levels(genes.oi)),
+                               row_title_rot = 0,
+                               show_row_dend =F,
+                               row_names_gp = gpar(fontsize=10),
+                               row_title_gp = gpar(fontsize=10),
+                               #intensityName = "Relative Protein Intensity", 
+                               proteinsOI = plot.dt)
+
+hm2 <- customintensityHeatmaps(mat.list[['cd4_challenged_1']], 
+                               sample = 'cd4_challenged_1',  
+                               row_order = (levels(genes.oi)),
+                               row_title_rot = 0,
+                               show_row_dend =F,
+                               row_names_gp = gpar(fontsize=10),
+                               row_title_gp = gpar(fontsize=10),
+                               intensityName = "Relative Protein Intensity", 
+                               proteinsOI = plot.dt)
+
+hm3 <- customintensityHeatmaps(mat.list[['cd4_infected_1']], 
+                               sample = 'cd4_infected_1',  
+                               row_order = (levels(genes.oi)),
+                               row_title_rot = 0,
+                               show_row_dend =F,
+                               row_names_gp = gpar(fontsize=10),
+                               row_title_gp = gpar(fontsize=10),
+                               intensityName = "Relative Protein Intensity", 
+                               proteinsOI = plot.dt)
+
+
+hm_list <- hm1 + hm2 +hm3
+hm_list
+
+BackupAsPDF(hm_list, paste0('geneSet.allConditions.heatmap'), dimensions=c(10,5))
+BackupAsPDF(hm2, paste0('genesOI.infected.heatmap'))
+
+
+subMat <- (mat.list[['cd4_infected_1']] - mat.list[['cd4_uninfected_1']])
+
+customintensityHeatmaps(subMat, 
+                               sample = 'cd4_infected_1-vs-cd4_uninfected_1',  
+                               row_order = (levels(genes.oi)),
+                               row_title_rot = 0,
+                               show_row_dend =F,
+                               row_names_gp = gpar(fontsize=10),
+                               row_title_gp = gpar(fontsize=10),
+                               intensityName = "Relative Protein Intensity", 
+                               proteinsOI = plot.dt)
+
+
+Heatmap(subMat,
+        col=circu)
+```
+

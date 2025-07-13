@@ -1,0 +1,482 @@
+---
+title: "012925_AF3PPIInvestigation"
+author: "Martin Gordon"
+date: "2025-01-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(seqinr)
+library(readxl)
+library(tidymodels)
+library(ggridges)
+library(RColorBrewer)
+
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R")
+
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_ipsum_rc() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+```
+AF3 models 
+```{r}
+af.summary.dt <- fread('./output/012425_firstRUn_summaryScores.csv')
+
+af.summary.dt[, ppi := gsub('[.]seed.+$', '', model)]
+af.summary.dt[, c('proteinA', 'proteinB') := tstrsplit(toupper(ppi), '__', keep=c(1,2))]
+af.summary.dt[, c('geneA', 'geneB') := .(multiUniprots2multiGenes(proteinA, species='HUMAN'), multiUniprots2multiGenes(proteinB, species='HUMAN'))]
+af.summary.dt[, gene_ppi := paste(geneA, geneB, sep='__')]
+```
+make a summary datatable 
+```{r}
+summary.dt <- af.summary.dt[, .(mean_ptm= mean(ptm, na.rm=T), mean_iptm=mean(iptm, na.rm=T)), by=.(ppi,gene_ppi, proteinA, proteinB, geneA, geneB)]
+summary.dt[geneA == 'PTEN']
+```
+
+
+First lets find the proteins that scored best, then we can run 
+```{r}
+bait.oi <- c("AKT1","PIK3CA","MTOR","PTEN")
+
+lapply(bait.oi, function(x){
+  
+  subdt <- af.summary.dt[geneA == x, ]
+  
+  g <- ggplot(subdt, aes(x=gene_ppi, y=iptm)) +
+    geom_boxplot(color="#FB9A99", alpha=0.5) +
+    geom_point(size=1.5) +
+    ggtitle(paste(x, 'AF3 iPTM scores')) +
+    scale_y_continuous(breaks=seq(0, 1, 0.1)) +
+    geom_hline(yintercept = 0.5, linetype=2, color= "#FB9A99") +
+    stat_summary(fun = "max", colour =  "#FB9A99", size = 2, geom = "point", shape=16) +
+    #stat_summary(fun = "mean_cl_boot", colour =  "#FB9A99", size = 2, geom = "point") +
+    customTheme +
+    theme(axis.text.x = element_text(size=6)) +
+    coord_cartesian(ylim=c(0,1))
+  BackupAsPDF(g, paste0(x, '.af3Scores.boxplots'), dimensions = c(11,6))
+})
+
+```
+Ok, now for this set of interactors, take the top ranking model and pull out ppi with interactors > .5 iPTM to invesitgate..
+
+```{r}
+af.summary.dt[, topRanked := ifelse(ranking == max(ranking), 'yes', 'no'), by=.(gene_ppi)]
+
+passingSet <- af.summary.dt[, .SD[which.max(ranking)], by=.(gene_ppi)] %>% 
+  .[iptm > .5, .(geneA, geneB, model, topRanked, mean_iptm=mean(iptm)), by=gene_ppi]
+
+nModels <- af.summary.dt[, .SD[which.max(ranking)], by=gene_ppi] %>% 
+  .[,.N, by=geneA]
+```
+
+```{r}
+g <- ggplot(passingSet[,.N, by=geneA], aes(x=geneA, y=N, fill=geneA)) +
+  geom_bar(stat='Identity') +
+  geom_text(data=nModels[geneA %in% passingSet$geneA,], geom='text', aes(x=geneA, y=c(11, 7,1), label=paste('N ==',N)), color='white') +
+  scale_fill_brewer(type='qual', palette = 'Set2') +
+  scale_y_continuous(breaks=seq(0,12,1)) +
+  ggtitle('Number of significant interactors', subtitle = 'AF3 iPTM > 0.5)') +
+  labs(x='gene', y='') +
+  customTheme
+g
+BackupAsPDF(g, 'nInteractors.barplot', dimensions = c(5,5))
+```
+Read in the contacts.dt, and filter to the set of model that pass our AF3 scoring threshold
+```{r}
+af.contacts.dt <- fread('./output/012425_firstRun_contacts.csv')
+
+af.contacts.dt[, model := gsub('[.]/output/012425_firstRun/[0-9a-z_]+/|[.]contacts[.]csv', '', filename)]
+af.contacts.dt[, c('proteinA', 'proteinB') := tstrsplit(toupper(model), '__', keep=c(1,2))]
+af.contacts.dt[, c('geneA', 'geneB') := .(multiUniprots2multiGenes(proteinA, species='HUMAN'), multiUniprots2multiGenes(proteinB, species='HUMAN'))]
+af.contacts.dt[, gene_ppi := paste(geneA, geneB, sep='__')]
+
+# tidy
+af.contacts.dt <- af.contacts.dt[, .(model, gene_ppi, chainRow, proteinA, geneA, residueNumberA=resnoRow, chainCol, proteinB, geneB, residueNumberB=resnoCol, pae)]
+
+af.contacts.dt[gene_ppi == 'PTEN__CAV1', unique(residueNumberA)]
+# subset our contacts table to just the models we want to further investigate
+af.contacts.dt <- af.contacts.dt[gene_ppi %in% passingSet$gene_ppi,]
+
+
+
+af.contacts.dt[grepl('PIK3CA__PIK', gene_ppi), ]
+# write out the list of contacts wih passing models
+#fwrite(af.contacts.dt, ScriptAndDatedFileName('af.contacts.passingModels.csv'))
+```
+Read in the de analysis output with the annotated symbols 
+
+```{r}
+de.dt <- fread('../../projects/101224_RBabu_CRISPRe_PIK3CA/111824_plotsForKroganWeekly_data/2025_01_22_deseq.pwcomparisons.allAnno.csv')
+# for now, just subset to sites that are significantly different across any contrasts 
+sub.dt <- de.dt[sig != 'not' & gene %in% passingSet$geneA,.(id, gene, log2FoldChange, pvalue, contrast, pep_mutant_id, peptide_position, most_severe_mutant, hgvs, clinicalSignificance)]
+
+#convert subdt to long format
+# pep_mutant_id peptide_postion, hgvs, clinicalSignificance
+
+# expand the list of sites 
+# problem with expanding is it isnt a 'full' representaiton; (when splitting, some strings have 1-4 elements, rather than a set number)
+sub.long <- sub.dt[, lapply(.SD, function(x) unlist(strsplit(x, ';'))), .SDcols = c('pep_mutant_id', 'peptide_position'), by=.(id, gene,contrast)]
+# use this for mapping to the contact db
+sub.long[, peptide_position := as.integer(peptide_position)]
+
+sub.long[gene == 'PIK3CA', ] %>% 
+  .[order(peptide_position)]
+
+
+af.contacts.dt <- merge(x=af.contacts.dt, y=sub.long, by.x=c('residueNumberA','geneA'), by.y=c('peptide_position', 'gene'), all.x=F, all.y=F)
+```
+write out the contacts info
+```{r}
+#fwrite(af.contacts.dt, ScriptAndDatedFileName('deGuides.interactorContactResidues.csv'))
+af.contacts.dt <- fread('~/Documents/projects/012425_RBabu_CRISPRe_AF3Runs/012925_AF3modelInvestigation_data/2025_01_29_deGuides.interactorContactResidues.csv')
+af.contacts.dt$gene_ppi %>% unique()
+```
+
+
+
+Get an estimation of the quality of the contact region.. we probably could merge this info with plddt/pae score?
+```{r}
+# I think we want to remove the duplicate records and just take the sites and thier pae values
+unique.sites <- unique(af.contacts.dt[, -c('contrast', 'id', 'pep_mutant_id')])
+
+g <- ggplot(unique.sites, aes(x=reorder(gene_ppi, pae), y=pae, fill=geneA)) +
+  geom_boxplot(alpha=0.7) +
+  ggtitle('Interchain contacts', subtitle='<= 4 Angstrom') +
+  labs(x='PPI', y='Predicted Aligned Error (PAE)') +
+  scale_fill_brewer(palette='Set1') +
+  customTheme
+
+g
+BackupAsPDF(g, 'interChainContacts.pae.boxplot', dimensions=c(7,5))
+
+# turn on its side and look at distribution of the contact values
+g <- ggplot(unique.sites, aes(x=pae, y=reorder(gene_ppi, -pae), fill=stat(x))) +
+  ggridges::geom_density_ridges_gradient() +
+  scale_fill_gradient(low=col.pal[1], high=col.pal[2], name='Predicted Aligned Error (PAE)') +
+  labs(x='Predicted Aligned Error (PAE)', y='PPI') +
+  customTheme
+g
+BackupAsPDF(g, 'pae.ridgePlots', dimensions = c(9,7))
+```
+```{r}
+unique.sites[grepl('AKT1__MCR', gene_ppi)]
+
+# want to merge this info to the guide info
+af.contacts.dt <- merge(af.contacts.dt, de.dt[sig != 'not', .(guide, editor, id, contrast, log2FoldChange, pvalue, nuc_mutant_id, pep_mutant_id, mutant_type, most_severe_mutant, hgvs, clinicalSignificance)], by.x=c('id', 'contrast'), by.y=c('id', 'contrast'))
+
+
+af.contacts.dt <- af.contacts.dt[,.(model, gene_ppi, chainRow, proteinA, geneA, residueNumberA, chainCol, proteinB, geneB, residueNumberB, pae, mutant_label=pep_mutant_id.x, id, guide, editor, contrast, log2FoldChange, pvalue, nuc_mutant_id, pep_mutant_id=pep_mutant_id.y, mutant_type, most_severe_mutant, hgvs, clinicalSignificance)]
+
+#fwrite(af.contacts.dt, ScriptAndDatedFileName('af3.modelContacts.Anno.csv'))
+af.contacts.dt <- fread('~/Documents/projects/012425_RBabu_CRISPRe_AF3Runs/012925_AF3modelInvestigation_data/2025_01_29_af3.modelContacts.Anno.csv')
+```
+pull the models for the successful overlaps, and plot in chimeraX
+
+```{r}
+ppi.oi <- 'PTEN__CAV1, PIK3CA__CALD1, PIK3CA__MPRIP, PIK3CA__SPTBN2, PIK3CA__PIK3R1, PIK3CA__PIK3R2, PIK3CA__PIK3R3, AKT1__MCRIP1, AKT1__BTN3A3'
+ppi.oi <- strsplit(ppi.oi, ', ')[[1]]
+
+af.contacts.dt[gene_ppi %in% (ppi.oi), .(model, gene_ppi)] %>% 
+  unique()
+```
+heatmaps
+
+read in the contacts.dt and the de.dt data and use to annotate our heatmap
+```{r}
+af.contacts.dt <- fread('~/Documents/projects/012425_RBabu_CRISPRe_AF3Runs/012925_AF3modelInvestigation_data/2025_01_31_af.contacts.passingModels.csv')
+
+de.dt <- fread('../../projects/101224_RBabu_CRISPRe_PIK3CA/111824_plotsForKroganWeekly_data/2025_01_22_deseq.pwcomparisons.allAnno.csv')
+# for now, just subset to sites that are significantly different across any contrasts 
+sub.dt <- de.dt[sig != 'not' & gene %in% passingSet$geneA,.(id, gene, log2FoldChange, pvalue, contrast, pep_mutant_id, peptide_position, most_severe_mutant, hgvs, clinicalSignificance)]
+
+#convert subdt to long format
+# pep_mutant_id peptide_postion, hgvs, clinicalSignificance
+
+# expand the list of sites 
+# problem with expanding is it isnt a 'full' representaiton; (when splitting, some strings have 1-4 elements, rather than a set number)
+sub.long <- sub.dt[, lapply(.SD, function(x) unlist(strsplit(x, ';'))), .SDcols = c('pep_mutant_id', 'peptide_position'), by=.(id, gene,contrast)]
+# use this for mapping to the contact db
+sub.long[, peptide_position := as.integer(peptide_position)]
+
+
+
+sub.long[gene == 'PIK3CA' & peptide_position %in% c(1031, 1032), unique(peptide_position)]
+# merge the contacts with the anno info and use as a heatmap annotation
+af.contacts.dt <- merge(x=af.contacts.dt, y=sub.long, by.x=c('residueNumberA','geneA'), by.y=c('peptide_position', 'gene'), all.x=T, all.y=F)
+```
+
+```{r}
+ifelse(sub.long$gene == 'PTEN' & as.character(1) %in% c('1','2'), 1, 0)
+
+lapply(unique(af.contacts.dt$geneA), function(x){
+  
+  gene.mat <- dcast(af.contacts.dt[geneA == x,], gene_ppi~residueNumberA, value.var='pae', fun.aggregate = min, na.rm=T) %>% 
+  as.matrix(rownames='gene_ppi')
+  gene.mat[is.infinite(gene.mat)] <- NA
+  
+  # show proportion of times it is in model
+  nResidues <-  apply(gene.mat, 2, function(x) {sum(!is.na(x))})
+  nResidues <- (nResidues/dim(gene.mat)[1]) * 100
+  
+  
+  #get the colnames 
+  res.f <- colnames(gene.mat) %in% sub.long[gene == x, as.character(unique(peptide_position))] # logical vec
+  res.names <- colnames(gene.mat)[res.f] # set of interacting res
+  res.val <- which(colnames(gene.mat) %in% sub.long[gene == x, as.character(unique(peptide_position))])
+  
+  # now we need to get the 
+  ha <- HeatmapAnnotation(#'% in interface'= anno_barplot(nResidues,axis_param=list(gp=gpar(fontsize=4), at = seq(0,100, 20), labels = seq(0,100,20)), gp=gpar(fill = "#CCCCCC"), height = unit(2, "cm")),
+                          '% in interface'= anno_barplot(nResidues, gp=gpar(fill = "#CCCCCC"), height = unit(2, "cm")),
+                          'CRISPR hit' = ifelse(colnames(gene.mat) %in% sub.long[gene == x, as.character(unique(peptide_position))], 'yes','no'),
+                          link = anno_mark(at = res.val, labels = res.names, labels_gp = gpar(fontsize = 10), side='column', padding = unit(1, "mm")),
+                          col=list('CRISPR hit' = c('yes'='cornflowerblue', 'no'='white')),
+                          border = TRUE
+                          )
+  
+
+  hm <- Heatmap(gene.mat,
+          na_col = 'white',
+          bottom_annotation = ha,
+          show_column_names = F,
+          cluster_rows = clusterWNA(gene.mat),
+          cluster_columns = FALSE,
+          row_title = sprintf('%s AF3 PPI > 0.5 iPTM', nrow(gene.mat)), 
+          #col = colorRamp2(colors=c(col.pal[1], col.pal[2]), breaks=c(0,30)),
+          col=viridis(30, direction=-1),
+          column_names_gp = gpar(fontsize=6),
+          name='Predicted alignment error (PAE)',
+          border=T)
+
+  hm
+  BackupAsPDF(draw(hm, column_title=paste(x, 'residues in PPI interface (< 4 Angstroms)')), paste0(x, 'contacts.pae.heatmap'), dimensions=c(12,7))
+})
+
+af.contacts.dt[gene_ppi == 'PTEN__CAV1', paste(unique(residueNumberA), collapse=',')]
+```
+
+Read in contacts for all model scores
+
+```{r}
+af.contacts.dt <- fread('./output/012425_firstRUn_contacts.csv')
+
+af.contacts.dt[, model := gsub('[.]/output/012425_firstRun/[0-9a-z_]+/|[.]contacts[.]csv', '', filename)]
+af.contacts.dt[, c('proteinA', 'proteinB') := tstrsplit(toupper(model), '__', keep=c(1,2))]
+af.contacts.dt[, c('geneA', 'geneB') := .(multiUniprots2multiGenes(proteinA, species='HUMAN'), multiUniprots2multiGenes(proteinB, species='HUMAN'))]
+af.contacts.dt[, gene_ppi := paste(geneA, geneB, sep='__')]
+
+# tidy
+af.contacts.dt <- af.contacts.dt[, .(model, gene_ppi, chainRow, proteinA, geneA, residueNumberA=resnoRow, chainCol, proteinB, geneB, residueNumberB=resnoCol, pae)]
+```
+```{r}
+de.dt <- fread('../../projects/101224_RBabu_CRISPRe_PIK3CA/111824_plotsForKroganWeekly_data/2025_01_22_deseq.pwcomparisons.allAnno.csv')
+# for now, just subset to sites that are significantly different across any contrasts 
+sub.dt <- de.dt[sig != 'not' & gene %in% af.contacts.dt$geneA,.(id, gene, log2FoldChange, pvalue, contrast, pep_mutant_id, peptide_position, most_severe_mutant, hgvs, clinicalSignificance)]
+
+#convert subdt to long format
+# pep_mutant_id peptide_postion, hgvs, clinicalSignificance
+
+
+
+# expand the list of sites 
+# problem with expanding is it isnt a 'full' representaiton; (when splitting, some strings have 1-4 elements, rather than a set number)
+sub.dt[1:713,] %>% View()
+
+sub.long <- sub.dt[, lapply(.SD, function(x) unlist(strsplit(x, ';'))), .SDcols = c('peptide_position'), by=.(id, gene,contrast)]
+
+# use this for mapping to the contact db
+sub.long[, peptide_position := as.integer(peptide_position)]
+sub.long <- sub.long[!is.na(peptide_position),]
+
+
+# merge the contacts with the anno info and use as a heatmap annotation
+# allow cartesian true to allow multiple joins?
+af.contacts.dt <- merge(x=af.contacts.dt, y=sub.long, by.x=c('residueNumberA','geneA'), by.y=c('peptide_position', 'gene'), all.x=T, all.y=F, allow.cartesian=TRUE)
+```
+
+```{r}
+af.contacts.dt[,.N, by=gene_ppi]
+```
+
+
+```{r}
+
+lapply(unique(af.contacts.dt$geneA), function(x){
+  
+  gene.mat <- dcast(af.contacts.dt[geneA == x,], gene_ppi~residueNumberA, value.var='pae', fun.aggregate = min, na.rm=T) %>% 
+  as.matrix(rownames='gene_ppi')
+  gene.mat[is.infinite(gene.mat)] <- NA
+  
+  # show proportion of times it is in model
+  nResidues <-  apply(gene.mat, 2, function(x) {sum(!is.na(x))})
+  nResidues <- (nResidues/dim(gene.mat)[1]) * 100
+  
+  
+  #get the colnames 
+  res.f <- colnames(gene.mat) %in% sub.long[gene == x, as.character(unique(peptide_position))] # logical vec
+  res.names <- colnames(gene.mat)[res.f] # set of interacting res
+  res.val <- which(colnames(gene.mat) %in% sub.long[gene == x, as.character(unique(peptide_position))])
+  
+  # now we need to get the 
+  ha <- HeatmapAnnotation(#'% in interface'= anno_barplot(nResidues,axis_param=list(gp=gpar(fontsize=4), at = seq(0,100, 20), labels = seq(0,100,20)), gp=gpar(fill = "#CCCCCC"), height = unit(2, "cm")),
+                          '% in interface'= anno_barplot(nResidues, gp=gpar(fill = "#CCCCCC"), height = unit(2, "cm")),
+                          'CRISPR hit' = ifelse(colnames(gene.mat) %in% sub.long[gene == x, as.character(unique(peptide_position))], 'yes','no'),
+                          link = anno_mark(at = res.val, labels = res.names, labels_gp = gpar(fontsize = 10), side='column', padding = unit(1, "mm")),
+                          col=list('CRISPR hit' = c('yes'='cornflowerblue', 'no'='white')),
+                          border = TRUE
+                          )
+  
+
+  hm <- Heatmap(gene.mat,
+          na_col = 'white',
+          bottom_annotation = ha,
+          show_column_names = F,
+          cluster_rows = clusterWNA(gene.mat),
+          cluster_columns = FALSE,
+          row_title = sprintf('%s AF3 PPI models', nrow(gene.mat)), 
+          #col = colorRamp2(colors=c(col.pal[1], col.pal[2]), breaks=c(0,30)),
+          col=viridis(30, direction=-1),
+          column_names_gp = gpar(fontsize=5),
+          row_names_gp = gpar(fontsize=8),
+          name='Predicted alignment error (PAE)',
+          border=T)
+
+  hm
+  BackupAsPDF(draw(hm, column_title=paste(x, 'residues in PPI interface (< 4 Angstroms)')), paste0(x, 'contacts.pae.allModels.heatmap'), dimensions=c(12,14))
+})
+```
+Remove proportion in interface histogram
+```{r}
+lapply(unique(af.contacts.dt$geneA), function(x){
+  
+  gene.mat <- dcast(af.contacts.dt[geneA == x,], gene_ppi~residueNumberA, value.var='pae', fun.aggregate = min, na.rm=T) %>% 
+  as.matrix(rownames='gene_ppi')
+  gene.mat[is.infinite(gene.mat)] <- NA
+  
+  # show proportion of times it is in model
+  nResidues <-  apply(gene.mat, 2, function(x) {sum(!is.na(x))})
+  nResidues <- (nResidues/dim(gene.mat)[1]) * 100
+  
+  
+  #get the colnames 
+  res.f <- colnames(gene.mat) %in% sub.long[gene == x, as.character(unique(peptide_position))] # logical vec
+  res.names <- colnames(gene.mat)[res.f] # set of interacting res
+  res.val <- which(colnames(gene.mat) %in% sub.long[gene == x, as.character(unique(peptide_position))])
+  
+  # now we need to get the 
+  ha <- HeatmapAnnotation(#'% in interface'= anno_barplot(nResidues,axis_param=list(gp=gpar(fontsize=4), at = seq(0,100, 20), labels = seq(0,100,20)), gp=gpar(fill = "#CCCCCC"), height = unit(2, "cm")),
+                         # '% in interface'= anno_barplot(nResidues, gp=gpar(fill = "#CCCCCC"), height = unit(2, "cm")),
+                          'CRISPR hit' = ifelse(colnames(gene.mat) %in% sub.long[gene == x, as.character(unique(peptide_position))], 'yes','no'),
+                          link = anno_mark(at = res.val, labels = res.names, labels_gp = gpar(fontsize = 10), side='column', padding = unit(1, "mm")),
+                          col=list('CRISPR hit' = c('yes'='cornflowerblue', 'no'='white')),
+                          border = TRUE
+                          )
+  
+
+  hm <- Heatmap(gene.mat,
+          na_col = 'white',
+          bottom_annotation = ha,
+          show_column_names = F,
+          cluster_rows = clusterWNA(gene.mat),
+          cluster_columns = FALSE,
+          row_title = sprintf('%s AF3 PPI models', nrow(gene.mat)), 
+          #col = colorRamp2(colors=c(col.pal[1], col.pal[2]), breaks=c(0,30)),
+          col=viridis(30, direction=-1),
+          column_names_gp = gpar(fontsize=5),
+          row_names_gp = gpar(fontsize=8),
+          name='Predicted alignment error (PAE)',
+          border=T)
+
+  hm
+  BackupAsPDF(draw(hm, column_title=paste(x, 'residues in PPI interface (< 4 Angstroms)')), paste0(x, 'contacts.pae.allModels.nohistAnno.heatmap'), dimensions=c(12,14))
+})
+```
+
+****
+
+```{r}
+af.contacts.dt[grepl('PIK3CA__PIK', gene_ppi), ] 
+
+
+pik3ca.contacts <- merge(x=af.contacts.dt[grepl('PIK3CA__PIK', gene_ppi), ], y=sub.long, by.x=c('residueNumberA','geneA'), by.y=c('peptide_position', 'gene'), all.x=F, all.y=F)
+
+
+guides.oi <- pik3ca.contacts[, unique(id)]
+subdt <- de.dt[id %in% guides.oi,] # extract the guide information
+
+
+# write the output to file
+#fwrite(pik3ca.contacts, ScriptAndDatedFileName('PIK3CA.receptors.contacts.csv'))
+fwrite(pik3ca.contacts, ScriptAndDatedFileName('guides.PIK3CA.receptors.DEanalysisResults.csv'))
+```
+
+
+
+*not used*
+plotting observed models
+```{r}
+# list of poor models 
+p60484__q03135
+p31749__c9jlw8
+p42336__o15020
+p42336__q6wcq1
+
+
+# better 
+p31749__o00478
+p60484__q03135
+af.contacts.dt
+af.contacts.dt[gene_ppi == 'PTEN__CAV1', unique(residueNumberA)] %>% paste(., collapse=',')
+```
+
+```{r}
+contacts.deSite.dt <- fread('~/Documents/projects/012425_RBabu_CRISPRe_AF3Runs/012925_AF3modelInvestigation_data/2025_01_29_deGuides.interactorContactResidues.csv')
+contacts.deSite.dt[gene_ppi == 'PTEN__CAV1', unique(residueNumberA)] %>% paste(., collapse=',')
+```
+

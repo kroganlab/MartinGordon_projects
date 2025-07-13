@@ -1,0 +1,1079 @@
+---
+title: "crossSpeciesComparisonWork"
+author: "Martin Gordon"
+date: "2024-09-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Looking at average host response to infection
+
+Look at the results vs mock 
+
+```{r}
+library(WGCNA)
+library(DESeq2)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(circlize)
+library(ComplexHeatmap)
+library(ggrepel)
+library(readxl)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj; eg facet_grid allow x/y axis to vary
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+library(viridis)
+library(readxl)
+library(viridis)
+library(tidymodels)
+
+library(biomaRt)
+
+# RNAseq DE functions
+library(tximport)
+library(IHW)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+source("../../utils/mg_utils/r_utils/differentialTesting.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+
+source ("../../utils/bp_utils/STRING_db_utils.R")
+```
+
+
+```{r}
+id.mapping.dt <- read_xlsx('./docs/human_to_RFE_gene_conversion_table_FINAL.xlsx') %>% 
+  data.table()
+
+isGenes <- fread('/Users/martingordon/Documents/projects/022624_AViDD_AB_PH_data/docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+```
+
+First goal, map bat to homolog
+
+take the txt2gene files, merge with homolog info, combine, and then map to 
+```{r}
+bat.tx2gene <- fread('./output/tx2gene/batSARS.tx2gene.tsv', header = F)
+hu.tx2gene <- fread('./output/tx2gene/huSARS.tx2gene.tsv', header=F)
+
+# map to bat 
+homolog.ids <- merge(x=hu.tx2gene[,.(V3)], y=unique(id.mapping.dt[, .(Human_gene_name, RFE_gene_name)]), by.x='V3', by.y='Human_gene_name') %>% 
+  unique()
+setnames(homolog.ids, new=c('HS_gene', 'RFE_gene_name'))
+```
+Read in the differential results for bat and human
+Using vs Mock; should be cleaner to see what is significantly changing overtime
+
+
+```{r}
+# pull in the DE list vs Mock
+de.vsMock <- fread('./080824_PWcomparisons_data/2024_08_08_PWcomparisonsvsMock.postProc.csv')
+
+# map homolog IDs to the dt
+de.dt <- rbind(de.vsMock[species=='human',],
+               merge(x=de.vsMock[species=='bat',], y=homolog.ids, by.x='gene', by.y='RFE_gene_name', all.x=T,all.y=F), fill=T)
+de.dt[species == 'human', HS_gene := gene]
+
+
+de.dt[is.na(HS_gene), unique(gene)]
+```
+Now we want to produce scatterplots of the shared genes in virus vs bat 
+
+```{r}
+library(tidymodels) #set equal axis range
+
+contrasts.oi <- de.dt[timepoint != '6h', unique(contrast)]
+
+
+dcast(de.dt[contrast == '9bI_N_P80T.12h_vs_Mock',], gene+HS_gene~species, value.var=c('log2FoldChange', 'sig'))
+
+lapply(contrasts.oi, function(x){
+  
+  wide.dt <- dcast(de.dt[contrast == x,], gene+HS_gene~species, value.var=c('log2FoldChange', 'sig'))
+  
+  # do we want to replace missing with 0 to plot these points? or is it better to only look things measured in both
+  # I think for now we drop?
+  wide.dt <- wide.dt[!is.na(log2FoldChange_human) & !is.na(log2FoldChange_bat)]
+  
+  # create a col factor for 
+  wide.dt[,status := ifelse(sig_human != 'not' & sig_bat != 'not', 'both sig',
+                            ifelse(sig_human != 'not' & sig_bat == 'not', 'human sig',
+                                   ifelse(sig_human == 'not' & sig_bat != 'not', 'bat sig',
+                                          'not sig')))]
+  
+  g <- ggplot(wide.dt, aes(x=log2FoldChange_human, log2FoldChange_bat, color=status, label=HS_gene)) +
+    geom_point() +
+    ggrepel::geom_text_repel(data=wide.dt[status == 'both sig',], size=2.2, max.overlaps = 20, segment.linetype=1, segment.alpha=0.4) +
+    ggtitle(paste(strsplit(x, '_vs_')[[1]], ' vs Mock')) +
+    xlab(expression(log[2] ~ "fold change MRC5")) +
+    ylab(expression(log[2] ~ "fold change RFe")) +
+    geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.4) +
+    geom_vline(xintercept=0, linetype=1, alpha=0.6) +
+    geom_hline(yintercept=0, linetype=1, alpha=0.6) +
+    geom_hline(yintercept=c(-1,1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('not sig'='grey', 'both sig'="#440154FF", 'human sig'="#35B779FF", 'bat sig'="#FDE725FF")) +
+    #scale_color_brewer(type='qual', palette=2) +
+    coord_obs_pred() +
+    theme_bw()
+  g
+ BackupAsPDF(g, paste0(x,'FC.vsMock.scatterplot'), dimensions = c(6.5,6.5))
+})
+```
+
+Pull out a table of these sets of genes and run enrichment
+Simple first pass; dont distinguish directionality, just look within the different sets
+For now only consider complete measurements in both
+```{r}
+sig.dt <- dcast(de.dt, gene+HS_gene+numerator~species, value.var=c('sig'))
+
+# how do we handle missingness here? Just add as missing
+sig.dt[, sig := ifelse(human == 'up' &  bat == 'up', 'both up',
+                          ifelse(human == 'down' &  bat == 'down', 'both down',
+                            ifelse(human != 'not' & bat == 'not', 'human sig',
+                                   ifelse(human == 'not' & bat != 'not', 'bat sig',
+                                          'not sig')))) ]
+
+sig.dt[, enrich.grp := paste(numerator, sig)]
+sig.dt <- sig.dt[!is.na(sig),] # not considering missingness for now
+```
+
+# run enrichment on the human samples
+```{r}
+ont <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+
+# all measured human genes in our data
+universe <- unique(sig.dt$HS_gene)
+```
+
+Needs refinement, but definitely something here..
+Seems the number of members of the geneset increases over time
+
+Try seperating the up and down regulated sets and see if we recover anything... I dont think we need to run enrichment on the bat and human as we anlready have done, although running togehter might show some overlap that isnt readily apparent elsewhere..
+
+```{r}
+  # run GO enrichment on each group seperately
+enrich.dt <- enricherOnGroups(sig.dt[sig %like% 'both'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "HS_gene", 
+                              term2gene.gmt = ont, 
+                              universe = universe)
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                           gmt=ont, 
+                                                           groupColumn = 'enrich.grp',
+                                                           max_pAdjust = 0.1)
+
+simp.enrich$simplified[, enrich.grp := factor(enrich.grp, levels=c("WA.12h both down","WA.12h both up",
+                                                                   "N_P80T.12h both up","N_P80T.12h both down",
+                                                                   "9bI_N_P80T.12h both up", "9bI_N_P80T.12h both down",
+                                                                   "WA.24h both down","WA.24h both up",
+                                                                   "N_P80T.24h both up","N_P80T.24h both down",
+                                                                   "9bI_N_P80T.24h both up", "9bI_N_P80T.24h both down",
+                                                                   "WA.48h both down","WA.48h both up",
+                                                                   "N_P80T.48h both up","N_P80T.48h both down",
+                                                                   "9bI_N_P80T.48h both up", "9bI_N_P80T.48h both down"))]
+
+
+hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified,
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=T,
+                                  border=T,
+                               #   cluster_column_slices=F,
+                              #    column_split=list(str_extract(levels(simp.enrich$simplified$enrich.grp), '[0-9]{1,2}h'),
+                               #                     str_extract(levels(simp.enrich$simplified$enrich.grp),'down|up')),
+                                #  column_split=list(str_extract(levels(simp.enrich$simplified$enrich.grp), '[0-9]{1,2}h'),
+                               #                     str_extract(levels(simp.enrich$simplified$enrich.grp),'down|up')),
+                                  negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                  topN=5,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6), 
+                                  upperThreshold = 5)
+
+BackupAsPDF(hm, 'sharedGenes.heatmap')
+```
+Now take the human genes, cluster identify the average
+
+```{r}
+hu.dds <- readRDS('./080824_PWcomparisons_data/2024_08_13_dds.human.vsMock.rds')
+bat.dds <- readRDS('./080824_PWcomparisons_data/2024_08_13_dds.bat.vsMock.rds')
+
+bat.counts <- data.table(assay(vst(bat.dds, blind=F)), keep.rownames = T)
+hu.counts <- data.table(assay(vst(hu.dds, blind=F)), keep.rownames=T)
+```
+
+Goal: Identify gene modules; WGCNA method?
+First, I think we only want to use genes shared between the two datasets; and then subset these to the same 
+
+```{r}
+bat.counts <-  merge(bat.counts, homolog.ids, by.x='rn', by.y='RFE_gene_name', all.x=T)
+# 
+dup.genes <- c('SRGAP2', 'CALM3')
+
+colnames(hu.counts) <- gsub('[.]quant[.]sf', '', colnames(hu.counts))
+colnames(bat.counts) <- gsub('[.]quant[.]sf', '', colnames(bat.counts))
+
+# subset to shared genes, then the differentially expressed genes
+shared.genes <- hu.counts$rn[hu.counts$rn %in% bat.counts$V3]
+
+# only want to consider genes differentially expressed 
+de.genes <- de.dt[species == 'human' & abs(log2FoldChange) >= 1 & pvalue < 0.001, unique(HS_gene)]
+#1.2k
+```
+
+Just take the significant and shared genes and lets cluster
+
+```{r}
+# first off, subset the genes in both networks to only those shared 
+hu.submat <- hu.counts[rn %in% shared.genes & rn %in% de.genes,] %>% 
+  as.matrix(rownames='rn')
+
+de.genes <- de.dt[species == 'bat' & abs(log2FoldChange) >= 0.58 & pvalue < 0.001, unique(HS_gene)]
+length(de.genes)
+
+# much bigger matrix
+bat.submat <- bat.counts[V3 %in% shared.genes & V3 %in% de.genes, -c('rn')] %>%
+  as.matrix(rownames='V3')
+
+```
+
+Sweep the mock expression values from the matrix and try clustering
+
+Lets try a couple of approaches; first, try a data driven approach to identify modules based on co-expression/correlation
+Not sure if they is a whole lot of variation int he data...lets try anyway
+
+```{r}
+submat <-  sweep(hu.submat, 1, apply(hu.submat[, grepl('Mock', colnames(hu.submat))], 1, mean,na.rm=T)) %>% 
+  .[, grep('Mock', colnames(submat),invert = T)]
+
+
+Heatmap(submat,
+        cluster_columns = F,
+        show_row_names = F,
+        border=T,
+        column_split = list(factor(str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('12h','24h','48h')),
+                            factor(ifelse(grepl('MRC5_N', colnames(submat)), 'N_P80T', str_extract(colnames(submat), 'WA|9bI_N_P80T')), levels=c('WA', 'N_P80T','9bI_N_P80T'))))
+                            
+```
+input genes look good
+```{r}
+gsg <- goodSamplesGenes(t(submat))
+summary(gsg)
+```
+Interesting, take high power to reach scale free... 
+^9 looks best
+```{r}
+net.in <- t(submat)
+
+s.thres <- data.table(pickSoftThreshold(net.in)$fitIndices)
+
+g <- s.thres %>%  
+  ggplot(aes(x=Power, y=SFT.R.sq)) + 
+  geom_point() +
+  geom_hline(yintercept = 0.8, color='darkred') +
+  labs(y="Scale Free Topology Model Fit, signed R^2") +
+  theme_classic()
+
+BackupAsPDF(g, 'wgcna.thresholding.plot')
+```
+use a power of 7
+
+```{r}
+softPower = 9 ##R^2 of .9 and highest connectivity,
+adj.mat = adjacency(net.in, power = softPower, corFnc = 'bicor', type = "signed") #Calculating the adjacency matrix
+#help(adjacency )
+```
+Define the topological overlap matrix
+
+```{r}
+TOM <- TOMsimilarity(adj.mat)
+```
+Generate the modules... doesn't seem to be enough heterogeneity in the data...
+Only 4 modules found when varying params... Think we need another approach 
+
+```{r}
+TOM.dissimilarity <- 1-TOM
+adj.dissimilarity <- 1-adj.mat
+
+#creating the dendrogram 
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average") 
+
+Modules <- cutreeDynamic(dendro = geneTree, distM =TOM.dissimilarity, deepSplit = 4, pamRespectsDendro = FALSE, minClusterSize = 30)
+table(Modules)
+```
+
+use a bigger set of genes as input for clustering
+Cluster all shared and then subtract the Mock
+I dont think we want to filter actually as low var in human could be interesting in bat?
+```{r}
+hu.submat <- hu.counts[rn %in% shared.genes,] %>% 
+  as.matrix(rownames='rn')
+
+#hu.submat <- hu.submat[, grep('Mock', colnames(hu.submat), invert=T)]
+
+submat <-  sweep(hu.submat, 1, apply(hu.submat[, grepl('Mock', colnames(hu.submat))], 1, mean,na.rm=T)) %>% 
+  .[, grep('Mock', colnames(hu.submat),invert = T)]
+
+# filtering to remove low variacne rows (Q1)
+#hu.submat <- hu.submat[apply(hu.submat, 1, var, na.rm=T) > quantile(apply(hu.submat, 1, var, na.rm=T), 0.25),] 
+
+net.in <- t(submat)
+
+s.thres <- data.table(pickSoftThreshold(net.in)$fitIndices)
+
+g <- s.thres %>%  
+  ggplot(aes(x=Power, y=SFT.R.sq)) + 
+  geom_point() +
+  geom_hline(yintercept = 0.8, color='darkred') +
+  labs(y="Scale Free Topology Model Fit, signed R^2") +
+  theme_classic()
+g
+softPower = 5 ##R^2 of .9 and highest connectivity,
+adj.mat = adjacency(net.in, power = softPower, corFnc = 'bicor', type = "signed") #Calculating the adjacency matrix
+
+TOM <- TOMsimilarity(adj.mat)
+
+TOM.dissimilarity <- 1-TOM
+adj.dissimilarity <- 1-adj.mat
+
+#creating the dendrogram 
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average") 
+
+Modules <- cutreeDynamic(dendro = geneTree, distM =TOM.dissimilarity, deepSplit = 2, pamRespectsDendro = FALSE, minClusterSize = 20)
+table(Modules)
+
+```
+
+# lets look at these modules
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(length(unique(Modules)))
+
+names(col.pal) <- seq(1,length(unique(Modules)),by=1)
+
+# add wgcna module annotation
+row_ha <- rowAnnotation(wgcna.modules=modules.tom, col=list(wgcna.modules = col.pal))
+
+hm <- Heatmap(submat, 
+              cluster_columns = FALSE, 
+         #show_row_names = FALSE,
+         border=T,
+         split = modules.tom,
+         name = 'norm Counts vs Mock',
+         right_annotation = row_ha,
+         column_split = list(factor(str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('12h','24h','48h')),
+                            factor(ifelse(grepl('MRC5_N', colnames(submat)), 'N_P80T', str_extract(colnames(submat), 'WA|9bI_N_P80T')), levels=c('WA', 'N_P80T','9bI_N_P80T'))),
+         na_col = 'darkgrey',
+         row_title =sprintf("%d homologs",
+                            nrow(submat)),
+         row_names_gp = gpar (fontsize= 1),
+         column_names_gp = gpar (fontsize= 3),
+         cluster_row_slices = F,
+         column_title_gp = gpar (fontsize= 7))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+
+BackupAsPDF(hm, 'wgcna.modules.vsMock.heatmap', dimensions = c(9,12))
+```
+At a quick glance, doesnt seem super interesting, but maybe run enrichment on the different modules
+Look at module conservation maybe?
+
+```{r}
+modules.dt <- data.table(gene = rownames(submat),
+           wgcna.module = as.character(Modules))
+
+fwrite(modules.dt, ScriptAndDatedFileName('human.vsMock.moduleAssignment.csv'))
+```
+
+```{r}
+# get human DBs ready
+go.bp <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+kegg <-  loadKegg(organism='hsa', keyType = 'kegg') # map to entrez ID
+
+
+# human kegg to symbol and can merge these tables and
+hsKeggMap.dt <- clusterProfiler:::bitr(kegg$gene, fromType='ENTREZID', toType='SYMBOL', OrgDb='org.Hs.eg.db')
+
+
+kegg.dt <- merge(x=kegg, y=hsKeggMap.dt, by.x="gene", by.y="ENTREZID", all.x=T)
+kegg.dt <- kegg.dt[, .(ont, gene = ifelse(SYMBOL == '', gene, SYMBOL), ont.id)]
+```
+
+Looks like we arent recovering anything interesting from the correlation... just not enough signal to cluster
+Two 'good' modules, things moving up and down overtime in all strains; things moving down related to replication,cell division
+Is the inflammatory response directly inhibiting cell division?
+
+Stuff moving 'up' is defense response, immune respnose etc.
+
+```{r}
+universe <- rownames(submat)
+
+enrich.dt <- enricherOnGroups(modules.dt, 
+                              groupColumns = 'wgcna.module',
+                              geneColumn = "gene", 
+                              term2gene.gmt = go.bp, 
+                              universe = universe)
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=go.bp, groupColumn = 'wgcna.module', max_pAdjust = 0.1)
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified,
+                                groupColumn = 'wgcna.module', 
+                                topN=8,
+                                title=paste0('GO Biological Processes'), 
+                                row_names_gp = gpar(fontsize = 7), 
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 5)
+```
+Calculate module eignengenes
+Very little difference between WT and double mutant host resposne, but double mut could be more interesting..
+Module 9 *might* be interesting..., maybe pull out the gene list for this to see whats in it and look at the original expression matrix
+```{r}
+# alculate eigengenes
+MEList = moduleEigengenes(t(submat), colors = Modules, verbose = 10)
+
+View(moduleEigengenes)
+
+MEList$eigengenes
+MEList$varExplained
+
+hm <- Heatmap(t(MEList$eigengenes),
+        border=T,
+        cluster_columns = F,
+        column_split = list(factor(str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('12h','24h','48h')),
+               factor(ifelse(grepl('MRC5_N', colnames(submat)), 'N_P80T', str_extract(colnames(submat), 'WA|9bI_N_P80T')), levels=c('WA', 'N_P80T','9bI_N_P80T'))))
+hm
+BackupAsPDF(hm, 'human.MEs.vsMock.heatmap', dimensions = c(13,5))
+```
+Not so interesting, but maybe we want to look at module conservation
+Module preservation analysis.. cant access tutorials right now so just pull out the module 9
+
+```{r}
+hm <- Heatmap(submat[rownames(submat) %in% modules.dt[wgcna.module == '9', gene],],
+        border=T,
+        cluster_columns = F,
+        name='normalized counts vs Mock',
+        row_names_gp = gpar(fontsize=3),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        column_split = list(factor(str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('12h','24h','48h')),
+               factor(ifelse(grepl('MRC5_N', colnames(submat)), 'N_P80T', str_extract(colnames(submat), 'WA|9bI_N_P80T')), levels=c('WA', 'N_P80T','9bI_N_P80T'))))
+        
+hm
+BackupAsPDF(draw(hm, column_title='module 9 genes MRC5'), 'mod9genes.vsMock.heatmap', dimensions=c(10,7))
+```
+Using BP functions as more intuitive than the STRINGDDB functions to access the class
+Network is pretty sparse; not many DEs shared and significant at thresholds defined, so we expand the network to >400 STRING score and also add OnehopConnectors
+These will be used to compute a measrue of network distance and then removed from the output
+
+```{r}
+library(STRINGdb)
+
+# subset to genes inboth datasets
+shared.genes <- unique(c(de.dt[species=='bat',]$HS_gene[de.dt[species=='bat',]$HS_gene %in% de.dt[species=='human',]$HS_gene],
+                  de.dt[species=='human',]$HS_gene[de.dt[species=='human',]$HS_gene %in% de.dt[species=='bat',]$HS_gene]))
+
+# just get the genes that pass thresholds
+genes.oi <- de.dt[species == 'human' & abs(log2FoldChange) >= 1 & pvalue < 0.001 & HS_gene %in% shared.genes,]$HS_gene %>% 
+  unique()
+
+string.mapping <- GetStringIDMapping(shared.genes, stringAliasFile = '~/Documents/utils/mg_utils/data/stringDB/9606.protein.aliases.v12.0.txt.gz')
+
+stringSet <- c(setdiff(genes.oi, string.mapping$alias), string.mapping[alias %in% genes.oi,]$string) 
+
+# using a STRING confidence score of 500 to threshold high conf interactions
+# more interactions than using the app why?
+# also extracting one hop connections here
+stringEdges <- GetStringSubNetwork(stringSet, 
+                                   minString = 400,
+                                   oneHopConnections = TRUE, 
+                                   stringFile = '~/Documents/utils/mg_utils/data/stringDB/9606.protein.links.detailed.v12.0.txt.gz') 
+```
+Write out the STRING connections
+```{r}
+#fwrite(stringEdges, ScriptAndDatedFileName('human.STRINGedges.400.txt'), sep = "\t", col.names=FALSE)
+
+#stringEdges <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/190924_crossSpeciesComparison_data/2024_09_26_human.STRINGedges.600.tsv')
+stringEdges <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/190924_crossSpeciesComparison_data/2024_09_26_human.STRINGedges.400.txt')
+```
+
+```{bash, eval=FALSE}
+# run this in CL
+
+conda activate python2.7
+# -c confidence values in ppi as edge weights
+# -s 20 steps in random walk
+
+python ~/Documents/utils/capDSD-src/DSD.py -s20 c ~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/190924_crossSpeciesComparison_data/2024_09_26_human.STRINGedges.400.tsv ~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/190924_crossSpeciesComparison_data/2024_09_26_human.DSD.STRING400.backbone
+```
+
+Load in the DSD matrix 
+
+```{r}
+#receptor.dsd <- fread("./output/11receptor.STRINGConnections.600.dsd")
+hs.dsd.nw <- fread("~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/190924_crossSpeciesComparison_data/2024_09_26_human.DSD.STRING400.backbone.dsd")
+
+dsd.mat <- as.matrix(hs.dsd.nw, rownames='V1')
+#dsd.mat.nw <- as.matrix(receptor.dsd.nw, rownames='V1')
+
+# remove the 1 hop connectors
+stringsInMat <- intersect(rownames(dsd.mat), c(stringSet))
+
+# sbset to just strings in the datatable
+dsd.mat <- dsd.mat[stringsInMat, stringsInMat]
+
+# compute distance matrix
+dsd.dist <- as.dist(dsd.mat)
+
+ddr <- hclust (dsd.dist, method= "average") %>%  as.dendrogram()
+hm <- Heatmap(dsd.mat, show_row_names = FALSE, show_column_names = FALSE, cluster_rows = ddr, cluster_columns = ddr)
+#BackupAsPDF(hm, 'STRINGphysint.600conf.DSDdist')
+
+```
+
+Lets assign the clusters to modules; use treeCutHybrid to cut the dendogram and extract
+```{r}
+library(dynamicTreeCut)
+
+hc <- hclust(dsd.dist, method= "average")
+
+mods <- cutreeHybrid(hc, 
+             dsd.mat,
+             minClusterSize = 10, 
+             deepSplit = 3)
+
+hs.clust.dt <- data.table(stringID = rownames(dsd.mat),
+                          module = mods$labels)
+
+source('~/Documents/utils/mg_utils/r_utils/STRING_db_utils_MGupdate.R')
+
+hs.clust.dt[, gene := translateSTRINGIDtoSymbol(stringID=stringID, fill=T)]
+
+fwrite(hs.clust.dt, ScriptAndDatedFileName('hs.dsd.moduleAssignments.csv'))
+```
+
+Run enrichment on the modules to see if they are valid, then enrich
+
+```{r}
+gmt.hs.go.bp <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+
+universe <- shared.genes
+
+enrich.dt <- enricherOnGroups(hs.clust.dt, 
+                              groupColumns = 'module', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = gmt.hs.go.bp, 
+                              universe = universe)
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                           gmt=gmt.hs.go.bp, 
+                                                           groupColumn = 'module',
+                                                           max_pAdjust = 0.1)
+
+
+# save the results
+fwrite(enrich.dt, ScriptAndDatedFileName('hs.dsd.modules.GO.BP.enrich.csv'))
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('hs.dsd.modules.GO.BP.simplified.enrich.csv'))
+```
+To name, assign the ID with the lowest pvalue 
+```{r}
+# how many genes in each set
+enrich.dt[, NGenes := unlist(strsplit(GeneRatio, '/'))[[1]], by=.I] %>% 
+  .[, NGenes := as.integer(NGenes)]
+
+
+# take the significant result with the most genes assigned to it 
+module.names <- enrich.dt[pvalue < 0.05, .SD[which.max(NGenes)],by=module] %>% 
+  .[,.(module, ID, pvalue, p.adjust, Count)]
+
+
+module.names <-  enrich.dt[pvalue < 0.05, .SD[which.min(pvalue)],by=module] %>% 
+    .[,.(module, ID, pvalue, p.adjust, Count)]
+
+
+#15 and 17 didnt pass significacnece after correction
+ enrich.dt[p.adjust < 0.05, .SD[which.min(pvalue)],by=module] %>% 
+    .[,.(module, ID, pvalue, p.adjust, Count)] %>% 
+   .[order(as.numeric(module))]
+ 
+ 
+enrich.dt[module %in% c('17') & pvalue < 0.05][order(pvalue)]
+```
+
+
+Plot of the gene clustering by modules, visualizing the DSD
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=27)
+
+tsne.dt <- data.table(Rtsne::Rtsne(dsd.mat,
+             is_distance=T,
+             perplexity=20,
+             theta=0.0, #speed/sensitivty tradeoff; not many points so want exact
+             dims=2)$Y)
+
+tsne.dt[,stringID := rownames(dsd.mat)]
+tsne.dt <-  merge(x=tsne.dt, y=hs.clust.dt, by='stringID')
+tsne.dt[, module := as.character(module)]
+
+
+tsne.dt[module %in% c('15','17')]
+
+tsne.dt <- merge(x=tsne.dt, y=module.names, by='module')
+
+#fwrite(tsne.dt, ScriptAndDatedFileName('hs.DSD.tsne.csv'))
+
+g <- ggplot(tsne.dt, aes(x=V1, y=V2, color=ID, label=gene)) +
+  geom_point() +
+  ggrepel::geom_text_repel(max.overlaps = 10, size=1.5) +
+  ggtitle('Human host response network') +
+  scale_color_manual(values=col.pal) +
+  guides(color=guide_legend(title='GO enrichment module ID')) +
+  theme_bw() +
+  theme(
+  legend.text=element_text(size=6))
+
+g
+BackupAsPDF(g, 'hs.dsd.tsne', dimensions = c(12,8))
+
+# plot wihth no lables
+g <- ggplot(tsne.dt, aes(x=V1, y=V2, color=ID)) +
+  geom_point() +
+  ggtitle('Human host response network') +
+  scale_color_manual(values=col.pal) +
+  guides(color=guide_legend(title='GO enrichment module ID')) +
+  theme_bw() +
+  theme(
+  legend.text=element_text(size=6))
+
+g
+BackupAsPDF(g, 'hs.dsd.nolabels.tsne', dimensions = c(12,8))
+```
+Get average response per module/sample and use this to calculate average host response
+
+```{r}
+hs.clust.dt
+# this is the output of the T-SNE view 
+hs.clust.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/190924_crossSpeciesComparison_data/2024_09_27_hs.DSD.tsne.csv')
+# subset to the module genes in human
+de.dt <- merge(de.dt[species=='human',], hs.clust.dt[,.(gene,module,ID,pvalue, p.adjust)], by.x='HS_gene', by.y='gene', all.y=T)
+
+# calculate the mean FC per module
+de.dt[, moduleResponse := mean(abs(log2FoldChange), na.rm=T), by=.(module, numerator)]
+de.dt[, avgHostResponse := mean(moduleResponse, na.rm=T), by=.(numerator)]
+```
+
+Linecharts of module response in human
+Clear that defense resposne to symbiont has the highest peak but trends generally similiar across all groups
+```{r}
+col.pal2 <- randomcoloR::distinctColorPalette(k=length(unique(de.dt$ID)))
+
+g <- ggplot(de.dt, aes(x=reorder(numerator,as.numeric(as.factor(timepoint))), y=moduleResponse, group=module, color=as.character(ID))) +
+  geom_line() +
+  ylab('Module Response (avg. abs(Log2FC))') +
+  xlab('Sample') +
+  scale_x_discrete(expand = expansion(mult = c(0.01, 0.01))) +
+  scale_color_manual(values=col.pal2) +
+  theme_bw() +
+  guides(colour = guide_legend('Module Name', ncol=1)) +
+  theme(axis.text.x=element_text(angle=90),
+        legend.text=element_text(size=6))
+
+g
+BackupAsPDF(g, 'meanModuleResponse.linechart', dimensions=c(11,8))
+```
+Replot with the average module response now included
+
+```{r}
+g <- ggplot(de.dt, aes(x=reorder(numerator,as.numeric(as.factor(timepoint))), y=moduleResponse, group=module)) +
+  geom_line(color='grey') +
+  geom_line(data=de.dt, aes(x=reorder(numerator,as.numeric(as.factor(timepoint))), y=avgHostResponse), color='firebrick') +
+  ylab('Module Response (avg. abs(Log2FC))') +
+  xlab('Sample') +
+  scale_x_discrete(expand = expansion(mult = c(0.01, 0.01))) +
+  theme_bw() +
+  guides(colour = guide_legend('Module Name')) +
+  theme(axis.text.x=element_text(angle=90),
+        legend.text=element_text(size=6))
+g
+
+g <- ggplot(de.dt, aes(x=reorder(numerator,as.numeric(as.factor(timepoint))), y=moduleResponse, group=module)) +
+  geom_line(color='grey') +
+  geom_line(data=de.dt, aes(x=reorder(numerator,as.numeric(as.factor(timepoint))), y=avgHostResponse, color='Average Host Response'), linewidth=1.5) + #avg host response
+  ylab('Module Response (avg. abs(Log2FC))') +
+  xlab('Sample') +
+  scale_x_discrete(expand = expansion(mult = c(0.01, 0.01))) +
+  scale_color_manual(values=c('Average Host Response' = 'firebrick')) +
+  theme_bw() +
+  guides(colour = guide_legend(FALSE)) +
+  theme(axis.text.x=element_text(angle=90),
+        legend.text=element_text(size=6),
+        legend.title = element_blank())
+
+g
+BackupAsPDF(g, 'human.avgHostResponse.linechart', dimensions=c(11,8))
+```
+facet the modules by virus and inlcude the average host response in each window
+
+```{r}
+g <- ggplot(de.dt, aes(x=reorder(numerator,as.numeric(as.factor(timepoint))), y=moduleResponse, group=module)) +
+  geom_line(color='grey') +
+  geom_line(data=de.dt, aes(x=reorder(numerator,as.numeric(as.factor(timepoint))), y=avgHostResponse, color='Average Host Response'), linewidth=1.5) + #avg host response
+  ylab('Module Response (avg. abs(Log2FC))') +
+  xlab('Sample') +
+  scale_x_discrete(expand = expansion(mult = c(0.01, 0.01))) +
+  scale_color_manual(values=c('Average Host Response' = 'firebrick')) +
+  theme_bw() +
+  guides(colour = guide_legend(FALSE)) +
+  theme(axis.text.x=element_text(angle=90),
+        legend.text=element_text(size=6),
+        legend.title = element_blank())
+
+g
+```
+
+Looks like most modules are correlated with AHR; maybe TORC2 signalling and resonse to symbiont/virus, but that just seems like a viral-load shift
+```{r}
+g <- ggplot(de.dt, aes(x=reorder(timepoint,as.numeric(as.factor(timepoint))), y=moduleResponse, group=virus, linetype=virus)) +
+  geom_line(color='grey') +
+  geom_line(data=de.dt, aes(x=reorder(timepoint,as.numeric(as.factor(timepoint))), y=avgHostResponse, color='Average Host Response')) + #avg host response
+  ylab('Module Response (avg. abs(Log2FC))') +
+  xlab('Sample') +
+  scale_x_discrete(expand = expansion(mult = c(0.01, 0.01))) +
+  scale_color_manual(values=c('Average Host Response' = 'firebrick')) +
+  ggtitle('Module response vs AHR') +
+  facet_wrap(~ID, ncol=5) +
+  theme_bw() +
+  guides(colour = guide_legend(FALSE)) +
+  theme(axis.text.x=element_text(angle=90),
+        legend.text=element_text(size=6),
+        legend.title = element_blank())
+
+g
+BackupAsPDF(g, 'human.moduleResponsevsAHR.linechart', dimensions=c(12,10))
+```
+
+Run the correlation and lets see how the response looks
+Seems to me most of the modules are strongly correlated with host response.
+
+Not super interesting I think...
+
+```{r}
+# create a module matrix 
+modules.mat <- de.dt[species == 'human', .(virus,timepoint,ID,moduleResponse,avgHostResponse)] %>% 
+  unique() %>% 
+  dcast(., interaction(virus,timepoint)~ID, value.var = c('moduleResponse')) %>% 
+  as.matrix(rownames='virus')
+
+# get vecotr of average host response and match order in matrix
+avgRespVec <- de.dt[, .(interaction(virus,timepoint), avgHostResponse)] %>% 
+  .[match(rownames(modules.mat), V1), .(avgHostResponse)]
+
+human.hostResponse <- cor(modules.mat, avgRespVec) %>% 
+  as.data.table(., keep.rownames=T)
+
+g <- ggplot(human.hostResponse, aes(x=reorder(rn,avgHostResponse), y=avgHostResponse, fill="Pearsons R")) +
+  geom_bar(stat='Identity') +
+  coord_flip() +
+  xlab('Module') +
+  ylab('Pearsons R') +
+  #scale_y_discrete(expand = expansion(mult = c(0.01, 0.01)),) +
+  scale_fill_manual(values=c("Pearsons R"='firebrick')) + 
+  guides(fill=FALSE) +
+  theme_bw()
+g 
+
+BackupAsPDF(g, 'human.AHR.module.cor.barchart')
+
+```
+Lets look at correlation of the modules and the AHR with viral level in each of the cells\
+For viral level, use genomic dna as a proxy for viral load
+
+```{r}
+
+viral.counts.dt <- fread('./091824_dataPreparationforJyoti_data/2024_09_19_viralsgRNANormalizedCounts.csv') %>% 
+  reshape2::melt(., id.vars = c('splice.name', 'timepoint')) %>% 
+  data.table()
+
+viral.counts.dt[, c('metric', 'species') := tstrsplit(variable, '_', keep=c(1,2))]
+viral.counts.dt[, replicate := str_extract(variable,'[123]$')]
+viral.counts.dt[,virus := sub('_[123]$', '', str_extract(variable, 'WA.+$|9b.+|N_P80T.+'))]
+```
+
+correlating counts (genomic CPM) of the virus with the module response
+Looks like many of the modules correlate with viral load
+```{r}
+viral.counts.dt[virus == '9b_T72I_N_P80T', virus := "9bI_N_P80T"]
+
+viral.counts.dt$metric %>%  unique()
+
+viralRespVec <- viral.counts.dt[timepoint != '6h' & species == 'human' & metric=='cpm' & splice.name == 'genomic', .(genomic_CPM= mean(value, na.rm=T)), by=.(interaction(virus,timepoint))] %>% 
+  .[match(rownames(modules.mat), interaction),]
+
+human.hostResponse.vsVirus <- cor(modules.mat, log2(viralRespVec$genomic_CPM)) %>% 
+  as.data.table(., keep.rownames=T)
+
+human.hostResponse.vsVirus[order(-V1)]
+
+
+g <- ggplot(human.hostResponse.vsVirus, aes(x=reorder(rn, V1), y=V1, fill='R')) +
+  geom_bar(stat='Identity') +
+  scale_y_continuous(breaks=seq(0,1,by=0.1), labels = seq(0,1,by=0.1), expand =  expansion(mult = c(0.01, 0.01))) +
+  scale_fill_manual(values=c('R'='skyblue')) +
+  ggtitle('SARS2 genomic CPM & host response modules') +
+  ylab('Pearsons R') +
+  xlab('Module') +
+  coord_flip() + 
+  guides(fill=FALSE) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'human.hostResponsevsViral.barchart')
+```
+**Cross species comparison**
+Pull out the homologs from the bat samples that match the genes OI (DE set), match map these to the human modules and look at response
+
+```{r}
+homolog.dt <- rbind(de.vsMock[species=='human',],
+               merge(x=de.vsMock[species=='bat',], y=homolog.ids, by.x='gene', by.y='RFE_gene_name', all.x=T,all.y=F), fill=T)
+
+homolog.dt[species == 'human', HS_gene := gene]
+# add the module name and info to the datatable
+# subset to the module genes in human
+homolog.dt <- merge(homolog.dt, hs.clust.dt[,.(gene,module,ID,enrich.pvalue = pvalue, enrich.p.adjust=p.adjust)], by.x='HS_gene', by.y='gene', all.y=T)
+
+# calculate the mean FC per module
+#homolog.dt[timepoint != '6h', moduleResponse := mean(abs(log2FoldChange), na.rm=T), by=.(species, module, numerator)]
+#homolog.dt[timepoint != '6h', avgHostResponse := mean(moduleResponse, na.rm=T), by=.(species,numerator)]
+
+homolog.dt[, moduleResponse := mean(abs(log2FoldChange), na.rm=T), by=.(species, module, numerator)]
+homolog.dt[, avgHostResponse := mean(moduleResponse, na.rm=T), by=.(species,numerator)]
+
+homolog.dt[, timepoint :=  factor(timepoint, levels=c("6h", "12h","24h","48h"))]
+```
+
+lets replot the bat response and compare to the ori, then plot bat response
+Looks a lot noiser, but clear increase overtime so not complete noise...
+
+Weirdly for this set, WA type also tends to increase overtime
+Also the fold changes are very small... 
+I'm defining the functional modules based on the human network, which likely doesnt make too much sense.. maybe want to map to bat, and then rerun, find the average host response and see if individual modules dont correlate with that?
+
+```{r}
+g <- ggplot(homolog.dt[species == 'bat',], aes(x=reorder(numerator,as.numeric(timepoint)), y=moduleResponse, group=module)) +
+  geom_line(color='grey') +
+  geom_line(data=homolog.dt[species == 'bat',], aes(x=reorder(numerator,as.numeric(timepoint)), y=avgHostResponse, color='Average Host Response'), linewidth=1.5) + #avg host response
+  ggtitle('RFe average host response') +
+  ylab('Module Response (avg. abs(Log2FC))') +
+  xlab('Sample') +
+  scale_x_discrete(expand = expansion(mult = c(0.01, 0.01))) +
+  scale_color_manual(values=c('Average Host Response' = 'firebrick')) +
+  theme_bw() +
+  guides(colour = guide_legend(FALSE)) +
+  theme(axis.text.x=element_text(angle=90),
+        legend.text=element_text(size=6),
+        legend.title = element_blank())
+
+g
+BackupAsPDF(g, 'bat.avgHostResponse.linechart')
+```
+```{r}
+g <- ggplot(homolog.dt[species == 'bat',], aes(x=reorder(numerator,as.numeric(timepoint)), y=moduleResponse, group=module, color=as.character(ID))) +
+  geom_line() +
+  ylab('Module Response (avg. abs(Log2FC))') +
+  xlab('Sample') +
+  ggtitle('RFe Functional Modules') +
+  scale_x_discrete(expand = expansion(mult = c(0.01, 0.01))) +
+  scale_color_manual(values=col.pal2) +
+  theme_bw() +
+  guides(colour = guide_legend('Module Name', ncol=1)) +
+  theme(axis.text.x=element_text(angle=90),
+        legend.text=element_text(size=6))
+
+g
+BackupAsPDF(g, 'bat.meanModuleResponse.linechart', dimensions=c(11,8))
+```
+faceted plot to look at differences in the different viral species
+Why does the WA trend track so well with the others?
+
+Clear these modules are very different to the average host response, its just a question of these groupings are relevant in this model
+```{r}
+g <- ggplot(homolog.dt[species == 'bat',], aes(x=reorder(timepoint,as.numeric(as.factor(timepoint))), y=moduleResponse, group=virus, linetype=virus)) +
+  geom_line(color='grey') +
+  geom_line(data=homolog.dt[species == 'bat',], aes(x=reorder(timepoint,as.numeric(as.factor(timepoint))), y=avgHostResponse, color='Average Host Response')) + #avg host response
+  ylab('Module Response (avg. abs(Log2FC))') +
+  xlab('Sample') +
+  scale_x_discrete(expand = expansion(mult = c(0.01, 0.01))) +
+  scale_color_manual(values=c('Average Host Response' = 'firebrick')) +
+  ggtitle('RFe Module response vs AHR') +
+  facet_wrap(~ID, ncol=5, scales = 'fixed') +
+  theme_bw() +
+  guides(colour = guide_legend(FALSE)) +
+  theme(axis.text.x=element_text(angle=90),
+        strip.text.x = element_text(size = 6),
+        legend.text=element_text(size=6),
+        legend.title = element_blank())
+
+g
+BackupAsPDF(g, 'bat.moduleResponsevsAHR.linechart', dimensions=c(12,10))
+```
+```{r}
+
+```
+
+
+
+**Question**
+Have I used the correct input gene list? Should I have used the genes differentially expressed in both, map to homologs in humans and take all of those? bigger set, perhaps more promising findings...
+
+```{r}
+# create a module matrix 
+modules.mat <- homolog.dt[species == 'bat', .(virus,timepoint,ID,moduleResponse,avgHostResponse)] %>% 
+  unique() %>% 
+  dcast(., interaction(virus,timepoint)~ID, value.var = c('moduleResponse')) %>% 
+  as.matrix(rownames='virus')
+
+
+# get vecotr of average host response and match order in matrix
+avgRespVec <- homolog.dt[species == 'bat', .(interaction(virus,timepoint), avgHostResponse)] %>% 
+  .[match(rownames(modules.mat), V1), .(avgHostResponse)]
+
+bat.hostResponse <- cor(modules.mat, avgRespVec) %>% 
+  as.data.table(., keep.rownames=T)
+
+g <- ggplot(bat.hostResponse, aes(x=reorder(rn,avgHostResponse), y=avgHostResponse, fill="Pearsons R")) +
+  geom_bar(stat='Identity') +
+  coord_flip() +
+  xlab('Module') +
+  ylab('Pearsons R') +
+  ggtitle('RFe Module vs Avg Host Response') +
+  scale_y_continuous(expand = expansion(mult = c(0.01, 0.01)),) +
+  scale_fill_manual(values=c("Pearsons R"='firebrick')) + 
+  guides(fill=FALSE) +
+  theme_bw()
+g 
+BackupAsPDF(g, 'bat.AHR.module.cor.barchart')
+
+# lets test tbis... these scores dont look right..
+comp.act <- homolog.dt[species == 'bat' & ID =='complement activation',]
+
+# complement activation
+
+
+```
+
+
+Not sure if this is the way to proceed... I think we need to process the bat distinctly, modularize and then look at response vs avg. These are not real clusters, we assume they belong 
+I think if we use the same homolog set, but then use the bat STRING as backbone maybe this might be interesting (first ask how many of these are DE in bat)
+
+```{r}
+rownames(modules.mat)
+de.dt[species != 'human',]
+
+de.dt[,.(numerator, module, ID, moduleResponse)] %>%  unique()
+
+modResponse.wide <- dcast(de.dt[species == 'human'], numerator~ID, value.var = c('moduleResponse'), fun.aggregate = mean) %>% 
+  as.matrix(rownames='numerator')
+
+modResponse.wide <- cbind(modResponse.wide, apply(modResponse.wide, 1, mean))
+colnames(modResponse.wide)[28] <- 'Avg Host Response'
+
+
+modResponse.wide %>% dim()
+
+
+cor(x=modules.mat[,3], modules.mat)
+```
+
+
+Correlate AHR or the different modules with viral load in each group
+
+My host response calculations here are off
+
+```{r}
+# read in the dataframe with viral load
+
+de.dt[,unique(avgHostResponse)]
+```
+
+
+Correlate each of the modules with the AHR, look at what is different
+Then look at the virus, perform correlations of the average host resposne and see what is different
+
+
+
+Looking at the plot above, does it just look the virus is a couple of generations ahead? like double Mut at 12h looks like the rest at 24h?
+
+
+Lets look at average host response in both species  and then identify functional modules from the DEGs that are significantly different
+First pull out all the human DE and build a string network
+```{r}
+library(STRINGdb)
+
+source('~/Documents/utils/mg_utils/r_utils/STRING_db_utils_MGupdate.R')
+z
+
+# get the human and bat STRINGDB set
+hs.string <- STRINGdb$new(version='12', species=9606,
+                          score_threshold=600, network_type="full", protocol="https", input_directory='~/Downloads')
+
+
+hs.nodes <- hs.string$map(de.dt[species == 'human' & abs(log2FoldChange) >= 1 & pvalue < 0.001 & HS_gene %in% shared.genes,], 'HS_gene', removeUnmappedRows = T)
+hs.nodes <- data.table(hs.nodes)
+
+
+View(translateString2Gene)
+```
+
+Use the string cutoffs to extract a PPI and estimate a network distance 
+```{r}
+# more interactions than expected... lets just pull out the interesting set
+hs.string$plot_network(hs.nodes$STRING_id)
+
+# get edge table
+hs.edge <- data.table(hs.string$get_interactions(hs.nodes$STRING_id))
+
+hs.edge <- merge(x=hs.edge, y=unique(hs.nodes[,.(HS_gene, STRING_id)]), by.x='from', by.y='STRING_id', all.x=T)
+hs.edge[, from_gene := HS_gene]
+hs.edge <- merge(x=hs.edge[, -c('HS_gene')], y=unique(hs.nodes[,.(HS_gene, STRING_id)]), by.x='to', by.y='STRING_id', all.x=T)
+hs.edge[, to_gene := HS_gene]
+hs.edge <- hs.edge[, -c('HS_gene')]
+
+connected.nodes <- c(hs.edge$from_gene, hs.edge$to_gene) %>%  
+  unique()
+
+fwrite(hs.edge[,.(from_gene, to_gene, combined_score)], col.names = F, ScriptAndDatedFileName('hs.sighomolog.interactions.tsv'))
+```
+
+I think now we want to 
+```{r}
+View(string)
+
+View(GetStringSubNetwork)
+```
+

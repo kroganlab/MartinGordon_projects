@@ -1,0 +1,491 @@
+---
+title: "060925_PPIenrichment"
+author: "Martin Gordon"
+date: "2025-06-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Have a list of coeluting PPI from the SEC-MS experiments. Need to get a handle on how info-rich this data is. 
+Two things to do first i) Check if the set is enrihced for AP-MS PPI and ii) check if the list is enriched for higher AF3/RosettaFold scoring 
+
+Look at differential vs Mock; is there enrichment for the Prey genes in the PPI set
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+library(eulerr)
+library(pROC)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# flag consec proteins
+source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+```
+
+First to look for enrichment of RosettaFold 
+
+```{r}
+#dca.scores  <- fread('./data/DCA_scores.zip') Dont read DCA scores tet
+af.scores <- fread('./data/AF_scores.zip')
+rf2.scores <- fread('./data/RF2-PPI_scores.zip')
+
+
+#46 million PPI
+dim(rf2.scores)
+
+# 3 million PPI
+dim(af.scores)
+
+
+af.scores[, ppi_uniprot_ordered := {
+  strsplit(V1, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+rf2.scores[, ppi_uniprot_ordered := {
+  strsplit(V1, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+
+fwrite(af.scores, ScriptAndDatedFileName('af.scores.csv.gz'))
+fwrite(rf2.scores, ScriptAndDatedFileName('rf2.ppi.scores.csv.gz'))
+
+rm(af.scores)
+rm(rf2.scores)
+
+af.scores <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060925_PPIenrichment_data/2025_06_09_af.scores.csv.gz')
+rf.scores <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060925_PPIenrichment_data/2025_06_09_rf2.ppi.scores.csv.gz')
+```
+Cosine and peak similarity scores
+```{r}
+allScores <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_05_pox.combinedCosinePeakSimilarity.scores.csv.gz')
+```
+A good RF2/AF score is >5; how do the cosine similarity scores compare between the two?
+Scores dont look great, but just so much noise is the issue...
+
+```{r}
+allScores[af.scores, af.scores := i.V2, on=.(ppi_uniprot_ordered)]
+allScores[rf.scores, rf.ppi.scores := i.V2, on=.(ppi_uniprot_ordered)]
+
+allScores[, AF_pair := 'no']
+allScores[af.scores >= 0.5, AF_pair := 'yes']
+allScores[bestLLRatio > 3]
+
+
+allScores[, RFppi_pair := 'no']
+allScores[rf.ppi.scores >= 0.5, RFppi_pair := 'yes']
+allScores[bestLLRatio > 3]
+
+
+ggplot(allScores, aes(x=peakLLRatio, fill=AF_pair)) +
+  geom_density() +
+  facet_wrap(~AF_pair) +
+  theme_bw()
+```
+
+plot the ecdf of the two distributions and maybe a statistical test to see if they are different
+This is the combined coSine and peakLLR... seperation v poor
+```{r}
+g <- ggplot(allScores, aes(x=peakLLRatio, color=AF_pair)) +
+  stat_ecdf(geom='line') +
+  labs(title='ECDFs of peak coelution scores', subtitle='AF iPTM >= .5') +
+  theme_bw()
+
+BackupAsPDF(g, 'peakCor.AF.iPTM.ecdf')
+```
+How many are sig in both R2 anf AF2
+
+```{r}
+# much more of the RFppi pass the threshold
+allScores[,.N, by=RFppi_pair]
+allScores[,.N, by=AF_pair]
+```
+
+
+Generate a mosaic plot; are the coelutions enriched for 
+```{r}
+g <- ggplot(allScores[peakLLRatio >= 0,], aes(x=peakLLRatio, color=AF_pair)) +
+  stat_ecdf(geom='line') +
+  labs(title='ECDFs of peak coelution scores', subtitle='AF iPTM >= .5') +
+  theme_bw()
+g
+
+
+g <- ggplot(allScores[peakLLRatio > 0,], aes(x=peakLLRatio, color=AF_pair)) +
+  stat_ecdf(geom='line') +
+  labs(title='ECDFs of peak coelution scores', subtitle='AF iPTM >= .5') +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'peakCor.LLRgreaterZero.AF.iPTM.ecdf')
+```
+Look at the RF scores also and see if we get good seperation
+Not as good as AF, which seems a higher quality set, but its not nothing!
+```{r}
+g <- ggplot(allScores[peakLLRatio>0,], aes(x=peakLLRatio, color=RFppi_pair)) +
+  stat_ecdf(geom='line') +
+  labs(title='ECDFs of peak coelution scores', subtitle='AF iPTM >= .5') +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'peakCor.LLRgreaterZero.RF2.iPTM.ecdf')
+```
+Cosine is not as good a seperator
+```{r}
+g <- ggplot(allScores[cosLLRatio > 0,], aes(x=cosLLRatio, color=RFppi_pair)) +
+  stat_ecdf(geom='line') +
+  labs(title='ECDFs of peak coelution scores', subtitle='AF iPTM >= .5') +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'cosCor.LLRgreaterZero.RF2.iPTM.ecdf')
+```
+
+So there is clearly some seperation between the groups based on peak based similarity
+Huge number o fPPI in the dataset, to evaluate just subset to the string set and see how the scores compare
+
+```{r}
+rm(allScores)
+
+allScores <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_05_pox.combinedCosinePeakSimilarity.scores.csv.gz')
+allScores <- allScores[gs %in% c('interactor', 'decoy')]
+```
+
+merge this with the AF and Rosettafold scores
+```{r}
+allScores <- merge(x=allScores, y=rf.scores[, .(ppi_uniprot_ordered, rf2_ppi=V2)], by='ppi_uniprot_ordered', all.x = T)
+allScores <- merge(x=allScores, y=af.scores[, .(ppi_uniprot_ordered, af2_ppi=V2)], by='ppi_uniprot_ordered', all.x = T)
+```
+
+scatterplot of peak cor scores and best PPI score. color by i) sig in AF, ii) sig in RF-2 and iii) sig in both
+```{r}
+allScores[, AF_pair := 'no']
+allScores[af2_ppi >= 0.5, AF_pair := 'yes']
+allScores[, RFppi_pair := 'no']
+allScores[rf2_ppi >= 0.5, RFppi_pair := 'yes']
+
+allScores[, grp := ifelse(AF_pair == 'yes' & RFppi_pair == 'yes', 'RF2-PPI & AF2 hit',
+                          ifelse(AF_pair == 'yes' & RFppi_pair != 'yes', 'AF2 hit',
+                                 ifelse(AF_pair != 'yes' & RFppi_pair == 'yes', 'RF2-PPI hit',
+                                        'no hit')))]
+
+
+```
+This is problematic.. looks like the scores for decoy seem to be higher!!
+```{r}
+col.pal <- c('gold', 'grey')
+names(col.pal) <- c('interactor', 'decoy')
+
+g <- ggplot(allScores, aes(x=rf2_ppi, fill=gs)) +
+  geom_density(alpha=0.5) +
+  geom_vline(xintercept=0.5) +
+  labs(title='RF2-PPI iPTM scores') +
+  scale_fill_manual(values=col.pal) + 
+  theme_bw() 
+
+BackupAsPDF(g, 'RF2.iptm.distributions.density')
+
+g <- ggplot(allScores, aes(x=af2_ppi, fill=gs)) +
+  geom_density(alpha=0.5) +
+  geom_vline(xintercept=0.5) +
+  labs(title='AF2 iPTM scores') +
+  scale_fill_manual(values=col.pal) + 
+  theme_bw() 
+g
+BackupAsPDF(g, 'AF2.iptm.distributions.density')
+
+
+g <- ggplot(allScores[rf2_ppi > .5], aes(x=rf2_ppi, fill=gs)) +
+  geom_density(alpha=0.5) +
+  geom_vline(xintercept=0.5) +
+  labs(title='AF2 iPTM scores') +
+  scale_fill_manual(values=col.pal) + 
+  theme_bw() 
+g
+```
+Clearly some enrichment here for high scores... if we look at differential hits,are they enrihced in the AP-MS and/or structural prediction scores?
+
+```{r}
+# take the best score and plot that
+allScores[, best_iptm := ifelse(af2_ppi > rf2_ppi, af2_ppi, rf2_ppi)]
+
+ggplot(allScores, aes(x=peakLLRatio)) +
+  geom_density()
+
+
+g <- ggplot(allScores[peakLLRatio >0,], aes(x=af2_ppi, y=peakLLRatio, color=gs)) +
+  geom_point(alpha=0.2) +
+  geom_density2d(color='black') +
+  scale_color_manual(values=col.pal) +
+  theme_bw() +
+  facet_wrap(~gs)
+
+BackupAsPDF(g, 'STRINGgs.LLRvsAF2ppi.dotplot')
+
+
+g <- ggplot(allScores[peakLLRatio >0,], aes(x=rf2_ppi, y=peakLLRatio, color=gs)) +
+  geom_point(alpha=0.2) +
+  geom_density2d(color='black') +
+  scale_color_manual(values=col.pal) +
+  theme_bw() +
+  facet_wrap(~gs)
+g
+BackupAsPDF(g, 'STRINGgs.LLRvsRF2ppi.dotplot')
+```
+gsset iPTM; are they useful to discriminate?
+```{r}
+g <- ggplot(allScores[peakLLRatio>0,], aes(x=af2_ppi, color=gs)) +
+  stat_ecdf(geom='line') +
+  geom_vline(xintercept = 0.5) +
+  scale_color_manual(values=col.pal) +
+  labs(title='ECDFs of peak coelution scores', subtitle='AF iPTM >= .5') +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'afiPTM.LLRgreaterZero.gsString.ecdf')
+```
+Try the same with the RF2 iPTM
+
+```{r}
+g <- ggplot(allScores[peakLLRatio>0,], aes(x=rf2_ppi, color=gs)) +
+  stat_ecdf(geom='line') +
+  geom_vline(xintercept = 0.5) +
+  scale_color_manual(values=col.pal) +
+  labs(title='ECDFs of peak coelution scores', subtitle='RF2-PPI iPTM >= .5') +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'rf2iPTM.LLRgreaterZero.gsString.ecdf')
+```
+Mosaic plot; are the LLRatio > 3 enriched for AF/RF high scoring PPI?
+```{r}
+allScores
+allScores[peakLLRatio >=3, LLRsig := 'yes']
+allScores[peakLLRatio >=3,.N, by=AF_pair]
+
+contTab <- xtabs(~LLRsig + AF_pair, data = allScores)
+
+pdf('/Users/martingordon/Documents/projects/060325_APelin_POX_SECMS/gs.mosaic.afIPTM.mosaic.pdf')
+g <- mosaicplot(contTab,
+           sub = NULL, 
+            main = 'STRING geneset',
+           xlab = 'LLRratio > 3', ylab = 'AF iPTM > 0.5',
+           col=c('grey', 'gold'),
+           border=T)
+g 
+dev.off()
+
+contTab <- xtabs(~LLRsig + RFppi_pair, data = allScores[peakLLRatio > 0])
+
+pdf('/Users/martingordon/Documents/projects/060325_APelin_POX_SECMS/gs.mosaic.rf2ppiIPTM.mosaic.pdf')
+g <- mosaicplot(contTab,
+           sub = NULL, 
+            main = 'STRING geneset',
+           xlab = 'LLRratio > 3', ylab = 'RF2-PPI iPTM > 0.5',
+           col=c('grey', 'gold'),
+           border=T)
+g 
+dev.off()
+
+# incredibly significant for the Genseset
+fisher.test(contTab, alternative = 'greater')
+
+# both sets are hugely significant when we look at STRING HC
+contTab <- xtabs(~LLRsig + AF_pair, data = allScores)
+```
+This looks good! Read in all the scores and repeat and check the significance
+```{r}
+allScores <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_05_pox.combinedCosinePeakSimilarity.scores.csv.gz')
+allScores <- merge(x=allScores, y=rf.scores[, .(ppi_uniprot_ordered, rf2_ppi=V2)], by='ppi_uniprot_ordered', all.x = T)
+allScores <- merge(x=allScores, y=af.scores[, .(ppi_uniprot_ordered, af2_ppi=V2)], by='ppi_uniprot_ordered', all.x = T)
+
+
+allScores[, AF_pair := 'no']
+allScores[af2_ppi >= 0.5, AF_pair := 'yes']
+allScores[, RFppi_pair := 'no']
+allScores[rf2_ppi >= 0.5, RFppi_pair := 'yes']
+```
+
+```{r}
+allScores[, LLRsig := 'no']
+allScores[peakLLRatio >=2, LLRsig := 'yes']
+contTab <- xtabs(~LLRsig + AF_pair, data = allScores)
+
+
+dt <- data.table(contTab)
+dt[, total := sum(N), by=LLRsig]
+dt[, labOffset := 1- N/total]
+dt[, AF_pair := factor(AF_pair, levels=c('yes', 'no'))]
+dt[, LLRsig := factor(LLRsig, levels=c('no', 'yes'))]
+
+g <- ggplot(dt, aes(x=LLRsig, y=N, fill=AF_pair, label=as.character(N))) +
+  geom_bar(stat='identity', position='fill') +
+  geom_col(color='black', position='fill') +
+  labs(x='LLRatio > 2') +
+ # facet_grid(~model, scales = "free_x", space = "free_x") +
+  geom_label(data=dt, aes(y=labOffset),  color='black', fill='white', size=4) +
+  scale_fill_brewer(type='qual', direction=-1, palette=6) +
+  theme_bw() +
+  guides(fill=guide_legend(title='AF iPTM > .5'))
+g
+
+BackupAsPDF(g, 'af2iptm.llr2threshold.mosaic')
+
+allScores[, LLRsig := 'no']
+allScores[peakLLRatio >=3, LLRsig := 'yes']
+
+contTab <- xtabs(~LLRsig + AF_pair, data = allScores)
+
+dt <- data.table(contTab)
+dt[, total := sum(N), by=LLRsig]
+dt[, labOffset := 1- N/total]
+dt[, AF_pair := factor(AF_pair, levels=c('yes', 'no'))]
+dt[, LLRsig := factor(LLRsig, levels=c('no', 'yes'))]
+
+g <- ggplot(dt, aes(x=LLRsig, y=N, fill=AF_pair, label=as.character(N))) +
+  geom_bar(stat='identity', position='fill') +
+  geom_col(color='black', position='fill') +
+  labs(x='LLRatio > 2') +
+ # facet_grid(~model, scales = "free_x", space = "free_x") +
+  geom_label(data=dt, aes(y=labOffset),  color='black', fill='white', size=4) +
+  scale_fill_brewer(type='qual', direction=-1, palette=6) +
+  theme_bw() +
+  guides(fill=guide_legend(title='AF iPTM > .5'))
+g
+BackupAsPDF(g, 'af2iptm.llr2threshold.mosaic')
+
+```
+Look at rosettafold2 scores 
+
+```{r}
+allScores[, LLRsig := 'no']
+allScores[peakLLRatio >=3, LLRsig := 'yes']
+
+contTab <- xtabs(~LLRsig + RFppi_pair, data = allScores)
+
+dt <- data.table(contTab)
+dt[, total := sum(N), by=LLRsig]
+dt[, labOffset := 1- N/total]
+dt[, RFppi_pair := factor(RFppi_pair, levels=c('yes', 'no'))]
+dt[, LLRsig := factor(LLRsig, levels=c('no', 'yes'))]
+
+g <- ggplot(dt, aes(x=LLRsig, y=N, fill=RFppi_pair, label=as.character(N))) +
+  geom_bar(stat='identity', position='fill') +
+  geom_col(color='black', position='fill') +
+  labs(x='LLRatio > 3') +
+ # facet_grid(~model, scales = "free_x", space = "free_x") +
+  geom_label(data=dt, aes(y=labOffset),  color='black', fill='white', size=4) +
+  scale_fill_brewer(type='qual', direction=-1, palette=6) +
+  theme_bw() +
+  guides(fill=guide_legend(title='RF2-PPI iPTM > .5'))
+g
+BackupAsPDF(g, 'rf2iptm.llr3threshold.mosaic')
+
+
+allScores[, LLRsig := 'no']
+allScores[peakLLRatio >=2, LLRsig := 'yes']
+
+contTab <- xtabs(~LLRsig + RFppi_pair, data = allScores)
+
+dt <- data.table(contTab)
+dt[, total := sum(N), by=LLRsig]
+dt[, labOffset := 1- N/total]
+dt[, RFppi_pair := factor(RFppi_pair, levels=c('yes', 'no'))]
+dt[, LLRsig := factor(LLRsig, levels=c('no', 'yes'))]
+
+g <- ggplot(dt, aes(x=LLRsig, y=N, fill=RFppi_pair, label=as.character(N))) +
+  geom_bar(stat='identity', position='fill') +
+  geom_col(color='black', position='fill') +
+  labs(x='LLRatio > 2') +
+ # facet_grid(~model, scales = "free_x", space = "free_x") +
+  geom_label(data=dt, aes(y=labOffset),  color='black', fill='white', size=4) +
+  scale_fill_brewer(type='qual', direction=-1, palette=6) +
+  theme_bw() +
+  guides(fill=guide_legend(title='RF2-PPI iPTM > .5'))
+g
+BackupAsPDF(g, 'rf2iptm.llr2threshold.mosaic')
+```
+Now check the DE results and see if these are eenriched for the AP-MS hits
+
+```{r}
+peakClusters <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_differentialAnalysis_data/2025_06_05_proteinPeaks.anova.pval.anno.csv.gz')
+viral.apms <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_05_viralAPMS.sigHits.anno.csv.gz')
+```
+What is interesting is that our co-elution is clearly enriched for sig hits, but differential expression set is not.... process of my analysis? averaging over batches? Worht considering how we handle these different batches
+
+```{r}
+peakClusters[, inPreySet := 'no']
+peakClusters[protein %in% preyPullDowns, inPreySet:= 'yes']
+
+peakClusters[,.N, by=inPreySet]
+
+peakClusters[, sigSet := 'no']
+peakClusters[treatmentDiff.p < 0.05, sigSet := 'yes']
+
+contTab <- xtabs(~sigSet+inPreySet, data=peakClusters)
+
+dt <- data.table(contTab)
+dt[, total := sum(N), by=inPreySet]
+dt[, labOffset := 1- N/total]
+dt[, sigSet := factor(sigSet, levels=c('yes', 'no'))]
+dt[, inPreySet := factor(inPreySet, levels=c('no', 'yes'))]
+
+
+g <- ggplot(dt, aes(x=inPreySet, y=N, fill=sigSet, label=as.character(N))) +
+  geom_bar(stat='identity', position='fill') +
+  geom_col(color='black', position='fill') +
+  labs(x='') +
+ # facet_grid(~model, scales = "free_x", space = "free_x") +
+  geom_label(data=dt, aes(y=labOffset),  color='black', fill='white', size=4) +
+  scale_fill_brewer(type='qual', direction=-1, palette=6) +
+  theme_bw() +
+  guides(fill=guide_legend(title='gene in HC AP-MS set'))
+g
+BackupAsPDF(g, 'rf2iptm.llr2threshold.mosaic')
+```
+Clearly no enrichment for the AP-MS set in the DE results
+
+```{r}
+sec.long <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_poxSECMS_firstLook_data/2025_06_03_sec.long.normalized.interpolated.filtered.csv.gz')
+sec.long[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+
+
+# summarize the intensity
+sec.long[!is.na(intensity), range(intensity)]
+sec.long[, sumIntensity := log2(sum(intensity, na.rm=T)), by=.(protein,sample)]
+```
+
+divide the set into prey and non-prey proteins; do the intensity values in the two groups look different?
+```{r}
+sec.long[, isPrey := 'no']
+sec.long[protein %in% preyPullDowns, isPrey := 'yes']
+
+ggplot(sec.long, aes(x=sumIntensity, fill=isPrey)) +
+  geom_density(alpha=0.5) +
+  facet_wrap(~sample)
+```
+
+```{r}
+
+```
+

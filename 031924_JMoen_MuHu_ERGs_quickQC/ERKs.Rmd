@@ -1,0 +1,921 @@
+---
+title: "ERGS_metadata_quicklook"
+author: "Martin Gordon"
+date: "2024-03-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## notes 
+Dropped sample "Human.PRKAG2.Propranolol.#367.106" from the analysis
+Features I included in my PCA:
+"Age_Years"         "Weight_KG"         "BSA"               "AVNN"              "SDNN"              "RMSSD"             "pNN50"             "SEM"              
+ [9] "PIP"               "IALS"              "PSS"               "PAS"               "BETA_AR"           "HF_NORM_AR"        "HF_PEAK_AR"        "HF_POWER_AR"      
+[17] "LF_NORM_AR"        "LF_POWER_AR"       "LF_TO_HF_AR"       "TOTAL_POWER_AR"    "VLF_NORM_AR"       "VLF_POWER_AR"      "VLF_TO_LF_AR"      "BETA_WELCH"       
+[25] "HF_NORM_WELCH"     "HF_PEAK_WELCH"     "HF_POWER_WELCH"    "LF_NORM_WELCH"     "LF_PEAK_WELCH"     "LF_POWER_WELCH"    "LF_TO_HF_WELCH"    "TOTAL_POWER_WELCH"
+[33] "VLF_NORM_WELCH"    "VLF_POWER_WELCH"   "VLF_TO_LF_WELCH"   "SD1"               "SD2"               "alpha1"            "alpha2"            "SampEn"           
+[41] "SD1-SD2" 
+
+
+Match levels? Drop samples collected not in one set of the data, or else we need to control for them eg Gender..
+
+Not possible to normalise across all these things... for now, lets look at each species individually, perform linear models to identify which of these variables change in response to treatment
+... maybe we want to look at the drugs separately. What variables are significantly different in response to genotype, per species
+... do we control for drug, look at interaction between drug and genotype
+
+## Quick look at the ERG data
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(GGally)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(broom) # tidymodel outputs
+library(eulerr) # venn diagrams
+
+
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LinearModels.R")
+```
+
+```{r}
+anova.dt <- fread('./data/2-way_ANOVA_results.csv')
+EKGs.dt <- fread('./data/EKGs_Clean.csv')
+```
+inpsect the original data
+250 individuals measured with 50 variables
+```{r}
+dim(EKGs.dt)
+EKGs.dt %>%  str()
+```
+
+First create a an identifier variable
+Just give 1:nrow as no easy way to combine atm
+```{r}
+EKGs.dt$sample %>%  unique()
+```
+
+sample breakdown
+```{r}
+
+g <- ggplot(EKGs.dt[, .N, by=.(Species,Drug,Genotype)], aes(x=interaction(Species, Genotype), y=N, fill=Drug)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  labs(title='Sample breakdown') +
+  theme_classic()
+
+BackupAsPDF(g, 'samplebreakdown.barplot')
+```
+Weirdly one of the rows is identical based on the identifiers below.. looks like repeated measures
+```{r}
+EKGs.dt[, rowID := .I]
+EKGs.dt[, sample := paste0(Species, '.', Genotype, '.', Drug, '.', ID, '.', rowID)]
+```
+
+Create a matrix to run PCA; we want sample names as columns, which will be this new ID value, and to remove rowIDs and other variables
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=8)
+
+cols.noi <- c('ID', 'Genotype', 'Species', 'Height', 'BMI', 'Age_Normalized','Gender', 'Drug','Pacemaker','rowID')
+
+# create an actual copy of the datatable
+EKGs.sub.dt <- copy(EKGs.dt)
+EKGs.sub.dt[, (cols.noi) := NULL]
+```
+
+First, plot the distribution of the variables per species
+Do these overlap? If they are completely different is there a point of comparison? We need to think of a normalization
+Need to plot distributions of the variables per sample, we need to see if the distributions overlap, otherwise we probably need to normalize
+
+```{r}
+tidy.dt <- melt(EKGs.sub.dt, id.vars=c("sample"))
+tidy.dt[, c("Species","Genotype", "Drug") := tstrsplit(sample, "[.]", keep = c(1,2,3)) ]
+
+g <- ggplot(tidy.dt, aes(x=value, fill=interaction(Genotype,Species))) + 
+  geom_histogram() +
+  facet_wrap(~variable, scales='free') +
+  scale_fill_manual(values=col.pal) +
+  theme_bw()
+g
+```
+many variables...lets find strongly correlated variables first
+
+```{r}
+ekg.mat <- melt(EKGs.sub.dt, id.vars=c("sample")) %>% 
+  dcast(., sample~variable, value.var = 'value') %>% 
+  as.matrix(rownames='sample')
+
+# also need to drop these as many missing values 
+cols.noi <- c('Height', 'BMI')
+
+ekg.mat <- ekg.mat[, !colnames(ekg.mat) %in% cols.noi]
+
+dim(ekg.mat)
+ekg.mat[complete.cases(ekg.mat),]  %>%  dim()
+```
+
+```{r}
+hm <- Heatmap(cor(ekg.mat, use='all.obs', method='pearson'), col=colorRamp2(breaks=c(-1, 0, .8), colors = c('blue', 'white', 'red')), 
+                                                                            column_names_gp = gpar(fontsize=6), row_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm,'variables.pearsonCorrelation.heatmaps')
+```
+
+
+```{r}
+scaled.mat <- scale(ekg.mat)
+
+ekg.clean.dt <- melt(data.table(scaled.mat, keep.rownames = T), id.vars = 'rn')
+ekg.clean.dt[,c("Species","Genotype", "Drug") := tstrsplit(rn, "[.]", keep = c(1,2,3)) ]
+
+
+g <- ggplot(ekg.clean.dt, aes(x=variable, y=value, fill=interaction(Species,Genotype), label=rn)) +
+  geom_boxplot() +
+  geom_text_repel(data=ekg.clean.dt[value > 2.5,], aes(label=rn)) +
+  theme_bw() +
+  scale_fill_manual(values=col.pal) +
+  facet_grid(Genotype~Species, scales = 'free_x') +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'variableDistributionScaled.boxplot', dimensions=c(12,12))
+```
+plot distributions of the raw scores
+
+```{r}
+g <- ggplot(ekg.clean.dt, aes(x=interaction(Genotype, Species), y=value, fill=interaction(Genotype, Species), label=rn)) + 
+  geom_violin() +
+  geom_point() +
+  geom_hline(yintercept = 0, alpha=0.4, linetype=2) +
+  geom_text_repel(size=1.5) +
+  facet_wrap(~variable, ncol=4, scales='free_y') +
+  scale_fill_manual(values = col.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'variableDistribution.groupFaceted.violinplot', dimensions = c(14,30))
+```
+
+Lets look at how scaling works for this data; driven by species
+Difference will be clearly driven by species along PC1
+
+```{r}
+#incorrect as scaling at species level will affect the output..
+scale.dt <- scale(ekg.mat, center=T, scale=T) %>% 
+  as.data.table(keep.rownames=T) %>% 
+  melt(., id.vars='rn')
+
+scale.dt[, c("Species","Genotype", "Drug") := tstrsplit(rn, "[.]", keep = c(1,2,3)) ]
+
+ggplot(scale.dt, aes(x=value, fill=(Species))) +
+  geom_histogram() +
+  facet_wrap(~variable, scales='free')
+```
+
+We know Species is the main driver of effect here
+
+```{r}
+
+pcaOut <- prcomp(ekg.mat, center = T, scale. = T)
+colInfo <- data.table(colname = rownames(ekg.mat))
+
+colInfo
+colInfo[,c("Species","Genotype", "Drug") := tstrsplit(colname, "[.]", keep = c(1,2,3)) ]
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+```
+
+plot a scree plot of the PCs
+Beyond the first 4 PCs not a lot of variance explained..
+
+```{r}
+# scree plot of the PCAs
+q <- qplot(1:10,  pcaPercentVar[1:10]) +
+  geom_line() +
+  xlab('Princpal Component 1:10') +
+  scale_x_continuous(breaks=seq(1,10)) +
+  ylab(('% Variance explained')) +
+  ggtitle('PCA scree plot') +
+  theme_bw()
+
+q
+BackupAsPDF(q, 'pca.screeplot.')
+```
+
+```{r}
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = Drug, shape = Drug)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  geom_vline(xintercept=0, linetype=2, alpha=0.4) +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.4) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_manual(values = col.pal) +
+  
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA_PC12")
+```
+Issue with the PCA is signal is dominated by species. We need to subset this to species seperately and run
+
+```{r}
+# create a human and mouse matrix seperately
+hs.mat <- ekg.mat[grepl('Human', rownames(ekg.mat)), ]
+mm.mat <- ekg.mat[!rownames(ekg.mat) %in% rownames(hs.mat),]
+
+mat.list <- list(human = hs.mat, 
+                 mouse = mm.mat)
+
+```
+
+run prcomp indiviudally
+
+```{r}
+lapply(seq_along(mat.list), function(x,n,i){
+  
+  pcaOut <- prcomp(x[[i]], center = T, scale. = T)
+  colInfo <- data.table(colname = rownames(x[[i]]))
+
+
+  colInfo[,c("Genotype", "Drug") := tstrsplit(colname, "[.]", keep = c(2,3)) ]
+
+  #PCA
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  
+  
+  #
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = Genotype, shape = Genotype)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 2) +
+  geom_vline(xintercept=0, linetype=2, alpha=0.4) +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.4) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+  
+},x=mat.list, n=names(mat.list))
+
+```
+Drop the outlier human samples and rerun
+The second one is not as bad.. may yet include
+
+```{r}
+mat.list$human <-  mat.list$human[rownames(mat.list$human) != "Human.PRKAG2.Propranolol.#367.106",]
+# dropping. two...
+mat.list$human <-  mat.list$human[!rownames(mat.list$human) %in% c("Human.PRKAG2.Propranolol.#367.106", "Human.PRKAG2.Atropine.#677.66"),]
+rownames(mat.list$human)
+```
+
+Looked at the other PCs and couldnt seem to recover genotype as a key driver distinguishing the samples
+```{r}
+lapply(seq_along(mat.list), function(x,n,i){
+  
+  pcaOut <- prcomp(x[[i]], center = T, scale. = T)
+  colInfo <- data.table(colname = rownames(x[[i]]))
+
+
+  colInfo[,c("Genotype", "Drug") := tstrsplit(colname, "[.]", keep = c(2,3)) ]
+
+  #PCA
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  
+  
+  #
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = Genotype, shape = Drug)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 2) +
+  geom_vline(xintercept=0, linetype=2, alpha=0.4) +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.4) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+# BackupAsPDF(p, paste0(n[[i]],'.pc1pc2.genotype.pca'))
+  
+},x=mat.list, n=names(mat.list))
+```
+
+More metadata information? combine the sample metadata table with the rownames. Color the variables by other metadata characteristics to see what is driving variance
+
+PC4 some speeration with pacemaker and BMI for human, for mouse on PC4 clear seperation on Age
+
+```{r}
+
+meta.dt <- EKGs.dt[, .(sample, Age_Years, Weight_KG, BMI, Gender, Pacemaker)]
+
+lapply(seq_along(mat.list), function(x,n,i){
+  
+  pcaOut <- prcomp(x[[i]], center = T, scale. = T)
+  colInfo <- data.table(colname = rownames(x[[i]]))
+
+
+  colInfo[,c("Genotype", "Drug") := tstrsplit(colname, "[.]", keep = c(2,3)) ]
+
+  #PCA
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  
+  # add in extra metadata
+  pcaDT <- merge(pcaDT, meta.dt, by.x="rn", by.y="sample", all.x=T)
+  
+    #
+  p <- ggplot (pcaDT, aes(x=PC3, y=PC4,  fill = Age_Years, shape = Drug)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 2) +
+  geom_vline(xintercept=0, linetype=2, alpha=0.4) +
+  geom_hline(yintercept = 0, linetype=2, alpha=0.4) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+ # scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+  
+},x=mat.list, n=names(mat.list))
+```
+What variables have a significantly different response to genotype?
+------
+
+Split the dataset into human and mouse and tidy
+
+```{r}
+hs.ekg.dt <- EKGs.dt[Species == 'Human']
+mm.ekg.dt <- EKGs.dt[Species == 'Mouse']
+
+
+#get all the numeric columns
+num.cols <- colnames(hs.ekg.dt)[unlist(lapply(hs.ekg.dt, is.numeric))]
+cols.oi <- c(num.cols, 'sample')
+hs.ekg.dt <- hs.ekg.dt[, ..cols.oi]
+
+
+num.cols <- colnames(mm.ekg.dt)[unlist(lapply(mm.ekg.dt, is.numeric))]
+cols.oi <- c(num.cols, 'sample')
+mm.ekg.dt <-  mm.ekg.dt[, ..cols.oi]
+
+# remove variables not of interest to use 
+cols.noi <- c('ID','Species','BMI', 'Age_Normalized', 'rowID', 'Height')
+
+mm.ekg.dt <- mm.ekg.dt[, (cols.noi) := NULL]
+hs.ekg.dt <- hs.ekg.dt[, (cols.noi) := NULL]
+
+
+ekg.dts <- list(human = hs.ekg.dt,
+                mouse =mm.ekg.dt)
+
+```
+
+
+```{r}
+lapply(seq_along(ekg.dts), function(x,n,i){
+  
+  dt <- melt(x[[i]], id.vars='sample')
+  dt[, c("Genotype", "Drug") := tstrsplit(sample, "[.]", keep = c(2,3)) ]
+  
+  g <- ggplot(dt, aes(y=value, x=Genotype, fill=Genotype)) +
+    geom_boxplot() +
+    geom_jitter(color='black', alpha=0.4, width=0.3, height=0.1) +
+    labs(title=n[[i]]) +
+    scale_fill_manual(values=col.pal) +
+    facet_wrap(~variable, scales='free_y')  +
+    theme_classic()
+  
+  BackupAsPDF(g, paste0(n[[i]],'variables.boxplot'), dimensions = c(14,18))
+  
+},x=ekg.dts, n=names(ekg.dts))
+
+
+lapply(seq_along(ekg.dts), function(x,n,i){
+  
+  dt <- melt(x[[i]], id.vars='sample')
+  dt[, c("Genotype", "Drug") := tstrsplit(sample, "[.]", keep = c(2,3)) ]
+  
+  g <- ggplot(dt, aes(y=value, x=interaction(Genotype,Drug), fill=interaction(Genotype,Drug))) +
+    geom_boxplot() +
+    geom_jitter(color='black', alpha=0.4, width=0.3, height=0.1) +
+    labs(title=paste0(n[[i]], ' treatment breakdown')) +
+    scale_fill_manual(values=col.pal) +
+    facet_wrap(~variable, scales='free_y')  +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+  
+  BackupAsPDF(g, paste0(n[[i]],'variables.drugbreakdown.boxplot'), dimensions = c(18,18))
+  
+},x=ekg.dts, n=names(ekg.dts))
+
+```
+
+convert some of the variables to log scale and drop BSA variable as covered by Weight
+
+```{r}
+
+ekgs.long$human <- ekgs.long$human[ variable != 'BSA',]
+ekgs.long$mouse<- ekgs.long$mouse[ variable != 'BSA',]
+
+##ekg.dts[[1]][, c("Genotype", "Drug") := NULL]
+ekg.dts[[2]] <- ekg.dts[[2]][, c("ID","Species","Genotype", "Drug","Gender", "Pacemaker") := NULL]
+
+
+# convert the datatable to long format
+ekgs.long <- lapply(ekg.dts, function(x){
+ melt(x, id.vars='sample')
+})
+names(ekgs.long) <- names(ekg.dts)
+
+# create a bkup copy
+ekgs.long.bak <- copy(ekgs.long)
+
+#hu8man
+# remove SEM and SD1-SD2
+# add VLF to FL AR
+
+vars.logtransform <- c( "pNN50","RMSSD", "SDNN", "HF_POWER_AR", "LF_POWER_AR", "TOTAL_POWER_AR", "VLF_POWER_AR", "HF_POWER_WELCH", "LF_POWER_WELCH", "TOTAL_POWER_WELCH", "VLF_POWER_WELCH", "VLF_TO_LF_WELCH", "VLF_TO_LF_AR", "SD1", "SD2") 
+
+ekgs.long$human[variable %in% vars.logtransform, value := log2(value)]
+
+#mosue
+vars.logtransform <- c("Age_Years", "Weight_KG", "pNN50","RMSSD", "SDNN", "PIP", "LF_POWER_AR", "TOTAL_POWER_AR", "LF_POWER_AR", "TOTAL_POWER_AR", "VLF_TO_LF_AR", "LF_PEAK_WELCH", "LF_POWER_WELCH", "VLF_POWER_AR", "LF_TO_HF_WELCH", "LF_POWER_WELCH", "TOTAL_POWER_WELCH", "VLF_POWER_WELCH", "VLF_TO_LF_WELCH") 
+
+ekgs.long$mouse[variable %in% vars.logtransform, value := log2(value)]
+```
+replot 
+
+```{r}
+lapply(seq_along(ekgs.long), function(x,n,i){
+  dt <-  x[[i]]
+  dt[, c("Genotype", "Drug") := tstrsplit(sample, "[.]", keep = c(2,3)) ]
+  
+  print(dt)
+  
+  g <- ggplot(dt, aes(y=value, x=interaction(Genotype,Drug), fill=interaction(Genotype,Drug))) +
+    geom_boxplot() +
+    geom_jitter(color='black', alpha=0.4, width=0.3, height=0.1) +
+    labs(title=paste0(n[[i]], ' treatment breakdown')) +
+    scale_fill_manual(values=col.pal) +
+    facet_wrap(~variable, scales='free_y')  +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+  
+  #BackupAsPDF(g, paste0(n[[i]],'variables.drugbreakdown.logtransformed.boxplot'), dimensions = c(18,18))
+  
+},x=ekgs.long, n=names(ekgs.long))
+
+
+g <- ggplot(ekgs.long$mouse, aes(y=value, x=interaction(Genotype,Drug), fill=interaction(Genotype,Drug))) +
+    geom_boxplot() +
+    geom_jitter(color='black', alpha=0.4, width=0.3, height=0.1) +
+   # labs(title=paste0(n[[i]], ' treatment breakdown')) +
+    scale_fill_manual(values=col.pal) +
+    facet_wrap(~variable, scales='free_y')  +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+
+
+g
+```
+ANOVA models
+-------
+Run modelling
+List of models including terms to control for age, gender etc
+
+```{r}
+# just take entire dts
+hs.ekg.dt <- EKGs.dt[Species == 'Human']
+mm.ekg.dt <- EKGs.dt[Species == 'Mouse']
+
+ekg.dts <- list(human = hs.ekg.dt,
+                mouse =mm.ekg.dt)
+
+# set as factors the things we wish to control for (set control base levels for genotype and treatment)
+#human
+ekg.dts[[1]][, Gender := factor(Gender, levels=c('M','F'))]
+ekg.dts[[1]][, Drug := factor(Drug, levels=c("Basal","Atropine", "Propranolol"))]
+ekg.dts[[1]][, Genotype := factor(Genotype, levels=c("Control","PRKAG2"))]
+
+# mouse
+ekg.dts[[2]][, Drug := factor(Drug, levels=c("Basal","Atropine", "Propranolol", "Double"))]
+ekg.dts[[2]][, Genotype := factor(Genotype, levels=c("Control","PRKAG2"))]
+```
+
+Select the variables we wish to measure 
+```{r}
+# list of variables to look at
+varToMeasure <- c("AVNN","SDNN","RMSSD","pNN50","SEM","PIP","IALS","PSS","PAS","BETA_AR","HF_NORM_AR",
+                  "HF_PEAK_AR","HF_POWER_AR","LF_NORM_AR","LF_POWER_AR","LF_TO_HF_AR","TOTAL_POWER_AR","VLF_NORM_AR","VLF_POWER_AR","VLF_TO_LF_AR","BETA_WELCH",
+                  "HF_NORM_WELCH","HF_PEAK_WELCH","HF_POWER_WELCH","LF_NORM_WELCH","LF_PEAK_WELCH","LF_POWER_WELCH","LF_TO_HF_WELCH","TOTAL_POWER_WELCH","VLF_NORM_WELCH",
+                  "VLF_POWER_WELCH","VLF_TO_LF_WELCH","SD1","SD2","alpha1","alpha2","SampEn","SD1-SD2") 
+
+ekg.dts[[1]][, c("Species", "Genotype", "Drug") := tstrsplit(sample, "[.]", keep = c(1, 2,3)) ]
+ekg.dts[[2]][, c("Species", "Genotype", "Drug") := tstrsplit(sample, "[.]", keep = c(1, 2,3)) ]
+
+#ekg.dts$human <- merge(x=ekg.dts$human, y=meta.dt$human[, .(Gender,sample)], by.x='sample', by.y='sample')
+
+# we only want to model gender for humams, no point controlling for mice if only 1 level and waste a DF
+human.lm.out <- lapply(varToMeasure, function(singleVar) {
+    
+    print(paste0('Running linear model on ', singleVar))
+
+    # define a new formula list
+    formulas = list (full = as.formula(paste(singleVar , "~Gender+Age_Years+Genotype*Drug")),
+                 noInteraction = as.formula(paste(singleVar ,'~Gender+Age_Years+Genotype+Drug')),
+                 basic = as.formula(paste(singleVar ,'~Genotype+Drug'))
+                 )
+
+    # run the linearModels on each response var  
+    lms <- lapply(formulas, function(x){
+      lm(formula = x, data=ekg.dts$human[, !"sample"]) #drop non-numeric variables
+    })
+    
+    # extract co-efficients as data.table
+    coef.table <- lapply (lms, function(lm.out)as.data.table(coefficients(summary(lm.out)), keep.rownames = TRUE)) %>% 
+      rbindlist(., idcol = "model")
+    setnames (coef.table, old = c("rn", "Pr(>|t|)"), new = c("term", "p.value"), skip_absent = TRUE)
+  
+    #f.tests from anova function; visualise pval histograms to assess model performance
+    anova.list <- lapply (lms, function(l)as.data.table(anova(l), keep.rownames=TRUE))
+    anovaTables <- rbindlist(anova.list, idcol = "model")
+    
+    anovaTables[, sigCode := dplyr::case_when(`Pr(>F)`< 0.001 ~ "***",
+                                              `Pr(>F)`< 0.01  ~ "**",
+                                              `Pr(>F)`< 0.05  ~ "*",
+                                              `Pr(>F)`< 0.1  ~ ".",
+                                              TRUE ~ "")]
+    setnames(anovaTables, old = c("rn", "Pr(>F)"), new = c("term", "p.value"), skip_absent = TRUE)
+
+    
+     return(list(anova = anovaTables, 
+                 coef = coef.table))
+})
+
+names(human.lm.out) <-  varToMeasure
+
+hu.anova <- lapply(human.lm.out, "[[", "anova") %>%  rbindlist(idcol=T)
+hu.coeff <- lapply(human.lm.out, "[[", "coef") %>%  rbindlist(idcol=T)
+
+# write out the results of the anova
+fwrite(hu.anova, ScriptAndDatedFileName('human.anova.txt'))
+fwrite(hu.coeff, ScriptAndDatedFileName('human.coefficients.txt'))
+```
+
+```{r}
+mouse.lm.out <- lapply(varToMeasure, function(singleVar) {
+    
+    print(paste0('Running linear model on ', singleVar))
+
+    # define a new formula list
+    formulas = list (full = as.formula(paste(singleVar , "~Age_Years+Weight_KG+Genotype*Drug")),
+                 noInteraction = as.formula(paste(singleVar ,'~Age_Years+Weight_KG+Genotype+Drug')),
+                 basic = as.formula(paste(singleVar ,'~Genotype+Drug'))
+                 )
+
+    # run the linearModels on each response var  
+    lms <- lapply(formulas, function(x){
+      lm(formula = x, data=ekg.dts$mouse[, !"sample"]) #drop non-numeric variables
+    })
+    
+    # extract co-efficients as data.table
+    coef.table <- lapply (lms, function(lm.out)as.data.table(coefficients(summary(lm.out)), keep.rownames = TRUE)) %>% 
+      rbindlist(., idcol = "model")
+    setnames (coef.table, old = c("rn", "Pr(>|t|)"), new = c("term", "p.value"), skip_absent = TRUE)
+  
+    #f.tests from anova function; visualise pval histograms to assess model performance
+    # only compares fit of full model to null model (just intercept)
+    anova.list <- lapply (lms, function(l)as.data.table(anova(l), keep.rownames=TRUE))
+    anovaTables <- rbindlist(anova.list, idcol = "model")
+    
+    anovaTables[, sigCode := dplyr::case_when(`Pr(>F)`< 0.001 ~ "***",
+                                              `Pr(>F)`< 0.01  ~ "**",
+                                              `Pr(>F)`< 0.05  ~ "*",
+                                              `Pr(>F)`< 0.1  ~ ".",
+                                              TRUE ~ "")]
+    
+     setnames(anovaTables, old = c("rn", "Pr(>F)"), new = c("term", "p.value"), skip_absent = TRUE)
+    
+    
+     return(list(anova = anovaTables, 
+                 coef = coef.table))
+})
+
+names(mouse.lm.out) <-  varToMeasure
+
+mm.anova <- lapply(mouse.lm.out, "[[", "anova") %>%  rbindlist(idcol=T)
+mm.coeff <- lapply(mouse.lm.out, "[[", "coef") %>%  rbindlist(idcol=T)
+
+```
+
+# losing about 20% of hits when you don't include Gender in model, how much interaction includes the model is debatable...
+
+```{r}
+g <- ggplot(hu.anova, aes(x=`Pr(>F)`, fill=model)) +
+  geom_histogram(boundary=0.0) +
+  facet_wrap(~model) +
+  scale_fill_manual(values=col.pal)
+
+BackupAsPDF(g, 'human.pvalhistogram.anovaModelComparison')
+
+g <- ggplot(mm.anova, aes(x=p.value, fill=model)) +
+  geom_histogram(boundary=0.0) +
+  facet_wrap(~model) +
+  scale_fill_manual(values=col.pal)
+g
+BackupAsPDF(g, 'mouse.pvalhistogram.anovaModelComparison')
+```
+Write out the tables used to produce the ANOVA
+
+```{r}
+lapply(seq_along(ekg.dts), function(x,n,i){
+  
+  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], '.anova.input.tsv')))
+},x=ekg.dts, n=names(ekg.dts))
+```
+First place to assess? Lets just pull out the list of terms that are significant to genotype in both human and mouse data
+Which of these terms are significant (after correction) in mouse but not in human and vice versa
+
+```{r}
+# list of the anova results
+anova.list <- list(human = hu.anova,
+                   mouse = mm.anova)
+
+lapply(anova.list, function(x){
+  # correct at level of each model
+  x[, p.adj := p.adjust(p.value, method='BH'), by=.(model,term)]
+})
+```
+For genotype alone, identify how many variables this is significant for in both datasets
+
+Lets just look at raw pvalue alone for now
+
+```{r}
+lapply(anova.list, function(x){
+  # correct at level of each model
+  x[term == 'Genotype' & p.value < 0.05, unique(.id), by=model]
+})
+
+```
+
+
+A couple of terms for genotype weakly significant for mouse, but much stronger evidence for human
+Just use a simple model for mouse and drop the other terms?
+
+```{r}
+sig.genotype <- lapply(anova.list, function(x){
+  # correct at level of each model
+  x[term == 'Genotype' & p.value < 0.05, unique(.id)]
+})
+
+names(sig.genotype) <- names(anova.list)
+
+p <- plot(euler(sig.genotype),
+    quantities = TRUE,
+    main = 'Sig (p.val < 0.05) Genotype hits',
+    fills = list(fill = c("red", "steelblue4"), alpha = 0.5)
+     )
+
+BackupAsPDF(p, 'genotype.pval.sig.eulerplot')
+
+```
+What about looking at drugs? How many of these terms respond differently to rtreatment?
+
+```{r}
+sig.drug <- lapply(anova.list, function(x){
+  # correct at level of each model
+  x[term == 'Drug' & p.value < 0.05, unique(.id)]
+})
+
+names(sig.drug) <- names(anova.list)
+
+p <- plot(euler(sig.drug),
+    quantities = TRUE,
+    main = 'Sig (p.val < 0.05) Treatment hits'#,
+    #fills = list(fill = c("", "steelblue4"), alpha = 0.5)
+     )
+p
+BackupAsPDF(p, 'treatment.pval.sig.eulerplot')
+```
+Interaction of drug and genotype
+
+```{r}
+sig.interactions <- lapply(anova.list, function(x){
+  # correct at level of each model
+  x[term == 'Genotype:Drug' & p.value < 0.05, unique(.id)]
+})
+
+names(sig.interactions) <- names(anova.list)
+
+p <- plot(euler(sig.interactions),
+    quantities = TRUE,
+    main = 'Sig (p.val < 0.05) Genotype Treatment Interactions',
+    fills = list(fill = c("#ffcf20FF", "#2f9aa0FF"), alpha = 0.5)
+     )
+p
+BackupAsPDF(p, 'treatment.genotype.pval.sig.eulerplot')
+```
+Interesting set of results from the analysis. Looks like a lot of things 
+
+
+Also just produce a simple interaction plot to illustrate to Jack what the interaction highlights
+
+
+test an anova for this
+basic model performs best for mouse, at least for this variable
+
+```{r}
+
+lm1 <- lm(AVNN~Weight_KG+Genotype+Drug, data=ekg.dts$mouse)
+lm2 <- lm(AVNN~WGenotype+Drug, data=ekg.dts$mouse)
+
+anova(lm1, lm2)
+# need to model drug and genotype
+# again, interaction doesnt help
+
+# tests with human
+# only thing not worth including for this is the interaction term..
+
+lm1 <- lm(AVNN~Gender+Age_Years+Weight_KG+Genotype*Drug, data=ekg.dts$human)
+lm2 <- lm(AVNN~Gender+Age_Years+Genotype*Drug, data=ekg.dts$human)
+
+anova(lm1, lm2)
+```
+
+
+
+03-22-24
+----
+I think we need to take a simplified approach. Look for things significantly different given genotype, per drug type within each species
+
+```{r}
+
+em.contrastOfContrasts <- function (l, factorFormula = ~status|timepoint){  # how does the drug effect change per tissue
+  emm <- emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+formulas = list (full = LogIntensities~timepoint*status)
+
+
+## testing 
+lm.out <- linearModelsAllProteins(ekg.dts$mouse, 
+                                  formulaList = formulas, 
+                                  splitColumn = "Protein", postProcessFunction = em.interactionContrast, cl = 6) |> suppressWarnings()
+
+
+
+mouse.lm.out.bp <- lapply(varToMeasure, function(singleVar) {
+    
+    print(paste0('Running linear model on ', singleVar))
+
+    # define a new formula list
+    formulas = list (full = as.formula(paste(singleVar , "~Age_Years+Genotype")),
+                 basic = as.formula(paste(singleVar ,'~Genotype'))
+                 )
+    
+    lm.out <- linearModelsAllProteins(ekg.dts$mouse, 
+                                  formulaList = as.formula(paste(singleVar , "~Age_Years+Genotype")), 
+                                  splitColumn = "Species") 
+})
+
+mouse.lm.out.bp
+
+mouse.lm.out.bp
+
+
+ekg.dts$mouse
+
+
+split (ekg.dts$mouse, ekg.dts$mouse[['Drug']])
+```
+
+
+
+
+Find the human terms significant for an interaction
+
+```{r}
+hu.anova[rn == 'Genotype:Drug', .N, .(.id, model)]
+
+hu.sig <- hu.anova[rn == 'Genotype' & `Pr(>F)` < 0.05, .N, .(.id)]$.id
+hu.anova[rn == 'Genotype:Drug' & `Pr(>F)` < 0.05,]
+
+hu.coeff
+hu.coeff[rn == 'Genotype:Drug' & `Pr(>F)` < 0.05,]
+# 
+
+
+hist(hu.anova$`Pr(>F)`)
+
+
+g <- ggplot(hu.anova, aes(x=`Pr(>F)`)) +
+  geom_histogram() +
+  facet_wrap(~model)
+
+BackupAsPDF(g, 'human.anova.histogram')
+```
+
+
+
+
+```{r}
+
+
+
+
+ekg.dts$human$Gender
+lm.out
+  
+ekgs.long
+
+
+## testing 
+lm.out <- linearModelsAllProteins(p.quant, 
+                                  formulaList = formulas, 
+                                  splitColumn = "Protein", postProcessFunction = em.interactionContrast, cl = 6) |> suppressWarnings()
+
+varToMeasure <- c("Weight_KG","BSA","AVNN","SDNN","RMSSD","pNN50","SEM","PIP","IALS","PSS","PAS","BETA_AR","HF_NORM_AR",
+                  "HF_PEAK_AR","HF_POWER_AR","LF_NORM_AR","LF_POWER_AR","LF_TO_HF_AR","TOTAL_POWER_AR","VLF_NORM_AR","VLF_POWER_AR","VLF_TO_LF_AR","BETA_WELCH",
+                  "HF_NORM_WELCH","HF_PEAK_WELCH","HF_POWER_WELCH","LF_NORM_WELCH","LF_PEAK_WELCH","LF_POWER_WELCH","LF_TO_HF_WELCH","TOTAL_POWER_WELCH","VLF_NORM_WELCH",
+                  "VLF_POWER_WELCH","VLF_TO_LF_WELCH","SD1","SD2","alpha1","alpha2","SampEn","SD1-SD2" ,"sample")  
+
+
+View(linearModelsAllProteins)
+```
+
+
+I think lets try the 
+
+
+I think best thing to do is process seperately
+For now lets look individually and find things that response differently to Genotype
+
+We also need to control for variables in our analysis also... need to control for Sex, Age etc (uninteresting..)
+
+```{r}
+
+```
+
+Compare the models with an F-test to see if adding these co-variates explains significantly more variance
+
+```{r}
+
+```
+
+
+Q. how do we handle these unmatched levels?
+
+Lets show the 
+
+Run Jacks anova first and extract the hits with significant p-value
+Maybe first normalise the prots of interest 
+
+```{r}
+lapply((mat.list), function(x,n,i){
+  colnames(x)})
+```
+
+
+
+Thinks to look at:
+i) multicolinearilty; need to simplify number of variables, can we find ones that strongly correlate with each other?
+ii) principal component regression:
+

@@ -1,0 +1,732 @@
+---
+title: "230623_QLi_DARPA"
+author: "Martin Gordon"
+date: "2023-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Summary
+Perform Differential Expression Analysis of MS-MS Spectronaut data using MSstats
+Data from DARPA project: Single timepoint with 6 conditions in total: 3 ligands vs NPFFR1, treated vs untreated with 30 min exposure to NPFF
+Perform pairwise contrasts for each of the conditions
+
+###: Contact: Qiongyu Li
+###: Date: 23-06-23
+
+```{r packages}
+library(purrr)
+library(tidyr)
+library(stringr)
+library(dplyr)
+library(data.table)
+library(MSstats)
+library(ggplot2)
+library(magrittr)
+library(circlize)
+library(ComplexHeatmap)
+library(parallelDist) #needed for some custom enrichment functions
+library(ggvenn)
+
+#source Bens utility scripts
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+Read in spectronaut data & metadata
+----
+```{r read-in}
+
+input <- fread('./data/20230619_090015_DAR32_dirDIA_EXc_15cm_MSStatsFormatReport.tsv')
+meta <- fread('./data/DAR32_dirDIA_EXc_15cm_ConditionSetup.tsv')
+```
+
+
+
+```{r data-inspection}
+input[,BioReplicate := as.factor(BioReplicate)]
+input[,Run := as.factor(Run)]
+input[,Condition := as.factor(Condition)]
+```
+
+Data inspection
+---------
+
+```{r data structure}
+# order by Condition
+setorder(input, Condition)
+
+# One run per condition per replicate
+input[, .N, by= .(Run,Condition, BioReplicate)]
+```
+Bioreplicate numbers (1-3) are repeated across conditions. Modified as msstats assumes repeated bioreplicate are processed as timeseries data
+Asigned each cond/biorep combo a unique ID (1-20) for msstats to model as a case-control experiment.
+
+```{r}
+# create new ID col for pairwise comparisons
+input[, ID:=.GRP, by=.(Condition,BioReplicate)]
+
+
+#reassign to biorep col and drop ID
+input[, BioReplicate:=ID]
+input[, ID:=NULL]
+
+#sanity check
+input[, .N, by = .(Condition,BioReplicate)]
+```
+
+Removed spectronaut peptides with intensities < 2^5 as likely artifacts of the identification/quantification tool.
+There is a lot of low intensity junk; might be worth notifying Qiongyu
+Looks like a bimodal distribution; what is that on left hand shoulder? Present in all groups
+
+Imputation turned on?
+
+```{r}
+ggplot(data=input,  mapping=aes(x=log2(Intensity))) +
+  geom_histogram(binwidth = 0.1) + 
+  facet_wrap(~Condition)
+
+input <- input[log2(Intensity) > 5] #filter out low abundance 
+
+ggplot(data=input,  mapping=aes(x=log2(Intensity))) +
+  geom_histogram(binwidth = 0.1) +
+  facet_wrap(~Condition)
+
+
+print(input)
+```
+Scatterplots of the intensities and compare samples
+```{r}
+input.wide <- dcast(input, ProteinName+PeptideSequence+PrecursorCharge~Condition+BioReplicate, value.var = 'Intensity')
+
+ggplot(input.wide, aes(x=log2(AT15_NP00_7), y=log2(AT15_NP00_9), color=c('blue'))) + 
+  geom_point()
+
+```
+Identify if there any multiple-feature peptide ions in the runs. We expect one peptide feature per row per run, so identify duplicates.
+No multi-feature peptides detected
+
+```{r}
+any(input[, .N, by = .(Run, PeptideSequence, PrecursorCharge)]$N) > 1
+```
+Plot of number of peptide ion measurements per run. Counts seem pretty consistent across replicates & conditions
+
+```{r}
+### plot of peptide ions per run
+p <- input %>%  
+      ggplot(mapping=aes(x=reorder(interaction(Condition,BioReplicate)), fill=Condition)) +
+      geom_bar() + 
+      theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+BackupAsPDF(p, "BarPlot_NPeptides_")
+```
+Boxplots of distributions of raw intensity values per condition/replicate. Again abundances are pretty consistent and no real concerns with raw data quality. 
+```{r create contrasts}
+p <- ggplot(data = input, mapping=aes(x=reorder(interaction(Condition, BioReplicate)), y=log2(Intensity), fill=Condition)) +
+      geom_boxplot() +
+      theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+BackupAsPDF(p, "BoxPlot_RawIntensities_")
+
+```
+
+
+Data Processing
+----
+Convert spectronaut data to msstats format
+```{r msstats-formatting}
+ab.mss <- specFileToCompleteMSstats(input)
+ab.mss[, IsotopeLabelType := 'L'] #label free
+setDF(ab.mss)  # convert to DF for msstats processing
+
+```
+MSStats DataProcess: Normalise (equilizemedians), filter & summarize peptides to protein intensities
+
+```{r mss-dataproc}
+
+dp.out <- MSstats::dataProcess(ab.mss,
+                               normalization = 'equalizeMedians',
+                               summaryMethod="TMP",
+                               featureSubset = "highQuality",
+                               remove_uninformative_feature_outlier = TRUE,
+                               MBimpute = FALSE )
+```
+Write out protein level data to file (provide feature level data also)
+```{r writeout-data}
+# the main data of interest is this one:
+fwrite(dp.out$ProteinLevelData, ScriptAndDatedFileName("ProteinLevelData.csv.gz"))
+
+#this table is mostly a copy of the input with some additional columns for hte post-normalization intensity (labeled ABUNDANCE), and columns for is_outlier and is_informative
+fwrite(dp.out$FeatureLevelData, ScriptAndDatedFileName("FeatureLevelData.csv.gz"))
+```
+```{r}
+prot.quant <- setDT(dp.out$ProteinLevelData)
+
+p <- prot.quant %>% 
+      ggplot(mapping=aes(x=interaction(GROUP,SUBJECT), y=LogIntensities, fill=GROUP)) +
+      geom_boxplot() +
+      theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+p
+BackupAsPDF(p, "BoxPlot_NormalizedProteinIntensities_")
+```
+
+Possibly might need another round of normalisation. Run some EDA before deciding
+
+Looking at log2 intensities can't see a lot of smaple clustering
+
+```{r}
+
+  rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+
+
+
+intensity.mat <- as.matrix(dcast(prot.quant, Protein ~GROUP+SUBJECT, value.var = "LogIntensities"),
+                           rownames = "Protein")
+  
+subMat <- intensity.mat[sample.int(nrow(intensity.mat), 2000),]
+
+
+colnames(subMat)
+unique(sub("_[0-9]{1,2}$", "", colnames(subMat)))
+#create heatmap annotation col
+type <-sub("_[0-9]{1,2}$", "", colnames(subMat))
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('AT00_NP00'='red', 'AT00_NP30' = 'blue', 'AT15_NP00'='green', 'AT15_NP30'='orange', 'AT22_NP00'='cyan', 'AT22_NP30'='purple', 'AT56_NP00'='yellow',  "AT56_NP30"='pink')))
+
+  #generate heatmap
+  hm <- Heatmap(subMat,
+        #clustering_distance_rows = function(m) dist(m, method = 'euclidean'),
+        #clustering_method_rows= "complete",
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(subMat)),
+        na_col = 'grey',
+       # column_title = paste0(' heatmap'),
+        name = "Log2 Int.")
+  hm
+  BackupAsPDF(hm,"heatmap_subsample_log2Intensities_")
+
+```
+Subtract median intensies per run and re-plot
+
+```{r}
+intensity.mat <- sweep(intensity.mat, 1, apply(intensity.mat, 1, median, na.rm=T)) 
+
+  
+subMat <- intensity.mat[sample.int(nrow(intensity.mat), 2000),]
+
+#generate heatmap
+hm <- Heatmap(subMat,
+        #clustering_distance_rows = function(m) dist(m, method = 'euclidean'),
+        #clustering_method_rows= "complete",
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(subMat)),
+        na_col = 'grey',
+       # column_title = paste0( heatmap'),
+        name = "Log2 Int.")
+
+
+BackupAsPDF(hm, "heatmap_subsample_log2Intensities_scaled_")
+
+```
+
+Apply second round of normalisation using TMP and rerun the plots
+
+```{r}
+prot.quant[, group_subject := paste(GROUP, SUBJECT, sep = "_")]
+
+
+ #generate matrix
+prot.mat <- dcast(prot.quant, Protein~GROUP + SUBJECT, value.var = "LogIntensities") %>%  #long to wide format dt
+  as.matrix (rownames = "Protein")
+  
+#perform tmp normalisation
+tmp <- medpolish(prot.mat, na.rm = TRUE) #iteratively subtract row and col median values 
+tmp.dt <- data.table(offset = tmp$col, group_subject = names(tmp$col))
+
+prot.quant[tmp.dt, normalize.offset := i.offset, on = "group_subject"]
+prot.quant[, LogIntensities := LogIntensities - normalize.offset]
+
+
+```
+
+Looks better after second round of normalisation. Write this data to file
+
+```{r}
+p <- ggplot(prot.quant, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill = GROUP)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90)) 
+
+p
+BackupAsPDF(p, "BoxPlot_TMP_NormalizedProteinIntensities_")
+```
+Write out protein level data to file (provide feature level data also)
+```{r writeout-data}
+# the main data of interest is this one:
+fwrite(prot.quant, ScriptAndDatedFileName("TMPnorm_ProteinLevelData.csv.gz"))
+```
+
+Lets regenerate the clustering and plot PCAs
+
+Seems to be some clustering by NP00 and NP30 group, more visible than agonist clustering anyway
+
+```{r}
+intensity.mat <- as.matrix(dcast(prot.quant, Protein ~GROUP+SUBJECT, value.var = "LogIntensities"),
+                           rownames = "Protein")
+  
+subMat <- intensity.mat[sample.int(nrow(intensity.mat), 2000),]
+
+
+unique(sub("_[0-9]{1,2}$", "", colnames(subMat)))
+#create heatmap annotation col
+type <-sub("_[0-9]{1,2}$", "", colnames(subMat))
+
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('AT00_NP00'='red', 'AT00_NP30' = 'pink', 'AT15_NP00'='green', 'AT15_NP30'='purple', 'AT22_NP00'='cyan', 'AT22_NP30'='blue', 'AT56_NP00'='yellow',  "AT56_NP30"='orange')))
+
+  #generate heatmap
+  hm <- Heatmap(subMat,
+        #clustering_distance_rows = function(m) dist(m, method = 'euclidean'),
+        #clustering_method_rows= "complete",
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(subMat)),
+        na_col = 'grey',
+       # column_title = paste0(' heatmap'),
+        name = "Log2 Int.")
+  hm
+ BackupAsPDF(hm,"tmpnorm_heatmap_subsample_")
+```
+
+Scaled heatmap
+
+```{r}
+intensity.mat <- sweep(intensity.mat, 1, apply(intensity.mat, 1, median, na.rm=T)) 
+
+  
+subMat <- intensity.mat[sample.int(nrow(intensity.mat), 2000),]
+
+#generate heatmap
+hm <- Heatmap(subMat,
+        #clustering_distance_rows = function(m) dist(m, method = 'euclidean'),
+        #clustering_method_rows= "complete",
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(subMat)),
+        na_col = 'grey',
+       # column_title = paste0( heatmap'),
+        name = "Log2 Int.")
+
+
+BackupAsPDF(hm, "tmpnorm_heatmap_subsample_scaled_")
+
+```
+PCA plot
+-----
+Based on the sample clustering and the above heatmaps, I think its best to drop the following 4 samples: AT15_NP00_9, AT00_NP30_4, AT56_NP30_24, AT15_NP30_12
+However we only have 3 replicates per condition so just proceed as is 
+```{r pca}
+intensity.mat <- as.matrix(dcast(prot.quant, Protein ~GROUP+SUBJECT, value.var = "LogIntensities"),
+                           rownames = "Protein")
+
+complete.mat <- intensity.mat[complete.cases(intensity.mat),]
+
+pcaOut <- prcomp(t(complete.mat))
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+#pcaDT[, mainGroup := tstrsplit(rn, "_")[[1]]] #transpose & split
+pcaDT[, mainGroup := sub("_[0-9]{1,2}$", "", rn)]
+
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color = mainGroup )) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA using %d proteins (log intensity)", nrow(complete.mat))) 
+p
+
+BackupAsPDF(p, "PCA_Complete_Proteins")
+```
+With the 4 samples dropped we can see clearer clustering of NP00 and NP30 groups along the x axis
+```{r}
+out.samples <- c('AT15_NP00_9', 'AT00_NP30_4', 'AT56_NP30_24', 'AT15_NP30_12')
+complete.mat <- intensity.mat[complete.cases(intensity.mat), !colnames(intensity.mat) %in% out.samples ]
+
+pcaOut <- prcomp(t(complete.mat))
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+#pcaDT[, mainGroup := tstrsplit(rn, "_")[[1]]] #transpose & split
+pcaDT[, mainGroup := sub("_[0-9]{1,2}$", "", rn)]
+
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color = mainGroup )) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA using %d proteins (log intensity)", nrow(complete.mat))) 
+p
+
+BackupAsPDF(p, "PCA_RmOutliers_Proteins")
+```
+Drop outliers
+------
+Drop the outlier samples and visualise
+
+```{r}
+prot.quant <- prot.quant[!group_subject %in% out.samples,]
+fwrite(prot.quant,ScriptAndDatedFileName("ProteinLevelData_rmoutliers.csv.gz"))
+```
+
+
+
+Differential Expression Analysis
+------
+
+Perform DEA with provided contrasts
+Generate a contrast matrix for requested pairwise comparisons of all groups:
+
+```{r make contrasts}
+
+#all pairwise; need to customise
+all.dp.contrasts <- MSstatsContrastMatrix("pairwise", unique(dp.out$ProteinLevelData$GROUP))
+all.dp.contrasts
+#np0 agonists
+#all.dp.contrasts[c(1,15,17,24),]
+#NP30 vs NP30
+#all.dp.contrasts[c(20,22,27),]
+
+dp.contrasts <- all.dp.contrasts[c(1,2,4,6,14,15,17,24,20,22,23,27,28),]
+dp.contrasts <- rbind(dp.contrasts, c(-1, 1,0,0,0,0,0,0))
+rownames(dp.contrasts)[14] <- 'AT00_NP30 vs AT00_NP00'
+dp.contrasts <- rbind(dp.contrasts, c(0, 0,0,0,0,0,-1,1))
+rownames(dp.contrasts)[15] <- 'AT56_NP30 vs AT56_NP00'
+dp.contrasts <- rbind(dp.contrasts, c(0, 0,0,0,-1,1,0,0))
+rownames(dp.contrasts)[16] <- 'AT22_NP30 vs AT22_NP00'
+dp.contrasts <- rbind(dp.contrasts, c(0, 0,-1,1,0,0,0,0))
+rownames(dp.contrasts)[17] <- 'AT15_NP30 vs AT15_NP00'
+
+dp.contrasts <- dp.contrasts[c(2,3,4,6,7,8,9,10,12,14,15,16,17),]
+
+dp.contrasts <- rbind(dp.contrasts, c(0, -1,0,1,0,0,0,0))
+rownames(dp.contrasts)[14] <- 'AT15_NP30 vs AT00_NP30'
+dp.contrasts <- rbind(dp.contrasts, c(0, -1,0,0,0,1,0,0))
+rownames(dp.contrasts)[15] <- 'AT22_NP30 vs AT00_NP30'
+dp.contrasts <- rbind(dp.contrasts, c(0, -1,0,0,0,0,0,1))
+rownames(dp.contrasts)[16] <- 'AT56_NP30 vs AT00_NP30'
+
+dp.contrasts
+```
+
+```{r mss-pairwise}
+
+# use the tpm normlaised data
+dp.out$ProteinLevelData <- prot.quant
+
+test.mss <- groupComparison(contrast.matrix=dp.contrasts, data=dp.out)
+test.mss.all <- setDT(test.mss$ComparisonResult)
+
+# adjust p values using the Benjamini Hochberg method, which estimates False Discovery Rate
+test.mss.all[, fdr := p.adjust(pvalue, method = "BH")] 
+#get gene names
+test.mss.all[, gene := multiUniprots2multiGenes(as.character(Protein), simplify = TRUE, allowDups = FALSE)]
+
+
+fwrite(test.mss.all, ScriptAndDatedFileName("msstats_groupcomparisons_rmoutliers.csv.gz"))
+```
+
+Generate Volcano plots for each of the pairwise comparisons
+
+```{r multi-volcanoplot}
+## volcano plots
+
+# define significant proteins
+test.mss.all[, sig := "Not"]
+test.mss.all[fdr < 0.05 & abs(log2FC) > log2(1.5),sig := ifelse (log2FC  > 0, "Up", "Down")]
+
+p <- ggplot (test.mss.all, aes (x = log2FC, y = -log10(fdr), color = sig, label = gene)) +
+  geom_point() +
+  scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+  ggrepel::geom_text_repel(data = test.mss.all[sig != "Not"]  ,  size = 2, max.overlaps = 20) +
+  theme_bw() +
+  facet_wrap(~ Label,)
+p <- p + theme(strip.text.x.top = element_text(size=6))
+BackupAsPDF(p, "norm_tmp-volcanoplot_multipanel")
+
+test.mss.all[, gene %in% "HGS"]
+prot.quant[Protein == 'O14964', .(LogIntensities,GROUP,SUBJECT)]
+prot.quant
+```
+
+
+Over plotting. Generate each volcano plot separately.
+```{r split-dt}
+#split datatable by comparison
+
+test.mss.list <- split(test.mss.all, test.mss.all$Label)
+```
+
+```{r cal-geommean}
+#calculate geomemtric mean
+test.mss.list <- test.mss.list %>% 
+  map( ~{
+    dt <- .x
+    dt$gm.pval.log2fc <- sqrt(dt[,'fdr']*abs(dt[,'log2FC']))
+    
+    return(dt)
+  })
+
+```
+
+```{r volcanoplots}
+# use purr to plot each list element 
+
+
+  imap(test.mss.list, ~ {
+    dt <- .x
+    dt.name <- .y
+    
+    p <- ggplot (dt, aes (x = log2FC, y = -log2(fdr), color = sig, label = gene)) +
+      geom_point() +
+      scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+      ggrepel::geom_text_repel(data = dt[sig != "Not"] ,  size = 2, max.overlaps = 20) +
+      ggtitle(paste0(dt.name, ' Volcano plot')) +
+      theme_minimal()
+    p
+   BackupAsPDF(p, paste0(dt.name,"_rmoutliers_volcanoplot"))
+  })
+```
+
+
+Enrichment Heatmaps for the different comparisons
+
+Perform enrichment analysis for each of the comparisons
+```{r}
+#creat new factor col of combined label sig info
+test.mss.all[, enrich_grp:= interaction(Label,sig)]
+
+# all go ontology genes (biological process, cellular componetn & metabolic function) for enrichment analysis
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# all identified genes as the background set
+universe <- unique(test.mss.all$gene)
+
+# perform enrichment on significant genes for all groups
+enrich.dt <- enricherOnGroups(test.mss.all[test.mss.all$sig != 'Not'], groupColumns = 'enrich_grp', term2gene.gmt = gmt.go, universe = universe)
+
+#simplify enrich results to remove redundant GO terms
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+
+# failed.. troubleshoot
+#enrichmentOnGroupsPL(test.mss.all[test.mss.all$sig != 'Not'], geneColumn = 'gene', groupColumns = 'enrich_grp', gmt = gmt.go, universe = universe)
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 8, negCols =unique(simp.enrich$simplified$enrich_grp[grep('Down', simp.enrich$simplified$enrich_grp)]), row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 8) 
+ht# compare enrichment in the top 10 terms per group
+BackupAsPDF(ht, "heatmap_GO_rmoutliers")
+```
+Barplots of interesting genes
+
+```{r}
+genes.IO <- c('SKP1', 'FBXW11', 'CUL1')
+contrasts.IO <- c('AT00_NP30 vs AT00_NP00','AT15_NP30 vs AT15_NP00','AT22_NP30 vs AT22_NP00','AT56_NP30 vs AT56_NP00')
+
+p <- ggplot(test.mss.all[gene %in% genes.IO & Label %in% contrasts.IO, ], aes(x=Label, y=log2FC, fill=Label)) +
+         geom_col() +
+         geom_errorbar( aes(x=Label, ymin=log2FC-SE, ymax=log2FC+SE), width=0.2, colour="black", alpha=0.5, size=0.5) +
+         theme_classic() +
+         theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 6 )) +
+         facet_wrap(~gene, nrow = 3)
+BackupAsPDF(p, '_barplot-NP30-vsNP00')
+
+test.mss.all[gene %in% genes.IO & Label %in% contrasts.IO,]
+
+test.mss.all
+```
+Plot comparisons for all conditions
+
+```{r}
+
+p <- ggplot(test.mss.all[gene %in% genes.IO , ], aes(x=Label, y=log2FC, fill=adj.pvalue < 0.05)) +
+         geom_col() +
+         theme_classic() +
+         theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 5)) +
+         facet_wrap(~gene, nrow = 3)
+p
+BackupAsPDF(p, 'barplot-all-contrasts')
+
+```
+
+Also generate heatmap of significant genes (use log2fc values)
+sub
+
+```{r}
+test.mss.all
+
+#take isg genes found in the four contrasts
+sig.genes <- unique(test.mss.all[adj.pvalue < 0.05 & Label %in% contrasts.IO & is.finite(log2FC), gene ])
+
+log2fc.mat <- as.matrix(dcast(test.mss.all[gene %in% sig.genes & Label %in% contrasts.IO, ], gene~Label, value.var = c('log2FC')), rownames = 'gene')
+
+# remove infinite vlaues
+log2fc.mat[is.infinite(log2fc.mat)] <- NA
+
+
+#generate heatmap
+hm <- Heatmap(log2fc.mat,
+        #clustering_distance_rows = function(m) dist(m, method = 'euclidean'),
+        #clustering_method_rows= "complete",
+       # top_annotation = ha,
+        cluster_rows = rowClusterWithNA(log2fc.mat),
+        cluster_columns = FALSE,
+        show_row_names = TRUE,
+        row_title = sprintf("%d differentialy expressed proteins", nrow(log2fc.mat)),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 3), 
+       column_names_gp= gpar(fontsize = 5),
+       # title = 'differentially expressed proteins  NP30 vs NP00 (p.adj < 0.05)',
+       # column_title = paste0( heatmap'),
+        name = "Log2FC.")
+hm
+BackupAsPDF(hm, 'heatmap-sig-genes', dimensions = c(8, 13))
+
+```
+Raw counts of the BTRC in prot.quant data
+
+```{r}
+prot.quant[,  gene := multiUniprots2multiGenes(as.character(Protein), simplify = TRUE, allowDups = FALSE)]
+
+
+ggplot(prot.quant[gene == 'BTRC'], aes(x=GROUP, y=LogIntensities)) +
+  geom_point()
+
+prot.quant[gene == 'BTRC']
+
+rownames(dp.contrasts)
+```
+
+
+07-05-23
+Generate a dot plot of the intensities for proteins of interest in each condition. Add a mean bar
+Generate heatmaps of log2FC changes for NPFF vs Ctrl and Anatagonists + NPFF vs Antagonists
+
+
+Dotplot
+Read in the data
+```{r}
+#prot.quant <- fread("./232306_QLi_DARPA_data/2023_06_27_ProteinLevelData_rmoutliers.csv.gz")
+prot.quant <- fread("./232306_QLi_DARPA_data/2023_06_26_TMPnorm_ProteinLevelData.csv.gz")
+
+
+mss <- fread("./232306_QLi_DARPA_data/2023_06_27_msstats_groupcomparisons_rmoutliers.csv.gz")
+```
+
+dotplot of genes of interest for the comparisons
+```{r}
+# check for others of interest
+genesOI <- c('BTRC', 'SKP1', 'ARRB2', 'FBXW11', 'STAM2', 'HGS')
+
+
+prot.quant[, gene := multiUniprots2multiGenes(Protein , species='HUMAN', simplify = T)]
+
+p <- ggplot(prot.quant[gene %in% genesOI,], aes(x=GROUP, y=LogIntensities, color=GROUP)) + 
+  geom_point(size=1.5) +
+  facet_wrap(~gene, scales = 'free') + 
+  stat_summary(fun.data = "mean_cl_normal",
+               geom = "errorbar",
+               color = 'black',
+               width = .4, 
+               alpha=0.4) +
+  stat_summary(fun = "mean", geom = "point", color='black', alpha=0.4) +
+  #stat_summary(fun.y = mean, geom='point') +#  fun.args = list(mult = 1), geom = "pointrange", colour = "red")
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle=90, hjust=1, size= 6)
+  )
+
+p
+
+#BackupAsPDF(p, 'geneIO.intensities.dotplot.pdf', dimensions = c(10,8))
+```
+
+Plot each of these individually
+
+```{r}
+for (g in genesOI){
+  
+ p <- ggplot(prot.quant[gene %in% g,], aes(x=GROUP, y=LogIntensities, color=GROUP, alpha=0.2)) + 
+  geom_point() +
+  geom_hline(aes(yintercept = mean.Ints,col=GROUP))
+ # facet_wrap(~gene, scales = 'free') + 
+ # stat_summary(fun.data = 'mean_cl_normal', geom='errorbar') +
+  ggtitle(paste0(g, ' Log2Intensity'))
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle=90, hjust=1, size= 6)
+  )
+ 
+ print(p)
+}
+
+```
+Generate heatmaps of the LOg2FCs for the same genes
+
+NPFF vs Ctrl
+
+```{r}
+ms.mat <- dcast(mss[gene %in% genesOI,],  gene~Label, value.var = c('log2FC'), rownames = 'gene') %>% 
+  as.matrix(rownames='gene')
+
+#define order here
+contrasts.OI <- c("AT00_NP30 vs AT00_NP00", "AT15_NP30 vs AT15_NP00", "AT22_NP30 vs AT22_NP00",  "AT56_NP30 vs AT56_NP00", "AT15_NP00 vs AT22_NP00", "AT15_NP00 vs AT56_NP00", "AT22_NP00 vs AT56_NP00")
+
+submat <- ms.mat[, colnames(ms.mat) %in% contrasts.OI]
+
+# remove infinite vlaues
+ms.mat[is.infinite(ms.mat)] <- NA
+
+
+#generate heatmap
+hm <- Heatmap(submat,
+        cluster_rows = hclust(dist(ms.mat)),
+        cluster_columns = FALSE,
+        column_order = contrasts.OI,
+        show_row_names = TRUE,
+        col = colorRamp2(c(-4,0, 4), c("blue", "white", "red")),
+        na_col = 'grey',
+        name = "Log2FC.")
+hm
+BackupAsPDF(hm, 'heatmap-genesOI')
+
+
+colnames(ms.mat)
+
+```
+```{r}
+ms.mat[, colnames(ms.mat) %in% contrasts.OI]
+```
+
+08-28-23
+----
+Read in the list of differentially expressed
+
+
+```{r}
+
+```
+

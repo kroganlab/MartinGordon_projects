@@ -1,0 +1,495 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+This template file located at:
+/Applications/RStudio.app/Contents/Resources/resources/templates/notebook_osx.Rmd
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("../../bp_utils/ManageScriptData.R")
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+
+
+
+# Loaad spec
+
+```{r}
+#spec <- fread ("/Users/ben/Box/DAR031/20230322_DAR31_MSstats_Report.xls")
+spec <- fread ("/Users/ben/Box/DAR031/timsTOF/20230322_DAR31_MSstats_Report.xls")
+```
+
+```{r}
+View(spec)
+mean (log2(spec$Intensity))
+sd(log2(spec$Intensity))
+```
+
+
+
+```{r}
+hist(log2(spec$Intensity), breaks = 100)
+abline (v = 6.4 + 2.1*(-4:4))
+spec <- spec[Condition == "CP55_01",]
+
+```
+
+```{r}
+wide <- dcast(spec, ProteinName+PeptideSequence+PrecursorCharge~Condition+BioReplicate, value.var = "Intensity")
+ggplot (wide, aes (x =log2(Cyto_new_1), y = log2(CP55_10_1))) + geom_point(shape = ".") + geom_density_2d() + coord_fixed()
+```
+
+
+
+```{r}
+hist(log2(spec$Intensity), breaks = 100)
+abline (v = 0.0)
+spec <- spec[Intensity > 1,]
+
+```
+
+
+```{r, fig.width = 10, fig.height = 5}
+numColors <- length(unique(spec$Condition))
+rColors <- randomcoloR::distinctColorPalette(numColors) 
+p <- ggplot (spec, aes (x = interaction(BioReplicate, Condition), fill = Condition)) + geom_bar()  + scale_fill_manual(values = rColors) + theme_bw()+ rotate.x.axis.text
+BackupAsPDF(p, "SpectronautRowCounts_")
+```
+
+```{r, fig.width = 10, fig.height = 4}
+p <- ggplot (spec[, .(numFeatures = length(unique(paste0(PeptideSequence, PrecursorCharge)))), by =.(BioReplicate, Condition)], 
+        aes (x = interaction(BioReplicate, Condition), y= numFeatures, fill = Condition)) +
+  geom_col() +
+  theme_bw() +
+  scale_fill_manual(values = rColors)  +
+  rotate.x.axis.text
+
+BackupAsPDF(p, "FeatureCounts_")
+
+```
+```{r, fig.width = 10, fig.height = 4}
+
+```
+
+
+## PCA, features
+```{r}
+featureMat <- dcast (spec[!Condition %in% c("Cyto", "Endo", "GalT", "LAMP1", "LAMTOR1", "PM")],
+                     paste0(PeptideSequence, PrecursorCharge)~Condition+BioReplicate, value.var = "Intensity") |> as.matrix(rownames = "PeptideSequence")
+
+featureMat <- featureMat[complete.cases(featureMat), ]
+
+```
+
+```{r}
+boxplot (log2(featureMat))
+```
+
+
+
+```{r}
+pcaOut <- prcomp(t(log2(featureMat)))
+
+colInfo <- data.table(colname = colnames(featureMat))
+colInfo[,c("treat", "time", "rep") := tstrsplit(colname, "[_.]", keep = c(1,2,3)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = time, shape = treat)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+BackupAsPDF(p, "PCA_Complete_Features")
+
+```
+
+
+# protein summarization:
+
+```{r}
+source ("../../bp_utils/MSstats_V4_Functions.R")
+
+mssInput <- specFileToCompleteMSstats(spec[!Condition %in% c("Cyto", "Endo", "GalT", "LAMP1", "LAMTOR1", "PM")])
+mssInput[, IsotopeLabelType := 'L']
+
+```
+
+```{r}
+dp.out<- MSstats::dataProcess(setDF(mssInput), MBimpute =  FALSE, featureSubset = "highQuality", remove_uninformative_feature_outlier = TRUE)
+```
+
+```{r}
+fwrite (dp.out$ProteinLevelData, ScriptAndDatedFileName("ProteinLevelData.csv"))
+fwrite (dp.out$FeatureLevelData, ScriptAndDatedFileName("FeatureLevelData.csv.gz"))
+```
+
+
+```{r}
+protQuant <- fread ("~/UCSF/kroganlab/BenPolacco/darpa2022/2023_03_22_CBD_firstLook_data/2023_03_22_ProteinLevelData.csv")
+```
+
+
+```{r}
+prot.mat <- dcast (protQuant, Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+```
+
+```{r}
+nrow(prot.mat)
+prot.mat <- prot.mat[complete.cases(prot.mat),]
+nrow(prot.mat)
+```
+
+
+```{r}
+pcaOut <- prcomp(t(prot.mat))
+
+colInfo <- data.table(colname = colnames(prot.mat))
+colInfo[,c("treat", "time", "rep") := tstrsplit(colname, "[_.]", keep = c(1,2,3)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = time, shape = treat)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+BackupAsPDF(p, "PCA_Complete_Proteins")
+
+```
+
+
+```{r}
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = rep, shape = treat)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+BackupAsPDF(p, "PCA_Complete_Proteins")
+```
+
+
+```{r}
+ggplot(protQuant, aes (x= interaction(SUBJECT, GROUP), y = LogIntensities, fill = GROUP)) + geom_boxplot(show.legend = FALSE)  + rotate.x.axis.text
+```
+
+
+
+# renormalize
+
+```{r}
+globalMedian <- median(prot.mat, na.rm = TRUE)
+adjusts <- apply(prot.mat, 2, median) - globalMedian
+prot.mat.norm <- sweep(prot.mat, 2, adjusts, FUN  = "-")
+
+```
+
+```{r}
+pcaOut <- prcomp(t(prot.mat.norm))
+
+colInfo <- data.table(colname = colnames(prot.mat))
+colInfo[,c("treat", "time", "rep") := tstrsplit(colname, "[_.]", keep = c(1,2,3)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = time, shape = treat)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+BackupAsPDF(p, "PCA_Complete_Proteins")
+
+```
+
+```{r}
+problemRuns <- c("CP55_0_3", "1066_01_04", "CP55_05_1", "CP55_10_1", "CP55_30_1", "Cyto_new_1", "1486_10_2")
+```
+
+
+
+
+
+```{r, fig.width = 12, fig.height = 12}
+prot.mat.norm2 <- sweep(prot.mat.norm, 1, apply(prot.mat.norm, 1, median, na.rm = TRUE))
+Heatmap(prot.mat.norm2, cluster_columns = FALSE)
+```
+```{r}
+prot.mat <- dcast (protQuant, Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+prot.mat <- prot.mat[, !colnames(prot.mat) %in% problemRuns]
+prot.mat <- prot.mat[, !grepl("Cyto", colnames(prot.mat))]
+
+prot.mat <- prot.mat[complete.cases(prot.mat), ]
+nrow(prot.mat)
+
+globalMedian <- median(prot.mat, na.rm = TRUE)
+adjusts <- apply(prot.mat, 2, median) - globalMedian
+prot.mat.norm <- sweep(prot.mat, 2, adjusts, FUN  = "-")
+
+
+```
+
+
+```{r}
+pcaOut <- prcomp(t(prot.mat.norm))
+
+colInfo <- data.table(colname = colnames(prot.mat))
+colInfo[,c("treat", "time", "rep") := tstrsplit(colname, "[_.]", keep = c(1,2,3)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = rep, shape = treat)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+BackupAsPDF(p, "PCA_Complete_Proteins")
+
+```
+
+
+
+```{r, fig.width = 10, fig.height = 4}
+biotin.carboxylases.up <- c("O00763","P05165","P11498","Q13085","Q96RQ3")
+
+p <- ggplot(protQuant[Protein %in% biotin.carboxylases.up], aes (x = interaction ( SUBJECT, GROUP ), y = LogIntensities, color = Protein)) + geom_line(aes(group = Protein)) + geom_point(aes(shape = as.factor(SUBJECT))) +
+  #geom_text(data = protQuant[Protein %in% c("O00763")], aes(label = paste0(GROUP, ".", SUBJECT), size = paste0(GROUP, "_", SUBJECT) %in% problemRuns)) +
+  rotate.x.axis.text
+
+p
+BackupAsPDF(p, "BiotinCarboxylaseLevels_")
+
+```
+
+
+```{r}
+source ("../../bp_utils/UniprotIDMapping.R")
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+protQuant[, c("drug", "time") := tstrsplit(GROUP, "_")]
+
+
+p <- ggplot(protQuant[gene %in% c("ARRB2", "KCTD12", "EYA4", "PRKCD") & drug != "Cyto"], aes (x = time, y = LogIntensities, color = as.factor(SUBJECT))) + geom_line(aes(group = as.factor(SUBJECT))) + geom_point(aes(shape = as.factor(SUBJECT))) +
+  #geom_text(data = protQuant[Protein %in% c("O00763")], aes(label = paste0(GROUP, ".", SUBJECT), size = paste0(GROUP, "_", SUBJECT) %in% problemRuns)) +
+  rotate.x.axis.text +
+  facet_grid(gene~drug, scales= "free_y")
+
+p
+
+
+```
+
+
+```{r}
+protQuant[, runName := paste0(GROUP, "_", SUBJECT)]
+
+
+p <- ggplot(protQuant[gene %in% c("ARRB2", "KCTD12", "EYA4", "PRKCD") & drug != "Cyto" & !runName %in% problemRuns], aes (x = time, y = LogIntensities, color = as.factor(SUBJECT))) + geom_line(aes(group = as.factor(SUBJECT))) + geom_point(aes(shape = as.factor(SUBJECT))) +
+  #geom_text(data = protQuant[Protein %in% c("O00763")], aes(label = paste0(GROUP, ".", SUBJECT), size = paste0(GROUP, "_", SUBJECT) %in% problemRuns)) +
+  rotate.x.axis.text +
+  facet_grid(gene~drug, scales= "free_y")
+
+p
+
+```
+
+
+# fit cubic time courses
+```{r}
+protQuant <- fread ("~/UCSF/kroganlab/BenPolacco/darpa2022/2023_03_22_CBD_firstLook_data/2023_03_22_ProteinLevelData.csv")
+
+# may want to renormalize, but as first pass we don't
+##
+
+# remove problem runs, and mis-ordered rep, cyto
+protQuant[, runName := paste0(GROUP, "_", SUBJECT)]
+protQuant <- protQuant[!runName %in% problemRuns][!grep ("Cyto", GROUP)][!(grepl("CP55", GROUP) & SUBJECT == 3)]
+
+protQuant[, c("drug", "timeStr") := tstrsplit(GROUP, "_")]
+protQuant[, SUBJECT := sprintf ("batch.%d", SUBJECT)]
+protQuant[, rankTime := as.integer(as.factor(timeStr))]
+protQuant[, .(timeStr, rankTime)] |> unique()
+source ("../../bp_utils/MS_ModelFitting_TimeSeries.R")
+
+allDrugs <- sort(unique(protQuant$drug))
+names(allDrugs) <- allDrugs
+
+out.list <- lapply(allDrugs, function(d)nicePolyFits.fullTable(protQuant[drug == d], splitColumn = "Protein", polyColumn = "rankTime", yColumn = "LogIntensities", otherTerms = "SUBJECT"))
+
+
+
+```
+
+```{r}
+allFits <- rbindlist(out.list, idcol = "drug")
+
+allFits[, adj.pvalue := p.adjust(pvalue, method = "BH"), by = drug]
+
+
+```
+
+```{r}
+allFits[, sig := "not"]
+allFits[abs(log2FC > log2(1.5)) & adj.pvalue < 0.05, sig := ifelse(log2FC > 0, "up", "down")]
+allFits[, gene := multiUniprots2multiGenes(Protein)]
+
+ggplot (allFits, aes(x = log2FC, y = -log10(adj.pvalue), color = sig)) + scale_color_manual(values = c(not = "gray", up = "red", blue = "down")) + geom_point() + facet_wrap(~drug) + coord_cartesian(xlim = c(-10, 10)) +
+  ggrepel::geom_text_repel(aes(label = gene))
+
+range (allFits$log2FC, na.rm = TRUE)
+```
+```{r}
+fwrite(allFits, ScriptAndDatedFileName("allFits.csv"))
+```
+
+
+```{r}
+allFits[gene == "ARRB2"]
+```
+
+
+
+```{r, fig.height = 5, fig.width = 6}
+allFits[, sig := "not"]
+allFits[abs(log2FC) > log2(1.5) & pvalue < 0.01, sig := ifelse(log2FC > 0, "up", "down")]
+allFits[, gene := multiUniprots2multiGenes(Protein)]
+
+p <- ggplot (allFits, aes(x = log2FC, y = -log10(pvalue), color = sig)) + scale_color_manual(values = c(not = "gray", up = "red", down = "blue")) + geom_point(show.legend = FALSE) + facet_wrap(~drug, ncol = 1) + coord_cartesian(xlim = c(-10, 10)) +
+  ggrepel::geom_text_repel(data = allFits[sig %in% c("up", "down")], aes(label = gene), show.legend = FALSE, size = 2, max.overlaps = 20) +
+  theme_bw()
+
+BackupAsPDF(p)
+
+
+```
+
+
+
+```{r, fig.width = 6, fig.height = 10}
+sigProteins <- allFits[sig != "not", Protein]
+
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProteins], gene~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "gene")
+hm <- Heatmap (prot.mat, cluster_rows = FALSE, cluster_columns = FALSE, row_names_gp  = gpar(fontsize= 5), column_split = tstrsplit(colnames(prot.mat), "_")[[1]])
+BackupAsPDF(hm)
+
+```
+
+```{r, fig.width = 6, fig.height = 6}
+numMissing <- rowSums(is.na(prot.mat))
+prot.mat <- prot.mat[numMissing < ncol(prot.mat)/2,]
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat,1, median, na.rm = TRUE))
+
+hm <- Heatmap (prot.mat, cluster_rows = TRUE, cluster_columns = FALSE, row_names_gp  = gpar(fontsize= 5), column_split = tstrsplit(colnames(prot.mat), "_")[[1]], name = "log2 vs Median")
+BackupAsPDF(hm)
+```
+
+
+
+```{r}
+source ("../../bp_utils/UniprotIDMapping.R")
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+protQuant[, c("drug", "time") := tstrsplit(GROUP, "_")]
+
+
+p <- ggplot(protQuant[gene %in% c("ARRB2", "KCTD12", "EYA4", "PRKCD") & drug != "Cyto"], aes (x = time, y = LogIntensities, color = as.factor(SUBJECT))) + geom_line(aes(group = as.factor(SUBJECT))) + geom_point(aes(shape = as.factor(SUBJECT))) +
+  #geom_text(data = protQuant[Protein %in% c("O00763")], aes(label = paste0(GROUP, ".", SUBJECT), size = paste0(GROUP, "_", SUBJECT) %in% problemRuns)) +
+  rotate.x.axis.text +
+  facet_grid(gene~drug, scales= "free_y")
+
+p
+
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r, fig.width = 5, fig.height = 6}
+source ("../../bp_utils/UniprotIDMapping.R")
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+protQuant[, c("drug", "time") := tstrsplit(GROUP, "_")]
+
+
+p <- ggplot(protQuant[gene %in% c("SNX3", "APPL2", "WASHC2C", "EEA1", "ARRB2") & drug != "Cyto"], aes (x = as.integer(time), y = LogIntensities, color = as.factor(SUBJECT))) + geom_line(aes(group = as.factor(SUBJECT))) + geom_point(aes(shape = as.factor(SUBJECT))) +
+  #geom_text(data = protQuant[Protein %in% c("O00763")], aes(label = paste0(GROUP, ".", SUBJECT), size = paste0(GROUP, "_", SUBJECT) %in% problemRuns)) +
+  rotate.x.axis.text +
+  facet_grid(gene~drug, scales= "free_y")
+
+BackupAsPDF(p)
+
+
+```
+
+

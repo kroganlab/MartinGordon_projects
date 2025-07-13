@@ -1,0 +1,117 @@
+---
+title: "061225_AF3set_dataInspection"
+author: "Martin Gordon"
+date: "2025-06-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Inspect the files shared by Jyoti and clean if neccessary prior to the AF3 run
+Two cell-lines, ~400 ppi in each 
+```{r packages}
+library(data.table)
+library(seqinr)
+library(magrittr)
+library(ggplot2)
+library(seqinr)
+library(readxl)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+```
+
+```{r read-data}
+hek.set <- setDT(readxl::read_xlsx('./data/FluB_PPI.xlsx', sheet=1))
+a549.set <- setDT(readxl::read_xlsx('./data/FluB_PPI.xlsx', sheet=2))
+
+hek.set$Bait.x %>% unique()
+a549.set$Bait.x %>% unique()
+fa.obj <- seqinr::read.fasta(file='./data/ibv.bait.seqs.fa', seqtype = 'AA', as.string = T)
+names(fa.obj)
+```
+
+we want to create two seperate tables and concatenate them
+```{r get-unique-baits}
+hek.baits <- unique(hek.set$Bait.x)
+a549.baits <- unique(a549.set$Bait.x)
+```
+Names dont match, I think easiest way to fix is to create a keys DT and manually match the IDs, then merge this to our bait-prey table 
+```{r merge-dts}
+keys.dt <- data.table(fa.header=c('up|I0B7A3|Hemagglutinin_IBV', 'up|Q596H2|Hemagglutinin_IBV', 'up|C0LT34|Neuraminidase_IBV', 'up|Q596G9|Neuraminidase_IBV','up|I0B7B2|PB1_IBV','up|Q596H4|PB1_IBV',
+                                  'up|I0B7B1|PA_IBV', 'up|Q596H3|PA_IBV', 'up|I0B7A8|Nucleoprotein_IBV', 'up|Q596H1|Nucleoprotein_IBV','up|I0B7A4|Matrix_protein','up|Q596G8|Matrix_protein',
+                                  'up|I0B7B0|Nuclear_export_protein_IBV', 'up|Q596G6|Nuclear_export_protein_IBV','up|I0B7A9|NS1_IBV','up|Q596G5|NS1_IBV','up|C0LT33|Glycoprotein_NB_IBV','up|Q596H0|Glycoprotein_NB_IBV',
+                                  'up|I0B7A5|BM2_IBV', 'up|Q596G7|BM2_IBV', "up|I0B7B0|Nuclear_export_protein_IBV"),
+                      bait.name =c('Brisbane_HA', 'Victoria_HA', 'Brisbane_NA', 'Victoria_NA','Brisbane_PB1', 'Victoria_PB1',
+                                   'Brisbane_PA', 'Victoria_PA','Brisbane_NP', 'Victoria_NP', 'Brisbane_M1', 'Victoria_M1',
+                                   'Bribane_NEP', 'Victoria_NS2','Brisbane_NS1','Victoria_NS1','Brisbane_NB', 'Victoria_NB',
+                                   'Brisbane_BM2', 'Victoria_BM2', 'Brisbane_NS2'
+                                   ))
+
+
+# same set now!
+setdiff(unique(apms.dt$bait_id), keys.dt$bait.name)
+setdiff(keys.dt$bait.name, unique(apms.dt$bait_id))
+
+keys.dt[, uniprot := tstrsplit(fa.header, '[|]', keep=c(2))]
+setkey(keys.dt, bait.name)
+
+apms.dt <- rbind(hek.set[, .(bait_id=Bait.x, prey=Prey.x)], a549.set[,.(bait_id=Bait.x, prey=Prey.x)]) %>% 
+  unique()
+setkey(apms.dt, bait_id)
+
+
+keys.dt[bait.name == 'Brisbane_NS2']
+apms.dt[bait_id == 'Brisbane_NS2',]
+apms.dt[bait_id == 'Brisbane_NS2',] %>% 
+  .[keys.dt, .(.I, uniprot, prey)]
+
+# merge and write
+apms.dt[bait_id %in% c('Brisbane_NS2', 'Victoria_PA')]
+keys.dt
+
+
+missing.set <- merge(apms.dt[bait_id %in% c("Brisbane_NS2","Victoria_PA")], keys.dt, by.x='bait_id', by.y='bait.name')[, .(.I, uniprot, prey)]
+fwrite(missing.set, sep=',', col.names = F, ScriptAndDatedFileName('hiv.missingSet.csv'))
+fwrite(apms.dt[keys.dt, .(.I, uniprot, prey)], sep=',', col.names = F, ScriptAndDatedFileName('hiv.fullbaitSet.csv'))
+
+
+```
+
+get the list of unique bait ids, wirte to file and download these fa records from uniprot website
+
+```{r get-prey-ids}
+#fwrite(data.table(unique(apms.dt$prey)), col.names = F, ScriptAndDatedFileName('hiv.apms.preyuniprots.txt')
+```
+```{bash get-prey-fasta, eval=FALSE}
+python ~/Documents/utils/mg_utils/py_utils/fetchFastafromUniProt.py \
+--input '~/Documents/projects/061225_JBatra_HostViralSecondSet_AF3/061225_AF3set_dataInspection_data/2025_06_12_hiv.apms.preyuniprots.txt' \
+--output  '~/Documents/projects/061225_JBatra_HostViralSecondSet_AF3/061225_AF3set_dataInspection_data/2025_06_12_hiv.apms.preyuniprots.fa'
+```
+
+
+missing baits in fasta file... ask Jyoti to share remainder and run this set for now 
+```{r missing-baits}
+setdiff(union(x=a549.baits, y=hek.baits), detected.set)  
+c('up|N0BQ34|PB2_IBV','up|Q596H5|PB2_IBV')
+```
+
+## 061425
+
+Review the set of ppi and see how it scores
+
+```{r}
+ppi.set <- fread('~/Documents/projects/061225_JBatra_HostViralSecondSet_AF3/061225_AF3set_dataInspection_data/2025_06_12_hiv.baitSet2.csv')
+
+apms.dt <- rbind(hek.set[, .(bait_prey=Bait_Prey, bait_id=Bait.x, prey=Prey.x, prey_gene=PreyGene.x)], a549.set[,.(bait_prey=Bait_Prey, bait_id=Bait.x, prey=Prey.x, prey_gene=PreyGene.x)]) %>% 
+  unique()
+apms.dt
+apms.dt[grepl('Brisbane_NS2', bait_prey)]
+
+
+names(fa.obj)
+```
+

@@ -1,0 +1,890 @@
+---
+title: "010624_IBD_gladstoneReseqQC"
+author: "Martin Gordon"
+date: "2025-01-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## analysis of the Gladstone resequenced data
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(fgsea)
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+
+
+# for generating the scatterplots
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+
+# my mageck functions for normalizing
+# this set of mageck functions is messing up my matrix generation... why is it calling another (maybe base?) as.matrix function?
+#source("../../utils/mg_utils/r_utils/MAGECK_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+
+#set one
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+col.pal <- getQualitativePalette(n=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+```
+
+Read in the new files  that were produced by MAGECK count
+
+```{r}
+# this is the full set of counts
+
+counts.dt <- fread('./data/Package_IBD-mageck_analysis_09-25-2023/merged_counts.table') %>% 
+  melt(id.vars=c('sgRNA', 'gene'), value.name = 'counts')
+
+setnames(counts.dt, old='variable', new='sample')
+counts.dt[, sample := as.factor(sample)]
+```
+
+```{r}
+# 4 guides targeting each gene
+counts.dt[,.N, by=.(gene,sample)]
+
+
+# how many genes sampled in total?
+# nearly 1000k non-targetin guides per sample
+counts.dt[, .N, by=.(gene,sample)][gene == 'NonTargeting']
+```
+```{r}
+counts.dt[, replicate := gsub('_EXP', '', str_extract(sample, '_EXP[12]'))]
+counts.dt[, group := gsub('_EXP[12]', '', sample)]
+
+# rename
+counts.dt[group == 'Library_representation', group := 'Library_Representation']
+```
+
+
+```{r}
+ggplot(counts.dt, aes(x=paste0(group,'.', replicate), y=log2(counts+1), fill=group)) +
+  geom_boxplot() +
+  scale_fill_ipsum() +
+  theme_ipsum_rc(grid = "XY")
+
+
+g <- ggplot(counts.dt, aes(x=paste0(group,'.', replicate), y=log2(counts+1), fill=group)) +
+    geom_boxplot() +
+   #scale_fill_manual(values=col.pal) +  
+    ggtitle(paste0('Raw count distributions')) +
+    xlab('sample') +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") +
+    theme(axis.text.x = element_text(angle=90, size=7),
+      panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+
+g
+BackupAsPDF(g, 'rawCounts.boxplot')
+```
+```{r}
+g <- ggplot(counts.dt[gene == 'NonTargeting'], aes(x=paste0(group,'.', replicate), y=log2(counts+1), fill=group)) +
+    geom_boxplot() +
+   #scale_fill_manual(values=col.pal) +  
+    ggtitle(paste0('Non-targeting controls raw count distributions')) +
+    xlab('sample') +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") +
+    theme(axis.text.x = element_text(angle=90, size=7),
+      panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+
+BackupAsPDF(g, 'sgCtrls.rawCounts.boxplot')
+```
+
+```{r}
+# zero counts in the
+g <- ggplot(counts.dt[counts == 0,.N, by=.(sample, group, replicate)], aes(x=paste0(group,'.', replicate), y=N, fill=group)) +
+    geom_bar(stat='Identity') +
+   #scale_fill_manual(values=col.pal) +  
+    ggtitle(paste0('Number of 0 count guides')) +
+    xlab('sample') +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") +
+    theme(axis.text.x = element_text(angle=90, size=7),
+      panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'nZeroCounts.barplot')
+```
+```{r}
+# count the number of rows per sample
+counts.dt[, nGuides:=.N,  by=sample] # so I guess this has been filled with zeros?
+summary.dt <- counts.dt[counts == 0,  .N, by=.(sample, group, replicate, nGuides)]
+
+summary.dt[, propZero := N/nGuides]
+
+g <- ggplot(summary.dt, aes(x=paste0(group,'.', replicate), y=propZero, fill=group)) +
+    geom_bar(stat='Identity') +
+   #scale_fill_manual(values=col.pal) +  
+    ggtitle(paste0('Proportion of 0 count guides')) +
+    xlab('sample') +
+    ylab('') +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") +
+    theme(axis.text.x = element_text(angle=90, size=7),
+      panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'proportionOfZeroCounts.barplot', format='png')
+```
+Total number of (log2) reads in each sample
+```{r}
+g <- ggplot(counts.dt[, .(seqDepth = sum(counts, na.rm=T)), by=.(group, replicate)], aes(x=paste0(group, replicate), y=log2(seqDepth), color=group)) +
+    geom_point()+
+   #scale_fill_manual(values=col.pal) +  
+    ggtitle(paste0('Sample sequencing depth')) +
+    xlab('sample') +
+    scale_y_continuous(breaks=seq(14,23, 1), labels=seq(14,23, 1)) +
+    ylab('log2 Total Reads') +
+    scale_color_ipsum() +
+    theme_ipsum_rc(grid = "XY") +
+    theme(axis.text.x = element_text(angle=90, size=7),
+      panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'Sample.seqDepth.dotplot', format='png')
+```
+
+```{r}
+counts.mat <- dcast(counts.dt, sgRNA~paste0(group, '.', replicate), value.var = 'counts') %>% 
+  as.matrix(rownames = 1)
+
+# look at AP previous hits and see how the counts look
+ap.genes <- 'CARD9 LUC7L3 TSC2 IRF8 PCYT2 HNRNPU EXOSC6 POLR3H SNRNP40 NELFB PRMT1 ARMC7 USP7 MAU2 MIS18A INTS3 TUT1 POLR2L EXOSC2 ADIPOR2 VHL SMC1A KDM8 CLNS1A GEMIN4 DKC1 MED12 SLC35B1 NHP2 RPN1 DHFR FBXO11 CTR9 GNB1L DNAJC17 EP300 PKMYT1 TMEM258 TCEB2 LSG1 EIF6 MED6 BCL2 RAD9A NUS1 RPTOR SUPT4H1 RCE1 RANGAP1 DRAP1 TRAPPC1 ERCC2 GEMIN8 PREB POLR3E EEF1G SKIV2L2 EXOSC4 PAPOLA GPN2 VPS52 SAMD4B VPS53 HAUS5 IPPK SYS1 CTDNEP1 CRCP WDR61 NOP14 ECT2 ALG2 SNAPC5 UROD EXOSC9 CARS RTFDC1 ZCRB1 POLR1D ELL SRSF11 RFC3 LSM7 RPL9 LSM5 ALYREF SNAPC4 NSA2 RSL24D1 POLR3K COG8 LSM8 PTMA STAG2 DDX51 PPP1R11 IPO13 MEF2D RFC2 GNL3L TELO2 CDS2 SMARCE1 C15orf41 SETD1A WDR18 TRAPPC5 DHX16 PRMT5 RNMT C14orf80 DCAF15 UBL5 NOP16 YKT6 DDX41 BUB3 TFAP4 VMP1 SFSWAP DYNLL1 ITPK1 RPL31 NOL10 DNAJC8 RABGGTA INTS4 WDR82 TTC1 COG4 DDX20 CTSL PELP1 AP2S1 HSPA5 URI1 SS18L2 PWP2 CCDC84 HSPA13 MED16 VPS51 FTSJ3 KBTBD4 OSBP EFTUD2 ELAC2 EXOSC3 AXIN1 CAND1 PRPF38B ST14 GALR3 IMP4 FIP1L1 DDOST DHODH NELFA SNUPN SETD1B LSM12 EIF2S3 CCDC86 LOC101060389 NCOA2 XRCC6 BTF3 RBM33 DYNLRB1 COPS6 PFN1 SLC6A20 CBFB MARCH5 POLE2 SMARCB1 SYMPK AGAP4 PSMB2 XPO1 SART3 CPSF3L RPL11 NOB1 NSL1 CSNK1A1 POLR3F ECD CENPL TUBB'
+
+ap.genes <- strsplit(ap.genes, ' ')[[1]]
+
+guides.oi <- counts.dt[gene %in% ap.genes, sgRNA]
+
+submat <- counts.mat[rownames(counts.mat) %in% guides.oi,!grepl('Library', colnames(counts.mat))]
+submat <- log2(submat +1)
+
+# sweep out the median values and lets see how these two things change; lets see if our hits look decent quality
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+        #col=viridis(100), 
+        name='log2(counts+1)',
+        column_split = gsub('.[12]$' ,'', colnames(submat)), 
+        border=T,
+        column_names_gp = gpar(fontsize=6),
+        show_row_names=F)
+hm
+
+BackupAsPDF(draw(hm, column_title='Median scaled log-tranformed counts'), 'raw.Log2counts.sigGenes.heatmap', format='png')
+```
+Look at a random subset of 3000 guides
+Actually, there is a bias between low and high; low group just seems to have higher counts
+Check the normalization proceedure before running with differential testing
+
+```{r}
+submat <- counts.mat[sample(rownames(counts.mat), 3000), !grepl('Library', colnames(counts.mat))]
+submat <- log2(submat +1)
+
+# sweep out the median values and lets see how these two things change; lets see if our hits look decent quality
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+
+hm <- Heatmap(submat, 
+        #col=viridis(100), 
+        name='log2(counts+1)',
+        column_split = gsub('.[12]$' ,'', colnames(submat)), 
+        border=T,
+        column_names_gp = gpar(fontsize=6),
+        show_row_names=F)
+hm
+
+BackupAsPDF(draw(hm, column_title='Random subset of 3K genes (median sweep)'), 'raw.Log2counts.randomGuides.heatmap', format='png')
+```
+Now lets normalize (just use RPM for quick fix) and look at how the differentially expressed guides look
+
+
+```{r}
+rpm.mat <- sweep(counts.mat, 2, apply(counts.mat, 2, sum, na.rm=T), FUN='/')  * 1e6
+
+submat <- rpm.mat[sample(rownames(rpm.mat), 3000), !grepl('Library', colnames(counts.mat))]
+submat <- log2(submat +1)
+# sweep out the median values and lets see how these two things change; lets see if our hits look decent quality
+
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+        #col=viridis(100), 
+       # col=colorRamp2(colors=c('blue', 'white', 'red'), breaks=c(-2,0,2)),
+        name='log2(RPM+1)',
+        column_split = gsub('.[12]$' ,'', colnames(submat)), 
+        border=T,
+        na_col = 'yellow',
+        column_names_gp = gpar(fontsize=6),
+        show_row_names=F)
+hm
+
+BackupAsPDF(draw(hm, column_title='Random gene subset (median swept RPM)'), 'rpm.Log2counts.randomGuides.heatmap', format='png')
+```
+Show a boxplot of i) all genes expression and ii) just the non-targeting guides
+
+```{r}
+reshape2::melt(rpm.mat)
+counts.dt[, sampleName := paste0(group, '.', replicate)]
+
+counts.dt <- merge(counts.dt, reshape2::melt(rpm.mat), by.x=c('sgRNA', 'sampleName'), by.y=c('Var1', 'Var2'))
+setnames(counts.dt, old='value', new='rpm')
+```
+
+Boxplots of RPM
+
+```{r}
+g <- ggplot(counts.dt, aes(x=paste0(group,'.', replicate), y=log2(rpm+1), fill=group)) +
+    geom_boxplot() +
+   #scale_fill_manual(values=col.pal) +  
+    ggtitle(paste0('RPM distributions')) +
+    xlab('sample') +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") +
+    theme(axis.text.x = element_text(angle=90, size=7),
+      panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'rpmCounts.boxplot')
+```
+Boxplots of non-targeting guides RPM; makes sense there is more of these guides in the library represnetation, as they will not be picked by the clone selection as we are picking the top and bottom 5% of genes
+
+```{r}
+g <- ggplot(counts.dt[gene == 'NonTargeting'], aes(x=paste0(group,'.', replicate), y=log2(rpm+1), fill=group)) +
+    geom_boxplot() +
+   #scale_fill_manual(values=col.pal) +  
+    ggtitle(paste0('Non-targeting controls RPM count distributions')) +
+    xlab('sample') +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") +
+    theme(axis.text.x = element_text(angle=90, size=7),
+      panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+
+BackupAsPDF(g, 'sgCtrls.rpmCounts.boxplot')
+
+apply(counts.mat, 2, sum, na.rm=T)
+counts.mat[1:10,]
+
+
+# all reads map to 1 million
+apply(rpm.mat, 2, sum, na.rm=T)
+```
+Lets check at how the Deseq2 method looks; I think we want this normalization of all guides right 
+
+
+```{r}
+source("../../utils/mg_utils/r_utils/MAGECK_Functions.R")
+
+ #DESeq2 method fails on both sample #2 due to low read counts... what to do?
+allnorm.mat <- sampleNormalization(counts.mat, diagnostics = T, returnSizeFactors = T)$normMat
+sgnorm.mat <- sampleNormalization(counts.mat, sgControls = counts.dt[gene == 'NonTargeting', sgRNA], diagnostics = T, returnSizeFactors = T)$normMat
+```
+
+
+Alright; lets look at the differential expression of the different groups; write out the sgControl normalized and all Normalized matrix
+When running, turn off normalization
+
+Now combine this with our counts.dt and write out both as the count matrix
+
+```{r}
+counts.dt <- merge(counts.dt, reshape2::melt(allnorm.mat), by.x=c('sgRNA', 'sampleName'), by.y=c('Var1', 'Var2'))
+setnames(counts.dt, old='value', new='norm.allGuides')
+
+counts.dt <- merge(counts.dt, reshape2::melt(sgnorm.mat), by.x=c('sgRNA', 'sampleName'), by.y=c('Var1', 'Var2'))
+setnames(counts.dt, old='value', new='norm.nontargetGuides')
+
+#fwrite(counts.dt, ScriptAndDatedFileName('sgRNAcounts.gladstoneSeq.csv'))
+counts.dt <- fread('~/Documents/projects/010225_ABanerjee_IBD_CRISPR/010624_gladstoneReseqQC_data/2025_01_06_sgRNAcounts.gladstoneSeq.csv')
+
+fwrite(dcast(counts.dt, sgRNA+gene~paste0(group, '.', replicate), values='norm.allGuides'), sep='\t', ScriptAndDatedFileName('allGuides.norm.mat'))
+fwrite(dcast(counts.dt, sgRNA+gene~paste0(group, '.', replicate), values='norm.nontargetGuides'),sep='\t', ScriptAndDatedFileName('nontargetGuides.norm.mat'))
+# and original counts.dt to rerun
+fwrite(dcast(counts.dt, sgRNA+gene~paste0(group, '.', replicate), values='counts'),sep='\t', ScriptAndDatedFileName('raw.mat'))
+
+
+ggplot(counts.dt, aes(x=sample, y=log2(counts))) +
+  geom_boxplot()
+```
+
+Read in the PW comparisons for each of the groups
+Look at the volcanoplots, see if they look reasonable, if so lets go with that..
+
+```{r}
+# look at the gene level info
+highVslow.dt <- list(card9H.allNorm = fread('output/010625_PWmageckComparisons/High_CARD9-Low_CARD9_allNorm.gene_summary.txt'),
+card9H.sigNorm = fread('output/010625_PWmageckComparisons/High_CARD9-Low_CARD9_sgNorm.gene_summary.txt'),
+card9H.mageckNorm = fread('output/010625_PWmageckComparisons/High_CARD9-Low_CARD9_mageckNorm.gene_summary.txt'),
+card9H.totalNorm = fread('output/010625_PWmageckComparisons/High_CARD9-Low_CARD9_magecktotalNorm.gene_summary.txt')) %>% 
+  rbindlist(idcol='normalization')
+
+
+highVslow.dt[, LFC := `pos|lfc`]
+highVslow.dt[, pvalue := ifelse(sign(`neg|lfc`) == 1, `pos|p-value`, `neg|p-value`)]
+highVslow.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(normalization)]
+
+# drop the non-targeting set; dont want this impacting the FDR
+clean.dt <- highVslow.dt[id != 'NonTargeting']
+# padj 
+clean.dt[, p.adj := p.adjust(pvalue, method='BH'), by=normalization]
+
+
+# sig label... nothing passess significance
+clean.dt[, sig := 'not']
+clean.dt[abs(LFC) >= 1 & p.adj < 0.05, sig := ifelse(LFC > 0, 'up', 'down')]
+```
+
+Look at volcanoplot and decide what to move forward with
+
+```{r}
+lapply(unique(clean.dt$normalization), function(x){
+  
+  g <- ggplot(clean.dt[normalization==x,], aes(x=LFC, y=-log10(`neg|fdr`), color=sig, label=id)) +
+  geom_point(size=0.7) +
+  geom_vline(xintercept = c(-1,1), linetype=4, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=4, alpha=0.4) +
+  geom_text_repel(data=clean.dt[sig != 'not' & normalization==x,], segment.linetype=1, segment.alpha=0.4, size=2, max.overlaps = 20) +
+  scale_color_manual(values=c('not'='grey', 'up'=col.pal[2], 'down'=col.pal[1])) +
+  ggtitle(x) +
+  ylab(expression(paste(-log10, ' pvalue'))) +
+  theme_ipsum_rc(grid = "XY") +
+  theme(axis.text.x = element_text(angle=90, size=7),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(Label = 'None')
+  g
+  #BackupAsPDF(g, paste0(x,'.pval0.005.volcanoplot'), format = 'png')
+})
+```
+Use the mageck normalization method and run the tests for high-low, high-rep, low-rep
+Reading in the results of the PW comparisons
+
+```{r}
+pw.contrasts.dt <- list(`High_CARD9-Low_CARD9` = fread('output/010625_PWmageckComparisons/High_CARD9-Low_CARD9_mageckNorm.gene_summary.txt'),
+                        `High_CARD9-Library_Representation` = fread('output/010625_PWmageckComparisons/High_CARD9-LibraryRepresentation_mageckNorm.gene_summary.txt'),
+                        `Low_CARD9-Library_Representation` = fread('output/010625_PWmageckComparisons/Low_CARD9-LibraryRepresentation_mageckNorm.gene_summary.txt')) %>% 
+  rbindlist(idcol='contrast')
+```
+
+```{r}
+pw.contrasts.dt[, LFC := `pos|lfc`]
+pw.contrasts.dt[, pvalue := ifelse(sign(`pos|lfc`) == 1, `pos|p-value`, `neg|p-value`)]
+pw.contrasts.dt[, p.adj := p.adjust(pvalue, method='BH'), by=contrast]
+```
+Non-targeting controls not significantly different between the High vs Low, which is great, but it is different between library rep and the high/low groups, which is a promising result!
+```{r}
+# non 
+pw.contrasts.dt[id == 'NonTargeting']
+```
+Find the significant hits 
+```{r}
+# sig label... nothing passess significance
+pw.contrasts.dt[, sig := 'not']
+pw.contrasts.dt[abs(LFC) >= 1 & p.adj < 0.05, sig := ifelse(LFC > 0, 'up', 'down')]
+
+
+pw.contrasts.dt[abs(LFC) >= 1 & p.adj < 0.05, ]
+```
+
+Volcanoplots of the different contrasts between the groups
+
+```{r}
+contrasts.oi <- pw.contrasts.dt$contrast %>%  unique()
+
+lapply(contrasts.oi, function(x){
+  
+  g <- ggplot(pw.contrasts.dt[contrast==x,], aes(x=LFC, y=-log10(p.adj), color=sig, label=id)) +
+  geom_point(size=0.7) +
+  geom_vline(xintercept = c(-1,1), linetype=4, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=4, alpha=0.4) +
+  geom_text_repel(data=pw.contrasts.dt[sig != 'not' & contrast==x,], segment.linetype=1, segment.alpha=0.4, size=2, max.overlaps = 20) +
+  scale_color_manual(values=c('not'='grey', 'up'=col.pal[2], 'down'=col.pal[1])) +
+  ggtitle(x) +
+  ylab(expression(paste(-log10, ' FDR'))) +
+  xlab('Log2 Fold Change') +
+  theme_ipsum_rc(grid = "XY") +
+  theme(axis.text.x = element_text(angle=90, size=7),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(Label = 'None')
+  g
+  BackupAsPDF(g, paste0(x,'.padj.volcanoplot'), format = 'png')
+})
+```
+```{r}
+ap.genes <- 'CARD9 LUC7L3 TSC2 IRF8 PCYT2 HNRNPU EXOSC6 POLR3H SNRNP40 NELFB PRMT1 ARMC7 USP7 MAU2 MIS18A INTS3 TUT1 POLR2L EXOSC2 ADIPOR2 VHL SMC1A KDM8 CLNS1A GEMIN4 DKC1 MED12 SLC35B1 NHP2 RPN1 DHFR FBXO11 CTR9 GNB1L DNAJC17 EP300 PKMYT1 TMEM258 TCEB2 LSG1 EIF6 MED6 BCL2 RAD9A NUS1 RPTOR SUPT4H1 RCE1 RANGAP1 DRAP1 TRAPPC1 ERCC2 GEMIN8 PREB POLR3E EEF1G SKIV2L2 EXOSC4 PAPOLA GPN2 VPS52 SAMD4B VPS53 HAUS5 IPPK SYS1 CTDNEP1 CRCP WDR61 NOP14 ECT2 ALG2 SNAPC5 UROD EXOSC9 CARS RTFDC1 ZCRB1 POLR1D ELL SRSF11 RFC3 LSM7 RPL9 LSM5 ALYREF SNAPC4 NSA2 RSL24D1 POLR3K COG8 LSM8 PTMA STAG2 DDX51 PPP1R11 IPO13 MEF2D RFC2 GNL3L TELO2 CDS2 SMARCE1 C15orf41 SETD1A WDR18 TRAPPC5 DHX16 PRMT5 RNMT C14orf80 DCAF15 UBL5 NOP16 YKT6 DDX41 BUB3 TFAP4 VMP1 SFSWAP DYNLL1 ITPK1 RPL31 NOL10 DNAJC8 RABGGTA INTS4 WDR82 TTC1 COG4 DDX20 CTSL PELP1 AP2S1 HSPA5 URI1 SS18L2 PWP2 CCDC84 HSPA13 MED16 VPS51 FTSJ3 KBTBD4 OSBP EFTUD2 ELAC2 EXOSC3 AXIN1 CAND1 PRPF38B ST14 GALR3 IMP4 FIP1L1 DDOST DHODH NELFA SNUPN SETD1B LSM12 EIF2S3 CCDC86 LOC101060389 NCOA2 XRCC6 BTF3 RBM33 DYNLRB1 COPS6 PFN1 SLC6A20 CBFB MARCH5 POLE2 SMARCB1 SYMPK AGAP4 PSMB2 XPO1 SART3 CPSF3L RPL11 NOB1 NSL1 CSNK1A1 POLR3F ECD CENPL TUBB'
+
+ap.genes <- strsplit(ap.genes, ' ')[[1]]
+```
+
+```{r}
+pw.contrasts.dt[, lab := sig ]
+pw.contrasts.dt[id %in% ap.genes, lab := 'APelin hit']
+pw.contrasts.dt[, lab := factor(lab, levels=c("not", "down", "up","APelin hit"))]
+```
+
+Save output, read back in and generate the relevant plots
+
+```{r}
+#fwrite(pw.contrasts.dt, ScriptAndDatedFileName('mageck.pwcomparisons.gladstoneDataset.csv'))
+clean.dt <-  fread('~/Documents/projects/010225_ABanerjee_IBD_CRISPR/010624_gladstoneReseqQC_data/2025_01_06_mageck.pwcomparisons.gladstoneDataset.csv')
+```
+
+Look at the overlap with Adrians hits
+```{r}
+lapply(contrasts.oi, function(x){
+  
+  g <- ggplot(clean.dt[contrast==x,], aes(x=LFC, y=-log10(pvalue), color=lab, label=id, order=lab)) +
+  geom_point(data=clean.dt[contrast==x & lab != 'APelin hit',], size=0.7) +
+  geom_point(data=clean.dt[contrast==x & lab == 'APelin hit',], size=0.7) +
+  geom_vline(xintercept = c(-1,1), linetype=4, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=4, alpha=0.4) +
+  geom_text_repel(data=clean.dt[sig != 'not' & contrast==x,], segment.linetype=1, segment.alpha=0.4, size=2, max.overlaps = 20) +
+  scale_color_manual(values=c('not'='grey', 'up'=col.pal[2], 'down'=col.pal[1], 'APelin hit'=col.pal[3])) +
+  ggtitle(x) +
+  ylab(expression(paste(-log10, ' pvalue'))) +
+  theme_ipsum_rc(grid = "XY") +
+  theme(axis.text.x = element_text(angle=90, size=7),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(Label = 'None')
+  g
+  BackupAsPDF(g, paste0(x,'.pval0.005.APelinHitslabelled.volcanoplot'), format = 'png')
+})
+```
+
+```{r}
+gmt.go.bp <- loadGmtFromBioconductor(dbName = "org.Hs.eg.db", ontology = 'BP', keyType = 'SYMBOL')
+# conver tthe GO geneset to named list
+go.list <- as.character(gmt.go.bp$gene) %>% 
+split(., gmt.go.bp$ont)
+
+gmt.kegg
+gmt.kegg <- loadKegg(organism='hsa', keyType = 'uniprot')
+gmt.kegg[, uniprot := gene]
+gmt.kegg[, gene := multiUniprots2multiGenes(uniprot, species='HUMAN')]
+gmt.kegg[, gene := gsub('[.].+', '', gene)]
+
+# convert KEGG to a named list 
+kegg.list <- as.character(gmt.kegg$gene) %>% 
+split(., gmt.kegg$ont)
+
+
+kegg.fgsea <- lapply(unique(clean.dt$contrast), function(x){
+  
+  message('subsetting to ', x,'...')
+  subdt <- clean.dt[contrast == x]
+  # create a ranked list of genes
+  # rank based on pval and LFC
+  ranking <-  subdt$LFC * -log10(subdt$pvalue)
+  names(ranking) <- subdt$id
+  print(ranking[1:10])
+  print(names(ranking)[1:10])
+  ranking <- sort(ranking, decreasing = T) # sort descending as interested in depletion
+  print(ranking[1:10])
+  print(names(ranking)[1:10])
+
+  message('Running KEGG GSEA on ', x)
+  
+  kegg.dt <- fgsea(pathways = kegg.list,
+        stats=ranking,
+        minSize = 10,
+        maxSize = 1000,
+        nPermSimple = 100000)
+  
+  
+  kegg.dt <- setDT(kegg.dt)
+  kegg.dt[, contrast := x]
+  return(kegg.dt)
+    
+}) %>% rbindlist()
+
+
+fwrite(kegg.fgsea, ScriptAndDatedFileName('gsea.kegg.csv'))
+
+gobp.fgsea <- lapply(unique(clean.dt$contrast), function(x){
+  
+  message('subsetting to ', x,'...')
+  subdt <- clean.dt[contrast == x]
+  # create a ranked list of genes
+  # rank based on pval and LFC
+  ranking <-  subdt$LFC * -log10(subdt$pvalue)
+  names(ranking) <- subdt$id
+  print(ranking[1:10])
+  print(names(ranking)[1:10])
+  ranking <- sort(ranking, decreasing = T) # sort descending as interested in depletion
+  print(ranking[1:10])
+  print(names(ranking)[1:10])
+
+  message('Running GOBP GSEA on ', x)
+  
+  gobp.dt <- fgsea(pathways = go.list,
+        stats=ranking,
+        minSize = 10,
+        maxSize = 1000,
+        nPermSimple = 100000)
+  
+  
+  gobp.dt <- setDT(gobp.dt)
+  gobp.dt[, contrast := x]
+  return(gobp.dt)
+    
+}) %>% rbindlist()
+
+# check out the number of sig hits in each contrast
+fwrite(gobp.fgsea, ScriptAndDatedFileName('gsea.GOBP.csv'))
+```
+Read in the fgsea results and plot for each of the different contrasrs
+```{r}
+go.bp.enrich.dt <- fread('~/Documents/projects/010225_ABanerjee_IBD_CRISPR/010624_gladstoneReseqQC_data/2025_01_06_gsea.GOBP.csv')
+kegg.enrich.dt <- fread('~/Documents/projects/010225_ABanerjee_IBD_CRISPR/010624_gladstoneReseqQC_data/2025_01_06_gsea.kegg.csv')
+
+kegg.enrich.dt[padj < 0.05]
+go.bp.enrich.dt[padj < 0.001]
+```
+```{r}
+# get N elements in the geneset size
+go.bp.enrich.dt[, leadingEdgeSize := length(unlist(strsplit(leadingEdge, '[|]'))), by=.I]
+go.bp.enrich.dt[, geneRatio := leadingEdgeSize/size, by=.I]
+
+g <- ggplot(go.bp.enrich.dt[contrast == 'High_CARD9-Low_CARD9' & padj < 0.001,], aes(x=reorder(pathway,NES), y=NES, size=geneRatio, color=-log10(padj))) +
+  geom_point() +
+  ggtitle('GO BP High_CARD9-Low_CARD9') +
+  xlab('GO Biological Process Pathway') +
+  ylab('Normalized Enrichment Score') +
+  scale_size_continuous(range = c(1, 5.5)) +
+  scale_color_viridis_c(option = 'A', limits = c(3, 15), oob = scales::squish) +
+  coord_flip() +
+  theme_ipsum_rc(grid = "XY") +
+  theme(axis.text.x = element_text(angle=90, size=7),
+        axis.text.y = element_text(size=6),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_colorbar(title='-log10 FDR', order=2),
+         size=guide_legend(title='Gene Ratio', order=1))
+g
+BackupAsPDF(g, 'GO.BP.GSEA.dotplot', format='png', dimensions = c(9,8))
+```
+Try make a GSEA & KEGG heatmap
+(For GSEA, try to collapse similiar terms)
+```{r}
+kegg.enrich.dt[, leadingEdgeSize := length(unlist(strsplit(leadingEdge, '[|]'))), by=.I]
+kegg.enrich.dt[, geneRatio := leadingEdgeSize/size, by=.I]
+
+g <- ggplot(kegg.enrich.dt[contrast == 'High_CARD9-Low_CARD9' & padj < 0.05,], aes(x=reorder(pathway,NES), y=NES, color=-log10(padj))) +
+  geom_point(aes(size=geneRatio)) +
+#  geom_segment(aes(x = pathway, xend = pathway, y = 0, yend = NES)) +
+ # geom_hline(yintercept=0, linetype=1, alpha=0.6) +
+  ggtitle('GO BP High_CARD9-Low_CARD9') +
+  xlab('KEGG Pathway') +
+  ylab('Normalized Enrichment Score') +
+  scale_size_continuous(range = c(1, 5.5)) +
+  scale_color_viridis_c(option = 'A', limits = c(1.3, 6), oob = scales::squish) +
+  coord_flip() +
+  theme_ipsum_rc(grid = "XY") +
+  theme(axis.text.x = element_text(angle=90, size=7),
+        axis.text.y = element_text(size=6),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_colorbar(title='-log10 FDR', order=2),
+         size=guide_legend(title='Gene Ratio', order=1))
+g
+BackupAsPDF(g, 'KEGG.GSEA.dotplot', format='png', dimensions = c(7,7))
+```
+Heatmap of the significant hits, PW sample correlations, PCA, enrichment heatmap maybe?
+
+Sig hit heatmap first to show the differentially expressed genes
+```{r}
+g <- ggplot(clean.dt[abs(LFC) > 1 & p.adj < 0.05,.N, by=.(sig,contrast)], aes(x=contrast, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=c('up'=col.pal[2], 'down'=col.pal[1])) +
+  ggtitle('Number of significant hits per contrast') +
+  ylab(expression(paste('pvalue < 0.005 & abs(LFC)  > 1'))) +
+  theme_ipsum_rc(grid = "XY") +
+  theme(axis.text.x = element_text(angle=90, size=7),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+BackupAsPDF(g, 'nHitsperContrast.barplot', format='png')
+```
+```{r}
+runEnrichment <- function(dt, ont, keepCl='MRC5', title, isKEGG=F){
+  
+  sub.dt <-dt
+  
+  # pull out bg
+  universe <-  unique(sub.dt$id)
+  
+  # create enrichment groups
+  sub.dt[, enrich.grp := interaction(contrast, sig)]
+  
+  # run GO enrichment on each group seperately
+  enrich.dt <- enricherOnGroups(sub.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "id", 
+                              term2gene.gmt = ont, 
+                              universe = universe)
+  
+  if (isKEGG) {
+    
+    return(list(
+              enrich=enrich.dt))
+    
+  } else {
+    simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                           gmt=ont, 
+                                                           groupColumn = 'enrich.grp',
+                                                           max_pAdjust = 0.1)
+    
+    return(list(
+              enrich=enrich.dt,
+              simpenrich=simp.enrich))
+  }
+}
+```
+load enrichment packages 
+```{r}
+# get human DBs ready
+gmt.hs.go.bp <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+gmt.hs.go.cc <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='CC', keyType='SYMBOL')
+gmt.hs.kegg <-  loadKegg(organism='hsa', keyType = 'kegg') # map to entrez ID
+
+
+# human kegg to symbol and can merge these tables and
+hsKeggMap.dt <- clusterProfiler:::bitr(gmt.hs.kegg$gene, fromType='ENTREZID', toType='SYMBOL', OrgDb='org.Hs.eg.db')
+gmt.hs.kegg <- merge(x=gmt.hs.kegg, y=hsKeggMap.dt, by.x="gene", by.y="ENTREZID", all.x=T)
+gmt.hs.kegg <- gmt.hs.kegg[, .(ont, gene = ifelse(SYMBOL == '', gene, SYMBOL), ont.id)]
+```
+
+Run enrichment for each of the different groups
+```{r}
+hm.bp <- runEnrichment(clean.dt, ont=gmt.hs.go.bp, title='GO Biological Process', isKEGG=F)
+hm.cc <- runEnrichment(clean.dt, ont=gmt.hs.go.cc, title='GO Biological Process', isKEGG=F)
+hm.kegg <- runEnrichment(clean.dt, ont=gmt.hs.kegg, title='GO KEGG Pathways', isKEGG = T) 
+
+fwrite(hm.bp$enrich, ScriptAndDatedFileName('IBD.GO.BP.enrichment.csv'))
+fwrite(hm.bp$simpenrich$simplified, ScriptAndDatedFileName('IBD.GO.BP.enrichment.simplified.csv'))
+fwrite(hm.cc$enrich, ScriptAndDatedFileName('IBD.GO.CC.enrichment.csv'))
+fwrite(hm.cc$simpenrich$simplified, ScriptAndDatedFileName('IBD.GO.CC.enrichment.simplified.csv'))
+fwrite(hm.kegg$enrich, ScriptAndDatedFileName('IBD.KEGG.enrichment.csv'))
+```
+
+```{r}
+plotHeatmap <- function(dt, pThresh=4, nTerms=8){
+  
+  subDT <- copy(dt) # create cp for modifying
+  subDT[, enrich.grp := factor(enrich.grp)]  
+  
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = subDT,
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                #  column_split=str_extract(levels(subDT$enrich.grp),'down|up'),
+                                  #column_split=list(str_extract(levels(subDT$enrich.grp), '[0-9]{1,2}hpi'),
+                                  #                  str_extract(levels(subDT$enrich.grp),'down|up')),
+                                  negCols=unique(grep('down', subDT$enrich.grp, value=T)),
+                                  topN=nTerms,
+                                  row_names_gp = gpar(fontsize = 6), 
+                                  column_names_gp= gpar(fontsize = 6), 
+                                  upperThreshold = pThresh)
+  
+  return(ht)
+}
+
+BackupAsPDF(plotHeatmap(hm.bp$enrich, pThresh = 8, nTerms=20),  'go.bp.heatmap', format='png')
+```
+KEGG heatmap 
+```{r}
+BackupAsPDF(plotHeatmap(hm.kegg$enrich, pThresh = 8, nTerms=20), 'kegg.heatmap', format='png')
+```
+Heatmap of the differentially expressed set
+
+```{r}
+counts.mat <- dcast(counts.dt, sgRNA~paste0(group, '.', replicate), value.var = 'counts') %>% 
+  as.matrix(rownames = 1)
+
+# get the sig gene hits
+sigHits <- clean.dt[contrast == 'High_CARD9-Low_CARD9' & sig != 'not', id]
+
+
+guides.oi <- counts.dt[gene %in% c(sigHits), sgRNA]
+# subset to guides belonging to sig list
+
+
+submat <- counts.mat[rownames(counts.mat) %in% guides.oi, !grepl('Library', colnames(counts.mat))]
+submat <- log2(submat +1)
+
+# sweep out the median values and lets see how these two things change; lets see if our hits look decent quality
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"), breaks=c(-3,0,3)), 
+        name='log2(counts)/\nmedian',
+        row_title = sprintf('%s |LFC| > 1 & FDR < 0.05', nrow(submat)),
+        column_split = gsub('.[12]$' ,'', colnames(submat)), 
+        border=T,
+        column_names_gp = gpar(fontsize=6),
+        show_row_names=F)
+hm
+
+BackupAsPDF(draw(hm, column_title='Significant Differentially Expressed Genes'), 'raw.Log2counts.sigGenes.heatmap', format='png')
+```
+plot the same for the normalized heatmap
+
+```{r}
+counts.mat <- dcast(counts.dt, sgRNA~paste0(group, '.', replicate), value.var = 'norm.allGuides') %>% 
+  as.matrix(rownames = 1)
+
+submat <- counts.mat[rownames(counts.mat) %in% guides.oi, !grepl('Library', colnames(counts.mat))]
+submat <- log2(submat +1)
+
+# sweep out the median values and lets see how these two things change; lets see if our hits look decent quality
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"), breaks=c(-3,0,3)), 
+        name='log2(counts)/\nmedian',
+        row_title = sprintf('%s |LFC| > 1 & FDR < 0.05', nrow(submat)),
+        column_split = gsub('.[12]$' ,'', colnames(submat)), 
+        border=T,
+        column_names_gp = gpar(fontsize=6),
+        show_row_names=F)
+hm
+
+BackupAsPDF(draw(hm, column_title='Significant Differentially Expressed Genes'), 'normalized.log2counts.sigGenes.heatmap', format='png')
+```
+Last thing to show is the correlation plot of the normalized values
+```{r}
+counts.mat <- dcast(counts.dt, sgRNA~paste0(group, '.', replicate), value.var = 'norm.allGuides') %>% 
+  as.matrix(rownames = 1)
+
+# log2 transform for normal distirbution
+corMat <- cor(log2(counts.mat+1), method='pearson', use = 'pairwise.complete.obs')
+
+# dendo ordereding
+od =  hclust(dist(corMat))$order
+corMat = corMat[od, od]
+
+
+hm <- Heatmap(corMat,
+        col=viridis(30, option='A'),
+        name='Pearsons r',
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        column_dend_side = 'bottom',
+        rect_gp = gpar(type = "none"),
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=6),
+	      cell_fun = function(j, i, x, y, w, h, fill) {
+		      if(i >= j) {
+			      grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		        grid.text(sprintf("%.2f", corMat[i, j]), x, y, gp = gpar(col='white', fontsize = 7))
+		      }
+	  })
+hm
+BackupAsPDF(draw(hm, column_title='Sample correlations (log-transformed counts)'), 'sgRNAnorm.PWCorrelations.heatmap',format='png')
+```
+
+Atoshi requests; highlight USP7 and CARD9 
+
+```{r}
+clean.dt[, lab := sig]
+clean.dt[contrast == 'High_CARD9-Low_CARD9' & sig != 'not' & id %in% c('CARD9', 'USP7'), lab := 'genes oi']
+
+lapply(contrasts.oi, function(x){
+  
+  g <- ggplot(clean.dt[contrast==x,], aes(x=LFC, y=-log10(pvalue), color=lab, label=id, order=lab)) +
+  geom_point(data=clean.dt[contrast==x & lab != 'APelin hit',], size=0.7) +
+  geom_point(data=clean.dt[contrast==x & lab == 'APelin hit',], size=0.7) +
+  geom_vline(xintercept = c(-1,1), linetype=4, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=4, alpha=0.4) +
+  geom_text_repel(data=clean.dt[sig != 'not' & contrast==x,], segment.linetype=1, segment.alpha=0.4, size=2, max.overlaps = 20) +
+  scale_color_manual(values=c('not'='grey', 'up'=col.pal[2], 'down'=col.pal[1], 'genes oi'=col.pal[3])) +
+  ggtitle(x) +
+  ylab(expression(paste(-log10, ' pvalue'))) +
+  theme_ipsum_rc(grid = "XY") +
+  theme(axis.text.x = element_text(angle=90, size=7),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(Label = 'None')
+  g
+  BackupAsPDF(g, paste0(x,'.pval0.005.CARD9USP7.hitslabelled.volcanoplot'), format = 'png')
+})
+```
+Look at the sites which are mutated in CARD9
+
+```{r}
+sgRNA.dt <- fread('output/010625_PWmageckComparisons/High_CARD9-LibraryRepresentation_mageckNorm.sgrna_summary.txt')
+```
+
+Read in the clinvar db to get these edits in CARD9; try to match to the site/Users/martingordon/Documents/projects/071724_BRabu_CRISPRbe_LibraryDesign/data
+
+```{r}
+clinvar.dt <- fread('/Users/martingordon/Documents/projects/071724_BRabu_CRISPRbe_LibraryDesign/data/GRCh38.snp_clinvar.txt')
+clinvar.dt[GeneSymbol == 'CARD9' & Type == 'single nucleotide variant' & ChromosomeAccession == 'NC_000009.12' & PositionVCF %in% c(136371900, 136371140, 136370918, 136371996),]
+```
+

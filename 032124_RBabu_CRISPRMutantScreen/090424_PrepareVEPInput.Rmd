@@ -1,0 +1,961 @@
+---
+title: "090424_PrepareVEPInput"
+author: "Martin Gordon"
+date: "2024-04-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Create table to extract clinvar and vep annotations for the mutation
+
+## Load packages
+
+```{r}
+library(readxl)
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(ggrepel)
+library(Biostrings) # for pw alignments of sequences
+library(stringi)
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+
+read in the sgRNA data and also the document tables
+merge the tables, then use seqinr/biostrings to map chr, gene, start and stop sites to each sgRNA
+read in the data
+---
+
+```{r}
+sgRNA.dt <-  fread('./docs/crispr.lib.txt', header = F)
+setnames(sgRNA.dt, new=c('guideRNA', 'guideSequence', 'gene'))
+```
+
+Using biomart with annotation DBI query to pull out nucleotide sequence
+```{r}
+library(AnnotationDbi) # query languagge to interact with the DB above and other types of DB (Biomart, org* Tx* etc..)
+library(biomaRt)
+
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+
+# this is a more standardised way of interacting with biomart using AnnotationDBI
+geneAttributes <- select(ensembl, 
+       keys=genes.oi,
+       keytype ='external_gene_name',
+       columns = c('ensembl_gene_id','external_gene_name', 'chromosome_name', 'start_position', 'end_position', 'strand'))
+
+# spe
+geneSequence <- getSequence(id = genes.oi, 
+            type="external_gene_name",
+            seqType="cdna",
+            mart=ensembl) 
+
+```
+
+read in the fasta file with the sequence information
+
+```{r}
+library(seqinr)
+fa.records <-  read.fasta(file='./docs/targetGenes.fa', as.string = TRUE, forceDNAtolower=F)
+
+# how you access objects with records
+attributes(fa.records)
+
+fa.dt <- lapply(fa.records, function(x){
+  
+  dt <- data.table(name = sub("[.][0-9]{1,}$","",attr(x, which='name')),
+                   loc =  str_extract(attr(x, which='Annot'), "GRCh38.+"),
+                   sequence = x[[1]]
+                   )
+  return(dt)
+}) %>%  rbindlist(idcol=NULL)
+
+fa.dt[, c('genome', 'chr', 'start', 'stop', 'strand') := tstrsplit(loc, ':')]
+
+#fa.dt[, gene := select(ensembl, keys=name, keytype ='ensembl_gene_id', columns = c('external_gene_name'))]
+# had to use HS.db as ensembl is down
+fa.dt[, gene := select(org.Hs.eg.db, keys=name, keytype ='ENSEMBL', columns ='SYMBOL')$SYMBOL]
+
+fa.dt <- fa.dt[,.(name, gene, genome, chr, start, stop, strand, sequence)]
+```
+now merge the sgRNA and the gene DT
+
+```{r}
+# change the gene names
+sgRNA.dt[gene == 'Akt1', gene := 'AKT1']
+sgRNA.dt[gene == 'COLN1', gene := 'MCOLN1']
+
+# combine the info
+comb.dt <- merge(x=sgRNA.dt, y=fa.dt, all.x=TRUE, by.x='gene', by.y='gene') %>% 
+  .[order(guideRNA)]
+
+
+#not what we want either... just want to process this row wise (see below how to enforce this with data.table)
+
+# get targetSeq
+comb.dt[, targetSequence := toString(reverseComplement(DNAString(guideSequence))), by=1:nrow(comb.dt)]
+
+# find match start and end sites
+comb.dt[, start_site := ifelse(strand == '-1', start(matchPattern(DNAString(guideSequence), DNAString(sequence), max.mismatch = 0)), 
+                               start(matchPattern(DNAString(targetSequence), DNAString(sequence), max.mismatch = 0)) ),
+                               by=1:nrow(comb.dt)]
+
+
+comb.dt[, end_site := ifelse(strand == '-1', end(matchPattern(DNAString(guideSequence), DNAString(sequence), max.mismatch = 0)), 
+                               end(matchPattern(DNAString(targetSequence), DNAString(sequence), max.mismatch = 0)) ),
+                               by=1:nrow(comb.dt)]
+
+comb.dt
+```
+alignment issues possibly due to accession mismatches (incorrect sequences downloaded)
+no, its due to the strand the guide is located on...
+
+wait to hear from Ronald; for now just take the file with the edited sequence and map these to the site
+
+
+# more info on the guide; where it maps, predicted edits etc..
+```{r}
+guideContext.dt <- list(TFEB = read_xlsx(path='./docs/base editing gRNA location_4.9.24.xlsx', sheet=2),
+  TFE3 = read_xlsx(path='./docs/base editing gRNA location_4.9.24.xlsx', sheet=3),
+  TFEC = read_xlsx(path='./docs/base editing gRNA location_4.9.24.xlsx', sheet=4),
+  MITF = read_xlsx(path='./docs/base editing gRNA location_4.9.24.xlsx', sheet=5),
+  MTOR = read_xlsx(path='./docs/base editing gRNA location_4.9.24.xlsx', sheet=6),
+  AKT1 = read_xlsx(path='./docs/base editing gRNA location_4.9.24.xlsx', sheet=7),
+  COLN1 = read_xlsx(path='./docs/base editing gRNA location_4.9.24.xlsx', sheet=8),
+  PP3CB = read_xlsx(path='./docs/base editing gRNA location_4.9.24.xlsx', sheet=9)) %>%  
+  rbindlist(idcol=T, fill=T)
+
+  # different col structure so ignore for now 
+  #Intergenic = read_xlsx(path='./docs/base editing gRNA location_4.9.24.xlsx', sheet=10),
+  #'non-targeting' = read_xlsx(path='./docs/base editing gRNA location_4.9.24.xlsx', sheet=11)
+```
+
+Get target sense strand for variant mapping
+```{r}
+sgRNA.info <- merge(x=sgRNA.dt[!gene %in% c('Intergenic', 'non-targeting'), .(gene,guideRNA,guideSequence)], y=guideContext.dt[,.(Position,Guide,`Guide Strand`, `Edited 5'->3' Sequence`, `Edit Scores`, `Efficiency Score`, Exon)], all=T, by.x=c('guideSequence'), by.y=c('Guide'))
+
+# get the non-edited sense sequence (coding seq)
+# this is what we will map to vep
+sgRNA.info[, `5'->3' Sequence` := ifelse(`Guide Strand` == -1, toString(reverseComplement(DNAString(guideSequence))), guideSequence), by=1:nrow(sgRNA.info)]
+```
+
+Get our editing window and mutants
+Setting as bp 4-8 now to start (this was the window used by Jeff who had a similiar setup)
+Sub upperStrand to lower strand edits
+
+```{r}
+# quite a narrow window used here.. may need to expand
+sgRNA.info[, window_old := ifelse(`Guide Strand` == '1', substr(`5'->3' Sequence`, 4, 7), substr(`5'->3' Sequence`, 17, 20) )]
+
+# new edit window; edit window will always be on 5' end of the protospacer
+#sgRNA.info[, window := substr(guideSequence, 4, 8)]
+
+# of edit window; dependent on guide strand
+sgRNA.info[, window_new := ifelse(`Guide Strand` == '1', substr(guideSequence, 4, 8), substr(guideSequence,13,17))]
+
+# now need to create the edit sequences
+# + strand:if C is found in window, convert to T
+# - strand: if G is found in window, convert to A (base pairing w edited site on +ve strand)
+sgRNA.info[, bemaxEdit := ifelse(`Guide Strand` == 1, gsub('C', 'T', window), gsub('G', 'A', window))]
+sgRNA.info[, abe8eEdit := ifelse(`Guide Strand` == 1, gsub('A', 'G', window), gsub('T', 'C', window))]
+
+
+# identify the edits 
+# account for guide strand and editor.
+#sgRNA.info[, `:=`(Bemax_Edit = ifelse(`Guide Strand` == 1, gsub('C', 'T', window), gsub('G', 'A', window)),
+#                  Abe8e_Edit = ifelse(`Guide Strand` == 1, gsub('A', 'G', window), gsub('T', 'C', window))
+#               )]
+
+sgRNA.info[, .(window, window_old, `Guide Strand`, Bemax_Edit, bemaxEdit, Abe8e_Edit, abe8eEdit)]
+sgRNA.info
+```
+
+
+Function to compare two strings and identify the locations and bases of difference
+
+```{r}
+findStringEdits <- function(seq1, seq2){
+  
+  # check both inputs are characters of equal length
+  stopifnot('One or both of the inputs are not strings' = type(seq1) == 'character' & type(seq2) == 'character')
+  stopifnot('Strings must be equal length' = length(strsplit(seq1, "")[[1]]) == length(strsplit(seq2, "")[[1]]))
+  
+  # find sites that differ
+  str.compare <- strsplit(seq1, "")[[1]] == strsplit(seq2, "")[[1]]
+
+  
+  dt <- (data.table(ori = strsplit(seq1, "")[[1]][!str.compare],
+                    mut =  strsplit(seq2, "")[[1]][!str.compare],
+                    idx  = seq(1, length(strsplit(seq1, "")[[1]]))[!str.compare]
+                    ))
+  
+  # if no difference retrun empty string
+  if (sum(str.compare) == length(str.compare)){
+    return('')
+  } else {
+  return(paste0(dt$ori,':', dt$mut, '_', dt$idx,  collapse =';'))
+  }
+}
+
+# actually, we want to paste the edits together;
+findStringEdits((sgRNA.info$`5'->3' Sequence`[6]), sgRNA.info$`Edited 5'->3' Sequence`[6])
+findStringEdits('AAAAATCACAGGAACAATTT', 'AAAAATCAFAGGAACCATTL')
+```
+
+Compare the seqs within the edit window for both base editors
+```{r}
+sgRNA.info[, `:=`(Bemax_editSites = findStringEdits(window, bemaxEdit),
+                  Abe8e_editSites = findStringEdits(window, abe8eEdit)
+                  ), by=1:nrow(sgRNA.info)]
+
+sgRNA.info <-  sgRNA.info[, .(guideRNA, guideSequence,`Guide Strand`, gene, chr, strand, start, stop, Position, window, bemaxEdit,abe8eEdit, Bemax_editSites, Abe8e_editSites)]
+
+sgRNA.info[gene == 'MITF',]
+```
+
+Define the edit windows
+----
+Combine the sgRNA with gene level info 
+Load in the fa 
+
+read in the fasta file with the sequence information
+
+```{r}
+library(seqinr)
+fa.records <-  read.fasta(file='./docs/targetGenes.fa', as.string = TRUE, forceDNAtolower=F)
+
+# how you access objects with records
+attributes(fa.records)
+
+fa.dt <- lapply(fa.records, function(x){
+  
+  dt <- data.table(name = sub("[.][0-9]{1,}$","",attr(x, which='name')),
+                   loc =  str_extract(attr(x, which='Annot'), "GRCh38.+"),
+                   sequence = x[[1]]
+                   )
+  return(dt)
+}) %>%  rbindlist(idcol=NULL)
+
+fa.dt[, c('genome', 'chr', 'start', 'stop', 'strand') := tstrsplit(loc, ':')]
+
+#fa.dt[, gene := select(ensembl, keys=name, keytype ='ensembl_gene_id', columns = c('external_gene_name'))]
+# had to use HS.db as ensembl is down
+fa.dt[, gene := select(org.Hs.eg.db, keys=name, keytype ='ENSEMBL', columns ='SYMBOL')$SYMBOL]
+
+fa.dt <- fa.dt[,.(name, gene, genome, chr, start, stop, strand, sequence)]
+```
+Mapping editing window positions: 
+If gene on + strand: 
++ve guide: map to + strand
+-ve guide; map to - strand
+
+
+If gene on -ve strand
+-ve guide; map to vep using + strand 
++ve guide; map to - strand; good
+
+Tested these and look good..
+
+```{r}
+# merge gene level info with the sgRNA DT
+# dont need seq as confirmed alignment start site is equal to that recorded in sgRNA dt 
+#sgRNA.info <- merge(x=sgRNA.info, y=fa.dt, by.x='gene', by.y='gene', all.x=T)
+
+sgRNA.info <- merge(x=sgRNA.info, y=fa.dt[,-c('sequence')], by.x='gene', by.y='gene', all.x=T)
+
+# define site of the edit window
+#sgRNA.info[, `:=`(window_start = ifelse(`Guide Strand` == '1' , Position + as.numeric(start) + 3, Position + as.numeric(start) + 17), 
+#                  window_end =  ifelse(`Guide Strand` == '1', Position + as.numeric(start) + 6, Position + as.numeric(start) + 20) )]
+
+sgRNA.info[, window_start := ifelse(strand == 1 & `Guide Strand` == '1', as.numeric(Position) + 3, 
+                                        ifelse(strand == 1 & `Guide Strand` == '-1', as.numeric(Position) + 12, 
+                                               ifelse(strand != 1 & `Guide Strand` == '-1', as.numeric(stop) - as.numeric(Position) -15,
+                                                  (as.numeric(stop) - as.numeric(Position)) - 6) )) ]
+                                              
+
+sgRNA.info[, window_end := ifelse(strand == 1 & `Guide Strand` == '1', as.numeric(Position) + 7, 
+                                        ifelse(strand == 1 & `Guide Strand` == '-1', as.numeric(Position) + 16, 
+                                               ifelse(strand != 1 & `Guide Strand` == '-1', as.numeric(stop) -  as.numeric(Position) -11,
+                                                      as.numeric(stop) - as.numeric(Position) - 2)))] #changed from -1
+
+# strand to use for variant mapping
+sgRNA.info[, ensembl_strand := ifelse(strand == 1 & `Guide Strand` == '1', '+',
+                                        ifelse(strand == 1 & `Guide Strand` == '-1', '-',
+                                               ifelse(strand != 1 & `Guide Strand` == '-1', '+',
+                                                  '-')))]
+
+```
+
+```{r}
+# write out a tab seperated text file
+#bemax first
+sgRNA.info[Bemax_editSites != '',.(chr, window_start, window_end, paste0(window,'/',bemaxEdit), strand, paste0(guideSequence,'__', Bemax_editSites))][order(chr, window_start)]
+
+
+fwrite(sgRNA.info[,.(chr, window_start, window_end, paste0(window,'/',bemaxEdit), ensembl_strand, paste0(guideSequence,'__', Bemax_editSites))][order(chr, window_start)], sep = '\t',
+       ScriptAndDatedFileName('bemaxEdits.VEP.input.tsv'))
+
+#abe8e edits
+fwrite(sgRNA.info[,.(chr, window_start, window_end, paste0(window,'/',abe8eEdit), ensembl_strand, paste0(guideSequence,'__', Abe8e_editSites))][order(chr, window_start)], sep = '\t',
+       ScriptAndDatedFileName('abe8eEdits.VEP.input.tsv'))
+
+```
+
+check. chrX is correct:
+Looks good
+
+```{r}
+
+sgRNA.info
+# looks good
+sgRNA.info$gene %>%  unique()
+
+sgRNA.info[chr == 'X' & `Guide Strand` == '-1',][order(-Position)]
+
+sgRNA.info[, .(windowsize=window_start - window_end, gene, strand, `Guide Strand`)][, .N, by=.(windowsize, gene, strand, `Guide Strand`)]
+```
+
+
+
+```{r}
+
+
+104795751 - 22757 + 20
+                                                   #ifelse(strand == -1 & `Guide Strand` == '-1', stop - Position + 12,   
+                  #window_end =  ifelse(strand == 1 & `Guide Strand` == '1', Position + 7, Position + 16) )]
+
+# lets test if the windows are correctly modified
+test.sg <- sgRNA.info[gene == 'AKT1',][c(2,1,3,6,5)]
+test.seq <- fa.dt[gene == 'AKT1', unique(sequence)]
+test.sg
+
+# this is -ve guide strand
+#https://rest.ensembl.org//vep/human/region/14:104775192-104775212:1/CCCCC?
+
+# edit window
+#https://rest.ensembl.org//vep/human/region/14:104775196-104775200:1/CCCCC?
+
+ #stop - pos - 15
+#104795751 - 22757 - 15
+
+# stop - pos -11
+#104795751 - 22757 - 11
+
+# no do the string on the pos strand
+104795751 - 20540 #104775211
+104775211 - 19
+
+# this gets the window
+#https://rest.ensembl.org//vep/human/region/14:104775196-104775200:1/CCCCC?
+  
+#same for both, just need to adjust the strand whenm providing arg to vep
+104795751 - 22379 + 1 #104775211 +
+104775211 - 19 
+
+
+7528602
+7528603 - 7528615
+
+
+7529192+ 12
+
+```
+
+
+
+for + strand + guide:
+use + for ensemble
+for + strand - guide:
+use - for ensembl
+
+
+```{r}
+test.sg
+getSeqRevComp('GTGCACAGCGTGTATTTTT')
+findStringEdits('AAAAATACACGCTGTGCACG', 'AAAAATACACGCTGTGCACG') # 69951803-69951822 guide strand
+# this was to find the guide hit on rev strand https://rest.ensembl.org//vep/human/region/3:69951815-69951819:-1/CCCCC?
+```
+
+
+Ok, now we have all the info needed to submit jobs to VEP
+Lets write out the tables for both Bemax and for Abe8e 
+
+Formatting: 5 112707720 112707720 G/A + GGCGTACATAGGGGGCGCCG;C_7;
+chr 
+
+## notes Ran VEP using custom FASTA and GFF from emsembl to match positions;
+The strand follows the strand specified in the fasta header
+
+```{r}
+# write out a tab seperated text file
+#bemax first
+sgRNA.info[Bemax_editSites != '',.(chr, window_start, window_end, paste0(window,'/',Bemax_Edit), strand, paste0(guideSequence,'__', Bemax_editSites))][order(chr, window_start)]
+
+
+fwrite(sgRNA.info[,.(chr, window_start, window_end, paste0(window,'/',Bemax_Edit), ifelse(strand == '1', '+', '-'), paste0(guideSequence,'__', Bemax_editSites))][order(chr, window_start)], sep = '\t',
+       ScriptAndDatedFileName('bemaxEdits.VEP.input.tsv'))
+
+#abe8e edits
+fwrite(sgRNA.info[,.(chr, window_start, window_end, paste0(window,'/',Abe8e_Edit), ifelse(strand == '1', '+', '-'), paste0(guideSequence,'__', Abe8e_editSites))][order(chr, window_start)], sep = '\t',
+       ScriptAndDatedFileName('abe8eEdits.VEP.input.tsv'))
+
+```
+
+Investigating why the sequences are not matching
+Postion has been correctly adjusted
+So + strand genes are good; just need to take the position + 19
+```{r}
+# all guides are 20bp
+sapply(strsplit(sgRNA.info$guideSequence,''), function(x) length(x)) %>%  table()
+
+# get small test set and find location of guide sequences...
+# these tests worked for MITF, what about the negative genes
+#for MITF positions are correct (Dont need to add start and stop but not true for all genes)
+test.sg <- sgRNA.info[gene == 'MITF',][c(1:2)]
+test.seq <- fa.dt[gene == 'MITF', unique(sequence)]
+
+# the position is already included....
+# means that guide+ and strand+ correct, just need to go from pos + 19 (then take 4-8)
+# guide - and strand +? also fine, just needs to be submitted on the -ve strand to VEP
+findStringEdits('AAAAATACACGCTGTGCACG', 'AAAAATACACGCTGTGCACG')
+
+# check another + gene MCOLN1
+test.sg <- sgRNA.info[gene == 'MCOLN1',][c(1:10)]
+test.seq <- fa.dt[gene == 'MCOLN1', unique(sequence)]
+
+# + guide; exact same
+findStringEdits('AACAGCTTCCGGCTCCTGTT', 'AACAGCTTCCGGCTCCTGTT')
+# - guide; exact same, just use -1 in the mapping
+findStringEdits('AAAACTCACATTGTAGTTGT', 'AAAACTCACATTGTAGTTGT')
+```
+
+
+For negative strand, subtract the pos value from the stop site (as reading 5' to 3')
+This returned the guide for the pos guide strand (so its on -ve strand same as gene)
+https://rest.ensembl.org//vep/human/region/14:104775686-104775705:-1/CCCCC?
+
+To get this:
+5' start
+stop site - pos + 1
+above - 19 (see below)
+
+Question is now, are the edit windows correctly labelled? could compare with the edit window to confirm; at least I know how to find the sequences...
+
+```{r}
+104775211 - 19
+
+sgRNA.info[strand == '-1',]
+# now check genes on - strand; I think just reverse the order
+test.sg <- sgRNA.info[gene == 'AKT1',][c(1,9)]
+test.seq <- fa.dt[gene == 'AKT1', unique(sequence)]
+
+# this is the 5' end
+104795751 - 20047 + 1 # 104775705
+# this is the 3' end
+104775705 - 19 # 104775686
+
+#NB confirm the reverse complement of our edit window is in this window and check its position
+
+
+# now for the opposite strand; just try reverse the strand in hteVEP submission
+# works! just change the sign of the strand
+# https://rest.ensembl.org//vep/human/region/14:104772976-104772995:1/CCCCC?
+104795751 - 22757 + 1 #104772995
+104772995 - 19 #104772976
+
+104775192 -19
+```
+Need to confirm my editing windows are correctly located, adjust the sites for the editing windows and submit
+
+```{r}
+
+
+str_locate('GACCTCAGAGGGTACAGGCCACTCCCCTTCATCCTGGAGGAGGCCTTGGCTTTGCTGAGTAAACACCCTTGAGAAGAGGTCTGTGGGGGA', 'AACTCAGGGGCTGAAGAGAT')
+
+ATCCTGGAGGAGGCCTTGGCT
+
+
+# so MTOR this is the + guide that maps to a -1 strand
+str_locate(test.seq,  toString(reverseComplement(DNAString('AAAAACAAGTGAAGACAGCG')))) + 11106535
+# this is what is ref at this site on + std GATATAGGTGAAGCACCTG
+# ref on -ve AGGTGCTTCACCTATATCG
+
+
+104769349 - 22757
+22757 - 3618
+
+GTTGTTCTGGATGCGGAGAGG
+TCTCCGCATCCAGAACAA
+
+# none of these work...
+getSeqRevComp('GATATAGGTGAAGCACCTG')
+getSeqRevComp('AGGTGCTTCACCTATATCG')
+getSeqRevComp('AAAAACAAGTGAAGACAGCG')
+
+# check mTOR seq
+test.seq
+test.sg
+
+getSeqRevComp <-  function(biostr){
+
+  rv <- toString(reverseComplement(DNAString(biostr)))
+  return(rv)
+  
+}
+
+str_locate(test.seq,getSeqRevComp('AAAAAGCTTCTCATGGTCCT'))
+
+toString(reverseComplement(DNAString('AAAAACAAGTGAAGACAGCG')))
+
+sgRNA.info[strand == 1,]
+
+getSeqRevComp('TTTCTCTAAAAATAAAATAAAATAAAAATTA')
+
+
+test.sg
+
+fa.dt[gene == 'AKT1']
+```
+
+
+```{r}
+
+# ok, so the way we are reporting the variants is incorrect
+# when submitting to VEP; report on the positive strand
+matchPattern(DNAString(fa.dt[gene == 'MITF', unique(substr(sequence,1,20))]), reverseComplement(DNAString('AAAACAGGGCAGAGAGCGAG')))
+
+
+# this is forward strand gene and frwd strand sgRNA
+# 199665 199684
+str_locate(fa.dt[gene == 'MITF', unique(sequence)], 'AAAACAGGGCAGAGAGCGAG')
+
+sgRNA.info[gene == 'MITF',]
+
+69739456 + 199664
+
+fa.dt[name == 'ENSG00000142208', unique(sequence)]
+
+# completely different reference sequences where I aam aligning...
+# this is the ref allele from VEP.. why is it so different location to my strand below?
+# why is this happening????
+matchPattern(DNAString('TAGTAAACACTGTGCTTTGTA'),  DNAString(fa.dt[name == 'ENSG00000112561', unique(sequence)]))
+
+# obvious issue is there is a mismathc in the sequences I am using...
+matchPattern(DNAString('AGGACCATGAGAAGCTTTTT'),  DNAString(fa.dt[name == 'ENSG00000142208', unique(sequence)]))
+
+
+fa.dt %>%  head()
+
+fa.dt
+
+
+str_locate(fa.dt[gene == 'MITF', unique(sequence)], 'ACAGTTCCAACTTCTAATGACTTCATTCACGTGCACAGCGTGTATTTTTCCCACAGAGTCTGAAGCAAGAG')
+
+212319 + 69739456
+
+
+substr(fa.dt[gene == 'MITF', unique(sequence)], 212348 ,212368)
+
+
+fa.dt[gene == 'AKT1', 'AGGACCATGAGAAGCTTTTT']
+
+'AGTTCCAACTTCTAATGACT'
+
+
+DNAString('TGTCATCCTTCAAGTTGAGAT') %>%  reverseComplement()
+
+str_locate('ACAGTTCCAACTTCTAATGACTTCATTCACGTGCACAGCGTGTATTTTTCCCACAGAGTCTGAAGCAAGAG', )
+
+
+# here is the test sg and test sequence
+test.sg <- sgRNA.info[gene == 'MITF',][c(1:2)]
+test.seq <- fa.dt[gene == 'MITF', unique(sequence)]
+test.seq
+test.sg
+
+str_locate(test.seq,'AAAACAGGGCAGAGAGCGAG')
+
+199665 + 69739456 - 1
+
+test.sg
+
+'AAACAGGGCAGAGAGCGAGTG'
+
+# so, for looking at 3:69939120-69939139:1 we recover the same guide sequence
+findStringEdits('AAAACAGGGCAGAGAGCGAG','AAAACAGGGCAGAGAGCGAG')
+```
+Read in transcript info and see wherre this maps to in the file
+
+```{r}
+sgRNA.info[gene == 'MITF']
+
+fa.dt %>%  head()
+
+fa.transcript.records <-  read.fasta(file='./docs/targetGenes.cds.fa', as.string = TRUE, forceDNAtolower=F)
+
+# map the cds
+fa.cds.dt <- lapply(fa.transcript.records, function(x){
+  
+  dt <- data.table(name = sub("[.][0-9]{1,}$","",attr(x, which='name')),
+                   sequence = x[[1]]
+                   )
+  return(dt)
+}) %>%  rbindlist(idcol=NULL)
+
+```
+Could try prepare the data as they did, but the mapping regions are completely off...
+Or 
+
+```{r}
+sgRNA.info
+
+#seems wrong...need to correct this site info
+substr(fa.dt[gene ==  'AKT1', unique(sequence)], 104792123,	104792126)
+
+
+```
+
+
+
+
+
+Lets look at the editing window
+
+```{r}
+# so 5' to 3' is the correct order according to the gene anyway..
+(matchPattern(DNAString('AAAACAGGGCAGAGAGCGAG'), DNAString(fa.dt[gene=='MITF', unique(sequence)]) ))
+
+# -ve strand guide are A->G edits and at right hand side of 5'3'seq
+# +ve strand guide are T->C edits and at right hand side of 5'3'seq
+findStringEdits('GGTAAGCTTATTCATGTTTT', 'GGTAAGCTTATTCATATTTT')
+```
+
+
+Define the editing window:
+For BeMax, we use an editiing window of 4-7
+For Ae window is 3-12
+
+Leaving as 4-7 for now as suggested by Ronald
+
+```{r}
+
+# quite a narrow window used here.. how does it compare to the others? A little narrower than both other papers
+sgRNA.info[, window := ifelse(`Guide Strand` == '1', substr(guideSequence, 4, 7), substr(guideSequence, 17, 20) )]
+
+
+
+# identify the edits 
+# account for guide strand and editor.
+sgRNA.info[, `:=`(Bemax_Edit = ifelse(`Guide Strand` == 1, gsub('C', 't', window), gsub('G', 'a', window)),
+                  Abe8e_Edit = ifelse(`Guide Strand` == 1, gsub('A', 'g', window), gsub('T', 'c', window))
+               )]
+
+
+sgRNA.info[order(gene)]
+```
+
+
+Write a function to compare two strings and identify the locations and bases of difference; concatenate them
+
+```{r}
+findStringEdits <- function(seq1, seq2){
+  
+  # check both inputs are characters of equal length
+  stopifnot('One or both of the inputs are not strings' = type(seq1) == 'character' & type(seq2) == 'character')
+  stopifnot('Strings must be equal length' = length(strsplit(seq1, "")[[1]]) == length(strsplit(seq2, "")[[1]]))
+  
+  # find sites that differ
+  str.compare <- strsplit(seq1, "")[[1]] == strsplit(seq2, "")[[1]]
+
+  
+  dt <- (data.table(ori = strsplit(seq1, "")[[1]][!str.compare],
+                    mut =  strsplit(seq2, "")[[1]][!str.compare],
+                    idx  = seq(1, length(strsplit(seq1, "")[[1]]))[!str.compare]
+                    ))
+  
+  # if no difference retrun empty string
+  if (sum(str.compare) == length(str.compare)){
+    return('')
+  } else {
+  return(paste0(dt$ori,'->', dt$mut, '_', dt$idx,  collapse =';'))
+  }
+}
+
+# actually, we want to paste the edits together;
+findStringEdits((sgRNA.info$`5'->3' Sequence`[6]), sgRNA.info$`Edited 5'->3' Sequence`[6])
+
+
+sgRNA.info[gene == 'MITF',]
+
+DNAString('AAAAATACACGCTGTGCACG') %>%  reverseComplement()
+
+
+
+```
+A-T & C-G base pairing
+C->T base editors
+A->G base editors
+
+Simplify; we are keeping base editing windows between 4-7 for both cas9s for now maybe change the adenosine base editor
+Reverse the order
+Assuming all bases within the window are edited for now
+
+
+
+```{r}
+# quite a narrow window used here.. how does it compare to the others? A little narrower than both other papers
+# I think this is wrong as we have already reversed tge seq; just take bases 4-7
+#sgRNA.info[, window := ifelse(`Guide Strand` == 1, substr(`5'->3' Sequence`, 4, 7), substr(`5'->3' Sequence`, 17, 20) )]
+sgRNA.info[, window := substr(`5'->3' Sequence`, 4, 7)]
+
+
+sgRNA.info
+
+# add the BeMax and Abe8e edit window
+# may need to expand this, but leave for now...
+sgRNA.info[, `:=`(Bemax_Edit = ifelse(`Guide Strand` == 1, gsub('C', 't', window), gsub('G', 'a', window)),
+               Abe8e_Edit = ifelse(`Guide Strand` == 1, gsub('A', 'g', window), gsub('T', 'c', window))
+               )]
+
+
+
+sgRNA.info <- sgRNA.info[, .(guideRNA, gene, guideSequence,  `5'->3' Sequence`, `Guide Strand`, Position, Exon, window, Bemax_Edit, Abe8e_Edit)]
+
+sgRNA.info
+
+
+reverseComplement(DNAString('GTACA'))
+```
+
+I can format the variants as they have done in Hannah et al
+Variant worked: formatted as: 5 112707720 112707720 G/A + GGCGTACATAGGGGGCGCCG;C_7; (last part is just the name)
+
+Ours also worked; this produced the relevant MTOR variant; so why does our alignment not work then?
+1 11156746 11156746 TTTT/cccc
+
+
+# merge the chr and location info from fasta annotation datatable, format the lines, write out and we will submit to VEP
+# find known variants from clinvar?
+
+```{r}
+# merge this info with the anno DT
+sgRNA.info <- merge(x=sgRNA.info, y=fa.dt[,-c('strand', 'sequence')], by.x='gene', by.y='gene', all.x=T)
+
+sgRNA.info[, `:=`(window_start = ifelse(`Guide Strand` == '1', Position + as.numeric(start) + 3, Position + as.numeric(start) + 17), 
+                   window_end = ifelse(`Guide Strand` == '1', Position + as.numeric(start) + 6, Position + as.numeric(start) + 20) )]
+
+
+```
+
+
+```{r}
+# set our guide window as bp 4-7
+sgRNA.info[, guide_window := substr(guideSequence, 4,7)]
+
+# now modify our bases; if 
+
+
+sgRNA.info %>%  head()
+
+sgRNA.info %>% str()
+# now we need to find the match site for the guide
+#sgRNA.info[, match_start := paste0(as.character(unlist(start(matchPattern(DNAString(`5'->3' Sequence`), DNAString(sequence)))))), by=1:nrow(sgRNA.info)]
+
+
+for (i in unique(fa.dt$sequence)){
+  
+  print(start(matchPattern(DNAString('GAGACTGACACCAGGTATTT'), DNAString(i))))
+}
+
+sgRNA.info %>% head()
+
+sgRNA.info %>% str()
+```
+```{r}
+
+# confirm our work so far is correct
+
+GGCGTACATAGGGGGCGCCG	AGG	GTACA	5 112707720 112707720 G/A + GGCGTACATAGGGGGCGCCG;C_7; #antisense guide
+CAAAACATCTTGTTGAGGGC	AGG	AACAT	17 7675213 7675213 C/T + CAAAACATCTTGTTGAGGGC;C_6; #sense guide
+
+
+# for their edit window, they just looked at the guide directly (no revComp)
+substr('GGCGTACATAGGGGGCGCCG', 4,8)
+substr('GACTCACCATCTTGGAGGCA', 4,8)
+
+
+```
+
+
+
+
+```{r}
+fa.dt %>%  head()
+sgRNA.info %>%  head()
+
+str_locate(sgRNA.info$`5'->3' Sequence`[1], fa.dt$sequence[5])
+```
+
+
+```{r}
+sgRNA.info[gene == 'TFEB',]
+
+
+str_locate('AATGACCTGTG', unique(fa.dt[gene == 'TFEB', sequence]))
+
+# to define the edit window, lets extract the sites edited, look at table 
+sgRNA.info[, siteEdits := findStringEdits(`5'->3' Sequence`, `Edited 5'->3' Sequence`), by=1:nrow(sgRNA.info)]
+
+
+fa.dt %>%  head()
+```
+
+```{r}
+fa.transcript.records <-  read.fasta(file='./docs/targetGenes.cds.fa', as.string = TRUE, forceDNAtolower=F)
+
+# map the cds
+fa.cds.dt <- lapply(fa.transcript.records, function(x){
+  
+  dt <- data.table(name = sub("[.][0-9]{1,}$","",attr(x, which='name')),
+                   sequence = x[[1]]
+                   )
+  return(dt)
+}) %>%  rbindlist(idcol=NULL)
+
+
+fa.cds.dt
+
+transcripts.oi <- c('ENST00000373033')
+
+
+str_locate_all(str_split('CGCTGTCTTCACTTGTTTTT'), str_split('CGCTGTCTTCACTTATTTTT'))
+
+sgRNA.dt$gene %>%  unique()
+```
+
+
+
+
+```{r}
+
+#library(seqinr)
+library(Biostrings)
+
+# not used...
+readFasta <- function(fastaPath='./data/C57_BL6+CoV2_v2.fasta',...){
+  fa <- seqinr::read.fasta(file=fastaPath, ...)
+  return(fa)
+}
+
+# simplify the peptide string (optional arg)
+tidySequence <- function(seq=seq){
+  # remove mods first, then extract sequences
+  seq <- gsub("\\[.+?\\]", "", seq) %>% 
+    gsub("[^A-Z]", "", .)
+  return(seq)
+}
+
+matchString <- function(fasta=fasta, string=string, type='',...){
+  
+  stopifnot(!is.null(toupper(type)))
+  stopifnot(toupper(type) %in% c('DNA','AA'))
+
+  if (toupper(type) == 'AA'){
+    # read fa
+    fa <- readAAStringSet(fasta, ...)
+    # convet seq to string
+    subseq <- AAString(string)
+     # many to many matching
+    matchStrings <- vmatchPattern(subseq, fa, ...)
+  } else if (toupper(type) == 'DNA'){
+    # read fa
+    fa <- readDNAStringSet(fasta, ...)
+    subseq <- DNAString(string)
+    matchStrings <- vmatchPattern(subseq, fa, ...) 
+  }
+  
+  #return(matchStrings)
+  # tidy the output; loop through the matchObj and extract
+  # too slow to loop through each fa record per string.. just collapse output
+  # something useful to get the start and end of the match?
+  
+  #matching_data <- lapply(seq_along(matchStrings), function(i) {
+  #indices <- matchStrings[[i]]
+  #headers <- fa[indices]
+  #fastaSeq <- as.character(fa[indices]) 
+  #substring <- string
+  #})
+  
+  # extract matches and returun in DT format
+  hits <- unlist(matchStrings)
+  
+  tidy.dt <- data.table(FastaHeader = hits@NAMES, 
+                        FastaSequence = fa[hits@NAMES], # maybe this slows too much 
+                        Sequence = string,
+                        stringsAsFactors = F)
+  # maybe dont want to return the entire thing, just the names of the 
+  return(tidy.dt)
+}
+
+
+# given a sequence, align to records in fa file and return the protein name
+# also you dont want to reread in the fa each time....
+getProteinName <- function(fasta=fasta, string=string, cleanSequence=TRUE, type='', sep=';',...){
+  
+  stopifnot(!is.null(toupper(type)))
+  stopifnot(toupper(type) %in% c('DNA','AA'))
+
+  if (cleanSequence == TRUE){
+    message('tidying sequences... extracting IUPAC characters only')
+   string <- tidySequence(string)
+  } else {
+    message('using sequences "as is".. ensure input sequence contain IUPAC characters only')
+  }
+  
+  if (toupper(type) == 'AA'){
+    fa <- readAAStringSet(fasta, ...)
+    subseq <- AAString(string)
+     # 1 to many matching
+    matchStrings <- vmatchPattern(subseq, fa, ...)
+  } else if (toupper(type) == 'DNA'){
+    fa <- readDNAStringSet(fasta, ...)
+    subseq <- DNAString(string)
+    matchStrings <- vmatchPattern(subseq, fa, ...) 
+  }
+  
+  hits <- unlist(matchStrings)
+  seqNames <- hits@NAMES
+  
+  message(paste0('found ', length(seqNames), ' fasta record matches in file..'))
+  message('returning fasta headers...')
+  
+  # return the matching fasta headers, concatenate headers where more than one match occurs...
+  return(sapply(seqNames, function(x){
+    paste(seqNames, collapse = sep)
+  }))
+}
+
+# looks good...
+getProteinName(fasta='./data/C57_BL6+CoV2_v2.fasta', test$PeptideSequence[303],  cleanSequence=TRUE, type='aa')
+
+```

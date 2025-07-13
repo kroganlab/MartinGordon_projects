@@ -1,0 +1,399 @@
+---
+title: "060325_differentialAnalysis"
+author: "Martin Gordon"
+date: "2025-06-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+**Overview**
+Unfortunately, the viral-host co-evolution signal between the datasets is very poor.. Really struggling to find correlations between the AP-MS and the SEC-MS data
+Different approach; as we find poor evidence of co-elution, find the differential protein hits and see which of these move with the host protein
+
+```{r cars}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# flag consec proteins
+source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+```
+
+Read in the fitlered normalized and interpolated protein set
+```{r}
+sec.long <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_poxSECMS_firstLook_data/2025_06_03_sec.long.normalized.interpolated.filtered.csv.gz')
+sec.long[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+
+sec.long[, intensity_totalScaled := intensity/(sum(intensity, na.rm=TRUE)), by=.(protein,sample)]
+
+# annotation datatable
+anno.dt <- fread('./data/2024_10_25_SEC_MS_Input_Long.csv.gz') %>% 
+  .[, .(protein=Protein.Ids, gene=Genes)] %>% 
+  unique()
+
+sec.long[anno.dt, gene := i.gene, on=.(protein)]
+```
+
+Read in the peak tables as differential peak and intensity analysis is performed at the peak level
+
+```{r}
+allPeaks <- fread('~/Documents/projects/043025_MGordon_SECMS_QCplotsWork/060325_coelutionDetection_data/2025_06_03_poxInf.detectedPeaks.csv.gz')
+peakTables <- split(allPeaks, allPeaks$sample)
+
+standardizeAllPeakTablesToStandard(peakTables, sec.long, standardIdx = "Mock_R1", fitPortion = 0.65, minPeaksPerFraction = 45, startFitAtPeak = 20)
+```
+For now leave as is, may need to revert these peaks to the original. As we know many of these peaks may be FP due to our clean-up, ignore for now as we only want preliminary results for meeting tomorrow and will refine methodology.
+
+```{r}
+allPeaks <- rbindlist(peakTables, idcol='sample')
+allPeaks[goodPeak == TRUE, proteinPeakCluster := clusterPeaks(cofmN.standardized, maxDistance = 2.5), by = protein]
+```
+
+```{r}
+
+# per peak cluster (per protein), summarize to a center (and height etc, but most important is center)
+peakClusters <- allPeaks[!is.na(proteinPeakCluster), 
+                         .(.N, meanPeakHeight  = mean(peakHeight), center = mean(cofmN.standardized)),
+                         keyby = .(protein, proteinPeakCluster)]
+
+
+# split data into single-protein chunks
+# peaks in the protein
+peakClusters.subTables <- split(peakClusters, by = "protein")
+
+# sec data per protein (only those in above table)
+allProteins <- names(peakClusters.subTables)
+sec.subTables <- split(sec.long[protein %in% allProteins], by = "protein" )
+
+# iterate over proteins
+names(allProteins) <- allProteins
+anova.ls <- pbapply::pblapply(allProteins, function(proteinOI) anovaPeaksInOneProtein(sec.subTables[[proteinOI]], peakClusters.subTables[[proteinOI]], radius = 5))
+anova.ls[[1]]
+
+# format output
+anova.dt <- rbindlist(anova.ls, use.names = TRUE, fill = TRUE, idcol = "protein")
+anova.dt
+# friendly names
+setnames(anova.dt,
+         old = c( "rn",        "Sum.Sq",     "Mean.Sq",    "F.value", "Pr..F."),
+         new = c( "modelTerm", "SumSquares", "MeanSquare", "F",       "p.F"))
+
+
+peakClusters[anova.dt[modelTerm == "poly(standardFraction, 4):treatment"], treatmentDiff.p := i.p.F]
+peakClusters[anova.dt[modelTerm == "treatment"], treatmentIntensity.p := i.p.F]
+
+setorder(peakClusters, treatmentDiff.p, na.last = TRUE)
+
+# correct for multiple testing 
+peakClusters[, treatmentDiff.padj := p.adjust(treatmentDiff.p, method='BH')]
+peakClusters[, treatmentIntensity.padj := p.adjust(treatmentIntensity.p, method='BH')]
+
+#fwrite(peakClusters, ScriptAndDatedFileName('proteinPeaks.anova.pval.anno.csv.gz'))
+peakClusters <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_differentialAnalysis_data/2025_06_05_proteinPeaks.anova.pval.anno.csv.gz')
+```
+
+Now we have the differentially expressed proteins, find those that are in our viral-host ppi
+
+```{r}
+# we have over 3k proteins differentially eluted across the treatments, take these and see which of these proteins are in 
+peakClusters[treatmentDiff.padj < 0.05, length(unique(protein))]
+```
+
+```{r}
+allScores <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_05_pox.combinedCosinePeakSimilarity.scores.csv.gz')
+viral.apms <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_05_viralAPMS.sigHits.anno.csv.gz')
+```
+Which of the significantly changing proteins are in the dataset that coelute with viral proteins? Extract this subset, enrich for BP and maybe corum complexes and draw up some heatmaps, coelution plots of these sets of proteins
+```{r}
+# first extract only rows with sig moving proteins 
+viralAssoc <- allScores[protein1 %in% peakClusters[treatmentDiff.padj < 0.05, protein] | protein2 %in% peakClusters[treatmentDiff.padj < 0.05, protein]] %>% 
+  .[protein1 %in% viral.apms$protein1 | protein2 %in% viral.apms$protein1]
+
+# gene-gene pairing 
+viralAssoc[, pair_uniprot := paste0(protein1, '_', protein2)]
+
+viralAssoc[, ppi_uniprot_ordered := {
+  strsplit(pair_uniprot, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+```
+
+These is the set of differentially expressed host proteins that are associated with viral proteins
+1900 PPI detected in total
+```{r}
+#fwrite(viralAssoc, ScriptAndDatedFileName('viralhostAssoc.diffElutionSet.csv.gz'))
+#fwrite(viralAssoc[ppi_uniprot_ordered %in% viral.apms$ppi_uniprot_ordered,], ScriptAndDatedFileName('apms.viralhostAssoc.diffElutionSet.csv.gz'))
+viralAssoc <-  fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_differentialAnalysis_data/2025_06_05_apms.viralhostAssoc.diffElutionSet.csv.gz')
+```
+
+enrich for GO terms in this set
+```{r}
+huString.mapper <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_protein.string.idMapper.csv.gz')
+
+geneSets.dt <- fread('~/Documents/utils/mg_utils/data/stringDB/9606.protein.enrichment.terms.v12.0.txt.gz')
+geneSets.dt[huString.mapper, protein := i.protein, on = c(`#string_protein_id` = "stringID")]
+
+go <- geneSets.dt[grep ("Gene Ontology", category)][, .(description,  stringID = `#string_protein_id`, protein)]
+
+# subset to minimal size
+smallish <- go[, .N, by= description][ N< 100, description]
+
+go <- go[description %in% smallish]
+```
+
+go enrich for the significantly moving proteins in the data
+No GO terms significant after correcting for permutations
+```{r}
+allContrasts <- peakClusters[, contrast := 'all']
+allContrasts[anno.dt, gene := i.gene, on=.(protein)]
+setorder(allContrasts, treatmentDiff.p, na.last = TRUE)
+
+contrast.singleProt <- allContrasts[, .SD[1], by= .(gene, contrast) ]
+contrast.singleProt[, diffScore := -log10(treatmentDiff.p)]
+
+contrasts <- contrast.singleProt$contrast %>% 
+  unique()
+names(contrasts) <- contrasts
+
+allsea <- lapply(contrasts, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(go$protein, go$description),
+                                           contrast.singleProt[contrast == contOI][diffScore > 0, setNames(diffScore, protein)],
+                                           scoreType = "pos")
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) |> rbindlist(idcol = "contrast")
+
+allsea[padj < 0.05,]
+```
+enrich vs corum
+```{r}
+corum.db<- fread('/Users/martingordon/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/docs/corum.hs.5.1.txt') %>% 
+  .[, .(protein=unlist(strsplit(subunits_uniprot_id, ';'))), by=complex_name]
+
+setorder(allContrasts, treatmentDiff.p, na.last = TRUE)
+contrast.singleProt <- allContrasts[, .SD[1], by= .(protein, contrast)] # taking hte top scoring peak per protein
+contrast.singleProt[, diffScore := -log10(treatmentDiff.p)]
+
+contrasts <- contrast.singleProt$contrast %>% 
+  unique()
+names(contrasts) <- contrasts
+
+corum.allsea <- lapply(contrasts, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(corum.db$protein, corum.db$complex_name),
+                                           contrast.singleProt[contrast == contOI][diffScore > 0, setNames(diffScore, protein)],
+                                           scoreType = "pos")
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) |> rbindlist(idcol = "contrast")
+```
+
+
+```{r, fig.width=10, fig.height = 5}
+# merge the contrast scores with a subset of enriched corum
+sigPathways  <- corum.allsea[size > 1 & pval < 0.005, unique(pathway)]
+shortComplexLength = 80
+
+# subset enrichment table
+sigEnrichedPathways <- corum.allsea[pathway %in% sigPathways]
+sigEnrichedPathways
+genesInEnrichedPathways <- go[sigEnrichedPathways,, on = c(description = "pathway")]
+genesInEnrichedPathways[,.N, by=description]
+
+# what are we doiung here? basically joinging all corum db to our sig pathways based onpathways key (join to get individual gene names)
+genesInEnrichedPathways <- corum.db[sigEnrichedPathways,,  on = c(complex_name = "pathway")]
+
+# join with contrast protein scores
+genesWDiffScores <- contrast.singleProt[genesInEnrichedPathways,,on = c("contrast", protein = "protein")]
+genesWDiffScores[, diffScore := -log10(treatmentDiff.p)]
+
+# add total as a 'total' complex
+genesWDiffScores <- rbind(genesWDiffScores, contrast.singleProt, fill = TRUE)
+genesWDiffScores[is.na(complex_name), complex_name := "total"]
+setorder(genesWDiffScores, pval, na.last = TRUE) # order by SEA score
+genesWDiffScores[, complex_name := factor(complex_name, levels = rev(unique(genesWDiffScores$complex_name))  )]
+```
+
+```{r, fig.width=10, fig.height = 5}
+genesWDiffScores[anno.dt, gene := i.gene, on='protein']
+
+
+plot.dt <- genesWDiffScores[!is.na(diffScore)][,.(protein, gene, contrast, diffScore, complex_name, pval, padj, ES, NES, size)] %>% 
+  unique()
+
+p <- ggplot(plot.dt[!is.na(diffScore)] , aes(y = complex_name, x = diffScore, color = pval < 0.005, label=gene, shape = complex_name == "total")) +
+  ggforce::geom_sina(scale = "width", show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched (pval < 0.005):") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+  ggrepel::geom_text_repel(data  = plot.dt[, .SD[order (-diffScore)][1:4], by = .(complex_name, contrast)], show.legend = FALSE, size = 2, direction = "y", box.padding = 0) +
+  theme_bw() +
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle = "") +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+
+p
+BackupAsPDF(p, 'enriched.pval0.005.corum.complexes.dotplot')
+```
+Label any of these genes that are viral-associated; only take strongly assoiated set of viral proteins LLR > 3
+
+```{r}
+plot.dt[,col.lab := 'not significant']
+plot.dt[complex_name != 'total' &  pval < 0.005, col.lab := 'significant']
+plot.dt[complex_name != 'total' &  pval < 0.005 &  protein %in% c(viralAssoc[bestLLRatio >= 2,  protein1], viralAssoc[bestLLRatio >= 2,protein2]), col.lab := 'viral-host coelution observed']
+```
+
+
+Out of the limited set of results we are finding, it seems that some of the proteosome complexes are signficantly enriched for the viral-associated host proteins
+```{r, fig.width=10, fig.height=8}
+p <- ggplot(plot.dt[!is.na(diffScore)] , aes(y = complex_name, x = diffScore, color = col.lab, label=gene, shape = complex_name == "total")) +
+  ggforce::geom_sina(scale = "width", show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #facet_wrap(~contrast ) +
+  scale_color_manual(values = c('significant' = "firebrick", 'not significant' = "gray",'viral-host coelution observed'='cornflowerblue'), name = "Enriched (pval < 0.005):") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+  ggrepel::geom_text_repel(data  = plot.dt[, .SD[order (-diffScore)][1:4], by = .(complex_name, contrast)], show.legend = FALSE, size = 2, direction = "y", box.padding = 0) +
+  theme_bw() +
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle = "") +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+
+p
+BackupAsPDF(p, 'gsea.corumEnrichmentresults.viralAssocCol.dotplot')
+```
+
+Focus on the spliceosome E complex,  the 20S proteomsome, 26S proteomsome and the PA28gamma-20S proteasome
+Find within these complexes the viral proteins that are co-eluting, and generate heatmaps and elution plots of the profiles
+
+Looking at these complexes, it appears some of the members may significantly coelute with viral proteins. Lets plot the viral proteins
+
+```{r}
+sec.long <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_06_secdata.forplotting.csv.gz')
+```
+
+
+```{r}
+plot.dt[grep('RNA', complex_name), unique(complex_name)]
+complexes.oi <- c('Spliceosome, A complex', '20S proteasome', '26S proteasome', 'Nop56p-associated pre-rRNA complex', 'DGCR8 multiprotein complex')
+```
+
+# loop through the list of complexes and plot the complexes and the associated viral proteins for each
+```{r, fig.height=8, fig.width=10}
+lapply(complexes.oi, function(comp){
+  #pull out all genes associated with a given specific complex
+  genes.oi <- plot.dt[complex_name == comp, unique(protein)] %>% 
+    paste(., collapse='|')
+  
+
+  # now, of the viral associated set of proteins 
+  subsetDT <- viralAssoc[(grepl(genes.oi, protein1) | grepl(genes.oi, protein2)) & bestLLRatio >= 2.5,]
+
+  # now get the viral proteins that complex with these 
+  assoc.viral <- unlist(strsplit(subsetDT$pair, '_'))
+  print(assoc.viral)
+  
+  
+  sec.sub <- sec.long[gene %in% assoc.viral,]
+  print(sec.sub)
+  sec.sub[, grp := comp]
+  sec.sub[protein %in% viral.apms$protein1, grp := 'viral']
+  
+  p <- ggplot(sec.sub, aes(x = fraction, y=gene, fill=replicate)) +
+    ggridges::geom_ridgeline(aes(height = interpolatedIntensity), alpha=0.4,  scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=2, aes(color='maroon'), alpha=0.4) +
+    #scale_fill_manual(values=status.col) +
+    labs(title=paste0(comp)) +
+    scale_y_discrete(expand=c(0,0)) + 
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) + # to reorder colnames
+    facet_grid(grp~treatment, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  guides(linetype=guide_legend('donor'))
+  print(p)
+  BackupAsPDF(p, paste0(comp,'.elutionProfiles.interpolated.ridgeline'))
+})
+```
+Looks genuinely terrible... how can the proteosomes be differentially expressed? Look exactly the same....
+
+```{r}
+topHits <- peakClusters[,head(.SD, 20),][,protein]
+
+p <- ggplot(sec.long[protein %in% topHits], aes(x = fraction, y=gene, color=replicate)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled), fill='white', alpha=0.4,  scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=2, aes(color='maroon'), alpha=0.4) +
+    #scale_fill_manual(values=status.col) +
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) + # to reorder colnames
+    facet_grid(.~treatment, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  guides(linetype=guide_legend('donor'))
+
+print(p)
+```
+
+```{r}
+
+```
+
+
+Label any that are part of the APMS viral-host set
+
+```{r}
+
+allContrasts <- peakClusters[,contrast := "all"]
+allContrasts[idmapper, stringID := i.stringID, on = c(protein = "protein")]
+setorder(allContrasts, treatmentDiff.p, na.last = TRUE)
+contrast.singleProt <- allContrasts[, .SD[1], by= .(gene, contrast) ] # taking hte top scoring peak per protein
+contrast.singleProt[, diffScore := -log10(treatmentDiff.p)]
+
+contrasts <- contrast.singleProt$contrast %>% 
+  unique()
+names(contrasts) <- contrasts
+
+allsea <- lapply(contrasts, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(go$stringID, go$description),
+                                           contrast.singleProt[contrast == contOI][diffScore > 0, setNames(diffScore, stringID)],
+                                           scoreType = "pos")
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) |> rbindlist(idcol = "contrast")
+
+allsea
+```
+```
+
+
+
+enrich for CORUM complexes and GO biological processes for this set of results; when we find a sig set
+```{r}
+corum.dt <- fread('~/Documents/utils/mg_utils/data/corum_humanComplexes.txt')
+corum.dt
+loadCORUMasGMT(path = '~/Documents/utils/mg_utils/data/corum_humanComplexes.txt', species='HUMAN')
+```
+

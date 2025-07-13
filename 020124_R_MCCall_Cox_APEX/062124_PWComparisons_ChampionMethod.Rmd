@@ -1,0 +1,1101 @@
+---
+title: "062124_PWComparisons_MChampionmethod"
+author: "Martin Gordon"
+date: "2024-06-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Redo of analysis using the MChampion analysis method
+Here we will process the 3 runs in parallel and then attempt an error propagation 
+
+Questions:
+How do you propagate the error of missing values? given 0 just strengthening things with a lack of information
+Further details on CV calculation in https://www.cell.com/cell/fulltext/S0092-8674(22)01361-7?_returnURL=https%3A%2F%2Flinkinghub.elsevier.com%2Fretrieve%2Fpii%2FS0092867422013617%3Fshowall%3Dtrue#sectitle0025 is t-test here to test for difference of the fold-changes of the two comparisons?
+
+
+```{r}
+library(data.table)
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+library(stringr)
+library(magrittr)
+library(MSstats)
+library(ggrepel)
+library(circlize)
+library(ggvenn)
+library(MSstats)
+# read in the db fasta and extract the TB proteins
+library(Biostrings)
+library(seqinr)
+library(broom)
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("../../utils/bp_utils/EvidenceFile2MSstatsInput.R")
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+Get the TB protein IDs
+```{r}
+hu.tb.fasta <- read.fasta('./docs/102022_Tb_Hu.fasta', seqtype = "AA", as.string = T)
+tb.prots <- names(hu.tb.fasta)[grep("MYCTU$", names(hu.tb.fasta))]
+```
+
+read in the quant data from the initial run
+We are going to read in our fragpipe results
+```{r}
+spec <- fread('./data/RitaMC_MQOut/210224_FPOut/MSstats.csv')
+spec[, RawFile := Run]
+# exp info
+keys <-  fread('./docs/keys.txt')
+
+spec <- merge(x=spec[,-c('Condition','Run','BioReplicate', 'IsotopeLabelType')], y=keys, by='RawFile')
+```
+
+split the dataset into 3; one for each biorep group
+```{r}
+spec[,.N,by=.(Run,Condition,BioReplicate)]
+
+spec.list <- list(biorep1 = spec[Condition %like% "BR1",],
+                  biorep2 = spec[Condition %like% "BR2",],
+                  biorep3 = spec[Condition %like% "BR3",])
+
+lapply(spec.list, function(x){
+  x[,.N,.(BioReplicate)]
+})
+```
+
+lets plot the number of TB genes in each of the individual sample
+```{r}
+col.pal <- getQualitativePalette(n=8)
+
+lapply(seq_along(spec.list), function(x,n,i){
+  g <- ggplot(x[[i]][grep("_MYCTU", ProteinName),][!is.na(Intensity)][, .N, by=.(ProteinName,Condition)], aes(x=ProteinName, y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  scale_y_continuous(breaks=seq(1,11)) +
+  labs(title = paste0(n[[i]],' TB proteins detected (measured Ints.)')) +
+  scale_fill_manual(values=col.pal)+
+  theme_classic() +
+  theme(axis.text = element_text(angle=90))
+  
+  g
+  #BackupAsPDF(g, paste0(n[[i]],'N.tbProts.barplot'))
+},x=spec.list, n=names(spec.list))
+
+```{r}
+g <- ggplot(spec[!is.na(Intensity),.N, by=.(Condition,BioReplicate,Run)][], aes(x=reorder(interaction(Condition,BioReplicate,Run)), y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90)) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+g
+BackupAsPDF(g, 'N.features.barplot')
+```
+
+```{r}
+g <- ggplot(spec, aes(x=interaction(Condition,BioReplicate,Run), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  theme_bw() +
+  labs(title='Feature Ints.') +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+BackupAsPDF(g, 'featureIntensity.boxplots')
+```
+ok lets normalise within each run
+(as we are only performing the DE analysis within each group)
+
+```{r}
+
+dp.list <- lapply(spec.list, function(x){
+  
+  dp.out <-  MSstats::dataProcess(x, 
+                        MBimpute =  FALSE, 
+                        min_feature_count = 1, # want to keep the TB prots with only one identification
+                        featureSubset = "highQuality", 
+                        remove_uninformative_feature_outlier = TRUE)
+  return(dp.out)
+})
+
+#save the output of the 3
+lapply(seq_along(dp.list), function(x,n,i){
+  saveRDS(x[[i]], ScriptAndDatedFileName(paste0(n[[i]],'.mss.proc.rds')))
+},x=dp.list, n=names(dp.list))
+```
+lets read back in the dataProcess
+
+```{r}
+BR1 <- readRDS('./062124_PWComparisons_ChampionMethod_data/2024_06_22_biorep1.mss.proc.rds')
+BR2 <- readRDS('./062124_PWComparisons_ChampionMethod_data/2024_06_22_biorep2.mss.proc.rds')
+BR3 <- readRDS('./062124_PWComparisons_ChampionMethod_data/2024_06_22_biorep3.mss.proc.rds')
+
+dp.list <- list('BR1' = BR1,
+                'BR2' = BR2,
+                'BR3' = BR3)
+```
+
+
+Rerun the analysis; calculate the mean and sd and COv
+The CoV is going to be very small as SD is estimate of technical error
+```{r}
+
+# extract the p.quant from the lists and bind as single column
+# lets just pull out the p.quant data
+p.quant.full <- lapply(dp.list, function(x){
+  
+  dt <- setDT(x$ProteinLevelData)
+  return(dt)
+  
+})  %>% rbindlist(idcol='biorep')
+
+```
+
+calculate biorep group means, sd  and CoV
+# plot of the CoV ; its tiny. majority of values < 1%
+# upperbound is all < 20%... all v small
+BR3 most consistent; over 80% of the values under 1% CV... ridiculously small... is this value inflated (deflated?) by using spectral matching at the peptide Identification/quantification step (MaxQuant.etc..)
+
+```{r}
+# calculate mean and sd
+p.quant.full[, `:=`(meanLogIntensities = mean(LogIntensities, na.rm=T),
+                    standardDeviation = sd(LogIntensities, na.rm=T)), by=.(biorep, GROUP, Protein)]
+
+# also calculate the coefficient of variaiton
+p.quant.full[, coefVariation := (standardDeviation/meanLogIntensities) * 100, by=.(biorep,GROUP,Protein)]
+
+p.quant.full[, mean(coefVariation, na.rm=T), by=biorep ]
+
+ggplot(p.quant.full, aes(x=coefVariation, fill=biorep, alpha=0.3)) +
+  geom_density() +
+  geom_vline(xintercept=1) +
+  facet_wrap(~biorep)+
+  ggtitle("Coefficient of Variation (%) of three bioreps") +
+  theme_bw() 
+```
+
+Ok, now lets calcualte the fold change within each biorep and then between condititions (avg difference between the different bioreps)
+
+```{r}
+# add new col to track if sample ori from mutant or WT
+p.quant.full[, status := gsub('_BR[123]', '', GROUP)]
+
+# calculate FC within each biorep
+p.quant.full[, log2FC := meanLogIntensities[status == 'EccCmut_inf'] -  meanLogIntensities[status == 'WT_inf'], by=.(biorep,Protein, SUBJECT)]
+
+# calcualte avg FC across bioreps
+p.quant.full[, avglog2FC := mean(log2FC, na.rm=T), by=.(Protein)]
+p.quant.full[avglog2FC < 0,][order(avglog2FC)]
+```
+Propagate the errors for for each group. 
+For this we will just sum the variancea and take the sqrt and divide by N samples (basically avg variance across groups)
+To accurately estimate, need a col identifying the number of estimates that went into each
+```{r}
+# get n measurements per protein per exp
+p.quant.full[, NObservations := .N, by=.(Protein, status, biorep)]
+
+# standard error; estimate of variance of sample mean to pop mean (within each biorep)
+p.quant.full[,  standardError := standardDeviation/sqrt(NObservations), by=.(Protein, status, biorep)]
+
+# subset the DT, need to get cols OI
+summary.dt <- p.quant.full[, .(biorep, Protein, status,meanLogIntensities, log2FC, avglog2FC, standardDeviation, standardError, coefVariation, NObservations)][order(Protein)] %>% 
+  unique()
+
+# 'propagate' the errors; using formula here https://www.statisticshowto.com/statistics-basics/error-propagation/
+# problem? assumes errors are random and not correlated.... not sure if this holds.. also we propagate the 'technical' error
+
+##  use SE so we just sum the variances, take the sqrt (back to SD space)
+summary.dt[, propSD := sqrt(sum((standardDeviation^2), na.rm = T)), by=.(Protein,status)]
+summary.dt[, propSE := sqrt(sum((standardError^2), na.rm = T)), by=.(Protein,status)]
+summary.dt[, propCV := sqrt(sum(coefVariation, na.rm = T)), by=.(Protein,status)]
+
+#avg CV is ~1% incredibly low.... this is going to be highly inflated with FP results..
+summary.dt[, mean(coefVariation, na.rm=T), by=status]
+```
+
+Welshs t-test for unequal variances
+---
+Get significance of the results
+```{r}
+stats.dt <- summary.dt[, .(Protein, status, avglog2FC, propSD, propSE, NObservations)]
+
+#welshs modified t-test; assuming unequal variances between the groups (same as paper, could also test using var.test)
+# our denominator is the summed propaged SE of both populations and taking the sqrt
+stats.dt[, tStat := (avglog2FC)/sqrt( (propSE[status == 'EccCmut_inf']^2) + (propSE[status == 'WT_inf']^2)), by=Protein]
+stats.dt[, pvalue := 2*pnorm(q=abs(tStat), lower.tail=FALSE)] #two sided test and take abs tStat to avoid pos scores (constrain from 0-1)
+stats.dt[, adj.pvalue := p.adjust(pvalue, method='BH')]
+
+results.dt <- stats.dt[, .(Protein, avglog2FC, tStat, pvalue, adj.pvalue)] %>% 
+  unique()
+
+# convert this to wide format and save
+results.dt <- results.dt[,.(Protein, Label='EccCmut_inf-WT_inf', avglog2FC, pvalue, adj.pvalue, tStat)]
+results.dt[, c('numerator', 'denominator') := tstrsplit(Label, '[-]', keep=c(1,2))]
+```
+
+get counts from the quantification of the data
+```{r}
+quant.dt <- p.quant.full[,.(biorep,status, Protein, LogIntensities)] %>% 
+  .[is.na(LogIntensities), LogIntensities := 0]
+
+# want to collapse the p.quant.full
+counts.dt <- quant.dt[, .(status, 
+                          BR1_numeratorCounts = paste(LogIntensities[status=='EccCmut_inf' & biorep == 'BR1'],collapse=';'), 
+                          BR1_denominatorCounts = paste(LogIntensities[status=='WT_inf' & biorep == 'BR1'],collapse=';'),
+                          BR2_numeratorCounts = paste(LogIntensities[status=='EccCmut_inf' & biorep == 'BR2'],collapse=';'), 
+                          BR2_denominatorCounts = paste(LogIntensities[status=='WT_inf' & biorep == 'BR2'],collapse=';'),
+                          BR3_numeratorCounts = paste(LogIntensities[status=='EccCmut_inf' & biorep == 'BR3'],collapse=';'), 
+                          BR3_denominatorCounts = paste(LogIntensities[status=='WT_inf' & biorep == 'BR3'],collapse=';')
+                          ), by=Protein] %>% 
+  .[, -c('status')] %>% 
+  unique()
+```
+Now merge the counts to the log2FC info table 
+
+```{r}
+results.dt <- merge(x=results.dt, counts.dt, by='Protein', all.x=T)
+```
+Now tidy the results 
+
+```{r}
+results.dt[, sig := 'not']
+results.dt[adj.pvalue < 0.05 & abs(avglog2FC) > 0.58, sig := ifelse(avglog2FC > 0, 'up', 'down')]
+results.dt[, label := sig]
+results.dt[Protein %in% tb.prots, label := 'tb' ]
+
+# tidy the protein names 
+results.dt[, ProteinName := tidyUniProtNames(as.character(Protein))]
+results.dt[, gene := multiUniprots2multiGenes(ProteinName, species='HUMAN')]
+
+# write out results, generate some plots tomorrow and share
+fwrite(results.dt, ScriptAndDatedFileName('pwComparisons.MChampionMethod.csv'))
+```
+
+```{r}
+mss.dt <- fread('~/Documents/projects/020124_R_MCCall_Cox_APEX/062124_PWComparisons_ChampionMethod_data/2024_07_16_pwComparisons.MChampionMethod.csv')
+```
+
+create some plots and run standard enrichment analysis
+
+N sig hits... over 200 pass significance at FC +/- 50% and adj.pval < 0.05
+
+```{r}
+mss.dt[sig != 'not',.N, by=.(sig,Label)]
+
+g <- ggplot(mss.dt[sig != 'not',.N, by=.(sig,Label)], aes(x=sig, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Number of significant hits (FC +/- 50% & p.adjust < 0.05)') +
+  xlab('EccCmut_inf vs WT_inf') +
+  ylab('N') +
+  scale_fill_manual(values=c('down'='dodgerblue2', 'up'='firebrick2')) +
+  theme_bw() +
+  theme() 
+
+g
+BackupAsPDF(g, 'nSigHits.barplot', dimensions=c(6,5))
+```
+ok, now lets plot a volcanoplot of the significant hits
+The adjusted pvalues are ridiculously inflated.... For plotting threshold these to a lower number so we can see the plot
+
+```{r}
+# 4 here that look really suspect wit
+
+# threshold the scores
+mss.dt[, thresh.pval := -log10(adj.pvalue)]
+mss.dt[ thresh.pval > 12, thresh.pval := runif(1, min=12, max=13), by=Protein]
+
+# volcanoplot
+g <- ggplot(mss.dt[label != 'tb',], aes(x=avglog2FC, y=p.adj, color=label, label=gene)) +
+    geom_point(alpha=0.8) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='firebrick2', 'down'="dodgerblue2",'not'='grey', 'tb'='darkgreen')) +
+    ggrepel::geom_text_repel(data=mss.dt[sig != 'not',], size = 2, max.overlaps = 20) +
+    # add the viral info
+    geom_point(data=mss.dt[label == 'tb',], color='darkgreen') +
+   # add the thresholded datapoints 
+    annotate("point",
+          mss.dt[-log10(adj.pvalue) > 13, avglog2FC], #xasis
+          mss.dt[-log10(adj.pvalue) > 13, thresh.pval], #yaxis
+           alpha=0.3) +
+    ggrepel::geom_text_repel(data=mss.dt[label == 'tb',], size = 2, max.overlaps = 20) +
+    xlab('log2 Fold Change') +
+    ylab('-log10 adj.pvalue') +
+    ggtitle('EccCmut_inf vs WT_inf Volcanoplot') + 
+    theme_bw()
+g 
+BackupAsPDF(g, 'MutVsWT.volcanoplot', dimensions=c(9,6))
+```
+
+plot a heatmap of the DEGs
+
+```{r}
+sig.prots <- mss.dt[sig != 'not', unique(Protein)]
+
+prot.mat <- dcast(p.quant.full, Protein~interaction(GROUP,SUBJECT, RUN), value.var = "LogIntensities") %>% 
+  as.matrix(rownames = "Protein")
+
+# subset the data
+submat <- prot.mat[(rownames(prot.mat)) %in% sig.prots, ]
+
+rownames(submat) <- tidyUniProtNames(rownames(submat))
+rownames(submat)  <- multiUniprots2multiGenes(rownames(submat))
+
+submat <- sweep(submat,1, STATS=apply(submat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+              cluster_rows=clusterWNA(submat),
+              show_row_names = T, 
+              cluster_columns = T, 
+              row_title = sprintf('%s Proteins (FC +/- 50%% & p.adj < 0.05)', nrow(submat)),
+              row_names_gp = gpar(fontsize=2.5),
+              column_split = ifelse(grepl('WT', colnames(submat)), 'WT', 'EccMut'),
+             # top_annotation = colAnn, 
+              name='LogIntensities/Median', 
+              column_names_gp = gpar(fontsize=5.5))
+hm
+BackupAsPDF(hm, 'sigProteins.medianScaled.heatmap', dimensions = c(8,8))
+```
+Run enrichment 
+
+```{r}
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(dbName = 'org.Hs.eg.db', ontology = "ALL", keyType = "UNIPROT")
+```
+
+```{r}
+# define the universe, the total set of identified genes in our study
+universe <- unique(p.quant.full$Protein)
+universe <- tidyUniProtNames(as.character(universe))
+
+# now want to run enrichment on each 
+mss.dt[,enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "ProteinName", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+# no enrichment results significant after MTC..
+fwrite(enrich.dt, ScriptAndDatedFileName('GO.enrichments.csv'))
+
+
+enrich.dt
+```
+
+```{r}
+enrich.dt <- fread('./062124_PWComparisons_ChampionMethod_data/2024_07_16_GOenrichments.csv')
+
+enrich.mat <- dcast(enrich.dt, ID~enrich.grp, value.var='p.adjust') %>% 
+  as.matrix(rownames='ID')
+
+
+enrich.mat %>% View()
+enrich.mat[rownames(enrich.mat) %in% pathways.oi,]
+
+pathways.oi <- enrich.dt[p.adjust < 0.1, ID]
+
+Heatmap(enrich.mat)
+
+
+enrichHeatmapBestPerGroup %>%  View()
+```
+
+
+```{r}
+ubiquitin.related <-   unique(unlist(strsplit(enrich.dt[ID %like% 'ubiquitin', geneID], '/'))) 
+phagocytosis.related <-  unique(unlist(strsplit(enrich.dt[ID %like% 'phago', geneID], '/')))
+host.entry.related <-  unique(unlist(strsplit(enrich.dt[ID %like% 'host', geneID], '/')))
+innate.related <- unique(unlist(strsplit(enrich.dt[ID %like% 'innate', geneID], '/')))
+```
+
+
+Just plot the DEGs of each
+```{r}
+
+g <- ggplot(mss.dt[label != 'tb',], aes(x=avglog2FC, y=thresh.pval, color=label, label=gene)) +
+    geom_point(alpha=0.2) +
+    geom_point(data = mss.dt[ProteinName %in% ubiquitin.related]) +
+    ggrepel::geom_text_repel(data=mss.dt[ProteinName %in% ubiquitin.related,], size = 2, max.overlaps = 20) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='firebrick2', 'down'="dodgerblue2",'not'='grey', 'tb'='darkgreen')) +
+   # ggrepel::geom_text_repel(data=mss.dt[sig != 'not',], size = 2, max.overlaps = 20) +
+    # add the viral info
+    geom_point(data=mss.dt[label == 'tb',], color='darkgreen') +
+    #ggrepel::geom_text_repel(data=mss.dt[label == 'tb',], size = 2, max.overlaps = 20) +
+    xlab('log2 Fold Change') +
+    ylab('-log10 adj.pvalue') +
+    ggtitle('Ubiquitin-related genes highlighted') + 
+    theme_bw()
+g 
+BackupAsPDF(g, 'UbiquitinRelatedGenes.volcanplot', dimensions = c(8,6))
+
+g <- ggplot(mss.dt[label != 'tb',], aes(x=avglog2FC, y=thresh.pval, color=label, label=gene)) +
+    geom_point(alpha=0.2) +
+    geom_point(data = mss.dt[ProteinName %in% phagocytosis.related]) +
+    ggrepel::geom_text_repel(data=mss.dt[ProteinName %in% phagocytosis.related,], size = 2, max.overlaps = 20) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='firebrick2', 'down'="dodgerblue2",'not'='grey', 'tb'='darkgreen')) +
+   # ggrepel::geom_text_repel(data=mss.dt[sig != 'not',], size = 2, max.overlaps = 20) +
+    # add the viral info
+    geom_point(data=mss.dt[label == 'tb',], color='darkgreen') +
+    #ggrepel::geom_text_repel(data=mss.dt[label == 'tb',], size = 2, max.overlaps = 20) +
+    xlab('log2 Fold Change') +
+    ylab('-log10 adj.pvalue') +
+    ggtitle('Phagocytosis-related genes highlighted') + 
+    theme_bw()
+g 
+BackupAsPDF(g, 'PhagocytosisRelatedGenes.volcanplot', dimensions = c(8,6))
+
+
+g <- ggplot(mss.dt[label != 'tb',], aes(x=avglog2FC, y=thresh.pval, color=label, label=gene)) +
+    geom_point(alpha=0.2) +
+    geom_point(data = mss.dt[ProteinName %in% host.entry.related]) +
+    ggrepel::geom_text_repel(data=mss.dt[ProteinName %in% host.entry.related,], size = 2, max.overlaps = 20) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='firebrick2', 'down'="dodgerblue2",'not'='grey', 'tb'='darkgreen')) +
+   # ggrepel::geom_text_repel(data=mss.dt[sig != 'not',], size = 2, max.overlaps = 20) +
+    # add the viral info
+    geom_point(data=mss.dt[label == 'tb',], color='darkgreen') +
+    #ggrepel::geom_text_repel(data=mss.dt[label == 'tb',], size = 2, max.overlaps = 20) +
+    xlab('log2 Fold Change') +
+    ylab('-log10 adj.pvalue') +
+    ggtitle('Host entry-related genes highlighted') + 
+    theme_bw()
+g 
+BackupAsPDF(g, 'HostEntryRelatedGenes.volcanplot', dimensions = c(8,6))
+
+```
+Champion Method #2 
+combine all three and treat the bioreps & technical reps same 
+
+```{r}
+spec_fragpipe = fread('./data/RitaMC_MQOut/210224_FPOut/MSstats.csv')
+
+keys <- fread('./docs/fp.keys.tidy.txt')
+
+spec.dt <- merge(x=spec_fragpipe[,-c('Condition', 'BioReplicate')], y=keys, by.x='Run', by.y='RawFile')
+```
+Now change Biorep col to indicate these are all different samples
+```{r}
+spec.dt[,.N,.(Condition,BioReplicate, Run)]
+spec.dt[,  `:=`(oldBioReplicate = BioReplicate,
+                BioReplicate = str_extract(Run,'RM[0-9]{1}[_][1-3]{1}'))]
+
+spec.dt[, .N, by=.(Run, Condition, BioReplicate, oldBioReplicate)]
+```
+
+
+Run MSS
+```{r}
+
+dp.out <- MSstats::dataProcess(spec.dt, 
+                               MBimpute =  FALSE)
+```
+
+```{r}
+saveRDS(dp.out, ScriptAndDatedFileName('combReps.dpOut.rds'))
+
+fwrite(dp.out$ProteinLevelData,  ScriptAndDatedFileName('pquant.combReps.csv'))
+fwrite(dp.out$FeatureLevelData,  ScriptAndDatedFileName('fquant.combReps.csv.gz'))
+```
+
+```{r}
+p.quant <- fread('~/Documents/projects/020124_R_MCCall_Cox_APEX/062124_PWComparisons_ChampionMethod_data/2024_07_16_pquant.combReps.csv')
+f.quant <- fread('~/Documents/projects/020124_R_MCCall_Cox_APEX/062124_PWComparisons_ChampionMethod_data/2024_07_16_fquant.combReps.csv.gz')
+```
+Add back in the tb prots filtered out
+
+Rerun dropping the second mutant group as it likely adds noise RM2_MUT
+
+```{r}
+hu.tb.fasta <- read.fasta('./docs/102022_Tb_Hu.fasta', seqtype = "AA", as.string = T)
+tb.prots <- names(hu.tb.fasta)[grep("MYCTU$", names(hu.tb.fasta))]
+
+keep.tb.prots <- f.quant[PROTEIN %in% tb.prots, ]
+keep.tb.prots[,unique(PROTEIN)]
+
+
+spec.dt[,.N, by=.(Run,Condition, BioReplicate)]
+
+ggplot(p.quant[,.N, by=.(GROUP,SUBJECT)], aes(x=interaction(GROUP,SUBJECT), y=N, fill=GROUP)) +
+  geom_bar(stat='Identity') +
+  theme(axis.text.x = element_text(angle=90))
+
+
+
+p.mat <- dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- sweep(p.mat, 1, apply(p.mat,1, median,na.rm=T))
+
+Heatmap(submat,
+        cluster_rows = clusterWNA(submat))
+```
+Tidy names 
+```{r}
+p.quant[, ProteinName := tidyUniProtNames(Protein)]
+p.quant[grep(';', ProteinName),]
+p.quant[, gene := multiUniprots2multiGenes(ProteinName)]
+```
+
+Rerun the PW comparisons w/o the mut2 biorep
+
+```{r}
+p.quant <- p.quant[!SUBJECT %in% c('RM2_1', 'RM2_2', 'RM2_3')]
+
+dp.out$ProteinLevelData <- p.quant
+
+contrasts.mat <- matrix(c(-1,1), nrow=1, ncol=2)
+colnames(contrasts.mat) <-  c('WT', 'MUT')
+rownames(contrasts.mat) <- 'MUT-WT'
+
+# run msstats w/o correcting for batch 
+mss <- groupComparison(contrast.matrix=contrasts.mat, data=dp.out)
+mss.dt <- setDT(mss$ComparisonResult)
+```
+
+Write out the results
+PWcomparisons; treating all reps as bioreps
+
+```{r}
+mss.dt <- fread('~/Documents/projects/020124_R_MCCall_Cox_APEX/062124_PWComparisons_ChampionMethod_data/2024_07_16_PWcomparisons.combBioReps.csv')
+```
+
+```{r}
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+mss.dt[, ProteinName := tidyUniProtNames(Protein)]
+mss.dt[, gene := multiUniprots2multiGenes(ProteinName)]
+mss.dt[, sig := 'not']
+mss.dt[p.adj < 0.1 & abs(log2FC) > 0.58, sig := ifelse(log2FC > 0, 'up', 'down')]
+mss.dt[, label := sig]
+mss.dt[Protein %in% tb.prots, label := 'tb' ]
+
+#fwrite(mss.dt, ScriptAndDatedFileName('PWcomparisons.combBioReps.dropMutgrp.csv'))
+```
+
+
+
+```{r}
+g <- ggplot(mss.dt[sig != 'not',.N, by=.(sig,Label)], aes(x=sig, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Number of significant hits (FC +/- 50% & p.adjust < 0.1)') +
+  xlab('EccCmut_inf vs WT_inf') +
+  ylab('N') +
+  scale_fill_manual(values=c('down'='dodgerblue2', 'up'='firebrick2')) +
+  theme_bw() +
+  theme() 
+
+g
+BackupAsPDF(g, 'nSigHits.barplot.combRep', dimensions=c(6,5))
+```
+plots of the sig hits
+
+```{r}
+# volcanoplot
+g <- ggplot(mss.dt[label != 'tb',], aes(x=log2FC, y=-log10(p.adj), color=label, label=gene)) +
+    geom_point(alpha=0.8) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='firebrick2', 'down'="dodgerblue2",'not'='grey', 'tb'='darkgreen')) +
+    ggrepel::geom_text_repel(data=mss.dt[sig != 'not',], size = 2, max.overlaps = 20) +
+    # add the viral info
+    geom_point(data=mss.dt[label == 'tb',], color='darkgreen') +
+    ggrepel::geom_text_repel(data=mss.dt[label == 'tb',], size = 2, max.overlaps = 20) +
+    xlab('log2 Fold Change') +
+    ylab('-log10 adj.pvalue') +
+    ggtitle('EccCmut_inf vs WT_inf Volcanoplot') + 
+    theme_bw()
+g 
+BackupAsPDF(g, 'MutVsWT.combReps.volcanoplot', dimensions=c(9,6))
+```
+
+heatmap of the sig proteins 
+
+```{r}
+sig.prots <- mss.dt[sig != 'not', unique(Protein)]
+
+prot.mat <- dcast(p.quant,
+                     Protein~interaction(GROUP,SUBJECT), value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+
+# subset the data
+submat <- prot.mat[(rownames(prot.mat)) %in% sig.prots, ]
+
+rownames(submat) <- tidyUniProtNames(rownames(submat))
+rownames(submat)  <- multiUniprots2multiGenes(rownames(submat))
+
+
+submat <- sweep(submat,1, STATS=apply(submat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+              cluster_rows=clusterWNA(submat),
+              show_row_names = T, 
+              cluster_columns = T, 
+              column_split = ifelse(grepl('MUT', colnames(submat)), 'MUT', 'WT'),
+              row_names_gp = gpar(fontsize=6),
+              name='LogIntensities/Median',  
+              column_names_gp = gpar(fontsize=5.5))
+hm
+
+BackupAsPDF(hm, 'sigproteins.clustered.combReps.medianscaled.heatmap', dimensions=c(8,8))
+```
+
+```{r}
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(dbName = 'org.Hs.eg.db', ontology = "ALL", keyType = "UNIPROT")
+```
+
+```{r}
+# define the universe, the total set of identified genes in our study
+universe <- unique(p.quant$Protein)
+universe <- tidyUniProtNames(as.character(universe))
+
+# now want to run enrichment on each 
+mss.dt[,enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "ProteinName", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+# no enrichment results significant after MTC..
+fwrite(enrich.dt, ScriptAndDatedFileName('GO.enrichments.combReps.csv'))
+```
+
+plot UB related
+```{r}
+
+g <- ggplot(mss.dt[label != 'tb',], aes(x=log2FC, y=-log10(p.adj), color=label, label=gene)) +
+    geom_point(alpha=0.2) +
+    geom_point(data = mss.dt[ProteinName %in% ubiquitin.related]) +
+    ggrepel::geom_text_repel(data=mss.dt[ProteinName %in% ubiquitin.related,], size = 2, max.overlaps = 20) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='firebrick2', 'down'="dodgerblue2",'not'='grey', 'tb'='darkgreen')) +
+   # ggrepel::geom_text_repel(data=mss.dt[sig != 'not',], size = 2, max.overlaps = 20) +
+    # add the viral info
+    geom_point(data=mss.dt[label == 'tb',], color='darkgreen') +
+    #ggrepel::geom_text_repel(data=mss.dt[label == 'tb',], size = 2, max.overlaps = 20) +
+    xlab('log2 Fold Change') +
+    ylab('-log10 adj.pvalue') +
+    ggtitle('Ubiquitin-related genes highlighted') + 
+    theme_bw()
+g 
+BackupAsPDF(g, 'UbiquitinRelatedGenes.combReps.volcanplot', dimensions = c(8,6))
+
+g <- ggplot(mss.dt[label != 'tb',],  aes(x=log2FC, y=-log10(p.adj), color=label, label=gene)) +
+    geom_point(alpha=0.2) +
+    geom_point(data = mss.dt[ProteinName %in% phagocytosis.related]) +
+    ggrepel::geom_text_repel(data=mss.dt[ProteinName %in% phagocytosis.related,], size = 2, max.overlaps = 20) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='firebrick2', 'down'="dodgerblue2",'not'='grey', 'tb'='darkgreen')) +
+   # ggrepel::geom_text_repel(data=mss.dt[sig != 'not',], size = 2, max.overlaps = 20) +
+    # add the viral info
+    geom_point(data=mss.dt[label == 'tb',], color='darkgreen') +
+    #ggrepel::geom_text_repel(data=mss.dt[label == 'tb',], size = 2, max.overlaps = 20) +
+    xlab('log2 Fold Change') +
+    ylab('-log10 adj.pvalue') +
+    ggtitle('Phagocytosis-related genes highlighted') + 
+    theme_bw()
+g 
+BackupAsPDF(g, 'PhagocytosisRelatedGenes.volcanplot', dimensions = c(8,6))
+
+
+g <- ggplot(mss.dt[label != 'tb',],  aes(x=log2FC, y=-log10(p.adj), color=label, label=gene)) +
+    geom_point(alpha=0.2) +
+    geom_point(data = mss.dt[ProteinName %in% host.entry.related]) +
+    ggrepel::geom_text_repel(data=mss.dt[ProteinName %in% host.entry.related,], size = 2, max.overlaps = 20) +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='firebrick2', 'down'="dodgerblue2",'not'='grey', 'tb'='darkgreen')) +
+   # ggrepel::geom_text_repel(data=mss.dt[sig != 'not',], size = 2, max.overlaps = 20) +
+    # add the viral info
+    geom_point(data=mss.dt[label == 'tb',], color='darkgreen') +
+    #ggrepel::geom_text_repel(data=mss.dt[label == 'tb',], size = 2, max.overlaps = 20) +
+    xlab('log2 Fold Change') +
+    ylab('-log10 adj.pvalue') +
+    ggtitle('Host entry-related genes highlighted') + 
+    theme_bw()
+g 
+BackupAsPDF(g, 'HostEntryRelatedGenes.volcanplot', dimensions = c(8,6))
+
+```
+
+Read in the previous processing and just take the 
+```{r}
+enrich.dt <- fread('~/Documents/projects/020124_R_MCCall_Cox_APEX/062124_PWComparisons_ChampionMethod_data/2024_07_16_GO.enrichments.combReps.csv')
+```
+
+Before returning, return an example of the counts from the RNAseq mat
+
+```{r}
+ggplot(p.quant, aes(x=interaction(GROUP,SUBJECT), y=LogIntensities)) +
+  geom_boxplot()
+
+p.quant <- fread('~/Documents/projects/020124_R_MCCall_Cox_APEX/062124_PWComparisons_ChampionMethod_data/2024_07_16_pquant.combReps.csv')
+
+p.quant[, ProteinName := tidyUniProtNames(Protein)]
+p.quant[, gene := multiUniprots2multiGenes(ProteinName)]
+
+
+# plot an example of this 
+ggplot(p.quant[gene == 'PES1'], aes(x=reorder(interaction(GROUP,gsub('_[1-3]$' ,'', SUBJECT)), as.numeric(as.factor(GROUP))), y=LogIntensities, fill=GROUP)) +
+  geom_boxplot() +
+  xlab('samples') +
+  scale_y_continuous(breaks=seq(13,16), labels=seq(13,16,1))
+
+
+mss.dt[gene == 'PES1',]
+```
+
+
+NOT USED...
+-----
+
+
+```{r}
+sqrt(50)
+
+lapply(dp.list, function(x){
+  
+  dt <- setDT(x$ProteinLevelData)
+  dt[, `:=`(meanLogIntensities = mean(LogIntensities, na.rm=T),
+             standardDeviation = sd(LogIntensities, na.rm=T)),  by=.(Protein, GROUP)]
+  
+  # calculate the coefficient of variation
+  dt[, coefVariation := (standardDeviation/meanLogIntensities) * 100,  by=.(Protein, GROUP)]
+
+  # return
+  x$ProteinLevelData <- dt
+  return(x)
+})
+
+
+# calculate the fold changes for each group
+lapply(dp.list, function(x){
+  
+  dt <- setDT(x$ProteinLevelData)
+
+  # return
+  dt[, log2FC := meanLogIntensities[GROUP == 'EccCmut_inf_BR1'] - meanLogIntensities[GROUP == 'WT_inf_BR1'], by=.(Protein,SUBJECT)] #added SUBJECT to run 3 times
+  x$ProteinLevelData <- dt
+  return(dt)
+})
+
+# lets just pull out the p.quant data
+p.quant.list <- lapply(dp.list, function(x){
+  
+  dt <- setDT(x$ProteinLevelData)
+  return(dt)
+  
+})
+
+
+res.list <- lapply(p.quant.list, function(x){
+  
+  # convert to wide format and back to impute missing vals
+  ints.dt <- setDT(dcast(x, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>% 
+    reshape2::melt())
+  
+  setnames(ints.dt, new=c('Protein', 'sample', 'LogIntensities'))
+  
+  ints.dt[, `:=`(GROUP = gsub('_[123]$', '', sample),
+                 SUBJECT = str_extract(sample, '[123]$')
+                 )]
+    
+  
+  # we need to set values here; not going to impute so just set any NA vals to 0
+  ints.dt[is.na(LogIntensities), LogIntensities := 0]
+  
+  # f-test for equal variances per protein
+  prots.oi <- unique(ints.dt$Protein)
+  
+  f.test.dt <- for (i in prots.oi){
+    
+    f.test <- var.test(LogIntensities~GROUP, data=ints.dt[Protein == i,], alternative='two.sided') %>%  
+      tidy() # broom pkg to tidy output
+    
+  } %>% rbind()
+  
+  # get summary statisitcs
+  summary.dt <- ints.dt[, .(meanLogInts = mean(LogIntensities, na.rm=T),
+                     standardDeviation = sd(LogIntensities, na.rm = T)), by=.(GROUP,Protein)]
+  
+  return(list('input' = ints.dt,
+              'groups' = unique(ints.dt$sample),
+              'summary'= summary.dt,
+              'equal.var' = f.test.dt))
+  
+})
+
+res.list
+
+p.quant.list$BR1
+
+# plot of the CoV ; its tiny. majority of values < 1%
+# upperbound is all < 20%... all v small
+lapply(dp.list, function(x){
+  dt <- setDT(x$ProteinLevelData)
+  
+  # F-test to check for equality of variances across the two groups. Figure out how to do this...
+  # not right I think... ft.dt <- dt[, (F.test = tidy(var.test(LogIntensities~GROUP, data=dt, alternative='two.sided'))), by=Protein]
+
+  ft.dt[, padj := p.adjust(p.value, method='BH')]
+
+})
+
+
+lapply(dp.list, function(x) unique(x$GROUP))
+```
+
+maybe an easier way 
+```{r}
+
+```
+
+
+
+# propagate the CV for the dataset...
+# this is just ensuring that we accurately estimate the technical error/variance right?
+# seems variance is equal across both...proceed with normal t-test for now
+
+```{r}
+# easiest to run a t-test per protein
+lapply(dp.list, function(x){
+  
+  dt <- setDT(x$ProteinLevelData)
+  print(dt)
+  
+  # I think the easiest way to do this is to set up a matrix and also a design matrix and run on that using apply, then tidy the results
+  
+  
+})
+
+
+t.test()
+```
+
+
+
+
+```{r}
+dp.list <- lapply(seq_along(dp.list), function(x,n,i){
+  
+  p.quant <- setDT(x[[i]]$ProteinLevelData)
+  p.quant[,SUBJECT := paste0(GROUP,'.',SUBJECT)] # want to treat this as a simple PW comparison per biorep
+  x[[i]]$ProteinLevelData <- p.quant
+  return(x[[i]])
+  
+},x=dp.list, n=names(dp.list))
+```
+
+PW contrasts
+--
+```{r}
+# make the contrast matrix
+contrasts.mat <- matrix(c(-1,1), nrow=1, ncol=2)
+colnames(contrasts.mat) <-  c('WT', 'MUT')
+rownames(contrasts.mat) <- 'MUT-WT'
+
+#lets tidy the GROUP names in each of the samples
+dp.list <- lapply(dp.list, function(x){
+  x$ProteinLevelData[, GROUP := ifelse(grepl('EccCmut', GROUP), 'MUT', 'WT')]
+  return(x)
+})
+```
+
+Run MSS data process on each of these individual groups
+
+```{r}
+mss.list <-  lapply(dp.list, function(x){
+  
+  mss <- groupComparison(contrast.matrix=contrasts.mat, data=x)
+  mss.dt <- setDT(mss$ComparisonResult)
+  return(mss.dt)
+})
+
+
+dp.list[[1]]$ProteinLevelData[,.N, by=Protein][N==6,]
+```
+lets clean up the uniprot names and add other informative cols
+
+```{r}
+lapply(mss.list, str)
+
+mss.list <- lapply(mss.list, function(x){
+  
+  x[, ProteinName := tidyUniProtNames(as.character(Protein))]
+  x[, gene := multiUniprots2multiGenes(ProteinName, species='HUMAN')]
+  x[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+  
+  x[, sig := 'not']
+  x[p.adj < 0.05 & abs(log2FC) > 0.58, sig := ifelse(log2FC > 0, 'up', 'down')]
+  x[, label := sig]
+  x[Protein %in% tb.prots, label := 'tb' ]
+})
+```
+
+create a volcanoplot of the different tests 
+```{r}
+names(mss.list) <- names(spec.list)
+
+lapply(seq_along(mss.list), function(x,n,i){
+  
+  # volcanoplot
+  g <- ggplot(x[[i]], aes(x=log2FC, y=-log10(p.adj), color=label, label=gene)) +
+    geom_point() +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='#990033', 'down'="#2A788EFF",'not'='grey', 'tb'='darkgreen')) +
+    ggrepel::geom_text_repel(data=x[[i]][sig != 'not',], size = 2, max.overlaps = 20) +
+    # add the viral info
+    geom_point(data=x[[i]][label == 'tb',], color='darkgreen') +
+    ggrepel::geom_text_repel(data=x[[i]][label == 'tb',], size = 2, max.overlaps = 20) +
+    xlab('log2 Fold Change') +
+    ylab('-log10 adj.pvalue') +
+    ggtitle(paste(n[[i]], ' MUT - WT volcanoplot')) + 
+    theme_bw()
+  g 
+  BackupAsPDF(g, paste0(n[[i]], '.MUT-WT.volcanoplot'))
+
+},x=mss.list, n=names(mss.list))
+```
+Not as many things DE in each run as expected, even using technical reps as independent sample events
+
+Recalculate the pvals following the MChampion manuscript
+----
+
+```{r}
+names(dp.list) <- names(mss.list)
+```
+
+# first off, lets calculate the standard deviation; here its going to be SE * sqrt(N)
+# only have one explanatory variable in our lm, so estimated 2 params (intercept and GROUP non-ref coefficent) so add 2 to DF to approx N
+# with mean(FC) and SD, calculate coefficient of variation 
+
+Problem here is we need a way to handle the NA values...
+I am setting to 0, not happy with this but...
+NA variance = 0? Doesnt make sense..
+Give a DF of 0.. again doesn't make sense, but....
+
+
+```{r}
+mss.list <- lapply(mss.list, function(x){
+  # need to find a way to modify the log2FC
+  
+  # do what champion group did and set to a high number..
+  # maybe we just want to set it to our threshold of interest? That way it contribtes to a DE result (a positive) but wont limits N FPs detected in MChampions approach
+  x[, modLFC := log2FC ]
+  x[is.infinite(abs(modLFC)), modLFC := ifelse(modLFC > 0, 0.58, -0.58)]
+  x[, modSE := ifelse(is.infinite(abs(log2FC)), 0, SE)]
+  x[, modDF := ifelse(is.infinite(abs(log2FC)), 0, DF)]
+  #x[, N := modDF + 2 ] # sample size + parameters estimated
+  #x[, SD := modSE * sqrt(N)] #cal SD (spread) from mean pop error estimate
+  #x[, CV := SD/modLFC] # calculate the coefficient of variation
+})
+```
+
+Now collapse the mssats output and calculate the average fold change and 'propagate' the error/variance
+
+```{r}
+mss.comb <- rbindlist(mss.list, idcol='biorep')
+mss.comb[, biorep := gsub('biorep','', biorep)]
+```
+
+N, SD and propagated error for each protein
+
+```{r}
+# calculate the avg FC across each test
+mss.comb[, avg.LFC := mean(modLFC, na.rm=T), by=Protein]
+
+# calculate N; number of detected proteins and SD 
+mss.comb[, N := .N, by=Protein]
+#mss.comb[, SD := modSE * sqrt(N),]
+mss.comb[, SD := modSE * sqrt(N),]
+
+
+# 'propagate' the errors
+## I guess for this use SD so we just sum the variances, take the sqrt (back to SD space) and divide by number of 
+mss.comb[, propSD := sqrt(sum((SD^2), na.rm = T))/.N, by=Protein]
+
+# lets add something to flag missing groups
+mss.comb[, anyMissing := ifelse(any(is.na(issue)), 'yes', 'no'), by=Protein]
+```
+
+one sample t-test using the variance estimates
+Here we are interested in finding things different to 0
+
+recalculate the pvalue
+```{r}
+mss.comb[, tStat := abs(avg.LFC)/(propSD/sqrt(N))]
+mss.comb[, modDF := N - 1]
+
+mss.comb[, pval := 2*pnorm(q=tStat, lower.tail=FALSE)]
+mss.comb[avg.LFC < 0,]
+
+summary.dt <- mss.comb[,.(Protein,ProteinName,gene, Label, avg.LFC, propagatedSD=propSD, tStat, pval, anyMissing)] %>% 
+  unique()
+
+help(t.test)
+```
+
+adjust for multiple testing and add a sig label if thresholds are passed
+```{r}
+summary.dt[,adj.pval := p.adjust(pval, method='BH')]
+summary.dt[, sig := 'not']
+summary.dt[adj.pval < 0.05 & abs(avg.LFC) > 0.58, sig := ifelse(avg.LFC > 0, 'up', 'down')]
+summary.dt[, label := ifelse(Protein %in% tb.prots, 'tb', sig)]
+```
+
+plot a volcanoplot of the results 
+So these *really* significant results are actually just proteins with many missing values, as their variance is 0 so we propagate that
+Maybe we just want to keep NA?
+
+```{r}
+
+# volcanoplot
+g <- ggplot(summary.dt, aes(x=avg.LFC, y=-log10(adj.pval), color=label, label=gene)) +
+    geom_point() +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='#990033', 'down'="#2A788EFF",'not'='grey', 'tb'='darkgreen')) +
+    ggrepel::geom_text_repel(data=summary.dt[sig != 'not',], size = 2, max.overlaps = 20) +
+    # add the viral info
+    geom_point(data=summary.dt[label == 'tb',], color='darkgreen') +
+    ggrepel::geom_text_repel(data=summary.dt[label == 'tb',], size = 2, max.overlaps = 20) +
+    xlab('log2 Fold Change') +
+    ylab('-log10 adj.pvalue') +
+    ggtitle(paste('MUT - WT volcanoplot')) + 
+    theme_bw()
+ g 
+BackupAsPDF(g, 'combined.MUT-WT.volcanoplot')
+
+```
+
+

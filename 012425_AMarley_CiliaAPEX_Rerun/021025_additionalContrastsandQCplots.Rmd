@@ -1,0 +1,430 @@
+---
+title: "021025_additionalContrastsanQCplots"
+author: "Martin Gordon"
+date: "2025-02-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(showtext)
+library(readxl)
+library(emmeans)
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/NMF_Helpers.R")
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+
+# for converting output to artMS format
+source("../../utils/bp_utils/spectronautFile2ArtMS.R")
+library(artMS)
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_ipsum_rc() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+```
+
+read in the output of dataProcess that was used for the differential comparisons (compare to old data).
+Plot Justins recommendations and also the 
+
+Read in data
+```{r}
+spec <- fread('./data/CR2/20250115_CR2_SMO_APEX_Report.tsv')
+
+dp.out <- readRDS('./012425_ciliaAPEX_firstLook_data/2025_01_24_mss.dataProc.rds')
+p.quant <- fread('012425_ciliaAPEX_firstLook_data/2025_01_24_ProteinlvlQuant.2ndRoundNorm.csv')
+
+p.quant[, GROUP := factor(GROUP)]
+p.quant[, SUBJECT := paste0(GROUP,'.', SUBJECT)] # to enforce lm for group comparisons
+
+p.quant[, LogIntensities := tmpAdjLogIntensities]
+dp.out$ProteinLevelData  <- p.quant
+```
+cilia protein markers 
+
+```{r}
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+cilia.AM <- c('INPP5E', 'LCA5', 'PRKAR1A', 'ARL13B', 'SMO', 'EVC2', 'EVC', 'PKD2', 'TTC21B', 'PKHD1', 'IFT88', 'NPHP4', 'EFCAB7', 'CYS1')
+
+cilia.Consensus <- c('Pdap1','Cep131','Cep41','Ift122','Ift172','Ift52','Ift57','Ift74','Ift81','Ift88','Cfap97','Lca5','Cemip2','Wdr35',
+                     'Arl13b','Arl3','Inpp5e','Nme7','Kif3a','Kif3b','Kifap3','Ywhaz','Cys1','Evc2','Ttc21b','Ift56')
+
+cilia.Consensus[!cilia.Consensus %in% unique(mh_mappings$Symbol.mouse)]
+
+# all found
+cilia.AM.prots <- mh_mappings[Symbol.human %in% cilia.AM, SWISS_PROT_IDs.mouse]
+cilia.Consensus.prots <- mh_mappings[Symbol.mouse %in% cilia.Consensus, SWISS_PROT_IDs.mouse]
+```
+Lets look at the sum of intensities in each run
+
+```{r}
+g <- ggplot(spec[, .(sumInts=sum(Intensity, na.rm=T)), by=.(Condition,BioReplicate)], aes(x=paste0(Condition), y=(sumInts), fill=Condition, group=as.factor(BioReplicate))) +
+  geom_bar(stat='identity', position='dodge', color='black') +
+  ggtitle('Sum of intensities per sample') +
+  scale_color_manual(values=col.pal) +
+  scale_fill_manual(values=col.pal) +
+  customTheme
+
+g
+BackupAsPDF(g, 'sumIntensities.barplot')
+
+
+g <- ggplot(spec[, .(sumInts=sum(Intensity, na.rm=T)), by=.(RunID=gsub('exD00|[.]raw','', Run), Condition,BioReplicate)], aes(x=RunID, y=sumInts, fill=Condition)) +
+  geom_bar(stat='identity',color='black') +
+  ggtitle('Sum of intensities per sample') +
+  scale_color_manual(values=col.pal) +
+  scale_fill_manual(values=col.pal) +
+  customTheme
+
+g
+BackupAsPDF(g, 'sumIntensities.runOrder.barplot')
+```
+find the median intensity peptides in each run and plot them; how do they look across samples and hwo do they look pre- and post- normalization
+
+```{r}
+g <- ggplot(spec[, .(sumInts=sum(Intensity, na.rm=T)), by=.(RunID=gsub('exD00|[.]raw','', Run), Condition,BioReplicate)], aes(x=RunID, y=sumInts, fill=Condition)) +
+  geom_bar(stat='identity',color='black') +
+  ggtitle('Sum of intensities per sample') +
+  scale_color_manual(values=col.pal) +
+  scale_fill_manual(values=col.pal) +
+  customTheme
+
+g
+```
+First lets look at levels of biotin carboxylases before and after normalization 
+get sample median, subtract each value from the median and find the peptide closest
+
+Look at peptide distributions across groups
+```{r}
+spec[, sampleMedian := median(log2(Intensity), na.rm=T), by=Run]
+spec[, intsDiff := log2(Intensity) - sampleMedian]
+
+# get peptides closest to median value; how do these peptide values look across groups?
+medianPeptides <- spec[, .SD[which.min(abs(intsDiff)),], by=Run] %>% 
+  .[,.(Condition, BioReplicate, ProteinName, PeptideSequence, PrecursorCharge)]
+medianPeptides[, protGrp := paste0(ProteinName, '__', PeptideSequence, '__', PrecursorCharge)]
+```
+
+
+```{r}
+spec[, protGrp :=  paste0(ProteinName, '__', PeptideSequence, '__', PrecursorCharge)]
+
+f.mat <- dcast(spec, protGrp~paste0(Condition, '.', BioReplicate), value.var='Intensity') %>% 
+  as.matrix(rownames='protGrp')
+
+# basically pull out median peptides with measuments across majority samples (n = smallest probe group size = 30 - 6 =24)
+subset.oi <- apply(f.mat, 1, function(x){sum(!is.na(x))})[medianPeptides$protGrp][apply(f.mat, 1, function(x){sum(!is.na(x))})[medianPeptides$protGrp] >= 24]
+
+
+g <- ggplot(spec[protGrp %in% names(subset.oi),], aes(x=paste0(Condition, BioReplicate), y=log2(Intensity), group=protGrp, color=protGrp)) +
+  geom_line() +
+  geom_point() +
+  ggtitle('median peptide log2 ints.') +
+  customTheme
+g
+BackupAsPDF(g, 'medianpetide.ints.linechart', dimensions = c(10,8))
+```
+Look at the endogenous biotinylases across each of the groups. cant find our standard set in the data, look for more for potential cilia markers
+No endo biotinylases detected in this set
+```{r}
+p.quant <- fread('012425_ciliaAPEX_firstLook_data/2025_01_24_ProteinlvlQuant.2ndRoundNorm.csv')
+
+biotin.carboxylases.up <- c("O00763","P05165","P11498","Q13085","Q96RQ3")
+p.quant[, gene := multiUniprots2multiGenes(Protein)]
+
+
+g <- ggplot(p.quant[Protein %in% biotin.carboxylases.up,], aes(x=paste0(GROUP, SUBJECT), y=LogIntensities)) +
+  geom_line() +
+  geom_point() +
+  ggtitle('median peptide log2 ints.') +
+  customTheme
+g
+```
+Run artMS on the output so we can see the differences 
+```{r}
+artms.in <- spectronautFile2ArtMS('./data/CR2/20250115_CR2_SMO_APEX_Report.tsv')
+
+```
+
+
+*to do ahead of data return*
+- look at endo biotinylases and profile of median peptides across runs - not found in the dataset, so have to ignore for now
+- rerun the contrasts controlling for biorep1; include the other contrasts, then try a contrast of contrasts approach
+
+Run the QC analysis of the data using artSM to
+```{r}
+artmsQualityControlEvidenceBasic(evidence_file = artms.in$evidence_file,
+                                 keys_file = artms.in$keys_file, 
+                                 prot_exp = 'AB')
+
+artmsQualityControlEvidenceExtended(evidence_file = artms.in$evidence_file,
+                                  keys_file = artms.in$keys_file)
+```
+**redo contrasts**
+
+lets redo the PW comparisons controlling for the outlier impact from biorep 1
+Take the list of 
+```{r}
+contrasts.list <- list('+cilia_SMO_ag vs +cilia_SMO' = data.table(V1='SMO_+Cilia_+Agonist', V2='SMO_+Cilia_-Agonist'),
+                       '+cilia_SMO vs -cilia_SMO' = data.table(V1='SMO_+Cilia_-Agonist', V2='SMO_-Cilia_-Agonist'),
+                       '+cilia_PTH2R_ag vs +cilia_PTH2R' = data.table(V1='PTH2R_+Cilia_+Agonist', V2='PTH2R_+Cilia_-Agonist'),
+                       '+cilia_PTH2R vs -cilia_PTH2R' = data.table(V1='PTH2R_+Cilia_-Agonist', V2='PTH2R_-Cilia_-Agonist'),
+                       '+cilia_GPR135 vs -cilia_GPR135' = data.table(V1='GPR135_+Cilia', V2='GPR135_-Cilia'),
+                       # look at the agonist in cilia vs agonist no-cilia comparison
+                       '+cilia_SMO_ag vs -cilia_SMO_ag' = data.table(V1='SMO_+Cilia_+Agonist', V2='SMO_-Cilia_+Agonist'),
+                       '+cilia_PTH2R_ag vs -cilia_PTH2R_ag' = data.table(V1='PTH2R_+Cilia_+Agonist', V2='PTH2R_-Cilia_-Agonist'))
+
+
+
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(p.quant$GROUP), 
+                               labels = names(contrasts.list))
+```
+use the TMP normalized data and try lmm controlling for biorep
+```{r}
+# I think we want to control at the level of probe?
+p.quant[, oldInts := LogIntensities]
+p.quant[, LogIntensities := tmpAdjLogIntensities]
+
+dp.out$ProteinLevelData <- p.quant
+```
+
+We want to run a mixed effects model to control for impact in the biorep1 and compare this to our previous hit-list
+Then run a contrast of contrasts for the agonist activation in both backgrounds
+
+```{r}
+mss <- groupComparison(contrast.matrix=contrasts.mat,
+                       verbose=T,
+                       data=dp.out)
+mss.dt <- setDT(mss$ComparisonResult)
+
+```
+
+save the results of the lmm test and compare to our original data; important to model for this batch effect
+
+```{r}
+mss.dt[, padj := p.adjust(pvalue, method='BH'), by=(Label)]
+mss.dt[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+mss.dt[, c('numerator','denominator') := tstrsplit(Label, ' vs ', keep=c(1,2))]
+mss.dt[, sig := 'not']
+mss.dt[abs(log2FC) > 0.58 & padj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+mss.dt[, probe := str_extract(Label, 'SMO|PTH2R|GPR135')]
+mss.dt[, label := sig]
+mss.dt[Protein %in% c(cilia.AM.prots, cilia.Consensus.prots), label := 'cilia assoc.']
+
+# save the results to file 
+fwrite(mss.dt, ScriptAndDatedFileName('pwcomparisons.allContrasts.batchControlled.csv.gz'))
+```
+
+So modelling for biorep1 recovered more hits, so proceed with the new analysis set
+```{r}
+mss.dt <- fread('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/021025_additionalContrastsandQCplots_data/2025_02_10_pwcomparisons.allContrasts.batchControlled.csv.gz')
+old.mss.dt <- fread('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/020325_msstatsDEanalysis_data/2025_02_04_mss.pwcomparisons.allGroups.csv.gz')
+
+old.mss.dt[, padj := p.adjust(pvalue, method='BH'), by=(Label)]
+old.mss.dt[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+old.mss.dt[, c('numerator','denominator') := tstrsplit(Label, ' vs ', keep=c(1,2))]
+old.mss.dt[, sig := 'not']
+old.mss.dt[abs(log2FC) > 0.58 & padj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+rm(old.mss.dt)
+```
+
+Controlling for batch (biorep 1), improves results. Regenerate the plots/tables used previously
+
+reorder the points plotted so 
+```{r}
+mss.dt[, label := factor(label, levels = c('not', 'down', 'up', 'cilia assoc.'))]
+```
+
+
+```{r}
+lapply(unique(mss.dt$Label), function(x){
+  
+  g <- ggplot(mss.dt[Label == x,][order(label)], aes(y=-log10(padj), x=log2FC, color=label, label=gene)) +
+  geom_point(size=1.5) +
+  geom_text_repel(data=mss.dt[Label == x & label != 'not',], show.legend=FALSE) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  ggtitle(paste0(x, ' comparison')) +
+  labs(x=expression(log[2]~'FoldChange'), y=expression(-log[10]~'adjusted pvalue')) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'cilia assoc.'='green4', 'not'='grey')) +
+  customTheme 
+  
+  g
+  BackupAsPDF(g, paste0(x,'.volcanoplots'), dimensions = c(10,8))
+})
+```
+```{r}
+g <- ggplot(mss.dt[sig != 'not',.N, by=.(sig,Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='identity') +
+  scale_fill_manual(values=c('up'=col.pal[2], 'down'=col.pal[1])) +
+  ggtitle('Overview of comparisons') +
+  labs(x='Contrast', y=expression('N sig hits ('~log[2]~'FC & padj < 0.05)')) +
+  customTheme + 
+  theme(axis.text.x = element_text(size=8))
+g
+BackupAsPDF(g, 'nSighits.barplot', dimensions = c(5,5))
+```
+GO CC enrichment first
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+```
+
+```{r}
+# define the universe, the total set of identified genes in our study
+universe <- as.character(unique(p.quant$Protein))
+
+mss.dt[, enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('pwContrasts.GO.CC.enrichments.csv'))
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('pwContrasts.GO.CC.simplified.enrichments.csv'))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, 
+                                groupColumn = 'enrich.grp', 
+                                topN = 10,
+                                title='GO Cellular Component', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'pwcontrast.GOCC.enrichments.heatmap', dimensions=c(6,7))
+```
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='BP', keyType='UNIPROT')
+```
+
+```{r}
+# define the universe, the total set of identified genes in our study
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+# this is a very small set, just save the output
+# cant simplify further...
+fwrite(enrich.dt, ScriptAndDatedFileName('pwcontrast.GO.BP.enrichments.csv'))
+```
+
+```{r}
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('pwcontrasts.GO.BP.simplified.enrichments.csv'))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, 
+                                groupColumn = 'enrich.grp', 
+                                topN = 12,
+                                title='GO Biological Process', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'agonistContrast.GOCC.enrichments.heatmap', dimensions=c(10,10))
+```
+
+```{r}
+p.mat <- dcast(p.quant, Protein~paste0(GROUP,'.',SUBJECT), value.var='tmpAdjLogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+sigProts <- mss.dt[label != 'not', unique(Protein)]
+
+submat <- p.mat[rownames(p.mat) %in% sigProts,]
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+# 260 proteins in total that move, but larger number of contrasts
+submat <- sweep(submat, 1, apply(submat,1, median, na.rm=T))
+
+
+# get the sig genes and contrasts they are sig in 
+sigGenes.dt <- unique(mss.dt[label != 'not',.(gene, Label, label)])
+sigGenes.dt <- sigGenes.dt[, lapply(.SD, function(x) paste(x, collapse='\n')), .SDcols=c('Label', 'label'), by=gene]
+
+
+# its a merge; merging names but just want the Label col in the order of the rownames
+splitGenes <- sigGenes.dt[rownames(submat), Label, on='gene']
+
+
+column_ha = HeatmapAnnotation(
+                              ciliaStatus = ifelse(grepl('[+]Cilia', colnames(submat)), 'cilia', 'na'), 
+                              agonistStatus= ifelse(grepl('[+]Agonist', colnames(submat)), 'agonist', 'na'), 
+                              col=list(ciliaStatus=c('cilia'='darkgreen', 'na'='white'), agonistStatus=c('agonist'='darkred', na='white')),
+                              border=T
+                              )
+
+row_ha = rowAnnotation(ciliaMarker = ifelse(rownames(submat) %in% multiUniprots2multiGenes(cilia.Consensus.prots, species='MOUSE'), 'yes', ''),
+                       col=list(ciliaMarker=c('yes'=col.pal[4], ''='white')),
+                       border=T)
+
+hm <- Heatmap(submat, 
+        name='Ints/\nmedian',
+        top_annotation = column_ha,
+        right_annotation = row_ha,
+        row_split = splitGenes,
+        cluster_columns = F,
+        column_split = list(str_extract(colnames(submat), 'SMO|PTH2R|GPR135')),
+        col=colorRamp2(breaks=c(-3,0,3), colors = c(col.pal[1], 'white', col.pal[2])),
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=3.5),
+        row_title_gp = gpar(fontsize=6),
+        border=T,
+        row_title_rot = 0
+        )
+hm
+BackupAsPDF(hm, 'sigGenes.heatmap', dimensions=c(17,29))
+```

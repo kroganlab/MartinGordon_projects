@@ -1,0 +1,268 @@
+---
+title: "240124.APMS.ContrastsofContrasts"
+author: "Martin Gordon"
+date: "2024-01-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Redo of contrasts of contrasts heatmap plots
+
+Essentially, we want to collapse/summarise the columns (conditions/replicates), but still keep the plots the same, so no need to rerun the analysis
+
+
+read in the processed p.quant data 
+```{r}
+dataDir <-'/Users/martingordon/Documents/projects/121123_DSwaney_APMSFirstRun/090124.APMS.contrastofcontrast_data/'
+
+p.quant.nsp6 <- fread(paste0(dataDir, '2024_01_16_nsp6_ProteinLevelData.csv'))
+p.quant.orf3a <- fread(paste0(dataDir, '2024_01_16_orf3a_ProteinLevelData.csv'))
+
+# combine in list
+p.quant.list <-  list(orf3a = p.quant.orf3a,
+                      nsp6 = p.quant.nsp6)
+```
+
+
+read in the contrasts of contrasts data:
+```{r}
+dataDir <-'/Users/martingordon/Documents/projects/121123_DSwaney_APMSFirstRun/090124.APMS.contrastofcontrast_data/interaction.contrasts/'
+
+
+nsp6.emm  <- fread(paste(dataDir,'2024_01_17_nsp6.emm.interactionContrasts.csv', sep='/'))
+orf3a.emm <- fread(paste(dataDir,'2024_01_17_orf3a.emm.interactionContrasts.csv', sep='/'))
+
+# read in the interaction data and convert to wide format
+emm.interactions <- list(orf3a = orf3a.emm,
+                         nsp6 = nsp6.emm)
+```
+
+Read in SAINT scoring output, we will take all prots passing APMS thresholds and plot
+
+```{r}
+nsp6.spc.saint <-  fread('./output/SAINT.scoring/nsp6.spc.saint.list.txt')
+nsp6.int.saint <-  fread('./output/SAINT.scoring/nsp6.ints.saint.list.txt')
+orf3a.spc.saint <-fread('./output/SAINT.scoring/orf3a.spc.saint.list.txt')
+orf3a.int.saint <-fread('./output/SAINT.scoring/orf3a.ints.saint.list.txt')
+
+saint.list <- list(nsp6.spc = nsp6.spc.saint,
+                   nsp6.int = nsp6.int.saint,
+                   orf3a.spc = orf3a.spc.saint,
+                   orf3a.int = orf3a.int.saint)
+
+
+lapply(saint.list, str)
+
+f.saint.list <- lapply(saint.list, function(x){
+  
+  x.dt <- x[BFDR < 0.1, unique(Prey)]
+  return(x.dt)
+})
+
+```
+
+Just combine the ints and spec count edges and lets look at comparisons of the entire set
+```{r}
+nsp6.saint.fdr.01 <- unique(c(f.saint.list[[1]],f.saint.list[[2]]))
+orf3a.saint.fdr.01 <- unique(c(f.saint.list[[3]],f.saint.list[[4]]))
+```
+
+
+read the emm.interactions data
+
+```{r}
+emm.interactions$orf3a <- emm.interactions$orf3a[Protein %in% orf3a.saint.fdr.01,]
+emm.interactions$nsp6 <- emm.interactions$nsp6[Protein %in% nsp6.saint.fdr.01,]
+
+lapply(emm.interactions, function(x){
+  x[, fdr := p.adjust(p.value, method='BH'), by=Label]
+})
+
+```
+# replot the data, this time using the z-score 
+I think best if we calculate once per sample_group, collapse to condition (take mean or z-scores among replicates) then plot the sig hits identified in each interaction contrast
+
+
+now that we have the matrix, calculate the z score and get the mean of each group. We will use this to plot all groups together
+# finish tonight 
+```{r}
+lapply(p.quant.list, function(x){
+  # calculate z-score per sample
+  x[, z.score := (LogIntensities - mean(LogIntensities))/sd(LogIntensities), by=.(GROUP,SUBJECT) ]
+  #now calculate avg z-score per condition
+  x[, avg.z.score := mean(z.score), by=.(GROUP,Protein)]
+})
+
+lapply(p.quant.list, head)
+
+p.mat.list <- lapply(p.quant.list, function(x){
+  p.mat <- dcast(x[SUBJECT == 1,], Protein~GROUP, value.var = 'avg.z.score') %>% 
+    as.matrix(rownames='Protein')
+})
+```
+
+ok now that we have the mat, plot and filter the results
+
+```{r}
+rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+
+#play with thresholds here
+lapply(seq_along(emm.interactions), function(x,n,y,i){
+  
+  bait <- n[[i]] 
+  print(paste0('Working on: ', bait))
+  
+  # extract sig proteins in the interaction list
+  sigProtein <- x[[bait]][fdr < 0.05 & Protein %in% y[[bait]] & !is.infinite(p.value),] %>% 
+    .[,unique(Protein)]
+
+  # filter just to our data
+   prot.mat <- p.mat.list[[bait]][rownames(p.mat.list[[bait]]) %in% sigProtein,]
+
+  # convert to gene names
+  rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  # median sweep
+  #prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+   #print(prot.mat[1:8,1:8])
+  
+  hm <- Heatmap(prot.mat, 
+                cluster_columns = FALSE, 
+                cluster_rows = rowClusterWithNA(prot.mat),
+                name = 'avg z-score',
+                show_row_names = T,
+                #column_title = paste0(n[[i]]),
+                row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(prot.mat)),
+                row_names_gp = gpar(fontsize = 8),
+                column_names_gp = gpar(fontsize = 8),#,
+                column_split = ifelse(grepl("^[DL]{1}", colnames(prot.mat)), 'pre-treatment', "no pre-treatment") )
+  
+ #BackupAsPDF(draw(hm, column_title=paste0(bait, ' treatment interactions')), paste0(bait, 'interaction.contrasts.fdr<0.05.avg.zscores.heatmap'), dimensions = c(8,7))
+  
+},x=emm.interactions, y=saint.fdr1prc.list, n=names(emm.interactions))
+```
+plot the fdr < 0.1
+
+```{r}
+#play with thresholds here
+lapply(seq_along(emm.interactions), function(x,n,y,i){
+  
+  bait <- n[[i]] 
+  print(paste0('Working on: ', bait))
+  
+  # extract sig proteins in the interaction list
+  sigProtein <- x[[bait]][fdr < 0.1 & Protein %in% y[[bait]] & !is.infinite(p.value),] %>% 
+    .[,unique(Protein)]
+
+  # filter just to our data
+   prot.mat <- p.mat.list[[bait]][rownames(p.mat.list[[bait]]) %in% sigProtein,]
+
+  # convert to gene names
+  rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  # median sweep
+  #prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+   #print(prot.mat[1:8,1:8])
+  
+  hm <- Heatmap(prot.mat, 
+                cluster_columns = FALSE, 
+                cluster_rows = rowClusterWithNA(prot.mat),
+                name = 'avg z-score',
+                show_row_names = T,
+                #column_title = paste0(n[[i]]),
+                row_title = sprintf('%s Proteins (fdr < 0.1)', nrow(prot.mat)),
+                row_names_gp = gpar(fontsize = 8),
+                column_names_gp = gpar(fontsize = 8),#,
+                column_split = ifelse(grepl("^[DL]{1}", colnames(prot.mat)), 'pre-treatment', "no pre-treatment") )
+  
+ BackupAsPDF(draw(hm, column_title=paste0(bait, ' treatment interactions')), paste0(bait, 'interaction.contrasts.fdr<0.1.avg.zscores.heatmap'), dimensions = c(8,7))
+  
+},x=emm.interactions, y=saint.fdr1prc.list, n=names(emm.interactions))
+```
+make new pmat for use to match colnames of testing
+
+```{r}
+# create a pretreatment and condition col 
+lapply(p.quant.list, function(x){
+  x[, condition   :=  sub("^[LD]{1}", '', GROUP)]
+  # tidy
+  x[ condition == 'Empty' | condition == "emptyVector", condition := 'empty']
+  x[, pretreat := ifelse(grepl("^[LD]{1}.*", GROUP), str_extract(GROUP, "^[LD]{1}"), 'Ctrl')] 
+})
+
+
+# create new matrix
+p.mat.list <- lapply(p.quant.list, function(x){
+  x.mat <- dcast (x[SUBJECT == 1,], Protein~condition+pretreat, value.var = "avg.z.score") %>% 
+        as.matrix(rownames = "Protein")
+})
+```
+plot each list of sig hits @ 0.1
+```{r}
+#play with thresholds here
+lapply(seq_along(emm.interactions), function(x,y,n,i){
+  
+  bait <- n[[i]]
+
+  # identify each contrast and iterate 
+  contrasts.oi <-  x[[bait]][, unique(Label)]
+  
+  lapply(contrasts.oi, function(lab){
+    
+   
+   # extract sig proteins in the interaction list
+   sigProtein <- x[[bait]][Label == lab & fdr < 0.1 & Protein %in% y[[bait]] & !is.infinite(p.value),] %>% 
+    .[,unique(Protein)]
+
+   # only create heatmap if more than 1 
+   if (length(sigProtein) > 1){
+     
+    # want to reduce the number of columns in each: try strsplit the label and extract the conditions, then look for something similiar in the data
+    # convert the label to a regex pattern  to match matrix cols and and use to grep
+    regex.pattern <- strsplit(lab, ' ') %>% 
+      lapply(., function(x){
+      paste( x[2], '_', x[5], '|', 
+           x[4], '_', x[5], '|',
+           x[9], '_', x[12],'|',
+           x[11], '_', x[12],  sep='')
+    })
+       # filter just to our data
+      prot.mat <- p.mat.list[[bait]][rownames(p.mat.list[[bait]]) %in% sigProtein,]
+     
+     
+      # extract specific cols to the contrast
+      prot.mat <- prot.mat[, grep(regex.pattern, colnames(prot.mat))]
+    
+
+      # convert to gene names
+      rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+      # median sweep
+      #prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+      hm <- Heatmap(prot.mat, 
+                cluster_columns = FALSE, 
+                cluster_rows = rowClusterWithNA(prot.mat),
+                name = 'zscore',
+                show_row_names = T,
+               #column_title = paste0(n[[i]], ' ', lab),
+                row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(prot.mat)),
+                row_names_gp = gpar(fontsize = 4),
+                column_names_gp = gpar(fontsize = 8),#,
+                column_split = ifelse(grepl("_[DL]{1}", colnames(prot.mat)), 'pre-treatment', "no pre-treatment") )
+  
+
+    BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' ', lab)), paste0(n[[i]], '.', lab, '.interaction.contrasts.fdr<0.1.heatmap'), dimensions = c(8,7))
+   }
+ })
+},x=emm.interactions, y=saint.fdr1prc.list, n=names(emm.interactions))
+
+regex.pattern
+```
+
+return to this tomorrow nd finish
+----
+need to consider a way of doing the z-score; does this make sense over all the data?

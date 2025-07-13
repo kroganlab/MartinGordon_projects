@@ -1,0 +1,295 @@
+---
+title: "WGCNA_moduleDSDCytoscape"
+author: "Martin Gordon"
+date: "2023-10-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Import our DSD modules into cytoscape to visualise
+Start with the big modules that are 'interesting' first
+
+
+# redo the networks, incorrect distance matrix used so retry with 11receptor.STRINGConnections.600.dsdDefaults.dsd
+
+## Packages
+```{r}
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(RcppCNPy) #R/W support to import numpy objects into R
+library(pbapply) #apply functions with progress bar
+library(igraph)
+library(RCy3) # cytoscape interface
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+source ("../../utils/bp_utils/NetworkPropagation.R")
+source("../../utils/bp_utils/PPINetworkModularized.R")
+```
+
+## Convert DSD matrix into dt and subset for each module
+
+```{r}
+dsd.f <- fread('./output/11receptor.STRINGConnections.600.dsdDefaults.dsd')
+#convert to matrix
+dsd.mat <- as.matrix(dsd.f, rownames='V1')
+```
+
+Filter out connectors not in our data
+```{r}
+#exp mat
+adj.mat <- readRDS('./output/gpcr.11.receptors.adj.mat.Rdata')
+selected.prots <- rownames(adj.mat)
+
+# find andremove the one hop connectors form the data
+stringMapping <- GetStringIDMapping(selected.prots, stringAliasFile='./data/9606.protein.aliases.v12.0.txt.gz')
+
+#just use the alias of genes with no stringIDs
+stringsOI <- c(setdiff(selected.prots, stringMapping$alias), stringMapping$string) 
+
+# remove the 1 hop connectors
+stringsInMat <- intersect(rownames(dsd.mat), c(stringsOI))
+# sbset to just strings in the datatable
+dsd.mat <- dsd.mat[stringsInMat, stringsInMat]
+
+
+dsd.dt <- reshape2::melt(dsd.mat) %>% 
+  setnames(c('STRING.source', 'STRING.target', 'dsd')) %>% 
+  as.data.table()
+
+dsd.dt[, interaction := 'interacts with']
+```
+
+```{r}
+# file with cluster assignment for each gene/protein
+cluster.assignment <- fread('./output/wgcna.clustergenes.adjmat.csv')
+
+string.gene.map <- fread('./data/9606.protein.aliases.v12.0.txt.gz')
+string.gene.map[,GeneID := alias]
+colnames(string.gene.map) <- c('string', 'alias', 'source', 'GeneID')
+
+cluster.assignment[string.gene.map, stringID := i.string, on=c('GeneID', 'GeneID') ]
+cluster.assignment[, Cluster := sub('cluster', '', Cluster)]
+```
+
+Make our edge tables per module 
+
+```{r}
+clusters <- cluster.assignment[, unique(Cluster)]
+
+clusters.edge <- lapply(clusters, function(x){
+  #genes of interest
+  clust.genes <- cluster.assignment[Cluster == x, stringID]
+  # subset to the network of interest
+  clust.dt <- dsd.dt[(STRING.source %in% clust.genes & STRING.target %in% clust.genes),]
+  
+  # remove self-loops
+  clust.dt <- clust.dt[ STRING.source != STRING.target , .(STRING.source, interaction, STRING.target, dsd)]
+  
+  # remove duplicate edges
+  
+   # cal similarity (inverse transformation)
+   clust.dt <- clust.dt[, ds.similarity := 1/(dsd)]
+  
+  # select edges of interest
+  clust.dt <- clust.dt[, c("source", "target", "weight") := .(STRING.source, STRING.target, ds.similarity)] %>% 
+    .[,.(source,target,interaction,weight,dsd)]
+})
+
+
+names(clusters.edge) <- clusters
+
+# dont think this is a good metric, but use for now
+lapply(clusters.edge, function(x){
+  
+  hist(x$weight)
+  #quantile(x$weight, c(0.8,0.9,0.95))
+  #plot(x$weight, scale(x$dsd))
+})
+```
+
+Make node table per module;
+Include some identifier info such 
+
+```{r}
+# add ME info to node table
+MEs <- fread('./output/top10.K.percluster.csv')
+
+clusters.node <- lapply(seq_along(clusters), function(x,n,i){
+  
+  node.tab  <- cluster.assignment[(stringID %in% clusters.edge[[i]]$source | stringID %in% clusters.edge[[i]]$target)]
+  # node eigengene boolean
+  mes <- MEs[i.cluster == i,rn]
+  node.tab[GeneID %in% mes, ME := GeneID]
+  
+  # simplify
+  node.tab[, id := stringID] %>% 
+    .[,.(id,GeneID,Cluster,ME)]
+
+},x=clusters.edge, n=names(clusters.edge))
+
+
+names(clusters.node) <- clusters
+```
+
+Now import directly to Cytoscape
+Issues loading this many edges at once? Should I threshold the network to reduce spurious links 
+
+```{r}
+
+collection.name <- "GPCR.receptors.DSD"
+
+lapply(clusters, function(x){
+  RCy3::createNetworkFromDataFrames(nodes = clusters.node[[x]], 
+                                    edges = clusters.edge[[x]][,.(source,target,interaction,weight,dsd)],
+                                    title = paste0('module',x,'dsd'), 
+                                    collection = collection.name
+                                    )
+})
+
+```
+Network Ids for iterating
+
+```{r}
+# name of the collection
+collection.id <-  getCollectionSuid()
+
+# networks that are part of the collection
+network.ids <- getCollectionNetworks(collection.suid = collection.id)
+
+network.ids
+```
+
+Create a visual style for the network (think you first need to create a style before modifying)
+
+```{r}
+#deleteVisualStyle("gcpr.style")
+# color palette for the 11 modules
+col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD")  #"#999933" '#DDCC77' "grey"
+
+
+style.name = "gcpr.style"
+
+
+defaults <- list(NODE_SHAPE="ellipse",
+                 LABEL_FONT_SIZE=30,
+                 NODE_SIZE=50,
+                 EDGE_TRANSPARENCY=60,
+                 EDGE_OPACITY=100,
+                 NODE_COLOR="#D3D3D3",
+                 NODE_BORDER_WIDTH =2)
+
+nodeLabels      <- mapVisualProperty('node label','GeneID','p')
+nodeFills       <- mapVisualProperty('node fill color','Cluster','d', c("1","2", "3","4","5","6","7","8","9", "10","11"), col.pal)
+edgeWidth       <- mapVisualProperty('edge width','weight','c', c(0,1), c(1,20))
+nodeLabels      <- mapVisualProperty('node label','GeneID','p')
+
+createVisualStyle(style.name, defaults, list(nodeLabels,nodeFills,edgeWidth))
+#setVisualStyle(style.name) test
+
+```
+
+Remove duplicate edges from the network doesnt consider undirected edges so need to do manually...
+
+```{r}
+lapply(network.ids, function(x){
+
+  deleteDuplicateEdges(network = list(network.ids))
+
+})
+
+```
+
+Apply the visual style to each network 
+
+```{r}
+lapply(network.ids, print)
+
+lapply(network.ids, function(x){
+  
+  setVisualStyle(style.name, network = x)
+})
+```
+
+## Clustering 
+
+MCL clustering; identify clusters of highly connected nodes in the network using information flow/current through the network
+two stages: expansion and contraction of information performed over a number of iterations. Goal to conserve high information edges and trim less informative ones
+I parameter for contraction (power matrix product is raised to before thresholding/pruning less informative edges)
+I parameter 2-2.5 recommended. Used 2.5 for denser networks
+
+Algorithm is controlled by the inflation
+
+For filtering, check out distributions of DSD
+For MCL clustering, exclude edges between nodes with 1/dsd < 0.12 (retaining approx top 10% of edges in each cluster)
+
+```{r}
+lapply(clusters.edge, function(x){
+  
+  #ggplot(x, aes(x=weight)) + geom_histogram() + geom_vline(xintercept=15)
+  print(quantile(x$weight))
+  print(quantile(x$weight, c(0.75,0.8, 0.9)))
+})
+```
+
+
+Enrichment on the different modules detected
+
+For enrichment analysis, we need to adjust the background 
+Create two string networks in the collection using i) all genes in clustering and ii) all genes detected in the dataset
+
+```{r}
+string.cmd <- paste('string protein query query="', paste(c('ARRB1', 'TP53'), collapse = '\n'), '" cutoff=0.4 limit=0 species="Homo sapiens"',  sep = "")
+string.cmd
+
+commandsRun(string.cmd)
+```
+
+```{r}
+# import the DSD dataframe
+RCy3::createNetworkFromDataFrames(edges = dsd.dt[, c('source', 'target', 'interaction') := .(STRING.source, STRING.target, interaction)][, .(source, target, interaction)], 
+                                  nodes = dsd.dt[, id := STRING.source][, .(id,interaction)],
+                                  title = 'parent.network.wgcna.input', 
+                                  collection = collection.name)
+
+```
+node size 
+
+```{r}
+nodeSize  <- mapVisualProperty('node size','gene','p')
+```
+
+
+
+```{r}
+# now subset the matrix into 11 clusters
+modules.mat <- lapply(cluster.vector, function(x){
+  
+  print(x)
+  prots.oi <- cluster.assignment[!is.na(stringID) & Cluster == x, stringID]
+
+  # subset the dsd matrix to each module
+  clust.mat <- dsd.mat[rownames(dsd.mat) %in% prots.oi, colnames(dsd.mat) %in% prots.oi]
+  return(clust.mat)
+  
+})
+
+
+
+lapply(modules.mat, dim)
+cluster.assignment[, .N, by=Cluster]
+names(modules.mat) <- sub('cluster','',cluster.vector)
+```
+

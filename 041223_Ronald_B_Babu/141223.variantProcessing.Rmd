@@ -1,0 +1,284 @@
+---
+title: "141223.variantProcesssing"
+author: "Martin Gordon"
+date: "2023-12-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Variant Processing Script
+Take vcf output from the NF-gigaassay pipeline and tidy
+Goals:
+
+Custom Python scripts are used to identify 
+- the amino acid substitution for the VCFs, 
+- the number of reads for each UMI-barcode in each sample, and 
+- the barcodes groups for cells with the same amino acid substitutions.
+
+Barcode data are multiplexed corresponding to which amino acid variant is identified. 
+Read counts are normalized to each flow sort group into reads per million (RPM), and amino acid substitutions which have <2.5 total RPM are filtered out. Reads for each amino acid variant are compared and the activity is calculated as the percentage of GFP positive RPM over GFP positive plus GFP negative RPM.
+
+
+packages
+```{r}
+library(data.table)
+library(magrittr)
+library(VariantAnnotation)
+library(seqinr) # read fasta
+library(stringr)
+library(Rsamtools) # create index for fa and create FAFile obj for calling variants
+library(GenomicFeatures)
+library(BSgenome)
+#library(Biostrings)
+```
+
+
+# read in the vcf file
+fread conveniently ignores all the hashed lines at the top of the file, so use this
+
+
+#identify the AA SUBSTITUTION
+-----
+read in the file
+extract the:
+
+aa substitution
+reads for each umi barcode per sample
+barcode groups for (cells?) with the same aa substitutions
+
+
+this does not look right... lots of missing locations... something wrong with merging?
+
+```{r}
+vcf.dt <- fread('/Users/martingordon/Documents/projects/041223_Ronald_B_Babu/output/snpeff/freebayes/SRR20707784/SRR20707784.ann.vcf')
+
+# extract the variant modification
+vcf.dt[, VARIANT.ANNO := str_extract(INFO,'(?<=;)ANN.+')]
+
+# pattern to detect SNPEFF annotation and extract
+aa.pattern <- '(?<=\\|p[.]).+?(?=\\|)'
+
+vcf.dt[, AA.MOD2 := sapply(str_extract_all(VARIANT.ANNO, aa.pattern), paste, collapse = ',')]
+#vcf.dt[, AA.MOD3 := apply(str_extract_all(VARIANT.ANNO, aa.pattern, simplify = TRUE), 1, function(matches) paste(matches, collapse = ','))]
+vcf.dt$`#CHROM` %>%  unique()
+
+# not enough locations for one complete file... did we subsample? lack of matching reads?
+vcf.dt$POS %>%  unique()
+
+
+vcf.dt[, .(ID, POS, REF,ALT, AA.MOD)] %>% 
+  .[order(POS,ID)]
+
+
+
+
+
+# not used
+# extract the AA substitutions
+vcf.dt[, AA.MOD :=  sapply(str_extract_all(VARIANT.ANNO, aa.pattern), function(matches) {  
+  if (length(matches) > 0) {
+    return(paste(matches, collapse = ','))
+  } else {
+    return('No.AA.SUB')
+  }
+} )]
+
+
+
+```
+function to count the number of reads attached to each barcode
+```{r}
+# this function should read in a vcf table and return the barcodes and the number of variants attached to each
+countVCFBarcodes <-  function(vcfFile, barcodeCol='ID'){
+  
+ dt <-  vcfFile[!grepl('_unassigned', get(barcodeCol)), .N, by=get(barcodeCol)] %>% 
+   .[order(-N, get)]
+ return(dt)
+}
+countVCFBarcodes(vcf.dt, 'ID')
+```
+Function to identify aa substitutions 
+
+```{r}
+# extract the variant modification
+vcf.dt[, VARIANT.ANNO := str_extract(INFO,'(?<=;)ANN.+')]
+
+# pattern to detect SNPEFF annotation and extract
+aa.pattern <- '(?<=\\|p[.]).+?(?=\\|)'
+
+vcf.dt[, AA.MOD2 := sapply(str_extract_all(VARIANT.ANNO, aa.pattern), paste, collapse = ',')]
+
+vcf.dt <- fread('/Users/martingordon/Documents/projects/041223_Ronald_B_Babu/output/snpeff/freebayes/SRR20707784/SRR20707784.ann.vcf')
+
+
+getAASubs <- function(vcfFile, AnnoString='ANN', AApattern='(?<=\\|p[.]).+?(?=\\|)') {
+  
+  dt.x <-  vcfFile[, .(POS,ID,REF,ALT,INFO)]
+  
+  regex_pattern <- paste('(?<=;)',AnnoString,".+", sep = "")
+  print('extracting SNPEFF annotation info...')
+  dt.x[, ANNO.INFO := str_extract(INFO, regex_pattern) ]
+  
+  print('extracting aa substitutions..')
+  dt.x[, AA.SUBS := sapply(str_extract_all(ANNO.INFO, AApattern), paste, collapse = ',')] #extract all aa subs and collapse to 1 col
+
+  print(paste0('Identified ', as.character(dt.x[AA.SUBS != '', .N]), '  AA substitutions in dataset out of ', as.character(nrow(dt.x)), ' variants'))
+  return(dt.x[, .(POS,ID,REF,ALT,AA.SUBS)])
+}
+
+test <- getAASubs(vcf.dt, AnnoString = 'ANN', AApattern='(?<=\\|p[.]).+?(?=\\|)')
+```
+
+another function to identify barcode groups with the same aa substitutions
+
+```{r}
+# one liner will do it 
+test[!ID %like% '*_unassigned', .(Count = .N, IDList = paste(ID, collapse = ",")), by = AA.SUBS]
+```
+wrap the functions into one::
+
+```{r}
+
+faFile <- './041323_RBenjamin_gigaassay/docs/AF324493.2.fa'
+
+# should just need the vcffile and the fasta reference (later function..)
+tidyVariantOutput <-  function(vcfIn=vcfFile, barcodeCol='ID', faRef=faFile,...) {
+  
+  # count table of N reads attached to each barcode
+  counts.dt <-  countVCFBarcodes(vcfFile = vcfIn, barcodeCol=barcodeCol)
+  
+  # identify the aa substitutions (write a better function using a dedicated tool)
+  aasub.dt <-  getAASubs(vcfIn, AnnoString = 'ANN', AApattern='(?<=\\|p[.]).+?(?=\\|)')
+  
+  
+  # maybe read in fasta
+  ref.fa <- read.fasta(faRef, seqtype = 'DNA', as.string = T)
+  
+  # identify barcode grps with same aa substitution and count
+  print('getting barcode groups and counts')
+  aaN.dt <- aasub.dt[!get(barcodeCol) %like% '*_unassigned', .(Count = .N, 
+                                                       IDList = paste(get(barcodeCol), collapse = ",")), by = AA.SUBS]
+  
+  
+  return(list(vcfTable=aasub.dt,
+              readCounts=counts.dt,
+              barcodeCounts=aaN.dt))
+
+}
+
+tidyTabs <- tidyVariantOutput(vcfIn=vcf.dt, barcodeCol = 'ID', faRef=faFile)
+```
+Another home-made function to identify the variant...
+
+```{r}
+library(Biostrings)
+
+identifyAminoAcidSubstitution <- function(referenceFasta, variantPosition, variantAllele) {
+  # Read reference fasta file
+  referenceSeq <- readDNAStringSet(referenceFasta)
+
+  # Extract reference allele
+  refAllele <- as.character(referenceSeq[[1]][variantPosition])
+
+  # Translate reference and alternate alleles
+  refCodon <- DNAStringToAA(refAllele)
+  altCodon <- DNAStringToAA(variantAllele)
+
+  # Compare amino acids to identify substitution
+  if (refCodon != altCodon) {
+    cat("Amino acid substitution detected:\n")
+    cat("Reference amino acid:", refCodon, "\n")
+    cat("Alternate amino acid:", altCodon, "\n")
+  } else {
+    cat("No amino acid substitution detected.\n")
+  }
+}
+
+# Example usage
+referenceFasta <- "path/to/your/reference.fasta"
+variantPosition <- 100   # Replace with the actual variant position
+variantAllele <- "C"     # Replace with the actual alternate allele
+
+identifyAminoAcidSubstitution(referenceFasta, variantPosition, variantAllele)
+```
+
+read in the new data and review after pipeline rerun
+
+```{r}
+
+vcf.dt <- fread('/Users/martingordon/Documents/projects/041223_Ronald_B_Babu/output/14.12.23.test/snpeff/freebayes/SRR20707784/SRR20707784.ann.vcf')
+
+tidyTabs <- tidyVariantOutput(vcfIn=vcf.dt, barcodeCol = 'ID', faRef=faFile)
+
+
+tidyTabs
+```
+
+
+
+function to predict coding changes
+Try using the variant annotation package
+```{r}
+
+library(VariantAnnotation)
+
+# vcf.in is fine
+
+vcf.in <- readVcf('/Users/martingordon/Documents/projects/041223_Ronald_B_Babu/output/snpeff/freebayes/SRR20707784/SRR20707784.ann.vcf')
+vcf.in %>%  str()
+# reference fa seq
+ref.fa <- read.fasta('./041323_RBenjamin_gigaassay/docs/AF324493.2.fa', seqtype = 'DNA')
+ref.fa %>%  str()
+
+# 
+Biostrings::BString(ref.fa)
+
+ref.fa[1] %>%  length()
+length(ref.fa$AF324493.2)
+Biostring
+
+ref.fa$AF324493.2
+predictCoding(vcf.in,seqSource = fa.obj)
+summary(vcf.in)
+seqlevels(vcf.in)
+seqlevels(ref.fa)
+
+
+seqnames(vcf.in)
+class(ref.fa)
+
+
+help("predictCoding")
+
+
+   
+# make fa index
+indexFa('./041323_RBenjamin_gigaassay/docs/AF324493.2.fa')
+fa.obj <- FaFile('./041323_RBenjamin_gigaassay/docs/AF324493.2.fa', index='./041323_RBenjamin_gigaassay/docs/AF324493.2.fa.fai')#,
+
+# make txdb from gff file
+txdb <- makeTxDbFromGFF('./041323_RBenjamin_gigaassay/docs/AF324493.2.gff3')
+
+# predict coding muts
+predictCoding(vcf.in, txdb,seqSource = fa.obj, ignore.strand=T)
+test
+
+rowRanges(vcf.in)
+
+seqnames(vcf.in)
+seqnames(fa.obj)
+txdb %>%  View()
+seqnames(txdb) # subject, which is needed 
+
+
+available.genomes(splitNameParts=T) %>% 
+  data.table() %>% 
+  .[organism %like% 'inf']
+
+
+maybe try varAllelle option: a DNAstring set same length as query
+```
+

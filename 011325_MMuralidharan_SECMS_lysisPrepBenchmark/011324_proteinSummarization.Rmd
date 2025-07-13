@@ -1,0 +1,318 @@
+---
+title: "011325_ProteinSummarisation"
+author: "Martin Gordon"
+date: "2025-01-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+To compare the different lysis methods, we want to first summarise the features to proteins 
+3 lysis methods being compared, Spectronaut used for the search
+In this case dont want a combined search, as we don't want to 'impute' intensity values predicted in one run but not the other
+
+```{r}
+library(MSstats)
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+
+
+# useful utility scripts
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <-  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+Read in the runs; we should have 3 reps in each msstats file
+```{r}
+lysisPrep.list <- list('sonic'=fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/data/Spectronaut_Final_010224/20241227_104957_MM_Sonic_Lysis_122724_PEP_Report.tsv'),
+                       'FT'=fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/data/Spectronaut_Final_010224/20241227_104610_MM_FT_Lysis_122724_PEP_Report.tsv'),
+                       'CL'=fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/data/Spectronaut_Final_010224/20241227_104259_MM_CL_Lysis_122724_PEP_Report.tsv')
+                       )
+
+
+lysisPrep.dt[Run == '[1] Sonic-1_Frac-1.PG.MS1Quantity',.N by=.(P)]
+```
+
+convert files to long format
+
+```{r}
+lysisPrep.list <- lapply(lysisPrep.list, function(x){
+  
+  x.long <- reshape2::melt(x, id.vars=c('PG.MolecularWeight', 'PG.ProteinAccessions', "PG.Genes", "PG.ProteinDescriptions", "EG.PrecursorId"))
+  head(x.long)
+  return(x.long)
+})
+```
+
+look at an example MSS input file 
+```{r}
+test.f <- fread('../121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/data/010425_ViralProtsInDBSearch/MRC5_AB/MSstats_20250104_141826_JB_MRC5_AB_rerun_010425_Report.tsv')
+cols.oi <- colnames(test.f)
+```
+
+Read a MSStats in example file format so we know what to use for the summarisation
+```{r}
+lysisPrep.list <- lapply(lysisPrep.list, setDT)
+
+lapply(lysisPrep.list, function(x){
+  setnames(x, old=c('variable', 'value'), new=c('sample', 'Intensity'))
+})
+
+lapply(lysisPrep.list, head)
+```
+
+Now add an identifier to the table, and r bind to make it easier to 
+
+```{r}
+lysisPrep.list[['sonic']][, Condition := 'sonic']
+lysisPrep.list[['FT']][, Condition := 'FT']
+lysisPrep.list[['CL']][, Condition := 'CL']
+
+lapply(lysisPrep.list, function(x){
+  # add necessary MSS columns
+  x[, BioReplicate := ifelse(grepl('Sonic-1_Frac|FT-1_Frac-|CL-1_Frac-', sample), 1, 2)]
+})
+```
+bind the data tables together to make the processing easier 
+
+```{r}
+lysisPrep.dt <- rbindlist(lysisPrep.list)
+rm(lysisPrep.list)
+
+lysisPrep.dt[, PG.MolecularWeight := NULL]
+lysisPrep.dt[, PrecursorCharge :=  as.numeric(str_extract(EG.PrecursorId, '[0-9]{1,2}$'))]
+lysisPrep.dt[, BioReplicate := ifelse(grepl('Sonic-1_Frac|FT-1-Frac-|CL-1-Frac-', sample), 1, 2)]
+lysisPrep.dt[, FragmentIon := NA]
+lysisPrep.dt[, PG.ProteinDescriptions := NULL]
+lysisPrep.dt[, fraction := str_extract(sample, '(?<=Frac-)[0-9]{1,2}')] #pos lookbehind to extract the sample id
+lysisPrep.dt[,  IsotopeLabelType := 'L']
+
+setnames(lysisPrep.dt, old=c('PG.ProteinAccessions',  'PG.Genes'), new=c('ProteinName', 'gene'))
+
+lysisPrep.dt[, PeptideSequence := gsub('[.][0-9]+$', '', EG.PrecursorId)]
+lysisPrep.dt[,.N, by=.(Condition, BioReplicate)]
+
+
+#(?<=a)b # only matches b preceded by an a
+lysisPrep.dt[, fraction := str_extract(sample, '(?<=Frac-)[0-9]{1,2}')]
+lysisPrep.dt[,.N,by=.(Condition, BioReplicate, fraction)][, .SD[which.min(fraction)], by=.(Condition,BioReplicate)]
+```
+
+For the protein level summarisation, I think we want to consider each fraction as its own condition, with two replicates each,
+do we want to normalize all these searches together?
+```{r}
+#fwrite(lysisPrep.dt[, .(Condition,Run=sample,BioReplicate, ProteinName, PeptideSequence, FragmentIon, PrecursorCharge,Intensity, ProductCharge=NA, fraction, IsotopeLabelType)], ScriptAndDatedFileName('combined.secms.input.csv'))
+
+lysisPrep.dt <- fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/011324_proteinSummarization_data/2025_01_13_combined.secms.input.csv')
+```
+
+
+
+```{r}
+# split the dt into its conditioanal components
+spec.list <- split(lysisPrep.dt, lysisPrep.dt$Condition)
+
+names(spec.list)
+
+spec.list <- lapply(spec.list, function(x){
+  
+  x[, Condition :=  paste0(Condition, '.', fraction)]
+  x[, fraction := NULL]
+  x[, Run := paste0(Condition, '.', BioReplicate, '.raw')]
+  return(x)
+})
+
+```
+Question here is what do we consider a sample. I think a sample should be the fraction/condition combo
+
+
+```{r}
+
+spec.list[['sonic']][!is.na(Intensity)]
+
+lapply(spec.list, str)
+lapply(spec.list, head)
+
+dp.out <- lapply(names(spec.list), function(x){
+
+  message('Running MSStats dataProcess on ', x)
+  
+  dp.out <- MSstats::dataProcess(spec.list[[x]], 
+                                MBimpute =  FALSE, 
+                                normalization = FALSE, # turn off for SECMS
+                                summaryMethod = "TMP",
+                                featureSubset = 'highQuality',
+                                remove_uninformative_feature_outlier=T)
+
+  saveRDS(dp.out, paste0('./output/', x, '.mss.dp.rds'))
+  return(dp.out)
+})
+```
+
+
+```{r}
+CL.ms <- readRDS('./output/CL.mss.dp.rds')
+f.quant <- setDT(CL.ms$FeatureLevelData)
+p.quant <- setDT(CL.ms$ProteinLevelData)
+
+f.quant[!is.na(ABUNDANCE), .N, by=.(PROTEIN, RUN)][N > 10][order(N)]
+CL.ms$FeatureLevelData[PROTEIN == 'O00213' & RUN == 76]
+
+
+CL.ms$FeatureLevelData
+
+
+f.quant <- f.quant[!is.na(INTENSITY),.(RUN, PROTEIN, F_INTENSITY=log2(INTENSITY))] %>% unique()
+p.quant <- p.quant[!is.na(LogIntensities),.(RUN, PROTEIN=Protein, INTENSITY=LogIntensities)]
+
+p.quant <- merge(p.quant, f.quant, by=c('RUN', 'PROTEIN'))
+
+```
+
+```{r}
+test[,.N, by=.(PROTEIN,RUN)]
+test[PROTEIN == 'O00213' & RUN == 10]
+```
+
+
+read in the new dataproc output and check out the data
+```{r}
+dp.out <- list('sonic' = readRDS('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/011324_proteinSummarization_data/2025_01_13_sonic.mss.dp.rds'),
+               'FT'= readRDS('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/011324_proteinSummarization_data/2025_01_13_FT.mss.dp.rds'),
+               'CL' = readRDS('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/011324_proteinSummarization_data/2025_01_13_CL.mss.dp.rds'))
+```
+Filter out the proteins with only feature used in the identification
+Use the script to identify them
+
+Worrying that the subject field is different in all 3? Maybe try rerunnning this overnight.. for now fix, merge and write output
+```{r}
+dp.out <- lapply(dp.out, function(x){
+  
+  x$FeatureLevelData <- setDT(x$FeatureLevelData)
+  x$ProteinLevelData <- setDT(x$ProteinLevelData)
+  
+  keys.dt <- unique(x$ProteinLevelData[, .(originalRUN, newGROUP=GROUP)])
+  
+  x$FeatureLevelData <- merge(x$FeatureLevelData, keys.dt, by='originalRUN', all.x=T)
+  return(x)
+})
+```
+
+Seems a lot of feat level data exists in this with NA values
+```{r}
+dp.out[[1]]$FeatureLevelData[,.(originalRUN,RUN, GROUP,newGROUP,SUBJECT)] %>% unique()
+dp.out[[2]]$FeatureLevelData[,.(originalRUN,RUN, GROUP,newGROUP,SUBJECT)] %>% unique()
+dp.out[[3]]$FeatureLevelData[,.(originalRUN,RUN,GROUP,newGROUP,SUBJECT)] %>% unique()
+
+dp.out[[1]]$FeatureLevelData[, GROUP := newGROUP]
+dp.out[[2]]$FeatureLevelData[, GROUP := newGROUP]
+dp.out[[3]]$FeatureLevelData[, GROUP := newGROUP]
+
+dp.out[[1]]$ProteinLevelData[,.N, by=.(GROUP,SUBJECT)][order(GROUP)]
+dp.out[[2]]$ProteinLevelData[,.N, by=.(GROUP,SUBJECT)][order(GROUP)]
+dp.out[[3]]$ProteinLevelData[,.N, by=.(GROUP,SUBJECT)][order(GROUP)]
+# fix labelling in 3rd set
+dp.out[[3]]$ProteinLevelData[, GROUP := gsub('[.][0-9]{1,2}$', '', GROUP)]
+dp.out[[3]]$FeatureLevelData[, GROUP := gsub('[.][0-9]{1,2}$', '', GROUP)]
+```
+
+```{r}
+dp.out[[3]]$ProteinLevelData[,.N, by=.(GROUP,SUBJECT)][order(GROUP)]
+dp.out[[2]]$ProteinLevelData[,.N, by=.(GROUP,SUBJECT)][order(GROUP)]
+dp.out[[1]]$ProteinLevelData[,.N, by=.(GROUP,SUBJECT)][order(GROUP)] # sonic.1 biorep1 and sonic.2 rep 1, sonic.4.rep 1, sonic.5 rep 1, sonic6.rep1,
+
+```
+ok, maybe just proceed as is for now with this...
+Write out the 6 files as is
+
+```{r}
+dp.out <- lapply(dp.out, function(x){
+  
+  x$FeatureLevelData <- setDT(x$FeatureLevelData)
+  x$ProteinLevelData <- setDT(x$ProteinLevelData)
+  
+  x$ProteinLevelData <- getNPeptidesPerProtein(proteinlvlDT = x$ProteinLevelData, x$FeatureLevelData, peptideThreshold = 2)
+  return(x)
+})
+
+# filter to just keep the set with two peptides
+dp.out[[1]]$ProteinLevelData <- dp.out[[1]]$ProteinLevelData[nPeptides >= 2,]
+dp.out[[2]]$ProteinLevelData <- dp.out[[2]]$ProteinLevelData[nPeptides >= 2,]
+dp.out[[3]]$ProteinLevelData <- dp.out[[3]]$ProteinLevelData[nPeptides >= 2,]
+
+
+dp.out[[1]]$ProteinLevelData
+dp.out[[1]]$FeatureLevelData[PROTEIN == 'A0A024RBG1' ]
+
+
+
+dp.out[[2]]$FeatureLevelData[PROTEIN == 'O60232']
+
+
+dp.out[[2]]$ProteinLevelData[nPeptides > 10,][order(NumMeasuredFeature)]
+
+dp.out[[3]]$FeatureLevelData[PROTEIN == 'A1KXE4']
+```
+look at another test rds obj
+
+```{r}
+test <- setDT(readRDS('../121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/MRC5.rds')$FeatureLevelData)
+test[,.N, by=.(originalRUN,PROTEIN)]
+
+test[PROTEIN == 'A0JNW5' & RUN == 10,]
+```
+
+```{r}
+ggplot(dp.out[[1]]$ProteinLevelData, aes(x=GROUP, y=LogIntensities)) +
+  geom_boxplot() +
+  facet_wrap(~SUBJECT) +
+  theme(axis.text.x = element_text(angle=90))
+```
+
+```{r}
+secms.in <- fread('011324_proteinSummarization_data/2025_01_13_combined.secms.input.csv')
+secms.in[,.N, by=.(Condition,BioReplicate,fraction)][order(fraction)][,.N, by=fraction]
+secms.in
+```
+
+
+
+```{r}
+dp.out <- lapply(dp.out, function(x){
+  
+  x$ProteinLevelData <- setDT(x$ProteinLevelData)
+  x$FeatureLevelData <- setDT(x$FeatureLevelData)
+  
+  return(x)
+  #getNPeptidesPerProtein(proteinlvlDT = x$ProteinLevelData, petidelvlDT = x$FeatureLevelData, peptideThreshold=2)
+})
+```
+011425- read in reprocessed data
+
+```{r}
+test <- fread('~/Library/CloudStorage/Box-Box/Spectronaut_Final_010224/20250114_135820_MM_CL_Lysis_122724_MSStat_Report.tsv')
+test.fill <- fread('~/Library/CloudStorage/Box-Box/Spectronaut_Final_010224/20250114_135820_MM_CL_Lysis_122724_MSStat_Report.tsv', fill=T)
+```

@@ -1,0 +1,800 @@
+---
+author: "Martin Gordon"
+date: "2023-09-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## DARPA 34.11 contrast of contrasts
+
+Want to look at both the drug and receptor response
+First look at the drug; drop NK1R and just look 
+
+libraries
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library (emmeans)
+library(stringr)
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+
+#source Bens utility scripts
+source ("/Users/martingordon/Documents/utils/bp_utils/MS_ModelFitting_TimeSeries.R")
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+WriteSessionInfo()
+WriteInstalledPackages()
+
+
+```
+Prepare the data 
+
+```{r}
+# including the dropped sample for now
+protQuant <- fread ("/Users/martingordon/Documents/projects/082423_QLi_DARPA.34.11/DARAP.34.11_data/2023_08_21_ProteinLevelData.tmp.2round.csv")
+
+# parse GROUP names to define the actual columns that the linear models will work on
+# this work depends on how your columsn are defined
+protQuant[, receptor   := str_extract(GROUP,"MRX2|NK1R")]
+protQuant[, drug := 'SP'] %>% .[GROUP %like% 'MRX2_R[0-9]{2}', drug := 'CZ']
+protQuant[, receptor.drug := interaction(receptor,drug)]
+
+protQuant <- protQuant[receptor != 'NK1R']
+
+# fix subject info to account for batch
+protQuant[ drug != 'SP', SUBJECT := SUBJECT + 4 ]
+protQuant[, SUBJECT := as.factor(SUBJECT)]
+#protQuant[, SUBJECT     := paste0(drug, '.', SUBJECT)] # remember superbatch with the treatment lvl so control for this
+
+
+protQuant[, timeStr := str_extract(GROUP, "[0-9]{2}$")]
+protQuant[, rankTime := as.integer(as.factor(timeStr))] #timeranked to 0-5
+protQuant[, .(timeStr, rankTime)] %>% unique() #timepoint to time rank 
+
+protQuant[, .N, by=.(receptor,drug, timeStr,SUBJECT)] %>% 
+  .[order(timeStr,drug)]
+
+# need to add rankTime columns
+protQuant[, `:=`(rankTime.2 = rankTime^2,
+                 rankTime.3 = rankTime^3)
+                  ]
+```
+
+Summarise ANOVA to assess output
+emmeans contrast I think is telling us if magnitude is different between drug levels; not sure if this is what we want
+This model comprises fitting, for each drug, a separate linear trend for expression versus rankTime 
+Accordingly, we can estimate and compare the slopes of those lines via the emtrends() function:
+
+
+```{r}
+model <- lm(LogIntensities ~ SUBJECT + poly(rankTime,degree=3)*drug, data=protQuant)
+emm <- emtrends(model, pairwise ~ drug, var='rankTime')
+
+#emm <- emmeans(model, ~ drug|poly(rankTime,degree=3))
+
+emmip(model,  drug ~ rankTime, cov.reduce= range)
+
+
+emmip(model, ~ drug|poly(rankTime,degree=3))
+
+test <-data.table(anova(model), keep.rownames = T)
+test
+```
+
+```{r}
+lm.out <- linearModelsAllProteins(protQuant, 
+                                  formulaList = list(full  = LogIntensities ~ SUBJECT + drug + rankTime + rankTime.2 + rankTime.3 + drug:rankTime.2 + drug:rankTime.3),
+                                  splitColumn = "Protein", cl=6) #use 6 threads to process in parallel
+
+```
+
+
+Looks like there are some significant interactors. Maybe just pull these out and plot
+
+```{r}
+g <- ggplot(lm.out$anova, aes(x=p.value)) +
+  geom_histogram(boundary=0.0, binwidth = 0.005) +
+  xlim(c(0,0.05)) +
+  facet_wrap(~term)
+g
+
+BackupAsPDF(g, 'pval.histograms.')
+```
+
+correct for multiple testing
+
+```{r}
+lm.out$anova[, fdr := p.adjust(p.value, method = "BH"), by= term]
+```
+
+
+Write out files to dir
+```{r}
+fwrite(lm.out$anova,'./mrx2:drug.anova.csv.gz')
+```
+
+## interaction between response & drug type
+
+proteins significant with FDR < 0.05
+
+# when plotting highlight diff between drugs by subtracting T0
+
+```{r}
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, receptor.drug)]
+
+sigProtein <- lm.out$anova[term %in%  c("drug:rankTime.2","drug:rankTime.3") & fdr < 0.05,] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'Log2 Ints. vs T0',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("R[0-9]{2}", colnames(prot.mat)), "CZ", "SP")))
+
+
+hm
+BackupAsPDF(hm, 'mrx2.drug:time.vsT0.fdr<0.05.heatmap', dimensions = c(8,9))
+```
+expand net to look at any genes with pval < 0.001
+again subtracting t0
+
+```{r}
+sigProtein <- lm.out$anova[term %in%  c("drug:rankTime.2","drug:rankTime.3") & p.value < 0.001,] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, receptor.drug)]
+prot.mat <- dcast (protQuant[Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'Log2 Ints. vs T0',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (pvalue < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("R[0-9]{2}", colnames(prot.mat)), "CZ", "SP")))
+
+hm
+BackupAsPDF(hm, 'mrx2.drug:time.vsT0.pval<0.001.heatmap', dimensions = c(8,12))
+
+```
+
+## interaction effects
+
+Running lm model and pull out the contrast of the interaction terms (ie different response to the drugs) but does interaction term give us this anyway?
+just for testing the functions... only using complete.cases of proteins for now
+
+
+
+070923
+------
+custom lm model 
+for now just test with complete cases and see if there is an overlap in sig results with Ben's analysis
+Issue is many significant results as different magnitude from T0..
+
+```{r}
+
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, receptor.drug)]
+
+prot.mat <- protQuant %>% 
+  dcast(Protein ~ interaction(receptor.drug,timeStr,SUBJECT), value.var = 'vsTimeZero') %>% 
+  as.matrix(rownames='Protein')
+
+prot.mat <- prot.mat[complete.cases(prot.mat),] # over 4k proteins
+
+#run our own analysis;anova per protein
+# try again with this filter, will also rm prots with low numbers of reps
+test.dt <- protQuant[Protein %in% rownames(prot.mat),] %>% # filter for complete cases for now
+split(., .$Protein)
+
+
+# run lm on each. of the proteins, 
+test.out <- lapply(test.dt, function(x,n,i){
+     lm.x <- lm(vsTimeZero ~ SUBJECT + poly(rankTime, degree=3) * drug, data=x) # different response to drug over time
+     #emm1 = emmeans(lm.x, specs = pairwise ~ poly(rankTime, degree=3):drug) #extract results for all pairwise comparisons for each factor combo
+     emm1 = emmeans(lm.x, specs = pairwise ~ drug|poly(rankTime, degree=3)) #compare the CZ SP drug response over time 
+    ##emm1$emmeans # emms for each combo. These are averaged over subject
+   emm1$contrasts %>%  
+   as.data.table()
+})
+
+
+# run lm on each. of the proteins, 
+test.out <- lapply(test.dt, function(x){
+     lm.x <- lm(vsTimeZero ~ SUBJECT + poly(rankTime, degree=3) * drug, data=x) # different response to drug over time
+     emm1 = emmeans(lm.x, specs = pairwise ~ drug|poly(rankTime, degree=3)) #compare the CZ SP drug response over time 
+     pairwise_comparisons <- pairs(emm1)
+  
+    # Conduct hypothesis tests (adjust p-values for multiple testing)
+    contrast_tests <- summary(pairwise_comparisons, adjust = "BH")
+  
+  # Extract and return the results
+  return(contrast_tests)
+})
+
+test.out <- rbindlist(test.out, idcol = T)
+test.out[, fdr:= p.adjust(p.value, 'BH')]
+
+
+final.out <- test.out
+
+
+final.out[, gene := multiUniprots2multiGenes(.id)]
+fwrite(final.out, './emm.mrx2:drug.csv')
+
+# both of the above proteins look significantly different profile generate a lineplot of expression
+# for the ts you need at least the 2 tps with the same number of replicates
+```
+
+
+plot the time0 values of these results to see if there is a significant difference
+inital results look quite good
+
+```{r}
+sigProtein <- test.out[fdr < 0.05, '.id'] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(.id)]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'Log2 Ints. vs T0',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("R[0-9]{2}", colnames(prot.mat)), "CZ", "SP")))
+
+hm
+BackupAsPDF(hm, 'mrx2:drug.fdr<0.05.heatmap', dimensions = c(9,12))
+```
+```{r}
+sigProtein <- test.out[fdr < 0.01, '.id'] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(.id)]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'Log2 Ints. vs T0',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (fdr < 0.01)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("R[0-9]{2}", colnames(prot.mat)), "CZ", "SP")))
+
+hm
+BackupAsPDF(hm, 'mrx2:drug.fdr<0.01.heatmap', dimensions = c(9,12))
+```
+Think we first need to confirm the proteins with a significant interaction. run the lm function again, this time check the anova output and extract specific coefficients
+
+```{r}
+# include all proteins 
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, receptor.drug)]
+
+prot.mat <- protQuant %>% 
+  dcast(Protein ~ interaction(receptor.drug,timeStr,SUBJECT), value.var = 'vsTimeZero') %>% 
+  as.matrix(rownames='Protein')
+
+prot.mat <- prot.mat[complete.cases(prot.mat)]
+
+#run our own analysis;anova per protein
+# try again with this filter, will also rm prots with low numbers of reps
+test.dt <- protQuant[Protein %in% rownames(prot.mat),] %>% # filter for complete cases for now
+split(., .$Protein)
+
+anov.out <- lapply(test.dt, function(x){
+     lm.x <- lm(LogIntensities ~ SUBJECT + poly(rankTime, degree=3) * drug, data=x) 
+     anov.x <- data.table(anova(lm.x), keep.rownames = T) # get the anova table 
+     
+     # tidy
+     setnames(anov.x, old=c("rn", "Pr(>F)"), new=c('term','p.value'))
+     return(anov.x[term == 'poly(rankTime, degree = 3):drug',]) # only interactions
+}) %>% rbindlist(idcol = TRUE)
+
+
+anov.out[, fdr := p.adjust(p.value, 'BH'), by=term]
+anov.out[fdr < 0.05, .N] # only 44 significant
+
+anov.out
+```
+
+```{r}
+sigProtein <- anov.out[fdr < 0.05, '.id'] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(.id)]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'Log2 Ints. vs T0',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (fdr < 0.1)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("R[0-9]{2}", colnames(prot.mat)), "CZ", "SP")))
+
+hm
+BackupAsPDF(hm, 'mrx2:drug.siginteractions.fdr<0.1.vsT0.heatmap', dimensions = c(9,10))
+
+```
+
+are these proteins found in the list of genes with a different drug response?
+about 50% of the significant interaction results in emmeans output..
+Can check for overlap with BP approach; good overlap with anova; seems this is due to 
+```{r}
+# compare results from emmeans with those showing a significant interaction
+emm.out <- fread('./emm.mrx2:drug.csv')
+sum(sigProtein.BP %in% emm.out[fdr < 0.05, .id]) # only 26 prots overlap between the two
+
+sigProtein.BP <- lm.out$anova[term %in%  c("drug:rankTime.2","drug:rankTime.3") & fdr < 0.05,] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+
+sum(sigProtein.BP %in% sigProtein) 
+# 33 overlap out of 44 sig results, so seems the aov output looks good (modelling approaach I used in BP function doesnt account for colinearity and i also drop incomplete rows so seems ok)
+
+length(sigProtein.BP)
+length(sigProtein)
+```
+
+repeat for the cell line comparison
+
+### cell-line effect for the same treatment (substance P)
+
+```{r}
+protQuant <- fread ("/Users/martingordon/Documents/projects/082423_QLi_DARPA.34.11/DARAP.34.11_data/2023_08_21_ProteinLevelData.tmp.2round.csv")
+
+# parse GROUP names to define the actual columns that the linear models will work on
+# this work depends on how your columsn are defined
+protQuant[, receptor   := str_extract(GROUP,"MRX2|NK1R")]
+protQuant[, drug := 'SP'] %>% .[GROUP %like% 'MRX2_R[0-9]{2}', drug := 'CZ']
+protQuant[, receptor.drug := interaction(receptor,drug)]
+
+# filter out the MRX2 compound Z  to allow substance P comparisons
+protQuant <- protQuant[drug != 'CZ',]
+
+# fix subject info to account for batch
+protQuant[ receptor != 'MRX2', SUBJECT := SUBJECT + 4 ]
+protQuant[, SUBJECT := as.factor(SUBJECT)]
+
+#protQuant[, .N, by=.(receptor.drug, SUBJECT)]
+
+protQuant[, timeStr := str_extract(GROUP, "[0-9]{2}$")]
+protQuant[, rankTime := as.integer(as.factor(timeStr))] #timeranked to 0-5
+protQuant[, .(timeStr, rankTime)] %>% unique() #timepoint to time rank 
+
+protQuant[, .N, by=.(receptor,drug, timeStr,SUBJECT)] %>% 
+  .[order(timeStr,drug)]
+
+# need to add rankTime columns
+protQuant[, `:=`(rankTime.2 = rankTime^2,
+                 rankTime.3 = rankTime^3)
+                  ]
+```
+
+Summarise ANOVA to assess output
+
+```{r}
+model <- aov(LogIntensities ~ SUBJECT + receptor+rankTime+rankTime.2+rankTime.3+receptor:rankTime.2+receptor:rankTime.3, data=protQuant)
+summary(model)
+```
+
+```{r}
+
+lm.out <- linearModelsAllProteins(protQuant, 
+                                  formulaList = list(full  = LogIntensities ~ SUBJECT + receptor + rankTime + I(rankTime^2) + I(rankTime^3) + receptor:I(rankTime^2) + receptor:I(rankTime^3)),
+                                  splitColumn = "Protein", cl=6)
+
+```
+
+
+```{r}
+g <- ggplot(lm.out$anova, aes(x=p.value)) +
+  geom_histogram(boundary=0.0, binwidth = 0.005) +
+  facet_wrap(~term, scales = 'free_y')
+g
+
+BackupAsPDF(g, 'pval.histograms')
+```
+
+mtc correct and write out the results to file 
+# anova are the BP results
+```{r}
+lm.out$anova[, fdr := p.adjust(p.value, 'BH')]
+lm.out$anova[, gene := multiUniprots2multiGenes(Protein)]
+#fwrite(lm.out$anova, './receptor:CP.anova.csv.gz')
+
+lm.out <- fread('./receptor:CP.anova.csv.gz')
+```
+
+lets plot the significant results from each 
+
+lots of proteins with different response to the treatment, which is good. May even have to make more stringent
+Again vs t0 plotting
+```{r}
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, receptor.drug)]
+
+sigProtein <- lm.out[term %in% c( "receptor:I(rankTime^2)","receptor:I(rankTime^3)") & fdr < 0.05, unique(Protein)] 
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'Log2 Ints. vs T0',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 2),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("MRX2", colnames(prot.mat)), "MRX2", "NK1R")))
+
+BackupAsPDF(hm, 'receptor.treatment.fdr<0.05.heatmap', dimensions=c(8,14))
+```
+Also look at terms significant at fdr < 0.01 as many found here
+
+```{r}
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, receptor.drug)]
+
+sigProtein <- lm.out[term %in% c( "receptor:I(rankTime^2)","receptor:I(rankTime^3)") & fdr < 0.01, unique(Protein)] 
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'Log2 Ints. vs T0',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (fdr < 0.01)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 4),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("MRX2", colnames(prot.mat)), "MRX2", "NK1R")))
+
+BackupAsPDF(hm, 'receptor.treatment.fdr<0.01.heatmap', dimensions=c(8,14))
+```
+TODO look at my anova and lm functions also to plot and compare
+other options: enrich the significant results? maybe just return to QIongyu, let her pick targets of interest and work from there
+
+12/09/23
+---
+Issue with previous emmeans is we are extracting the EMMs for facotr/covariate but we want the slopes of the covariate for each level of the factor: 
+instead use the `emtrends` function to extract slopes for each drug level
+if we don't handle correctly, emmeans will just use the average of each covariate
+
+
+
+Perform GO enrichment analysis of the different results and see what pops out
+
+read in the data
+```{r}
+# look at receptor drug combo first
+emm.mrx2.drug <- fread('./emm.mrx2.drug.csv')
+anova.mrx2.drug <- fread('./mrx2.drug.anova.csv.gz')
+```
+
+re-run lm and emmeans using emtrends to extract estimates of slopes for each covariate for each drug level
+```{r}
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, receptor.drug)]
+
+prot.mat <- protQuant %>% 
+  dcast(Protein ~ interaction(receptor.drug,timeStr,SUBJECT), value.var = 'vsTimeZero') %>% 
+  as.matrix(rownames='Protein')
+
+prot.mat <- prot.mat[complete.cases(prot.mat),] # over 4k proteins
+
+#just filter out proteins with more than 25% of values misssing
+na.vals <- apply(prot.mat, 1, function(x){
+  # use the any function to detect 
+  any(sum(is.na(x)) > 9) })
+
+sum(na.vals) # removing over 1k proteins
+names(na.vals[na.vals == TRUE])
+
+
+#run our own analysis;anova per protein
+# try again with this filter, will also rm prots with low numbers of reps
+test.dt <- protQuant[!Protein %in% names(na.vals[na.vals == TRUE]),] %>% # filter out missing vals
+split(., .$Protein)
+
+
+# run lm on each. of the proteins, 
+test.out <- lapply(test.dt, function(x){
+     lm.x <- lm(vsTimeZero ~ SUBJECT + poly(rankTime, degree=3) * drug, data=x) # different response to drug over time
+     #emm1 = emmeans(lm.x, specs = pairwise ~ drug|poly(rankTime, degree=3)) #compare the CZ SP drug response over time 
+     emm1 = emtrends(lm.x, pairwise ~ drug, var='rankTime') #asking is the slope different for each level of the factor
+     emm1$contrasts %>%  
+     as.data.table()
+})
+
+```
+
+Adjust for multiple testing
+
+```{r}
+test.out <- rbindlist(test.out, idcol = T)
+test.out[, fdr:= p.adjust(p.value, 'BH')]
+
+final.out <- test.out
+
+
+final.out[, gene := multiUniprots2multiGenes(.id)]
+
+fwrite(final.out, './emm.mrx2.drug.slope.contrast.csv')
+```
+
+Lets plot the significant results for this 
+
+```{r}
+hist(final.out$p.value)
+
+sigProtein <- final.out[p.value < 0.01, unique(.id)] 
+sigProtein
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'Log2 Ints. vs T0',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (pval < 0.01)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("SP", colnames(prot.mat)), "SP", "CZ")))
+
+hm
+BackupAsPDF(hm, 'emm.drug.pval<0.01.heatmap', dimensions=c(8,12))
+
+
+```
+There is overlapping enriched terms; look at the enrichment table for the 3 and decide which to use
+```{r}
+sigProtein %in% anova.mrx2.drug[term %in% c('drug:rankTime.2','drug:rankTime.3') & fdr < 0.1, unique(Protein)] 
+
+```
+
+# enrichment for anova drug.mrx2 and other lm approaches
+enrichment for BP method looks good; write output to file and then run the other two
+
+```{r}
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+universe <- protQuant$gene %>%  unique()
+
+anova.mrx2.drug[, enrich_grp := 'no']
+anova.mrx2.drug[term %in% c('drug:rankTime.2','drug:rankTime.3') & fdr < 0.05, enrich_grp := 'yes']
+
+anova.mrx2.drug[, gene := multiUniprots2multiGenes(Protein)]
+
+enrich.dt <- enricherOnGroups(anova.mrx2.drug[enrich_grp == 'yes'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'enrich_grp', topN = 10, title='GO term enrichment (proteins FDR < 0.05)', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 10)
+
+BackupAsPDF(ht, '/mrx2.drug.go.anova.heatmap.')
+
+fwrite(enrich.dt, 'mrx2.drug.go.anova.enrich.table.csv.gz')
+
+```
+
+Run enrichment for sig results from emmeans slope analysis
+Dont trust significant results here as no coordinated enrichment
+Look at first GO enrichment for emmeans, otherwise proceed with BP method
+Take genes with pval < 0.01 as significant
+
+```{r}
+final.out[, enrich_grp := 'no']
+final.out[fdr < 0.05, enrich_grp := 'yes']
+
+
+enrich.dt <- enricherOnGroups(final.out[enrich_grp == 'yes'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+
+#simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+head(enrich.dt)
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt,groupColumn = 'enrich_grp', topN = 10, title='GO term enrichment (proteins fder < 0.05)', row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 10)
+
+BackupAsPDF(ht, '/mrx2.drug.go.emmeans.cov.interaction.fdr<0.05.heatmap.')
+
+fwrite(enrich.dt, 'mrx2.drug.go.emmeans.cov.interaction.enrich.table.fdr<0.05.csv.gz')
+```
+
+Run enrichment on the original emmeans data
+
+
+```{r}
+emm.mrx2.drug[, enrich_grp := 'no']
+emm.mrx2.drug[ fdr < 0.05, enrich_grp := 'yes']
+
+enrich.dt <- enricherOnGroups(emm.mrx2.drug[enrich_grp == 'yes'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt,groupColumn = 'enrich_grp', topN = 10, title='GO term enrichment (proteins FDR < 0.05)', row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 10)
+
+BackupAsPDF(ht, '/mrx2.drug.go.emmeans.heatmap.')
+
+fwrite(enrich.dt, 'mrx2.drug.go.emmeans.enrich.table.csv.gz')
+```
+Strong overlap in enrichment for the emmeans and anova output from BP script; think this is interesting even though they are looking at different things
+Now for the receptor, not interested in magnitude as may have different starting points, but we are interested in magnitude, rather just different trends
+
+```{r}
+receptor.cp <- fread('./receptor:CP.anova.csv.gz')
+
+receptor.cp[term %in% c('receptor:I(rankTime^2)','receptor:I(rankTime^2)') & fdr < 0.05, .N] # ~450 significant results
+
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+universe <- protQuant$gene %>%  unique()
+
+receptor.cp[, enrich_grp := 'no']
+receptor.cp[term %in% c('receptor:I(rankTime^2)','receptor:I(rankTime^2)') & fdr < 0.05, enrich_grp := 'yes']
+
+enrich.dt <- enricherOnGroups(receptor.cp[enrich_grp == 'yes'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'enrich_grp', topN = 10, title='GO term enrichment (proteins FDR < 0.05)', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 10)
+
+BackupAsPDF(ht, '/receptor.cp.go.anova.heatmap.')
+
+fwrite(enrich.dt, 'receptor.cp.go.anova.enrich.table.csv.gz')
+```
+After this lets use the emmeans package to look at interaction of factor and covariate
+using emtrends to estimate the slopes for each receptor level
+
+```{r}
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, receptor.drug)]
+
+prot.mat <- protQuant %>% 
+  dcast(Protein ~ interaction(receptor.drug,timeStr,SUBJECT), value.var = 'vsTimeZero') %>% 
+  as.matrix(rownames='Protein')
+
+#prot.mat <- prot.mat[complete.cases(prot.mat),] # over 4k proteins
+
+#just filter out proteins with more than 25% of values misssing
+na.vals <- apply(prot.mat, 1, function(x){
+  # use the any function to detect 
+  any(sum(is.na(x)) > 9) })
+
+sum(na.vals) # removing over 1k proteins
+names(na.vals[na.vals == TRUE])
+
+
+#run our own analysis;anova per protein
+# try again with this filter, will also rm prots with low numbers of reps
+test.dt <- protQuant[!Protein %in% names(na.vals[na.vals == TRUE]),] %>% # filter out missing vals
+split(., .$Protein)
+
+
+# run lm on each. of the proteins, 
+test.out <- lapply(test.dt, function(x){
+     lm.x <- lm(vsTimeZero ~ SUBJECT + receptor*poly(rankTime, degree=3), data=x) # different response to drug over time
+     #emm1 = emmeans(lm.x, specs = pairwise ~ drug|poly(rankTime, degree=3)) #compare the CZ SP drug response over time 
+     emm1 = emtrends(lm.x, pairwise ~ receptor, var='rankTime') #asking is the slope different for each level of the factor
+     emm1$contrasts %>%  
+     as.data.table()
+     
+})
+
+test.out <- rbindlist(test.out, idcol = T)
+test.out[, fdr:= p.adjust(p.value, 'BH')]
+
+final.out <- test.out
+
+final.out[, gene := multiUniprots2multiGenes(.id)]
+
+final.out
+
+fwrite(final.out, './emm.receptor.SP.slope.contrast.csv')
+```
+
+plot the most significant results for the emmeans contrast
+
+```{r}
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, receptor.drug)]
+
+sigProtein <- final.out[p.value < 0.01, unique(.id)] 
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'Log2 Ints. vs T0',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.value < 0.01)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 4),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("MRX2", colnames(prot.mat)), "MRX2", "NK1R")))
+
+hm
+BackupAsPDF(hm, 'receptor.treatment.emmeans.cov.interaction.pvalue<0.01.heatmap', dimensions=c(8,14))
+
+
+```
+
+
+Run enrichment on the emmeans output and see if it aligns with what we expect from the GO groups
+
+```{r}
+final.out[, enrich_grp := 'no']
+final.out[p.value < 0.01, enrich_grp := 'yes']
+
+
+enrich.dt <- enricherOnGroups(final.out[enrich_grp == 'yes'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+#simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+head(enrich.dt)
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt,groupColumn = 'enrich_grp', topN = 10, title='GO term enrichment (proteins fder < 0.05)', row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 10)
+
+BackupAsPDF(ht, '/receptor.treatment.go.emmeans.cov.interaction.fdr<0.05.heatmap.')
+
+fwrite(enrich.dt, 'receptor.treatment.go.emmeans.cov.interaction.enrich.table.fdr<0.05.csv.gz')
+```
+
+
+Not used
+----
+
+issues so far: unbalanced (only 1 factor level per protein) and timepoints with less values than polynomial degree... need to catch these errors before running
+
+```{r}
+# maybe need another sanity check to ensure both treatments exist
+
+# handling missing vlaues for the ts analysis
+# count the number of replicates per timeStr/drug.receptor combo per protein
+protQuant[, n.reps := .N, by=.(timeStr,receptor.drug,Protein)]
+
+# check for at least one timepoint with 3 reps
+protQuant[, na.filter := fcase(
+  n.reps >= 3, 'yes',
+  n.reps < 3, 'no'), by=.(receptor.drug,Protein)]
+
+
+
+#just filter out proteins with more than 25% of values misssing
+na.vals <- apply(prot.mat, 1, function(x){
+  # use the any function to detect 
+  any(sum(is.na(x)) > 9) })
+
+keep <- rownames(prot.mat)
+
+36/4
+```
+
+Rerun with emtrends to look for differences in slopes of the two
+
+```{r}
+model <- lm(LogIntensities ~ SUBJECT + poly(rankTime,degree=3)*drug, data=protQuant)
+emm <- emtrends(model, pairwise ~ drug, var='rankTime')
+```
+

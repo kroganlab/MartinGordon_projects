@@ -1,0 +1,171 @@
+---
+title: "082724_MRX2.QRFPR.pwComparisonsPlots"
+author: "Martin Gordon"
+date: "2024-08-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## packages
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(circlize)
+library(ComplexHeatmap)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj; eg facet_grid allow x/y axis to vary
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(ggrepel)
+
+library(IHW)
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+```
+
+Read in the two MSS pwcomparisons files 
+
+```{r}
+mrx2.dt  <- fread('./output/MRX2.mss.pwcomparisons.raw.csv')
+qrfpr.dt <- fread('./output/QRFPR.mss.pwcomparisons.raw.csv')
+
+mrx2.dt[, receptor := 'MRX2']
+qrfpr.dt[, receptor := 'QRFPR']
+
+comb.dt <- rbind(mrx2.dt, qrfpr.dt)
+
+# 
+comb.dt[, padj := p.adjust(pvalue, method='BH'), by=Label]
+comb.dt[, gene := multiUniprots2multiGenes(Protein, species='HUMAN')]
+
+comb.dt[, sig := 'not']
+comb.dt[padj < 0.05 & abs(log2FC) > 0.58, sig := ifelse(log2FC > 0, 'up', 'down')]
+```
+
+Lets try independent hypothesis weighting 
+
+
+Lets plot the differential expression plots for each of the groups
+```{r}
+g <- ggplot(comb.dt[receptor == 'MRX2',], aes(x=log2FC, y=-log10(padj), color=sig, label=gene)) +
+  geom_point() +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, color='grey', alpha=0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, color='grey', alpha=0.5) +
+  ggtitle('MRX2 comparisons (adj.pval < 0.05 & FC +/- 50%)') +
+  geom_text_repel(data=comb.dt[receptor == 'MRX2' & sig != 'not',], max.iter = 1000, max.overlaps = 20, size=2.5, segment.alpha=0.3,segment.color='black') +
+  scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+
+BackupAsPDF(g, 'MRX2.FC0.58adjpval.volcanoplot', dimensions = c(14,24))
+
+
+g <- ggplot(comb.dt[receptor == 'QRFPR',], aes(x=log2FC, y=-log10(padj), color=sig, label=gene)) +
+  geom_point() +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, color='grey', alpha=0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, color='grey', alpha=0.5) +
+  ggtitle('QRFPR comparisons (adj.val < 0.05 & FC +/- 50%)') +
+  geom_text_repel(data=comb.dt[receptor == 'QRFPR' & sig != 'not',], max.iter = 1000, max.overlaps = 20, size=2.5, segment.alpha=0.3,segment.color='black') +
+  scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+
+BackupAsPDF(g, 'QRFPR.FC0.58adjpval.volcanoplot', dimensions = c(14,24))
+```
+Share the individual pvalue plots for those that dont pass thresholds
+
+MRX2 - ZC00_PTX-ZC00, ZC00_YM-ZC00, ZC05_PTX-ZC05, ZC05_YM-ZC00_YM, ZC10_PTX-ZC10, ZC10_YM-ZC10
+QRFPR - RF00_PTX-RF00, RF00_YM-RF00, RF05_PTX-RF05, RF10_PTX-RF10
+
+```{r}
+# reset the significance thresholds
+
+comb.dt[, sigReducedTreshold := 'not']
+comb.dt[ abs(log2FC) > 0.58 & pvalue < 0.005, sigReducedTreshold := ifelse(log2FC > 0, 'up', 'down')]
+
+
+# mrx2 thresholds 
+contrasts.oi <- c('ZC00_PTX-ZC00', 'ZC00_YM-ZC00', 'ZC05_PTX-ZC05', 'ZC05_YM-ZC00_YM', 'ZC10_PTX-ZC10', 'ZC10_YM-ZC10')
+
+g <- ggplot(comb.dt[receptor == 'MRX2' & Label %in% contrasts.oi,], aes(x=log2FC, y=-log10(pvalue), color=sigReducedTreshold, label=gene)) +
+  geom_point() +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, color='grey', alpha=0.5) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, color='grey', alpha=0.5) +
+  ggtitle('MRX2 comparisons reduced thresholds (pval < 0.005 & FC +/- 50%)') +
+  geom_text_repel(data=comb.dt[receptor == 'MRX2' & Label %in% contrasts.oi & sigReducedTreshold != 'not',], max.iter = 1000, max.overlaps = 20, size=2.5, segment.alpha=0.3,segment.color='black') +
+  scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+g
+BackupAsPDF(g, 'MRX2.FC0.58pval0.005.volcanoplot', dimensions = c(14,11))
+
+
+# mrx2 thresholds 
+contrasts.oi <- c('RF00_PTX-RF00', 'RF00_YM-RF00', 'RF05_PTX-RF05', 'RF10_PTX-RF10')
+
+g <- ggplot(comb.dt[receptor == 'QRFPR' & Label %in% contrasts.oi,], aes(x=log2FC, y=-log10(pvalue), color=sigReducedTreshold, label=gene)) +
+  geom_point() +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, color='grey', alpha=0.5) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, color='grey', alpha=0.5) +
+  ggtitle('QRFPR comparisons reduced thresholds (pval < 0.005 & FC +/- 50%)') +
+  geom_text_repel(data=comb.dt[receptor == 'QRFPR' & Label %in% contrasts.oi & sigReducedTreshold != 'not',], max.iter = 1000, max.overlaps = 20, size=2.5, segment.alpha=0.3,segment.color='black') +
+  scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  facet_wrap(~Label, scales='free', ncol=2) +
+  theme_bw()
+g
+BackupAsPDF(g, 'QRFPR.FC0.58pval0.005.volcanoplot', dimensions = c(10,9))
+```
+
+```{r}
+g <- ggplot(comb.dt[receptor == 'MRX2',], aes(x=log2FC, y=-log10(pvalue), color=sig, label=gene)) +
+  geom_point() +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, color='grey', alpha=0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, color='grey', alpha=0.5) +
+  ggtitle('MRX2 comparisons') +
+  geom_text_repel(data=comb.dt[receptor == 'MRX2' & sig != 'not',], max.iter = 1000, max.overlaps = 20, size=2.5, segment.alpha=0.3,segment.color='black') +
+  scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+g
+#BackupAsPDF(g, 'MRX2.FC0.58adjpval.volcanoplot', dimensions = c(14,24))
+
+g <- ggplot(comb.dt[receptor == 'QRFPR',], aes(x=log2FC, y=-log10(pvalue), color=sig, label=gene)) +
+  geom_point() +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, color='grey', alpha=0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, color='grey', alpha=0.5) +
+  ggtitle('QRFPR comparisons') +
+  geom_text_repel(data=comb.dt[receptor == 'QRFPR' & sig != 'not',], max.iter = 1000, max.overlaps = 20, size=2.5, segment.alpha=0.3,segment.color='black') +
+  scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_bw()
+g
+#BackupAsPDF(g, 'QRFPR.FC0.58adjpval.volcanoplot', dimensions = c(14,24))
+```
+
+

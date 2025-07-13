@@ -1,0 +1,205 @@
+---
+title: "WGCNA.paperFig5.correlationPlots"
+author: "Martin Gordon"
+date: "2023-11-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Generating plots of the correlation scores from figure 5 in the DARPA proteomics paper
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(WGCNA)
+library(magrittr)
+library(preprocessCore) # quantile normalisation
+library(stringr)
+library(matrixStats)
+library(simplifyEnrichment)
+library(fmsb)
+library(readxl)
+library(ggbeeswarm)
+library(ggrepel)
+library(curl)
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+
+# helper scripts for module/network export etc
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+```
+
+plots we wish to generate
+- rank plot of the correlation scores
+- heatmaps of the top ranking genes [maybe take top 10-20 per group] and plot log2FC and correlation values
+
+lets first look at the data we have; are these cor scores correctly calculated?
+
+06/09/23
+-----
+Correlations with the IUPHAR classification
+
+lets first check the raw data 
+
+```{r}
+
+pred <- fread("./data/predictionScores.txt")
+exp <- fread ("./data/experimentalScores.txt")
+iupar <- data.table(read_xlsx("./data/IUPHAR_11GPCRs_Gprotein_class_primary.xlsx"))
+
+
+exp.long <- melt(exp, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+pred.long <- melt(pred, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+
+# convert to long format
+iupar.long <- melt(iupar, id.vars = 'GPCR', measure.vars = grep('GPCR', colnames(iupar), invert=T),  variable.name = "GProtein", value.name = "score") %>% 
+  .[, score := as.numeric(score)] 
+```
+
+
+```{r scores.list}
+scores.list <- list(exp = exp.long,
+                    pred = pred.long,
+                    iupar = iupar.long)
+```
+Convert the scores to a matrix
+
+```{r}
+scores.mat <- lapply(scores.list, function(x){
+  dcast(x, GProtein~GPCR, value.var = 'score') %>% 
+    as.matrix(rownames = 'GProtein')
+})
+
+lapply(scores.mat, colnames)
+```
+apply the scores mat to the data
+```{r}
+scores.mat <- lapply(scores.mat, function(x){
+  colnames(x) <- c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+  return(x)
+})
+```
+
+
+
+reorder the mss columns to follow the order above 
+
+```{r}
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+
+mss.out <- fread('./data/2022_08_31_NiceFitsPower3.csv')
+
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+
+# filter to sig genes and reorder
+sig.genes <- mss.out[pvalue < 0.05 & abs(log2FC) > log2(1.5) & receptor != 'MOR.LG94', unique(gene) ]
+exp.mat <- exp.mat[rownames(exp.mat) %in% sig.genes,]
+
+
+# renanme MOR DAMGO to MOR
+colnames(exp.mat) <- c('DOR', 'KOR', 'MOR', 'MRX2', 'MRX4', 'NK1R', 'NPFFR1', 'NPY1R','PTGER1', 'PTGER4','QRFPR')
+
+# reorder the cols to match the matrices
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+
+exp.mat[1:10,1:10]
+exp.mat <- exp.mat[, col.order]
+exp.mat[1:10,1:10]
+
+
+# sanit check; looks good
+lapply(scores.mat, colnames)
+```
+
+run the correlations for each of the datasets
+
+
+```{r}
+cor.list <- lapply(scores.mat, function(x){
+  cor(t(exp.mat), t(x), use= "pairwise.complete.obs")
+})
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "gene")
+  return(x)
+})
+```
+
+count number of observations, only want to take results with vals observed for all receptors to reduce FPs
+
+```{r}
+cor.long$iupar[, .SD[which.max(R)], by=GProtein]
+
+# most of these have values for the 11 receptors
+obs.counts <- mss.out[!is.na(log2FC) & receptor != 'MOR.LG94' & gene %in% sig.genes, .N, by = gene]
+hist(obs.counts$N, breaks=seq(1,11))
+
+```
+
+add this info to the correlation res
+
+```{r}
+lapply(cor.long, function(x){
+  
+  x[obs.counts, numObservations := N, on = 'gene']
+  #setorder(x, -numObservations, -R, na.last = TRUE) #strongest associations at top
+})
+
+```
+```{r}
+
+lapply(cor.long, function(x){
+  
+  x[, direction := ifelse(R > 0, 'pos', 'neg')]
+  x[!is.na(R) & numObservations == 11, percentile.rank := rank(R)/length(R), by=GProtein] # only interested in those found in all
+    
+})
+```
+sanity check of the top hits vs the 11 receptor app
+```{r}
+cor.long$iupar[numObservations == 11 & R > 0.8,]
+
+cor.long$pred
+scores.mat$iupar
+
+
+# sanity check; is ZFYVE21 top Gi/Go correlation?
+# yes these seemto be the top scorers
+cor(scores.mat$iupar[1,], exp.mat[rownames(exp.mat) %in% 'ZFYVE21',])
+cor(scores.mat$iupar[2,], exp.mat[rownames(exp.mat) %in% 'PRKCA',])
+```
+write out these results for the scores to the WGCNA directory
+
+```{r}
+#lapply(seq_along(cor.long), function(x,n,i){
+#  fwrite(x[[i]][numObservations == 11], paste0('output/', n[[i]], '.proteinClassificationCorrelations.csv'))
+#},x=cor.long, n=names(cor.long))
+```
+
+read in this data and plot the correlation ranks, then a heatmap of the top scores per gene
+
+
+
+
+```{r}
+cor.long$iupar$GProtein
+
+lapply(cor.long$iupar$GProtein, function(x){
+  
+  ggplot(cor.long$iupar[ GProtein == x,], aes(x=reorder(gene,-R), y=R)) + geom_point()
+  
+})
+```
+

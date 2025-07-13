@@ -1,0 +1,92 @@
+---
+title: "031025_formatPCprophetInput"
+author: "Martin Gordon"
+date: "2025-03-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("~/Documents/utils/bp_utils/UniprotIDMapping.R")
+```
+
+Read in the DIANN data
+
+```{r}
+sec.list <- list(m0=fread('./data/Macrophage_M0-M1-M2-Company-031025/M0_report.pg_matrix.tsv'),
+                 m1=fread('./data/Macrophage_M0-M1-M2-Company-031025/M1_report.pg_matrix.tsv'),
+                 m2=fread('./data/Macrophage_M0-M1-M2-Company-031025/M2_report.pg_matrix.tsv'))
+
+
+sec.list <- lapply(sec.list, function(x){
+  # remove path and .d suffix 
+  colnames(x) <- gsub(".+[\\]|[.]d$", '', colnames(x))
+  cols.oi <- c("Protein.Group", grep('M[012].+F[0-9]{1,2}.+', colnames(x), value=T))
+  return(x[,..cols.oi])
+  
+})
+```
+# lets fix these NA to 0 as PCprophet expects explicit values 
+
+```{r}
+sec.list <- lapply(sec.list, function(x){
+
+  mat <- as.matrix(x, rownames='Protein.Group')
+  mat[is.na(mat)] <- 0
+  dt <- as.data.table(mat, keep.rownames = T)
+  dt[, GN := multiUniprots2multiGenes(rn, species='HUMAN')]
+  
+  cols.oi <- c('GN', 'rn', grep('M[012].+F[0-9]{1,2}.+', colnames(x), value=T))
+  dt <- dt[, ..cols.oi]
+  setnames(dt, old='rn', 'ID')
+  return(dt)
+})
+```
+
+check fraction order meets expectations
+All True..
+```{r}
+# check to ensure the order matches expected
+# all true, so seems fractions are in correct order
+lapply(sec.list, function(x){
+  
+  #fractOrder <- sapply(strsplit(colnames(x)[3:ncol(x)], '[._]'), function(y) y[2]) for M1
+  fractOrder <- sapply(strsplit(colnames(x)[3:ncol(x)], '[._]'), function(y) y[3])
+  print(fractOrder)
+  all(fractOrder == paste0('F', seq(1,ncol(x)-2))) == TRUE
+  
+})
+```
+```{r}
+lapply(sec.list, colnames)
+lapply(sec.list, head)
+
+
+# write to file 
+lapply(names(sec.list), function(x){
+  
+  print(sec.list[[x]])
+  fwrite(sec.list[[x]], sep='\t', ScriptAndDatedFileName(paste0(x,'.macrophage.pcp.input.mat.txt')))
+  
+})
+
+```
+Fix the corum DB to match expected column input 
+```{r}
+corum.dt <- fread('./data/Macrophage_M0-M1-M2-Company-031025/corum_humanComplexes.txt')
+
+fwrite(corum.dt[, .(ComplexID=complex_id, ComplexName=complex_name, `subunits(Gene name)`=subunits_gene_name, `subunits(UniProt IDs)`=subunits_uniprot_id, `GO ID`=functions_go_id, `GO description`=functions_go_name)], sep='\t', ScriptAndDatedFileName('corum_humanComplexes.reformat.txt'))
+```
+
+

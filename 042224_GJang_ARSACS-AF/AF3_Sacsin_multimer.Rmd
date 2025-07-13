@@ -1,0 +1,208 @@
+---
+title: "AF3_multimer_plots"
+author: "Martin Gordon"
+date: "2024-05-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## AF3 multimer SACSIN runs
+
+Look at the output of AF3 multimer runs and plot the iPTM for each of the 5 models
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(jsonlite) # convert json to do
+library(stringr)
+library(gggenes) # draw gene segements
+library(patchwork) # combine plots
+library(ComplexHeatmap)
+library(circlize)
+#library(rjson) # for reading in the R json files
+library(jsonlite)
+library(RColorBrewer)
+
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("../../utils/bp_utils/manageScriptData.R")
+```
+
+Read in the data for each of the models
+
+As these datasets are very large, we will need to delete these after each of the runs
+```{r}
+getwd()
+models <- dir(path='/Users/martingordon/Documents/projects/042224_GJang_ARSACS-AF/output', pattern="*sacs_vdac3_full_data_[01234].json", full.names = T, recursive = T)
+models
+af.mods <- lapply(models, function(x){jsonlite::fromJSON(x) })
+names(af.mods) <- str_extract(models, 'sacs_[a-z0-9]+_full_data_[0-9]')
+```
+
+heatmap of pae scores
+
+```{r}
+col.pal <- brewer.pal(8, name='Dark2')
+
+lapply(seq_along(af.mods[c(1:2)]), function(x,n,i){
+  
+  
+  # first annotation  
+  sacsin.anno <-rep('', length(x[[i]]$token_res_ids))
+  sacsin.anno[1:67] <- 'UBL'
+  sacsin.anno[107:505] <- 'SRR1'
+  sacsin.anno[1471:1921] <- 'SRR2'
+  sacsin.anno[2539:2922] <- 'SRR3'
+  sacsin.anno[3659:3735] <- 'XPCB'
+  sacsin.anno[4295:4384] <- 'DNAJ'
+  sacsin.anno[4450:4466] <- 'HEPN'
+
+  # seconda annotation
+  chain.anno <- x[[i]]$token_chain_ids
+  
+  
+  # set up matrix
+  mat <- x[[i]]$pae
+  rownames(mat) <- x[[i]]$token_res_ids
+  colnames(mat) <- x[[i]]$token_res_ids
+
+  #simplify dim names; if not in 
+  rownames(mat) <- ifelse(rownames(mat) %in% seq(1, nrow(mat), by=100), rownames(mat), '')
+  colnames(mat) <- ifelse(rownames(mat) %in% seq(1, nrow(mat), by=100), rownames(mat), '')
+  
+  hm1 <- Heatmap(mat, 
+                cluster_rows = FALSE, 
+                cluster_columns = FALSE, 
+                column_title = paste0('model ', gsub('full_data_', '', n[[i]])),
+                show_row_names = T, 
+                show_column_names = T,
+                name='Predicted Aligned Error (Angstroms)')
+ 
+   hm2 <- Heatmap(sacsin.anno, 
+          name='Domains',
+          col=structure(col.pal, names=unique(sacsin.anno)),
+          width=unit(0.5, 'cm'))
+   
+   hm3 <- Heatmap(chain.anno, 
+          name='Chain IDs',
+          col=structure(col.pal, names=unique(chain.anno)),
+          width=unit(0.5, 'cm'))
+   
+  BackupAsPDF(draw(hm3+hm2+hm1), paste0(n[[i]], '.pae.heatmap'), dimensions=c(14,14))
+  
+},x=af.mods, n=names(af.mods))
+```
+
+Read the summary results and plot the iPTM scores per model
+
+```{r}
+summary <- dir(path='/Users/martingordon/Documents/projects/042224_GJang_ARSACS-AF/output', pattern="*_summary_confidences_[01234].json", full.names = T, recursive = T)
+
+summary.dt <- lapply(summary, function(x){
+  # read in all info 
+  json.dt <- jsonlite::fromJSON(x)
+  # just take the iPTM scores
+  return(json.dt['iptm'])
+  })
+
+names(summary.dt) <- str_extract(summary, 'sacs_[a-z0-9]+_summary_confidences_[01234]')
+names(summary.dt) <- gsub('summary_confidences_', '', names(summary.dt))
+names(summary.dt)
+
+summary.dt <- rbindlist(summary.dt, idcol='model')
+
+summary.dt[, `:=`(pair = gsub('_[0-9]$','', model),
+                  modelRanking = str_extract(model, '[0-4]$'))]
+summary.dt[, c('bait','prey') := tstrsplit(model, '_', keep=c(1,2))]
+```
+plot the output
+
+```{r}
+g <- ggplot(summary.dt, aes(x=pair, y=iptm, color=modelRanking)) +
+  geom_point(alpha=0.4) +
+  geom_hline(yintercept=c(0.5), linetype=c(2), alpha=0.5) +
+  #annotate(geom='text', label='excellent prediction', x=1.5, y=0.82, size=3) +
+  annotate(geom='text', label='iPTM threshold', x=1.5, y=0.51, size=4) +
+  ylab('iPTM') +
+  xlab('Interacting Pair') +
+  ggtitle('Accuracy of the predicted relative positions of complex subunits') +
+  scale_color_brewer(type='qual', palette=2) +
+  theme_bw()
+
+BackupAsPDF(g, 'SacsinInteractor.iPTMscores.dotplot')
+```
+As these datasets are very large, we will need to delete these after each of the runs
+Instead, loop through each pair, generate the PAE plots for the top 2 ranked models
+```{r}
+models <- dir(path='/Users/martingordon/Documents/projects/042224_GJang_ARSACS-AF/output', pattern="*_full_data_0.json", full.names = T, recursive = T)
+pairs <- unique(str_extract(models, 'sacs_[a-z0-9]+'))
+
+af.mods <- lapply(models, function(x){jsonlite::fromJSON(x) })
+names(af.mods) <- str_extract(models, 'sacs_[a-z0-9]+')
+```
+
+heatmap of pae scores
+
+```{r}
+col.pal <- brewer.pal(8, name='Dark2')
+col.pal
+
+
+lapply(seq_along(af.mods), function(x,n,i){
+  
+  
+  # first annotation  
+  sacsin.anno <-rep('', length(x[[i]]$token_res_ids))
+  sacsin.anno[1:67] <- 'UBL'
+  sacsin.anno[107:505] <- 'SRR1'
+  sacsin.anno[1471:1921] <- 'SRR2'
+  sacsin.anno[2539:2922] <- 'SRR3'
+  sacsin.anno[3659:3735] <- 'XPCB'
+  sacsin.anno[4295:4384] <- 'DNAJ'
+  sacsin.anno[4450:4466] <- 'HEPN'
+
+  # seconda annotation
+  chain.anno <- x[[i]]$token_chain_ids
+  
+  
+  # set up matrix
+  mat <- x[[i]]$pae
+  rownames(mat) <- x[[i]]$token_res_ids
+  colnames(mat) <- x[[i]]$token_res_ids
+
+  #simplify dim names; if not in 
+  rownames(mat) <- ifelse(rownames(mat) %in% seq(1, nrow(mat), by=100), rownames(mat), '')
+  colnames(mat) <- ifelse(rownames(mat) %in% seq(1, nrow(mat), by=100), rownames(mat), '')
+  
+  hm1 <- Heatmap(mat, 
+                cluster_rows = FALSE, 
+                cluster_columns = FALSE, 
+                column_title = paste0('best model ',n[[i]]),
+                show_row_names = T, 
+                show_column_names = T,
+                name='Predicted Aligned Error (Angstroms)')
+ 
+   hm2 <- Heatmap(sacsin.anno, 
+          name='Domains',
+          col=structure(col.pal, names=unique(sacsin.anno)),
+          width=unit(0.5, 'cm'))
+   
+   hm3 <- Heatmap(chain.anno, 
+          name='Chain IDs',
+          col=structure(col.pal, names=unique(chain.anno)),
+          width=unit(0.5, 'cm'))
+   
+  BackupAsPDF(draw(hm3+hm2+hm1), paste0(n[[i]], '.pae.heatmap'), dimensions=c(14,14))
+  
+},x=af.mods, n=names(af.mods))
+```
+
+
+
+```{r}
+col.pal
+```
+

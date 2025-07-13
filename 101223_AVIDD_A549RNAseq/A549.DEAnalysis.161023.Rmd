@@ -1,0 +1,365 @@
+---
+title: "101623.A569.RNAseq"
+author: "Martin Gordon"
+date: "2023-10-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  results = 'asis',
+  fig.pos='H', 
+  fig.wide=TRUE)
+```
+
+```{r load-packages, message=FALSE, warning=FALSE, echo=TRUE}
+library(gtools)
+library(tidyverse)
+library(ggplot2)
+library(tximport)
+library(DESeq2)
+library(ashr) #adaptive shrinkage estimator to improve lFC estimates in DESEq2
+library(apeglm)
+library(IHW) # Independent Hypothesis Weighting 
+
+# visualisation
+library(EnhancedVolcano) 
+library(RColorBrewer)
+library(data.table)
+library(ComplexHeatmap)
+
+library(genefilter) # not available 
+
+# annotations
+#library(biomaRt)
+
+# load helper functions in other packages
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.old.R")
+
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+#source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+
+## Differential Expression Analysis using DESeq2 
+### 16-10-23
+### Contacts: Martin Gordon, Krogan lab; Paddy O Leary, Ashworth Lab
+
+### Synopsis
+Processing A549 experimental data
+EV, WT and Mac1 mutant cell lines
+Are we observing the same differentially expressed genes as the earlier analysis?
+Perform a DEA between the conditions and identify genes that are upregulated in the mutant relative to WT 
+Are we observing the same differentially expressed genes as the earlier analysis?
+
+
+```{r input-files}
+
+path <- 'output/nf.rnaseq.out'
+
+input <- dir(path=path, pattern = "quant.sf$", recursive = T, full.names = TRUE) %>% 
+  data.table() %>% 
+  setnames('.', 'path') %>% 
+  .[, file.names := gsub("output/nf.rnaseq.out/|_quant.sf", "", path) ]
+
+rm(path)
+
+```
+
+
+Creating metadata file
+
+```{r create-metadata}
+
+# set WT as base level for comparisons
+sample_meta <- input %>% 
+  .[, `:=`(condition = factor(str_extract(file.names, 'uninf|WT|NSP3D'), levels = c('uninf','WT','NSP3D')),
+           timepoint = factor(str_extract(file.names, '24|48$')) )]
+ 
+sample_meta[, .N, by=.(condition,timepoint)]
+
+#only controls at 48hr - is this an issue? how to distinguish time changes from bio relevant ones?
+sample_meta[condition == 'uninf', condition := 'CTRL']
+
+# create an identifer per group
+sample_meta[, replicate := seq_len(.N), by=.(condition,timepoint)]
+
+# now create a group col to allow PW comparisons
+sample_meta[, group := paste0(condition, '_', timepoint)]
+sample_meta[, group := factor(group, levels = c("CTRL_48", "WT_24","WT_48", "NSP3D_24", "NSP3D_48"))]
+
+```
+need file names as rownames for the metadata
+
+```{r}
+# need file names as row names for the metadata 
+# convert to tibble
+sample_meta <- sample_meta %>% 
+  as_tibble() %>% 
+  column_to_rownames('file.names')
+```
+
+read in txt2gene from output
+```{r}
+# txt2gene from nf pipeline run - no lost transcripts
+nf.txt2g <- read_tsv('./output/star_salmon/salmon_tx2gene.tsv', col_names = F) 
+nf.txt2g
+colnames(nf.txt2g) <- c('transcript', 'gene', 'symbol')
+```
+
+Summarising transcript level abundances to the gene level using tximport
+
+```{r tximport-txt2gene}
+txi_files <- input$path
+names(txi_files) <- input$file.names
+
+#tximport: convert transcript level abundances to gene
+txi <- tximport(files = txi_files, type = "salmon", tx2gene = nf.txt2g) 
+
+# safety check; assert that col in txi match order and rownames in metadata table. # TRUE
+all(rownames(sample_meta) == colnames(txi[["counts"]])) 
+```
+Group means comparison; identify the DEGs and compare to our list 
+
+For first pass, I've kept it simple and combined timepoint and cell type factors into a single factor. The drawback here is we can't tease apart effects of different co-variates (ie is timepoint or cell type driving the expression difference) but it does indicate differences between groups at a quick glance. 
+
+```{r run dds, echo=FALSE, message=FALSE, warning=FALSE}
+
+dds <- DESeqDataSetFromTximport(txi = txi, 
+                                colData = sample_meta, 
+                                design = ~ group)
+
+mingrpsize <- 3
+keep <- rowSums(counts(dds) >= 10) >= mingrpsize
+dds <- dds[keep, ]
+#rm(keep, mingrpsize)
+
+
+# run DESeq workflow ; normalise
+dds <- DESeq(dds)
+```
+
+EDA generate a PCA plot of the data 
+
+```{r pca}
+# variance stabilising transformatiions
+dds_vst <- vst(dds, blind =F)
+# ge tthe normalised count matrix
+dds.vst.mat <- assay(dds_vst)
+
+save_plot(PCA_fun, list(x=dds_vst, grouping="group"), "PCA_conditions.png", "./output/plots/EDA")
+```
+
+PCA plot
+looks like timepoint is the main driver of variance... this is a concern I think
+Get clarity from Paddy about this.. this is an issue
+I think we can do PW comparisons between each condition, but how is this helpful
+```{r}
+pcaOut <- prcomp(t(dds.vst.mat))
+
+colInfo <- data.table(colname = colnames(dds.vst.mat))
+colInfo[, c("group", "timepoint") := tstrsplit(colname, "[_.]", keep = c(2,3)) ] # v useful fucntion
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = timepoint)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+          color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA.fullset")
+```
+```{r}
+p <- ggplot (pcaDT, aes(x=PC2, y=PC3,  fill = group, shape = timepoint)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ylab (sprintf ("PC3, %.1f%%", pcaPercentVar[3])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+          color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+```
+drop the 24hr samples and rerun
+Seems PC1 high mycoplasma + SARSCov2 load on x axis seperatea
+
+```{r}
+subset.dds.vst.mat <- dds.vst.mat[, grepl('48$', colnames(dds.vst.mat))]
+
+pcaOut <- prcomp(t(subset.dds.vst.mat))
+
+colInfo <- data.table(colname = colnames(subset.dds.vst.mat))
+colInfo[, c("group", "timepoint") := tstrsplit(colname, "[_.]", keep = c(2,3)) ] # v useful fucntion
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = timepoint)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+          color = guide_legend(override.aes = list(shape =21) ) )
+p
+```
+
+
+
+run standard deseq2 analysis and run enrihcment on the output; what respsone are we seeing to infedction
+pull out the contrasts OI
+```{r}
+resultsNames(dds)
+
+wt.ctrl.48 <- results(dds, contrast = list("group_WT_48_vs_CTRL_48"))
+nsp.ctrl.48 <- results(dds, contrast = list("group_NSP3D_48_vs_CTRL_48"))
+wt.nsp.48 <- results(dds, contrast= list("group_WT_48_vs_CTRL_48", "group_NSP3D_48_vs_CTRL_48"))
+
+
+#res <- results(dds, contrast=c("condition","Mac1","WT")) #
+
+colData(dds)
+
+sample_meta$group %>%  levels()
+
+# define model matrix
+mod_mat <- model.matrix(design(dds), colData(dds))
+mod_mat
+
+# calculate coefficient vectors for each group
+NSP3D_48 <- colMeans(mod_mat[dds$group == 'NSP3D_48', ])
+NSP3D_24 <- colMeans(mod_mat[dds$group == 'NSP3D_24', ])
+WT_48 <- colMeans(mod_mat[dds$group == 'WT_48', ])
+CTRL_48 <- colMeans(mod_mat[dds$group == "CTRL_48", ])
+
+NSP3D_24
+```
+run the contrasts between conditions.. no significant hits found comparing conditions
+check out difference when comparing timepoints
+
+The exp needs to be re-run, serious issue with contaminats
+No difference in condition at same timepoint, but huge difference in t24 vs t48
+```{r}
+# obtain results for each pairwise contrast
+WT.vs.CTRL <- results(dds, contrast = WT_48 - CTRL_48)
+WT.vs.NSP3D <- results(dds, contrast = WT_48 - NSP3D_48)
+NSP3D.vs.CTRL <- results(dds, contrast = NSP3D_48 - CTRL_48)
+NSP48.vs.NSP24 <- results(dds, contrast = NSP3D_48 - NSP3D_24)
+
+
+deseq.res <- list(WT.CTRL = WT.vs.CTRL,
+                  WT.NSP = WT.vs.NSP3D,
+                  NSP.CTRL = NSP3D.vs.CTRL,
+                  NSP48.NSP24 = NSP48.vs.NSP24)
+
+lapply(deseq.res, summary)
+```
+Check out the comparisons 
+
+```{r}
+res <- results(dds, contrast=c("group","WT_48","CTRL_48"), alpha=0.05)
+test <- res %>%  as.data.table(keep.rownames=T)
+
+setnames(test, old=colnames(test), new=c('gene',"baseMean","log2FoldChange","lfcSE","stat","pvalue","padj"))
+
+
+test[as.data.table(nf.txt2g), symbol := i.symbol, on=c('gene', 'gene')]
+test[symbol == 'HIF1A']
+
+plotCounts(dds, gene='ENSG00000100644', intgroup="group")
+
+
+test[symbol == 'U2AF1']
+plotCounts(dds, gene=c('ENSG00000178397'), intgroup="group")
+```
+Looking at their list of differentially expressed genes, I am not sure how they found them...
+Read in their PCA and plot
+```{r}
+pca.data <- fread('/Users/martingordon/Documents/projects/101223_AVIDD_A549RNAseq/data/BGI_F23A480000480-02_HOMoinyR/Basic/Overview/PCA_all_sample.xls')
+
+pca.data[, condition := gsub('A[1-9]{1,2}_','', sample_name)]
+pca.data
+
+ggplot(pca.data, aes(x=pca_comp1, y=pca_comp2, color=condition)) + geom_point()
+```
+read in their core.table and check out the results 
+
+```{r}
+bgi.out <- fread('/Users/martingordon/Documents/projects/101223_AVIDD_A549RNAseq/data/BGI_F23A480000480-02_HOMoinyR/Differentially_expressed_gene/Diff_exp/gene_diff.xls')
+bgi.out[gene_symbol %in% 'DOCK7']
+
+# get the proteins that are differentially expressed in the conditions and see what they look like 
+bgi.out %>%  colnames(0)
+cols.oi <- c("gene_symbol","diffexp_degseq_pvalue_uninfect_48-vs-WT_48", "diffexp_degseq_qvalue_uninfect_48-vs-WT_48", "diffexp_log2fc_uninfect_48-vs-WT_48")
+
+bgi.test <- bgi.out[, ..cols.oi]
+
+setnames(bgi.test, old = colnames(bgi.test), new=c('gene', 'pval', 'qval', 'log2FC'))
+
+bgi.test[, p.adj := p.adjust(pval, method = 'BH')]
+
+vector.oi <- bgi.test[p.adj < 0.05 & abs(log2FC) > 1, gene]
+vector.oi
+# now find the Entrez gene id for this veco
+entrez.vec <- test[ symbol %in% vector.oi, gene]
+
+lapply(entrez.vec, function(x){
+  
+  p <- plotCounts(dds, gene=x, intgroup="group", returnData = T)
+  
+  # recover gene symbol
+  gene.s <- as.data.table(nf.txt2g) %>%
+    .[gene == x, unique(symbol)]
+  
+  print(gene.s)
+ g <- ggplot(p, aes(x=group, y=count, color=group)) + 
+             geom_point(position=position_jitter(w=0.1,h=0)) + 
+             ggtitle(paste0(gene.s, ' normalised counts - sig genes WT vs CTRL (48hrs)'))
+ 
+ print(g)
+ BackupAsPDF(g, paste0(gene.s, 'gene.counts.WTvsCTRL.48hrs'))
+ 
+})
+
+```
+
+```{r}
+vector.oi
+```
+

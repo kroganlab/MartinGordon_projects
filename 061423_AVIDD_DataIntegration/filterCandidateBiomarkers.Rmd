@@ -1,0 +1,484 @@
+---
+title: "potentialBiomarkerFiltering"
+author: "Martin Gordon"
+date: "2023-11-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Filtering sites of OI
+
+Goal of the analysis is to identify  features (genes/proteins) that distinguish WT vs EV/mutant (MUT) treated A549 cell lines for use as a biomarker
+
+For earlier analysis we identified a candidate list based on sites changing between WT vs EV/MUT in presence of IFN-γ 
+IFN-γ treamtnet is important for innate immune response: activation of macrophages, resting NK cell activity, and up-regulation of MHC class II on the macrophage cell surface
+
+Identify the significantly moving sites in the IFNg- data and use this to filter our candidate biomarkers
+
+
+
+packages
+```{r}
+library(data.table)
+library(ggplot2)
+library(DESeq2)
+library(magrittr)
+library(stringr)
+library(ggrepel)
+library(ComplexHeatmap)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+```
+Read in the AVIDD DEA RNAseq results and identify significant movers
+
+```{r}
+box.loc <- '~/Library/CloudStorage/Box-Box/Mac1_omics_data/'
+rna.core <- fread(paste0(box.loc, 'CellLines_RNAseq/core_table_gene.xls.gz'), fill=T)
+
+cols.OI <- grep('gene_id|gene_symbol|diffexp', colnames(rna.core), value = T)[2:51]
+
+rna.core.long <- rna.core[, ..cols.OI] %>% 
+  melt(., id.vars=c('gene_id', 'gene_symbol'))
+
+
+rna <- rna.core.long[ variable %like% "EV_ctrl-vs-WT_ctrl|WT_ctrl-vs-ND_ctrl",] %>% 
+  .[, label := str_extract(variable, 'EV_ctrl-vs-WT_ctrl|WT_ctrl-vs-ND_ctrl')]
+
+rna <- rna[, variable := gsub('diffexp_|deseq2_|_EV_ctrl-vs-WT_ctrl|_WT_ctrl-vs-ND_ctrl', '', variable)]
+
+rna.dt <- dcast(rna, gene_symbol+label~variable, value.var = 'value')
+```
+
+identify the significant movers in both labels and see if there is any overlap with the IFNg treatment hits
+
+```{r}
+rna.dt <- rna.dt[, sig := 'not',] %>% 
+  .[abs(log2fc) > 0.58 & qvalue < 0.05, sig := ifelse(log2fc > 0, 'up', 'down')]
+
+rna.dt[,.N, by=.(sig,label)]
+```
+plot of significant movers in both contrasts 
+
+```{r}
+g <- ggplot(rna.dt, aes(x=log2fc, y=-log10(qvalue), color=sig, label=gene_symbol)) + 
+  geom_point() +
+  scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue')) +
+  geom_text_repel(data=rna.dt[sig !='not']) +
+  facet_wrap(~label) +
+  theme_bw()
+  
+
+BackupAsPDF(g, 'volcanoplots.noIFNgTreatment')
+```
+
+Are any of these overlapping with our targets?
+Identify the list of target genes and label these in the volcanoplot
+Also generate a heatmap of what they look like across conditions
+
+```{r}
+#read in sig genes from IFNg treatment
+exp.sig <- fread('./output/17.06.experimental-omics-sig-genes.csv')
+exp.sig[, .N, by=omics]
+
+sig.hits <- exp.sig[omics %in% c('all.sig', 'rna.ab.sig'), unique(gene)]
+```
+
+Not promising, seems many of the genes we see moving are also due to 
+```{r}
+g <- ggplot(rna.dt, aes(x=log2fc, y=-log10(qvalue), color=sig, label=gene_symbol)) + 
+  geom_point() +
+  scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue')) +
+  geom_text_repel(data=rna.dt[gene_symbol %in% sig.hits]) +
+  facet_wrap(~label) +
+  theme_bw()
+  g
+
+BackupAsPDF(g, 'volcanoplots.noIFNgTreatment.candidatesLabelled')
+```
+
+Table: which of these genes are significant in either comparison?
+Unfortunately, only 7 things that are not significantly different in both of the comparisons and many of these things seem to be statisitcally significant but miss the log2FC threshold
+
+```{r}
+new.candidates <- rna.dt[ gene_symbol %in% sig.hits & sig == 'not', (gene_symbol)] %>% .[duplicated(.)]
+new.candidates
+rna.dt[ gene_symbol %in% new.candidates,]
+```
+Heatmap of these sig features in the IFNg -ve dataset 
+subtract row medians from the values used (has this data been normalised? maybe process the counts the same as previously..)
+
+Create matrix from the RNAseq count data, normalise and plot the sig hits from 
+
+```{r}
+
+#cols.OI <- grep("gene_symbol|read_count", colnames(rna.core), value = T)[c(1,5,6,7,11,12,13,22,23,24)]
+cols.OI <- grep("gene_symbol|read_count", colnames(rna.core), value = T)[c(1:24)]
+
+rna.mat <- rna.core[, ..cols.OI] %>%  
+  as.matrix(rownames='gene_symbol')
+
+# filter low count genes
+smallestGrp <- 3
+
+keep <- rowSums(rna.mat >= 10) >= smallestGrp
+rna.mat <- rna.mat[keep,]
+
+rna.mat <- vst(round(rna.mat))
+
+# subtract row medians to highligth differences between conditions
+new.mat <- sweep(rna.mat, MARGIN=1, FUN='-', STATS = apply(rna.mat, 1, median))
+
+
+new.mat %>%  colnames()
+
+col.order <- c('read_count_Par_ctrl_B', 'read_count_Par_ctrl_C',"read_count_Par_IFNg_A","read_count_Par_IFNg_B","read_count_Par_IFNg_C", "read_count_EV_ctrl_A" ,"read_count_EV_ctrl_B" ,"read_count_EV_ctrl_C","read_count_EV_IFNg_A","read_count_EV_IFNg_B","read_count_EV_IFNg_C",
+               "read_count_WT_ctrl_A", "read_count_WT_ctrl_B", "read_count_WT_ctrl_C", "read_count_WT_IFNg_A","read_count_WT_IFNg_B","read_count_WT_IFNg_C")
+
+
+
+
+              column_split = list(ifelse(grepl("NP00", colnames(prot.mat)), "NP00", "NP30"),
+                                ifelse(grepl("CM00", colnames(prot.mat)), "CM00", "CM15")))
+
+BackupAsPDF(Heatmap(new.mat[rownames(new.mat) %in% sig.hits,], cluster_columns = F), 'candidates.NoIFNgData.allsamplesheatmap', dimensions=c(8,8))
+```
+
+plot the log2FC of the two conditions against each other
+
+```{r}
+rna <- rna.core.long[ variable %like% "EV_ctrl-vs-WT_ctrl|WT_ctrl-vs-ND_ctrl|EV_IFNg-vs-WT_IFNg|WT_IFNg-vs-ND_IFNg",] %>% 
+  .[, label := str_extract(variable, "EV_ctrl-vs-WT_ctrl|WT_ctrl-vs-ND_ctrl|EV_IFNg-vs-WT_IFNg|WT_IFNg-vs-ND_IFNg")]
+
+rna <- rna[, variable := gsub('diffexp_|deseq2_|_EV_ctrl-vs-WT_ctrl|_WT_ctrl-vs-ND_ctrl|_WT_IFNg-vs-ND_IFNg|_EV_IFNg-vs-WT_IFNg', '', variable)]
+
+rna.dt <- dcast(rna, gene_symbol+label~variable, value.var = 'value')
+
+```
+scatter 
+```{r}
+colnames(rna.core)
+
+cols.OI <- grep("gene_symbol|diffexp_log2fc", colnames(rna.core))[c(1:17)]
+
+rna.dt <- rna.core[, ..cols.OI]
+colnames(rna.dt) <- gsub("-", ".", colnames(rna.dt))
+
+g <- ggplot(rna.dt, aes(x=diffexp_log2fc_EV_IFNg.vs.ND_IFNg, y=diffexp_log2fc_EV_ctrl.vs.ND_ctrl, label=gene_symbol)) + 
+  geom_point(aes(alpha=0.7)) + 
+  geom_point(data=rna.dt[gene_symbol %in% sig.hits,], aes(color='darkred')) + 
+  geom_abline(intercept=0, slope=1, color='grey', alpha=0.4) +
+  geom_density2d() +
+  geom_text_repel(data=rna.dt[gene_symbol %in% sig.hits]) +
+  ggtitle('EV-ND Comparison') +
+  xlab('log2FC IFNg +ve') +
+  ylab('log2FC IFNg -ve') +
+  theme_minimal()
+
+BackupAsPDF(g, 'EV-ND.log2FC.scatterplot')
+```
+
+Modify sig hits list so they are the only ones used in each comparison
+```{r}
+
+#read in sig genes from IFNg treatment
+exp.sig <- fread('./output/17.06.experimental-omics-sig-genes.csv')
+exp.sig[, .N, by=omics]
+exp.sig
+sig.hits <- exp.sig[omics %in% c('all.sig', 'rna.ab.sig') & Label %in% 'WT_IFNg-vs-ND_IFNg', unique(gene)]
+
+g <- ggplot(rna.dt, aes(x=diffexp_log2fc_WT_IFNg.vs.ND_IFNg, y=diffexp_log2fc_WT_ctrl.vs.ND_ctrl, label=gene_symbol)) + 
+  geom_point(aes(alpha=0.7)) + 
+  geom_point(data=rna.dt[gene_symbol %in% sig.hits,], aes(color='darkred')) + 
+  geom_abline(intercept=0, slope=1, color='grey', alpha=0.4) +
+  geom_density2d() +
+  geom_text_repel(data=rna.dt[gene_symbol %in% sig.hits]) +
+  ggtitle('ND-WT Comparison') +
+  xlab('log2FC IFNg +ve') +
+  ylab('log2FC IFNg -ve') +
+  theme_minimal()
+g
+BackupAsPDF(g, 'WT-ND.sig.log2FC.scatterplot', dimensions=c(8,6))
+
+```
+Interaction analysis of IFNg treatment
+We want to assess if addition of IFNg impacts cell response to transfection
+
+
+Quick plot to check counts - doesn't look normalised so should be safe to rerun DESeq2 normalisation
+
+```{r}
+cols.OI <- grep("gene_symbol|read_count", colnames(rna.core), value = T)[c(1:24)]
+
+rna.mat <- rna.core[, ..cols.OI] %>%  
+  as.matrix(rownames='gene_symbol')
+
+ggplot(melt(log2(rna.mat+1)), aes(x=Var2, y=value, fill=Var2)) + geom_boxplot() + theme(axis.text.x = element_text(angle=90))
+```
+reference levels are ctrl and EV for IFNg treatment and transfection respectively
+```{r}
+design.mat <- data.frame(replicate=as.factor(c(rep(c('A','B','C'),5), 'B','C',rep(c('A','B','C'),2))),
+                         IFNg.status=as.factor(str_extract(colnames(rna.mat), 'IFNg|ctrl')), 
+                         Infect.status=as.factor(str_extract(colnames(rna.mat),'EV|ND|WT|Par')))
+
+#assign rownames from the colnames of count matrix & simplify
+colnames(rna.mat) <- sub('read_count_','',colnames(rna.mat))
+rownames(design.mat) <- colnames(rna.mat)
+```
+Run DEseq2 to normalize library & extract variance stabilised counts
+
+Here we are testing for differences in infection status effects
+```{r}
+# only accepts integers.. round for input
+rna.mat <- round(rna.mat)
+
+dds <- DESeqDataSetFromMatrix(countData = rna.mat,
+                              colData = design.mat,
+                              design = ~ IFNg.status + Infect.status + IFNg.status:Infect.status) # w/o interaction we would be controlling for the difference due to IFNg status and looking for differences due to condition
+
+
+#maybe use log2 as more gaussian? Let look again after feature selection
+# vst handles the transformation of the data better than log2 + pseudocount, so proceed with this
+vsd <- rlog(dds)
+vst <- assay(vsd)
+```
+
+*Important note from DESeq2 vignette:*
+The key point to remember about designs with interaction terms is that, unlike for a design ~genotype + condition, where the condition effect represents the overall effect controlling for differences due to genotype, by adding genotype:condition, the main condition effect only represents the effect of condition for the reference level of genotype (I, or whichever level was defined by the user as the reference level). 
+The interaction terms genotypeII.conditionB and genotypeIII.conditionB give the difference between the condition effect for a given genotype and the condition effect for the reference genotype.
+
+This means with our design the interaction terms such as IFNg.WT and IFNg.Par give *difference* in response to infection mode for the IFNg+ vs reference level (IFNg-)
+
+How do we compare these conditions directly? We do a contrast of contrast
+
+```{r}
+ggplot(melt(rna.mat), aes(x=Var2, y=value, fill=Var2)) + geom_boxplot() + theme(axis.text.x = element_text(angle=90))
+```
+
+PCA plot:
+Do we see a change here in response to infection model?
+I'm not sure if we do... looks like a shift in response to IFNg but no evidence of interaction
+```{r}
+plotPCA(vsd,  intgroup = c('Infect.status'))
+```
+
+
+Identify genes with a different response to IFNg treatment
+Look for genes with interactions != 0
+
+resultsnames shows:
+main effect: this will be "Infect.status_ND_vs_EV" etc. difference between infection modes/resposne *for the IFNg -ve refernece group*
+IFNg effect: 'IFNg.status_IFNg_vs_ctrl'
+"IFNg.statusIFNg.Infect.statusND" # *think* this is difference from "Infect.status_ND_vs_EV" (IFNg -ve reference) from ND-vs-EV in IFNg +ve samples 
+- IFN treamtnet effect: the effect of IFNg treatment in EV (as EV is reference level)
+
+```{r}
+dds <- DESeq(dds)
+
+# output here is IFNg vs reference(control), then the 3 infection status vs reference (EV), then the 
+resultsNames(dds) # second name is the denominator (reference level)
+
+
+### Main effect
+
+# this is ND - EV (EV denom) in  IFNg.status reference (no IFNg); only ~80 genes differentially expressed
+# both below give the same result
+results(dds, contrast=c("Infect.status","ND","EV")) #second condition is the baseline
+results(dds, list(c("Infect.status_ND_vs_EV")) )
+
+results(dds, list(c("Infect.status_ND_vs_EV")) ) %>% 
+  as.data.table() %>% 
+  .[,sig := 'not'] %>% 
+  .[abs(log2FoldChange) > 0.58 & padj < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')] %>% 
+  .[, .N, by=.(sig)]
+
+
+# ND-EV in IFNg +ve samples (effect of treatment in IFNg+ samples)
+# this is measuring the effect of infection mode in IFNg treatment
+#  adding main effect and the interaction term ( the 'extra' infection effect in IFNg ND vs IFNg EV)
+results(dds, list( c("Infect.status_ND_vs_EV","IFNg.statusIFNg.Infect.statusND")))
+results(dds, list( c("Infect.status_ND_vs_EV","IFNg.statusIFNg.Infect.statusND"))) %>%  
+  as.data.table() %>% 
+  .[,sig := 'not'] %>% 
+  .[abs(log2FoldChange) > 0.58 & padj < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')] %>% 
+  .[, .N, by=.(sig)]
+
+
+## what impact is IFNg treatment alone?
+### huge number of DEGs
+results(dds, list( c("IFNg.status_IFNg_vs_ctrl" )))
+results(dds, list( c("IFNg.status_IFNg_vs_ctrl"))) %>%  
+  as.data.table(keep.rownames=T) %>% 
+  .[,sig := 'not'] %>% 
+  .[abs(log2FoldChange) > 0.58 & padj < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')] %>% 
+  .[, .N, by=.(sig)]
+
+
+
+### Interaction effects
+
+# ND vs EV
+
+# Q is the response to infection  different across IFNg treatment status? 
+# This is just the interaction term
+# no significant interaction ffects found for ND-EV... ie no sig impact of IFng treatment
+results(dds, list( c("IFNg.statusIFNg.Infect.statusND")))
+results(dds, list( c("IFNg.statusIFNg.Infect.statusND"))) %>%  
+  as.data.table(keep.rownames=T) %>% 
+  .[,sig := 'not'] %>% 
+  .[abs(log2FoldChange) > 0.58 & padj < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')] %>% 
+  .[, .N, by=.(sig)]
+
+
+
+## 14 genes with a significant interaction for IFNg treatment status WT-EV
+results(dds, list( c("IFNg.statusIFNg.Infect.statusWT")))
+results(dds, list( c("IFNg.statusIFNg.Infect.statusWT"))) %>%  
+  as.data.table(keep.rownames=T) %>% 
+  .[,sig := 'not'] %>% 
+  .[abs(log2FoldChange) > 0.58 & padj < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')] %>% 
+  .[, .N, by=.(sig)]
+
+# write out the sig interaction
+wt.ev.sig.interactions <- results(dds, list( c("IFNg.statusIFNg.Infect.statusWT"))) %>%  
+  as.data.table(keep.rownames=T) %>% 
+  .[,label := 'WT-EV'] %>% 
+  .[,sig := 'not'] %>% 
+  .[abs(log2FoldChange) > 0.58 & padj < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')] %>% 
+  .[sig != 'not']
+
+
+# WT vs ND
+# for these more complicated contrasts, we need to create a contrast matrix using the coefficients returned by resultsNames(dds) 
+## look at https://rpubs.com/ge600/deseq2
+
+
+# need to define a custom contrast for this we are subtracting the ND-EV interaction effect from WT-EV interaction effect to see value
+test.contrast <- cbind(resultsNames(dds),c(0,0,0,0,0,-1,0,1))
+test.contrast
+
+#only 3 genes with a significant interaction
+
+wt.nd.sig.interactions <- results(dds, contrast =c(0,0,0,0,0,-1,0,1)) %>%  
+  as.data.table(keep.rownames=T) %>% 
+  .[,sig := 'not'] %>% 
+  .[abs(log2FoldChange) > 0.58 & padj < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')] %>% 
+  .[sig != 'not']
+```
+
+Confirm this result is correct by releveling the design.mat putting ND as the control
+
+```{r}
+#relevel reference here 
+design.mat %>%  str()
+design.mat$Infect.status <- relevel(design.mat$Infect.status, 'ND') 
+
+dds <- DESeqDataSetFromMatrix(countData = rna.mat,
+                              colData = design.mat,
+                              design = ~ IFNg.status + Infect.status + IFNg.status:Infect.status) # w/o interaction we would be controlling for the difference due to IFNg status and looking for differences due to condition
+
+
+#maybe use log2 as more gaussian? Let look again after feature selection
+# vst handles the transformation of the data better than log2 + pseudocount, so proceed with this
+vsd <- rlog(dds)
+vst <- assay(vsd)
+
+dds <- DESeq(dds)
+# output here is IFNg vs reference(control), then the 3 infection status vs reference (EV), then the 
+resultsNames(dds) # 
+```
+Now check out the sig interaction term and see results 
+Results same, so this is the correct way to do interacitons
+
+```{r}
+# WT -ND 
+results(dds, list( c("IFNg.statusIFNg.Infect.statusWT"))) %>%  
+  as.data.table(keep.rownames=T) %>% 
+  .[,sig := 'not'] %>% 
+  .[abs(log2FoldChange) > 0.58 & padj < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')] %>% 
+  .[sig != 'not']
+
+
+wt.nd.sig.interactions[, label := 'WT-ND']
+wt.ev.sig.interactions
+
+sig.interactions <- rbind(wt.nd.sig.interactions, wt.ev.sig.interactions) %>% 
+  .[,.(rn, label, baseMean,log2FoldChange, lfcSE, pvalue, padj)] %>% 
+  setnames(., old='rn', new=c('gene'))
+
+fwrite(sig.interactions[, gene],'./output/sig.interactions.IFNgTreatment.csv')
+
+sig.interactions
+```
+How many of these sig interactions are in our candidate biomarker list?
+None of these are in our candidate biomarker list: TRIM31, FRMD3, CAECAM6 (this one has a large FC but 0 pval?)
+
+How many of these are differentially expressed in conditions?
+Only 3 of the significant interactions were also significantly different in comparisons of conditions of interest.. doubt this is useful..
+
+
+
+```{r}
+sig.hits %in% sig.interactions$gene
+
+rna.deglist<- fread('./output/rna_ab.csv')
+rna.deglist$Label %>%  unique()
+rna.deglist
+
+labels.oi <- c("EV_IFNg-vs-ND_IFNg", "WT_IFNg-vs-ND_IFNg")
+
+# which genes are deg from the sig interaction list
+rna.deglist[ Label %in% labels.oi & abs(log2FC) > 0.58 & fdr < 0.05 & gene %in% sig.interactions$gene,]
+```
+
+plot CEACAM6, can see interaction seems to be elevated in EV IFNg, stable in other conditions
+
+```{r}
+plotCounts(dds, 'CEACAM6', intgroup = c("Infect.status", "IFNg.status"))
+```
+
+Now that we have the list of things with a different interaction, look at the PAR EV comparison, find the sig hits, enrich and look for
+In this data, denominator is first name, so eg RBM20 is increased in EV relative to PAR
+
+```{r}
+cols.oi <- c("gene_symbol","diffexp_deseq2_pvalue_Par_IFNg-vs-EV_IFNg", "diffexp_deseq2_qvalue_Par_IFNg-vs-EV_IFNg", "diffexp_log2fc_Par_IFNg-vs-EV_IFNg")
+
+par.vs.ev <- rna.core[, ..cols.oi]
+par.vs.ev[,sig := 'not']
+colnames(par.vs.ev) <- gsub('-', '.', colnames(par.vs.ev))
+
+par.vs.ev[diffexp_log2fc_Par_IFNg.vs.EV_IFNg > 0.58 & diffexp_deseq2_qvalue_Par_IFNg.vs.EV_IFNg < 0.05, sig := ifelse(diffexp_log2fc_Par_IFNg.vs.EV_IFNg > 0, 'up', 'down')]
+
+plotCounts(dds, 'RBM20', intgroup = c("Infect.status"))
+```
+
+Enrich for the differentially expressed genes;  is there a significant IFNg resposne in PAR vs EV? this would tell us vector treatment is inducing this response
+Enriched for things related to cell adhesion but not immune resposne
+```{r}
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+universe <- rna.core$gene_symbol %>%  unique()
+
+# give label for grouping
+par.vs.ev[,label := 'EV-PAR']
+par.vs.ev[, enrich_grp := paste0(label,sig)]
+
+
+enrich.dt <- enricherOnGroups(par.vs.ev[sig != 'not'], groupColumns = "enrich_grp", geneColumn = "gene_symbol", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+inf.go
+
+enrich.dt
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 15, title='GO term enrichment', 
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 5)
+
+
+BackupAsPDF(ht, 'go.enrich.heatmap')
+```
+

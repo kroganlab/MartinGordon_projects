@@ -1,0 +1,281 @@
+---
+title: "peptideLevelDifferentialExpressionAnalysis"
+author: "Martin Gordon"
+date: "2024-02-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Peptide Level Differential Expression Analysis
+
+```{r}
+library(data.table)
+library (ComplexHeatmap)
+library (circlize)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(magrittr)
+library(MSstats)
+library(ggrepel)
+library(circlize)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+lets try reread in the data for the 
+
+```{r}
+spec <- fread('./data/AB_Report_MSstats_Format.tsv')
+
+#keys <- fread('data/AB_ConditionSetup.tsv') #conditions not defined... use keys.old but flag
+# use ori data
+keys <- fread('./docs/keys.txt')
+
+
+contrasts.txt <- fread('docs/contrasts.txt', sep='-', header=F)
+
+# merge the 
+spec.dt <- merge(x=spec[,!c("Condition", "BioReplicate")], y=keys[,.(Condition, BioReplicate, RawFile, Fraction,IsotopeLabelType)], by.x='Run', by.y='RawFile')
+spec.dt
+
+spec.dt[, .N, by=.(Condition,BioReplicate)] %>% 
+  .[order(Condition,BioReplicate)]
+
+keys[, .N, by=.(RawFile,Condition,BioReplicate)]
+spec.dt[,.N, by=.(Run,Condition,BioReplicate)]
+# sanity check
+keys[, .N, by=.(RawFile,Condition,BioReplicate)]$Condition == spec.dt[,.N, by=.(Run,Condition,BioReplicate)]$Condition
+```
+
+Filter out nosiy identifications
+
+```{r}
+spec.dt <-  spec.dt[Intensity > 2^5, ]
+```
+
+
+GeneSets of interest
+
+```{r}
+#Immune response genes
+piGenes <- read_xlsx('docs/1-s2.0-S0092867423009157-mmc4.xlsx', col_names = T, sheet=7) %>% 
+  setDT(.) %>% 
+  .[category == 'Proinflammatory'] %>% 
+  .[,unique(gene)]
+
+isGenes <- fread('./docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+
+```
+
+Map to mouse IDs
+
+```{r}
+# lets map the homologs to the mss output and write the complete and tidied data to file 
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+```
+
+
+
+```{r}
+spec.dt[, gene := multiUniprots2multiGenes(ProteinName, species='MOUSE')]
+
+
+detectedISGs <- multiUniprots2multiGenes(unique(spec.dt[ProteinName %in% mh_mappings[Symbol.human %in% isGenes, SWISS_PROT_IDs.mouse]]$ProteinName), species='MOUSE')
+
+spec.dt[ProteinName %in% mh_mappings[Symbol.human %in% isGenes, SWISS_PROT_IDs.mouse]]
+
+
+#plot the number of peptides in each ISG per Condition/Protein
+# counts look v consistent
+
+ggplot(spec.dt[ProteinName %in% mh_mappings[Symbol.human %in% isGenes, SWISS_PROT_IDs.mouse], .N, by=.(ProteinName, Condition,BioReplicate)],
+       aes(x=BioReplicate, y=N)) +
+  facet_grid(Condition~ProteinName) +
+  geom_bar(stat='Identity') +
+  theme(axis.text.x=element_text(angle=90))
+
+# need more indepth look
+# check out the DEGs or the standout proteins; how many counts do these have? Idea is to see if these may have low peptide N and 
+```
+
+Basically too many things to look at the peptide level individually; look at these 6 as they have quite a strong signal
+
+```{r}
+counts <- spec.dt[ProteinName %in% mh_mappings[Symbol.human %in% isGenes,SWISS_PROT_IDs.mouse], .N, by=.(gene, Condition,BioReplicate)] %>% 
+  .[order(-N)] %>% 
+  unique(by=c('gene'))
+
+g <- ggplot(counts, aes(x=reorder(gene,-N), y=N)) +
+  geom_bar(stat='Identity') +
+  labs(title='N peptides detected per protein') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90)) 
+
+BackupAsPDF(g, 'Npeptides.ISGproteins.barplot')
+
+```
+linechart of subset of peptide intensities
+doesnt look right... think I am not plotting the linecharts correctly...
+
+```{r}
+genes.oi <- c('Rsad2', 'Oasl1','Ifit2','Epsti1', 'Dhx58', 'Ifit3')
+
+subDT <- spec.dt[ProteinName %in% mh_mappings[Symbol.mouse %in% genes.oi,SWISS_PROT_IDs.mouse], ]
+
+# get a subset of the dt and lets look at the median line of each proteins expression per group
+subDT[, medianProtIntensity := median(Intensity, na.rm=T), by=.(ProteinName, Condition, BioReplicate)]
+
+
+# to me, doesnt look like an obvious problem with the peptide summarisation
+g <- ggplot(subDT, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), group=interaction(PeptideSequence,PrecursorCharge), alpha=0.2)) +
+  geom_line() +
+  geom_line(data=unique(subDT, by=c("Condition","BioReplicate","ProteinName", "medianProtIntensity")),
+             aes(x=reorder(interaction(Condition,BioReplicate), y=log2(medianProtIntensity))), color='red') +
+  facet_wrap(~gene, scales = 'free_y')  +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+g
+
+
+#unique(subDT, by=c("Condition","BioReplicate","ProteinName", "medianProtIntensity"))
+
+#median(subDT[gene == 'Ifit3' & Condition == 'x4206_7D' & BioReplicate == '1', log2(Intensity)], na.rm=T)
+#summary(subDT[gene == 'Ifit3' & Condition == 'x4206_7D' & BioReplicate == '1', ])
+```
+heatmaps of the peptide level info for each group
+```{r}
+spec.dt[Condition == 'Mock', Condition := 'Mock_ND' ]
+
+submat <-  dcast(spec.dt[ProteinName %in% mh_mappings[Symbol.mouse %in% genes.oi,SWISS_PROT_IDs.mouse], ], interaction(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = 'Intensity') %>% 
+  as.matrix(rownames=1)
+submat <-  log2(submat)
+
+hm <- draw(Heatmap(submat,
+                   cluster_rows = clusterWNA(submat), 
+                   show_row_names=F,
+                   column_split=list(gsub("_.+","", colnames(submat)),
+                                     str_extract(colnames(submat), '[N47]D'))
+                   ), column_title='ISG peptide heatmap')
+
+# subtract row medians to better visualise
+
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+hm <- draw(Heatmap(submat,
+                   cluster_rows = clusterWNA(submat), 
+                   show_row_names=F,
+                   name='Ints/Median',
+                   column_title_gp = gpar(fontsize=8), 
+                   column_split=list(gsub("_.+","", colnames(submat)),
+                                     str_extract(colnames(submat), '[N47]D'))
+                   ), column_title='ISG peptide heatmap')
+
+
+BackupAsPDF(draw(hm, column_title='ISG peptides'), 'isg.peptides.medianscaled.heatmap', dimensions=c(10,12))
+```
+
+
+
+Annotate each peptide according to the protein it belongs to and split on that 
+
+```{r}
+annoBar <-  dcast(spec.dt[ProteinName %in% mh_mappings[Symbol.mouse %in% genes.oi,SWISS_PROT_IDs.mouse], ], interaction(PeptideSequence, PrecursorCharge)+ProteinName~interaction(Condition,BioReplicate), value.var = 'Intensity') %>% 
+  as.matrix(rownames=1)
+
+annoBar<- annoBar[,1]
+annoBar <- multiUniprots2multiGenes(annoBar, species='MOUSE')
+
+hm <- draw(Heatmap(submat,
+                  # cluster_rows = clusterWNA(submat), 
+                   show_row_names=F,
+                   name='Ints/Median',
+                   row_split = annoBar,
+                   right_annotation = rowAnnotation(Protein =annoBar),
+                   column_title_gp = gpar(fontsize=8), 
+                   column_split=list(gsub("_.+","", colnames(submat)),
+                                     str_extract(colnames(submat), '[N47]D'))
+                   ), column_title='ISG peptide heatmap')
+
+
+BackupAsPDF(draw(hm, column_title='ISG peptides w Protein groups'), 'isg.peptides.protsAnno.medianscaled.heatmap', dimensions=c(10,12))
+```
+Lets look at intensities for the different peptides
+-----
+Of the subset these dont look so noisy.
+
+```{r}
+
+subDT <- spec.dt[ProteinName %in% mh_mappings[Symbol.mouse %in% genes.oi,SWISS_PROT_IDs.mouse],]
+# get median ints. per peptide per group
+subDT[, medianInts := median(Intensity, na.rm=T), by=.(PeptideSequence, gene, ProteinName, Condition)]
+
+
+
+g <- ggplot(subDT, aes(x=Condition, y=log2(medianInts), group=PeptideSequence)) +
+      geom_line() +
+      geom_line(data=subDT[, .(ProtMedianIntensity = median(medianInts, na.rm=T), PeptideSequence = PeptideSequence), by=.(gene, Condition)], aes(x=Condition, y=log2(ProtMedianIntensity)), color='red') +
+      facet_wrap(~gene) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'subsetISG.peptideIntswMedian.linechart')
+
+```
+plot this for all the groups
+
+```{r}
+subDT <- spec.dt[ProteinName %in% mh_mappings[Symbol.human %in% isGenes,SWISS_PROT_IDs.mouse],]
+# get median ints. per peptide per group
+subDT[, medianInts := median(Intensity, na.rm=T), by=.(PeptideSequence, gene, ProteinName, Condition)]
+
+g <- ggplot(subDT, aes(x=Condition, y=log2(medianInts), group=PeptideSequence)) +
+      geom_line() +
+      geom_line(data=subDT[, .(ProtMedianIntensity = median(medianInts, na.rm=T), PeptideSequence = PeptideSequence), by=.(gene, Condition)], aes(x=Condition, y=log2(ProtMedianIntensity)), color='red') +
+      facet_wrap(~gene, scales='free_y') +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'ISG.peptideIntswMedian.linechart', dimensions = c(10,14))
+
+```
+
+Peptide level analysis
+-----
+For now just process as is: normalise as usual and swap the Peptide labels to ProteinName col
+
+```{r}
+mssInput <- specFileToCompleteMSstats(spec.dt)
+mssInput[, IsotopeLabelType := 'L']
+
+mssInput[,ProteinName := PeptideSequence,]
+```
+
+```{r}
+dp.out <- MSstats::dataProcess(mssInput, 
+                               summaryMethod = 'TMP',
+                               MBimpute =  FALSE)
+```
+
+## Notes
+If rerunning, drop investigate the fractionation info and drop unused samples like Mock and not interested in this for the comparsison
+
+
+
+

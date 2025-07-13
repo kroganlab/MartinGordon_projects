@@ -1,0 +1,756 @@
+---
+title: "CRISPRe_playground"
+author: "Martin Gordon"
+date: "2024-10-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## packages
+
+Read in the data shared on the MAECK website
+
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(viridis)
+library(eulerr)
+library(parallel) # parallel processing
+library(tidymodels)
+
+
+source('~/Documents/utils/bp_utils/manageScriptData.R')
+```
+
+Firstly running MAGECK on the test data and our data 
+With the test data run it in both directions and compare the volcanoplots
+
+First is to compare their data;
+First issue is we have low counts: avg coverage is ~200x
+
+```{r}
+testMat.dt <- fread('./data/leukemia.new.csv')
+test.long.dt <- reshape2::melt(testMat.dt) %>% 
+  as.data.table()
+
+# read in our data
+pik3ca.dt <- fread('../101224_RBabu_CRISPRe_PIK3CA/output/141024_sgCtrlNorm.count.txt')
+pik3ca.long.dt <- reshape2::melt(pik3ca.dt) %>%  
+  as.data.table()
+
+setnames(test.long.dt, new=c('sgrna', 'gene', 'sample', 'counts'))
+setnames(pik3ca.long.dt, new=c('sgrna', 'gene', 'sample', 'counts'))
+
+pik3ca.long.dt[gene %like% 'sgINTERGENIC', gene := 'intergenic']
+
+pik3ca.norm.dt <- fread('../101224_RBabu_CRISPRe_PIK3CA/output/141024_sgCtrlNorm.count_normalized.txt')
+pik3ca.norm.long.dt <- reshape2::melt(pik3ca.norm.dt) %>%  
+  as.data.table()
+
+setnames(pik3ca.norm.long.dt, new=c('sgrna', 'gene', 'sample', 'counts'))
+pik3ca.norm.long.dt[gene %like% 'sgINTERGENIC', gene := 'intergenic']
+
+
+# lets
+test.long.dt
+test.long.dt[, id := 'demo']
+pik3ca.long.dt[, id := 'pik3ca']
+pik3ca.norm.long.dt[, id := 'pik3ca.sgCtrlNorm']
+
+comb.dt <- rbind(test.long.dt, pik3ca.long.dt)
+
+# cleaerly we have much lower counts
+g <- ggplot(comb.dt, aes(x=log2(counts), fill=id)) +
+  geom_histogram(bins=100, alpha=0.7)  +
+  scale_fill_viridis(option='D', discrete = T) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'counts.histogram')
+```
+N guides in each datasdet
+
+```{r}
+
+comb.dt[,.N, by=.(id,sgrna)][, nrow(.SD), by=id]
+
+# getting table of counts of each guide & id, then count n rows in each datatable
+g <- ggplot(comb.dt[,.N, by=.(id,sgrna)][, nrow(.SD), by=id],  aes(x=id, y=V1, fill=id)) +
+  geom_bar(stat='Identity') + 
+  ggtitle('N guides') +
+  ylab('N guides') +
+  xlab('dataset') +
+  scale_fill_viridis(option='D', discrete = T) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'nGuides.barplot')
+
+
+#plot the guides to gene ratio
+
+g <- ggplot(comb.dt[,.N, by=.(id,gene,sgrna)][, nrow(.SD), by=.(gene,id, sgrna)],  aes(x=id, y=V1, fill=id)) +
+  geom_bar(stat='Identity') + 
+  ggtitle('N guides') +
+  ylab('N guides') +
+  xlab('dataset') +
+  scale_fill_viridis(option='D', discrete = T) +
+  theme_bw()
+
+g
+
+# count the number of guides to gene
+ggplot(unique(comb.dt[,.N, by=.(gene,id,sample)][, .(gene,id, N)]), aes(x=log10(N), fill=id)) +
+  geom_histogram(bins=10) +
+  xlab('log10(Number guides to gene)') +
+  scale_y_continuous(trans = "log10") +
+  ggtitle('guides to gene') 
+
+
+unique(comb.dt[,.N, by=.(gene,id,sample)][, .(gene,id, N)])
+
+# 7 k genes with range or guides
+unique(comb.dt[,.N, by=.(gene,id,sample)][, .(gene,id, N)])
+
+g <- ggplot(unique(comb.dt[,.N, by=.(gene,id,sample)][, .(gene,id, N)]), aes(x=reorder(gene, N), y=N, color=id)) +
+  geom_point() +
+  scale_y_continuous(trans='log10') +
+  scale_x_discrete(expand=c(0.005,0)) +
+  scale_color_viridis(discrete = T, option='D') +
+  ylab('log10 guides per gene') +
+  xlab('') +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.x = element_blank())
+
+g
+BackupAsPDF(g, 'guidesPerGene')
+```
+
+How many 0s in the two datasets?
+Missing values not a problem here, but low counts certainly are...
+
+```{r}
+comb.dt[, isZero := ifelse(counts == 0, 'yes', 'no')]
+
+
+g <- ggplot(comb.dt[,.N, by=.(isZero, id)], aes(x=id, y=log2(N), color=isZero)) +
+  geom_point() +
+  ylab('log2(N)') +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'NAcounts.dotplot')
+
+```
+This makes me wonder if not missingness, but low counts is our issue....
+Maybe easiest way to deal with this is filter out rows < 10 counts in each, vst transform and then run the DE 
+At very least should make our analysis more symmetrical...
+
+Now need to plot our variance vs base mean
+Key point to make CRISPR data is even more over-dispersend (variance >>> mean) than tes dataset RNAseq.. so maybe 
+
+Green line is what we expect if the variance = mean
+Red line is what is expected if the variance = 2xmean: quadratic fit for our data..
+```{r}
+library(matrixStats)
+library(DESeq2)
+library(tidymodels)
+
+
+comb.dt[, `:=`(meanCounts = mean(counts, na.rm=T),
+               varCounts = var(counts, na.rm=T)), by=sgrna]
+
+
+g <- ggplot(comb.dt, aes(x=log2(meanCounts+1), y=log2(varCounts+1))) +
+  geom_hex(bins=40) +
+  xlim(0,25) +
+  ylim(0,25) +
+  geom_abline(slope=1:2, color=c('forestgreen', 'red', 'forestgreen', 'red')) +
+  facet_wrap(~id)  +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'meanVsVariance.plot')
+
+
+g <- ggplot(comb.dt, aes(x=log2(meanCounts+1), y=log2(varCounts+1))) +
+  geom_point() +
+  geom_density2d() +
+  xlim(0,25) +
+  ylim(0,25) +
+  geom_abline(slope=1:2, color=c('forestgreen', 'red', 'forestgreen', 'red')) +
+  facet_wrap(~id)  +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'meanVsVariance.scatterplot')
+
+
+comb
+```
+How does our normalized data look?
+Our low count stuff also tends to be noisy??
+
+```{r}
+comb.dt <- rbind(test.long.dt, pik3ca.long.dt, pik3ca.norm.long.dt)
+
+
+comb.dt[, `:=`(meanCounts = mean(counts, na.rm=T),
+               varCounts = var(counts, na.rm=T)), by=.(sgrna, id)]
+
+g <- ggplot(comb.dt, aes(x=log2(meanCounts+1), y=log2(varCounts+1))) +
+  geom_hex(bins=40) +
+  xlim(0,25) +
+  ylim(0,25) +
+  geom_abline(slope=1:2, color=c('forestgreen', 'red', 'forestgreen', 'red', 'forestgreen', 'red')) +
+  facet_wrap(~id)  +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'meanVsVariance.plot')
+```
+Count distirbutions in each of the samples
+```{r}
+g <- ggplot(comb.dt,aes(x=id, y=log2(counts+1), fill=id)) +
+  geom_violin()  +
+ # geom_boxplot(width=0.4,color="grey", alpha=0.2) +
+  scale_fill_viridis(discrete = TRUE) +
+  theme_bw()
+  
+BackupAsPDF(g, 'studyCountDistributions.violinPlots')
+```
+What about within each of the groups samples?
+Looks like after normalization we dont hit 200x coverage for most things... its these high count outliers that elevate 
+```{r}
+g <- ggplot(comb.dt[id != 'demo', ],aes(x=sample, y=log2(counts+1), fill=id)) +
+  geom_boxplot()  +
+  geom_hline(yintercept=log2(200), col='red') +
+  scale_fill_viridis(discrete = TRUE) +
+  facet_wrap(~id, ncol=1, scales='free_x') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+
+g
+BackupAsPDF(g, 'sampleDistributions.pik3ca.boxplot', dimensions=c(9,9))
+```
+Need to match samples to ids. Create a key file from one of the metadata files
+```{r}
+fread('../101224_RBabu_CRISPRe_PIK3CA/output/141024_noNormalization.countsummary.txt')
+pik3ca.meta.dt
+pik3ca.meta.dt <- fread('../101224_RBabu_CRISPRe_PIK3CA/output/141024_noNormalization.countsummary.txt')[,.(File, Label)]
+pik3ca.meta.dt[,  samplename := gsub('.+/|_R1_001.fastq.gz','', File)]
+
+comb.dt <- merge(comb.dt, pik3ca.meta.dt[,.(Label,samplename)], by.x='sample', by.y='Label', all.x=T)
+comb.dt[grepl('sample[0-9]+', sample), sample := samplename]
+
+
+comb.dt$id %>% unique()
+```
+
+Read in the differential expression results
+Two cell-lines; final day vs day0; swap numerator and denominator
+
+```{r}
+fread('../101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_16_PWcomparisonsVsLibDay0.firstpass.csv')
+fread('./data/final-vs-inital.sgrna_summary.txt')
+```
+
+
+```{r}
+
+demo.de.dt <- list('final-vs-initial'=fread('./data/final-vs-inital.sgrna_summary.txt'),
+                   'final-vs-initial.subset'=fread('./data/demo1.subsetSample.sgrna_summary.txt'),
+                   'initial-vs-final'=fread('./data/inital-vs-final.sgrna_summary.txt'),
+                   'pik3ca'=fread('../101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_16_PWcomparisonsVsLibDay0.firstpass.csv')
+                   ) %>% 
+  rbindlist(idcol='sample', fill=T)
+
+demo.de.dt[, sig := 'not']
+demo.de.dt[abs(LFC) > 1 & FDR < 0.05, sig := ifelse(LFC > 0, 'up', 'down')]
+
+
+# lets plot a volcanoplot of the two
+g <- ggplot(demo.de.dt, aes(x=LFC, y=-log10(FDR), color=sig)) +
+  geom_point(size=1) +
+  geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.5) +
+  geom_hline(aes(yintercept=-log10(0.05)), linetype=2, alpha=0.5) +
+  scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  facet_wrap(~sample) +
+  theme_bw()
+g
+BackupAsPDF(g, 'demoData.volcanoplots')
+
+# drop the subsample demo set 
+sub.de.dt <-  demo.de.dt[sample %in% c("final-vs-initial", "initial-vs-final")]
+
+g <- ggplot(sub.de.dt, aes(x=LFC, y=-log10(FDR), color=sig)) +
+  geom_point(size=1) +
+  geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.5) +
+  geom_hline(aes(yintercept=-log10(0.05)), linetype=2, alpha=0.5) +
+  scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  facet_wrap(~sample) +
+  theme_bw()
+g
+BackupAsPDF(g, 'demoData.volcanoplots')
+
+
+g <- ggplot(sub.de.dt, aes(x=LFC, y=-log10(FDR), color=log2(control_mean))) +
+  geom_point(size=1) +
+  geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.5) +
+  geom_hline(aes(yintercept=-log10(0.05)), linetype=2, alpha=0.5) +
+  #scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  scale_color_viridis(option='D', discrete = F) +
+  facet_wrap(~sample) +
+  theme_bw()
+g
+BackupAsPDF(g, 'demoData.controlMean.col.volcanoplots')
+
+g <- ggplot(sub.de.dt, aes(x=LFC, y=-log10(FDR), color=log10(control_var))) +
+  geom_point(size=1) +
+  geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.5) +
+  geom_hline(aes(yintercept=-log10(0.05)), linetype=2, alpha=0.5) +
+  #scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  scale_color_viridis(option='D', discrete = F) +
+  facet_wrap(~sample) +
+  theme_bw() +
+  coord_cartesian(ylim=c(0,20))
+
+BackupAsPDF(g, 'demoData.controlVar.zoom.col.volcanoplots')
+
+g <- ggplot(sub.de.dt, aes(x=LFC, y=-log10(FDR), color=log10(treatment_var))) +
+  geom_point(size=1) +
+  geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.5) +
+  geom_hline(aes(yintercept=-log10(0.05)), linetype=2, alpha=0.5) +
+  #scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  scale_color_viridis(option='D', discrete = F) +
+  facet_wrap(~sample) +
+  theme_bw() +
+  coord_cartesian(ylim=c(0,20))
+g
+BackupAsPDF(g, 'demoData.treatVar.zoom.col.volcanoplots')
+```
+lower counts in control tend to be noiser (more LFC spread)
+The straight lines are when there are 0s in either control or treatment
+Makes sense... smaller counts, need more evidence (larger FC) to call something sig
+```{r}
+g <- ggplot(sub.de.dt, aes(y=LFC, x=log2(control_mean), color=sig)) +
+  geom_point(size=1) +
+  geom_density2d(color='black') +
+  geom_hline(yintercept=c(-1,1), linetype=2, alpha=0.7) +
+  geom_vline(xintercept=c(log2(10)), linetype=2, alpha=0.7) + 
+  scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  #scale_color_viridis(option='D', discrete = F) +
+  facet_wrap(~sample, ncol=1) +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'FCvsCtrlMean.scatterplot', dimensions=c(8,8))
+
+
+g <- ggplot(sub.de.dt, aes(y=LFC, x=log2(treat_mean), color=sig)) +
+  geom_point(size=1) +
+  geom_density2d(color='black') +
+  geom_hline(yintercept=c(-1,1), linetype=2, alpha=0.7) +
+  geom_vline(xintercept=c(log2(10)), linetype=2, alpha=0.7) + 
+  scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  #scale_color_viridis(option='D', discrete = F) +
+  facet_wrap(~sample, ncol=1) +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'FCvsTreatmentlMean.scatterplot', dimensions=c(8,8))
+
+
+sub.de.dt
+g <- ggplot(sub.de.dt, aes(y=LFC, x=log2(control_mean), color=log10(treatment_var))) +
+  geom_point(size=1) +
+  geom_density2d(color='black') +
+  geom_hline(yintercept=c(-1,1), linetype=2, alpha=0.7) +
+  geom_vline(xintercept=c(log2(10)), linetype=2, alpha=0.7) + 
+  #scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  scale_color_viridis(option='D', discrete = F) +
+  facet_wrap(~sample, ncol=1) +
+  theme_bw()
+g
+BackupAsPDF(g, 'FCvsTreatmentlMean.adjVar.Col.scatterplot', dimensions=c(8,8))
+```
+scatteplot of adj var vs pvalue
+I guess this is where the curvature comes from..
+```{r}
+g <- ggplot(sub.de.dt, aes(y=-log10(FDR), x=log10(adj_var), color=sig)) +
+  geom_point(size=1) +
+  geom_hline(yintercept=c(-log10(0.05)), linetype=2, alpha=0.7) +
+  scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  #scale_color_viridis(option='D', discrete = F) +
+  facet_wrap(~sample, ncol=1) +
+  coord_cartesian(ylim=c(0,10))
+ 
+g 
+
+
+
+
+g <- ggplot(sub.de.dt, aes(x=log2(treat_mean)-log2(control_mean), y=-log2(adj_var), color=sig, alpha=sig)) +
+  geom_point() +
+  scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  geom_vline(xintercept=c(1,-1)) +
+  scale_alpha_manual(values=c('not'=0.1, 'up'=1, 'down'=1)) +
+  facet_wrap(~sample, ncol=1) 
+
+
+BackupAsPDF(g, 'volcanoplotWVar')
+```
+
+
+
+Some ideas: visualize using standard deviation (smaller range)
+plot the FCs and variance scatterplots and label by sig
+Try visualize a transformation of variance... what about vst, then calculate the variances and merge to this data to view?
+
+```{r}
+g <- ggplot(sub.de.dt, aes(x=abs(LFC), y=-log10(FDR), color=log2(control_mean))) +
+  geom_point(size=1) +
+  geom_density_2d(color='red') +
+  geom_vline(xintercept=c(1), linetype=2, alpha=0.5) +
+  geom_hline(aes(yintercept=-log10(0.05)), linetype=2, alpha=0.5) +
+  #scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  scale_color_viridis(option='D', discrete = F) +
+  facet_wrap(~sample) +
+  theme_bw()
+g + coord_cartesian(ylim=c(0,20))
+#BackupAsPDF(g, 'demoData.controlVar.col.volcanoplots')
+```
+
+
+
+
+
+```{r}
+g <- ggplot(sub.de.dt, aes(x=abs(LFC), y=-log10(FDR), color=log2(control_mean))) +
+  geom_point(size=1) +
+  geom_density_2d(color='red') +
+  geom_vline(xintercept=c(1), linetype=2, alpha=0.5) +
+  geom_hline(aes(yintercept=-log10(0.05)), linetype=2, alpha=0.5) +
+  #scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  scale_color_viridis(option='D', discrete = F) +
+  facet_wrap(~sample) +
+  theme_bw()
+g + coord_cartesian(ylim=c(0,20))
+```
+
+
+
+color variance for the control plots 
+
+```{r}
+g <- ggplot(sub.de.dt[sig != 'not',.N, by=.(sample,sig)], aes(x=sample, y=N, fill=sig)) +
+  geom_col(position='dodge', stat='Identity') +
+   scale_fill_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  theme_bw()
+g
+BackupAsPDF(g, 'DEBreakdown.barplot')
+```
+Take the non-overlapping group, and plot a heatmap of their values
+
+```{r}
+same.hits <- intersect(sub.de.dt[sample == 'final-vs-initial' & sig != 'not',sgrna], sub.de.dt[sample == 'initial-vs-final' & sig != 'not',sgrna])
+ 
+g <- ggvenn(list('final-vs-initial'=sub.de.dt[sample == 'final-vs-initial' & sig != 'not',sgrna],
+               'initial-vs-final'=sub.de.dt[sample == 'initial-vs-final' & sig != 'not',sgrna]))
+               
+         
+BackupAsPDF(g, 'comparisonOverlaps.venn')
+
+demo.mat <- dcast(comb.dt[id == 'demo', .(sgrna, sample, counts)], sgrna~sample, value.var='counts') %>% 
+  as.matrix(rownames='sgrna')
+
+sub.de.dt$sample
+
+anno.dt <- sub.de.dt[sample %in% c("final-vs-initial", 'initial-vs-final') & sig != 'not' & !sgrna %in% same.hits, .(sgrna, set=sample, treatment_var, control_var)]
+
+
+submat <- demo.mat[rownames(demo.mat) %in% sub.de.dt[sig != 'not' & sgrna %in% anno.dt$sgrna, sgrna], ]
+
+# subset to and reorder to amtch annotation 
+submat <- submat[anno.dt$sgrna,]
+dim(submat)
+row_ha = rowAnnotation(log2treatmentvar =log2(anno.dt$treatment_var+1), 
+                       log2controlvar = log2(anno.dt$control_var+1),
+                       sample = anno.dt$set,
+                       col = list(log2treatmentvar = colorRamp2(breaks=c(0,4,20), colors=c('white', 'lightblue', 'darkblue')),
+                                  log2controlvar   = colorRamp2(breaks=c(0,4,20), colors=c('white', 'pink', 'darkred')),
+                                  sample = c("final-vs-initial"='yellow', 'initial-vs-final'='purple')
+                                  ))
+
+hm <- Heatmap(log2(submat+1), 
+        cluster_rows=F,
+        name='counts', 
+        show_row_names = F,
+        col=colorRamp2(colors=c('white', 'firebrick'), breaks=c(0, 12)),
+        right_annotation = row_ha,
+        na_col='grey')
+  
+hm
+BackupAsPDF(hm, 'differnetSigGuides.heatmap')
+
+
+
+submat <- log2(submat +1)
+# sweep out the inital maybe?
+submat <- sweep(submat, 1, apply(submat[, grepl('initial', colnames(submat))], 1, mean))
+
+hm <- Heatmap(submat, 
+        cluster_rows=F,
+        name='log2(counts - mean(initial))', 
+        show_row_names = F,
+       # col=colorRamp2(colors=c('white', 'firebrick'), breaks=c(0, 12)),
+        right_annotation = row_ha,
+        na_col='grey')
+  
+hm
+BackupAsPDF(hm, 'counts.diffSigGuides.initalTpSweep.heatmap')
+
+```
+The final vs inital missing set looks good, but the  initial-vs-final one not so much..looks to be driven by one replicate, other is v similar to initial
+
+plot the adjusted var vs control var
+What is this adjusted var? Looks like for the lower variance estimates (probably low counts) it tends to 'bump' up these values
+
+
+# adjusted var vs control var
+Looks like for low variance estimates, it bumps up variance (by collapsing across genes?) while for high estimates, it tends to reduce
+But majority of points get slight variance reduction. (make sense from borrowing info perspective, and also to bump vairance for noisy low counts...)
+
+```{r}
+g <- ggplot(sub.de.dt, aes(x=log2(control_var+1), y=log2(adj_var+1))) +
+  geom_hex(bins=40) +
+  geom_abline(slope=1, col='red') +
+  scale_fill_viridis(discrete = F, option='D') +
+  coord_obs_pred() +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'adjVarvsControlVar.hexplot')
+```
+# for now, simple test of the normalized count data; lets try NB model
+
+How does the tool borrow variance estimates from close by genes?
+
+mageck dispersion = mean+ k*mean^B
+mean + mean(2)/k
+
+# write a function to run the GLM 
+```{r}
+library(MASS)
+
+de.input.dt <- comb.dt[!grepl('Undetermined|Plasmid_librep', sample) & id =="pik3ca.sgCtrlNorm",] %>% 
+  .[,.(sample,sgrna, gene, counts)]
+
+
+# need to tidy the library prep groups
+de.input.dt[grepl('Librep|Lib-rep', sample), timepoint := 'Day0']
+de.input.dt[grepl('Librep|Lib-rep', sample),]
+
+de.input.dt[, c('editor', 'treatment', 'timepoint') := tstrsplit(sample, '_', keep=c(1,2,3))]
+de.input.dt[, rep := stringr::str_extract(treatment,'[12]$')]
+
+
+de.input.dt[, treatment := sub('[12]$', '', treatment)]
+de.input.dt[treatment == 'CTRL', treatment := 'DMSO']
+de.input.dt[, editor := ifelse(grepl('ABE8', editor), 'abe8e', 'bemax')]
+
+# need to tidy the library prep groups
+de.input.dt[grepl('Librep|Lib-rep', sample), timepoint := 'day0']
+de.input.dt[grepl('Librep|Lib-rep', sample), rep :=seq(1,nrow(.SD)), by=.(sgrna,treatment)]
+
+de.input.dt[grepl('Lib-rep', treatment), treatment := gsub('Lib-rep', 'Librep', treatment)]
+
+de.input.dt[, group := interaction(editor, treatment, timepoint)] 
+
+de.input.dt[,.(sample, treatment, editor, timepoint, rep, group)][order(group)] %>%  unique()
+
+
+de.input.dt$group %>%  unique()
+
+de.input.dt[, group := relevel(factor(gsub('abe8e[.]|bemax[.]','', group)), ref='Librep.day0')]
+de.input.dt  %>%  str() # check ref level of group
+
+#fwrite(de.input.dt, ScriptAndDatedFileName('de.testing.input.csv'))
+de.input.dt <- fread('~/Documents/projects/102324_MGordon_CRISPRe_MAGECK_Testing/MAGECK_playground_data/2024_10_25_de.testing.input.csv')
+de.input.dt[, group := relevel(factor(gsub('abe8e[.]|bemax[.]','', group)), ref='Librep.day0')]
+
+
+```
+
+Run a GLM per guide 
+```{r}
+library(parallel)
+library(MASS)
+detectCores() # detects number of available cores
+
+
+require(broom)
+GLMperGuide <-  function(subDT, formula){
+  # lm obj
+  guideGLM <- glm.nb(formula, data=subDT)
+
+  
+  #glm stores its estimates in 
+  de.dt <- tidy(guideGLM) %>% 
+    as.data.table()
+  
+  pred.fctr <- strsplit(formula,'~')[[1]][2]
+  ref.level  <- levels(subDT[[pred.fctr]])[1]
+ 
+  return(de.dt[!grepl('Intercept', term), .(contrast = paste0(gsub(pred.fctr, '',term), '-', ref.level),
+            LFC = log2(exp(estimate)), 
+            std.error,
+            statistic,
+            p.value)
+            ])
+}
+
+# this is how yuo can split a list on two factors
+de.input.list <- split(de.input.dt, interaction(de.input.dt$editor,de.input.dt$sgrna))
+
+test <- de.input.list[1]
+test
+GLMperGuide(subDT=test, formula=count~group)
+
+lm.out <- mclapply(de.input.list, function(x) GLMperGuide(formula='counts~group', subDT=x), mc.cores = 1)
+lm.out
+
+
+
+help(glm)
+
+
+lapply(test, function(x) glm.nb(formula ='counts~group', data=x))
+
+
+lapply(de.input.list[c(1,2)], function(x) GLMperGuide(subDT=x, formula='counts~group'))
+
+
+
+test
+
+help(glm.nb)
+GLMperGuide(formula='counts~group', subDT=test[1])
+
+
+test
+
+GLMperGuide(oneGuide=formula = GLMperGuide(oneGuide=comb.dt[sgrna == 'A1CF_m52595977',], formula='counts~group', family='nb')
+
+
+
+
+
+fc<- exp(fit$coefficients[2]) ## Antilog coef #2
+log2(fc) ## Convert to more familiar log2 fold change:
+2
+
+de.input.dt[, grp_mean := mean(counts, na.rm=T), .(sgrna, group, editor)]
+de.input.dt[sgrna == 'BE_1' & group %in% c('Alpelisib.day7', 'Librep.day0') & editor == 'abe8e',]
+
+
+
+log2(94.58466) - log2(107.81179)
+```
+
+Ok think I need another couple of functions... try convert the mageck functions to R
+```{r}
+
+```
+
+
+
+Another interesting type of plot....
+
+
+```{r}
+# get the average counts per row (sgRNA)
+sub.de.dt[, meanCounts := mean(c(control_mean, treat_mean), na.rm=T), by=.I]
+# get the treatment variance
+sub.de.dt[, treatment_var :=  sapply(.SD, function(x){ var(as.numeric(strsplit(x,'/')[[1]])) }), .SDcols = 'treatment_count', by=.I]
+sub.de.dt[, control_var_test :=  sapply(.SD, function(x){ var(as.numeric(strsplit(x,'/')[[1]])) }), .SDcols = 'control_count', by=.I]
+
+
+sub.de.dt[, treatment_var :=  var(as.numeric(strsplit(treatment_count,'/')[[1]])), by=.I]
+sub.de.dt[, control_var_test := var(as.numeric(strsplit(control_count,'/')[[1]])),by=.I]
+```
+
+
+control var vs treatment var
+
+```{r}
+ggplot(sub.de.dt, aes(x=log2(adj_var), y=log2(treatment_var), color=sig, alpha=sig)) +
+  geom_point() +
+  geom_abline(slope=1) +
+  scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  scale_alpha_manual(values=c('not'=0.2, 'up'=1, 'down'=1)) +
+  facet_wrap(sig~sample) +
+  theme_bw() +
+  coord_obs_pred()
+
+
+
+sub.de.dt[log2(control_var) %between% c(10,10.1) & log2(treatment_var) %between% c(10,10.1) & sig != 'not',]
+```
+
+
+
+```{r}
+g <- ggplot(sub.de.dt, aes(x=log2(control_var), y=-log10(p.twosided), color=sig)) +
+  geom_point() +
+  geom_density_2d() +
+  scale_x_continuous() +
+  scale_color_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))  +
+  facet_wrap(~sample, ncol=1, scales='free') +
+  theme_bw() +
+  theme() 
+
+g + coord_cartesian(ylim=c(0,100))
+```
+
+
+
+Lets create a MA plot (commonly used in RNAseq)
+```{r}
+demo.de.dt[F-log10(FDR) > 300,]
+
+
+demo.de.dt[,.N,by=sample]
+
+g <- ggplot(demo.de.dt, aes(x=LFC, y=-log10(FDR), color=log2(control_mean))) +
+  geom_point() +
+  geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.5) +
+  geom_hline(aes(yintercept=-log10(0.05)), linetype=2, alpha=0.5) +
+  scale_color_viridis(option='D', discrete = F)  +
+  facet_wrap(~sample) +
+  theme_bw()
+
+g
+
+
+73151/10
+```
+
+
+Ok, read in the de results from the tutorial with the two 
+
+
+
+
+Lets just quickly try negative binomial regression using the mast package.. Not really sure how we will handle variance estimates yet...
+```{r}
+library(MASS)
+```
+

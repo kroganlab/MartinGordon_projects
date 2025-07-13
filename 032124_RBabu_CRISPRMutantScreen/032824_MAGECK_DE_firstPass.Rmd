@@ -1,0 +1,850 @@
+---
+title: "CRISPR Screen DE Analysis"
+author: "Martin Gordon"
+date: "2024-03-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Differential Expression Analysis
+
+Have used the CRISPR MAGECK pipeline to count reads in each of the different fastq files
+These counts are not normalised; combine the count files into one dt, plot the QC metrics and perform DE analysis
+Performed normalization and looked at sample clustering; still some large discrepancies between the samples
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(ggrepel)
+
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+# read in the count tables and the summary files
+```{r}
+summary.dt <- lapply(dir(path='./data/mageck_count', pattern="countsummary.txt",full.names = T, recursive = T), function(x){
+  fread(x)
+}) %>%  rbindlist()
+
+counts.list <-  lapply(dir(path='./data/mageck_count', pattern="count.txt",full.names = T, recursive = T), function(x){
+  fread(x)
+})
+```
+merge the data.tables 
+
+```{r}
+# nice function to merge multiple dts based on defined keys
+# https://stackoverflow.com/questions/13273833/merging-multiple-data-tables
+mergeDTs <- function(dt_list, by = NULL, sort = FALSE) {
+  Reduce(
+    function(...) {
+      merge(..., by = by, all = TRUE, sort = sort)
+    }, dt_list)
+}
+
+counts.dt <- mergeDTs(counts.list, by=c('sgRNA', 'Gene'), sort=TRUE)
+```
+
+First lets look at the summary stats and do a quick QC:
+1- N mapped reads per sample
+2 - Prop mapped reads per sample
+3 - Read count correlation per sample
+4 - Gini Index per sample
+5 - N mapped sgRNAs with zero mapped reads
+6 - Replicate correlation
+
+```{r}
+# define hte nbumber of groups in each dt
+summary.dt %>%  str()
+summary.dt$Label %>%  unique()
+
+summary.dt[, cas9 := ifelse(grepl('Abe8e|Bemax', Label), str_extract(Label, 'Abe8e|Bemax'), 'Ctrl')]
+summary.dt[, group := sub("_[0-9]{1,2}$","", Label)]
+
+# fix some of the labels
+summary.dt[group %like% 'Bemax_Lib', group := 'Bemax_Lib']
+summary.dt[group %like% 'Abe8e_Lib', group := 'Abe8e_Lib']
+
+summary.dt[, sample_no := str_extract(Label, "[0-9]{1,2}$")]
+summary.dt[, treatment := sub("Abe8e_|Bemax_|Abe8eDMSO_|Abe8eSerum_|BemaxDMSO_|BemaxSerum_", "", group)]
+
+summary.dt$group %>%  unique()
+summary.dt$treatment %>%  unique()
+```
+
+Plot of N mapped reads per sample
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(summary.dt$treatment)))
+
+g <- ggplot(summary.dt, aes(x=reorder(interaction(group, sample_no), as.numeric(factor(cas9))), y=log2(Mapped+1), fill=cas9)) +
+  geom_bar(stat='Identity') +
+  scale_fill_brewer(type='qual', palette=2) +
+  facet_wrap(~treatment, scales='free', nrow=3) +
+  labs(title='N mapped reads',
+       xlab='Sample', 
+       ylab='log2(N mapped +1)') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+BackupAsPDF(g, 'nMappedReads.treatFaceted.barplots', dimensions = c(12,14)) 
+
+# facet by cas9 
+g <- ggplot(summary.dt, aes(x=reorder(interaction(group, sample_no), as.numeric(factor(treatment))), y=log2(Mapped+1), fill=treatment)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~cas9, scales='free', nrow=3) +
+  labs(title='N mapped reads',
+       xlab='Sample', 
+       ylab='log2(N mapped +1)') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+g
+
+BackupAsPDF(g, 'nMappedReads.treatFaceted.barplots', dimensions = c(14,10)) 
+```
+
+Percentage mapped reads per sample
+```{r}
+# calculate unmapped perc.
+summary.dt[, UnmappedPercentage := 1 - Percentage]
+
+# reshape the dt to plot
+summary.long <- melt(summary.dt[, .(Label,Percentage,UnmappedPercentage)],id.vars = 1)
+summary.long[, cas9 := ifelse(grepl('Abe8e|Bemax', Label), str_extract(Label, 'Abe8e|Bemax'), 'Ctrl')]
+summary.long[, group := sub("_[0-9]{1,2}$","", Label)]
+summary.long[, variable := ifelse(variable == 'Percentage', 'Mapped', 'Unmapped')]
+summary.long[, variable := factor(variable, levels=c('Unmapped', 'Mapped'))]
+
+g <- ggplot(summary.long, aes(x=reorder(Label, as.numeric(factor(group))), y=value, fill=variable)) +
+  geom_bar(stat='Identity') +
+  scale_fill_brewer(type='qual', palette=2) +
+  facet_wrap(~cas9, scales='free') +
+  ylim(0,1) +
+  labs(title='Percentage mapped reads',
+       xlab='Sample', 
+       ylab='% Mapped') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+g
+BackupAsPDF(g, 'propMappedReads.treatFaceted.barplots', dimensions = c(14,10)) 
+
+```
+Number of zero count sgRNAs
+
+```{r}
+summary.dt$Zerocounts %>%  length()
+
+g <- ggplot(summary.dt, aes(x=reorder(interaction(group, sample_no), as.numeric(factor(cas9))), y=Zerocounts, fill=cas9)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~treatment, scales='free', nrow=3) +
+  labs(title='Number of sgRNAs with zero counts per sample',
+       xlab='Sample', 
+       ylab='N') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+g
+BackupAsPDF(g, 'zeroCountsgRNAs.treatFaceted.barplots', dimensions = c(12,14)) 
+
+# facet by cas9 
+g <- ggplot(summary.dt, aes(x=reorder(interaction(group, sample_no), as.numeric(factor(treatment))), y=Zerocounts, fill=treatment)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~cas9, scales='free', nrow=3) +
+  labs(title='Number of sgRNAs with zero counts per sample',
+       xlab='Sample', 
+       ylab='N') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+g
+BackupAsPDF(g, 'zeroCountsgRNAs.treatFaceted.barplots', dimensions = c(14,14)) 
+```
+Gini index;
+Assesses evenness of sgRNA reads depth within a sample - a lower score is better
+A high Gini index suggests that the sgRNA read count is unevenly distributed across the target genes.
+This is potentially caused by unevenness in CRISPR oligonucleotide synthesis, low-quality viral library packaging, poor efficiency in viral transfection or over-selection during the screens.
+
+We can view this as a heatmap and barplot
+
+```{r}
+g <- ggplot(summary.dt, aes(x=reorder(interaction(group, sample_no), as.numeric(factor(group))), y=GiniIndex, fill=treatment)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~cas9, scales='free') +
+  labs(title='Evenness of sgRNA reads',
+       xlab='Sample', 
+       ylab='Gini index score') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+g
+BackupAsPDF(g, 'Gini-Index.cas9Faceted.barplots', dimensions = c(14,10)) 
+
+
+g <- ggplot(summary.dt, aes(x=reorder(interaction(group, sample_no), as.numeric(factor(group))), y=GiniIndex, fill=cas9)) +
+  geom_bar(stat='Identity') +
+  scale_fill_brewer(type='qual', palette=2) +
+  facet_wrap(~treatment, scales='free') +
+  labs(title='Evenness of sgRNA reads',
+       xlab='Sample', 
+       ylab='Gini index score') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+g
+BackupAsPDF(g, 'Gini-Index.treatFaceted.barplots', dimensions = c(14,10)) 
+```
+Now that we have produced these plots, lets read in the count matrix, normalise the reads and look at pairwise correlations
+
+Plot the count distributions for each of the samples
+Samples are v different; need to normalise before processing
+
+Looks from the output that there may be one troublesome sample, but in general pretty consistent across groups
+```{r}
+# convert to long format dor plotting
+counts.dt.long <- melt(counts.dt[, -c('sgRNA_Gene')], id.vars = c('sgRNA', 'Gene'))
+counts.dt.long[, cas9 := ifelse(grepl('Abe8e|Bemax', variable), str_extract(variable, 'Abe8e|Bemax'), 'Ctrl')]
+counts.dt.long[, group := sub("_[0-9]{1,2}$","", variable)]
+
+# fix some of the labels
+counts.dt.long[group %like% 'Bemax_Lib', group := 'Bemax_Lib']
+counts.dt.long[group %like% 'Abe8e_Lib', group := 'Abe8e_Lib']
+
+counts.dt.long[, sample_no := str_extract(variable, "[0-9]{1,2}$")]
+counts.dt.long[, treatment := sub("Abe8e_|Bemax_|Abe8eDMSO_|Abe8eSerum_|BemaxDMSO_|BemaxSerum_", "", group)]
+
+setnames(counts.dt.long, old=c('variable', 'value'), new=c('sample', 'counts'))
+
+g <- ggplot(counts.dt.long, aes(x=sample, y=log2(counts+1), fill=treatment)) +
+  geom_boxplot() +
+  labs(title='Unnormalised sample count distribution') +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~cas9, scales='free') +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'raw.count.distribution.boxplots',  dimensions=c(14,8))
+```
+```{r}
+g <- ggplot(counts.dt.long, aes(x=reorder(sample, as.numeric(factor(cas9))), y=log2(counts+1), fill=cas9)) +
+  geom_boxplot() +
+  labs(title='Unnormalised sample count distribution') +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~treatment, scales='free') +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+BackupAsPDF(g, 'raw.count.distribution.treatmentFaceted.boxplots',  dimensions=c(14,10))
+```
+
+Look at sample clustering of the normalised data and generate a cor plot
+Lets look at the (unnormalised) read count correlations between samples
+```{r}
+counts.dt[, sgRNA_Gene := paste0(sgRNA, '_', Gene)]
+count.mat <- as.matrix(counts.dt[, -c('sgRNA', 'Gene')], rownames='sgRNA_Gene')
+# log transformed count matrix
+count.mat <-  log2(count.mat+1)
+
+# grab a subset of the rows for visualising
+submat <- count.mat[sample(rownames(count.mat), 2000), ]
+
+# median scale
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+
+colnames(count.mat)
+# color annotation for the plot
+
+# create annotation
+ann <- data.table(group=str_extract(colnames(submat), 'BAFA1|Lib|DOXO|CTRL[123]|STARVE|TORIN|GPN|plasmid_BE|gRNA_noBE'),
+                  cas9=ifelse(grepl('Abe8e|Bemax', colnames(submat)), str_extract(colnames(submat), 'Abe8e|Bemax'), 'Ctrl'))
+
+colours <- list('cas9' = c('Abe8e' = '#4477AA', 'Bemax'="#228833", 'Ctrl'="#CCBB44"),
+                'group' =c('BAFA1' = col.pal[1], 'Lib'=col.pal[2], 'DOXO'=col.pal[3], 'CTRL1'=col.pal[4], 'CTRL2'=col.pal[5], 'CTRL3'=col.pal[6],
+                           'STARVE' = col.pal[7], 'TORIN'=col.pal[8], 'GPN'=col.pal[9], 'plasmid_BE'=col.pal[10], 'gRNA_noBE'=col.pal[11]))
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+hm <- Heatmap(submat, cluster_rows=T, 
+              show_row_names = F, 
+              cluster_columns = T, 
+              top_annotation = colAnn, 
+              name='Log2(Counts+1)/Median',  
+              column_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm, 'rawCounts.clustered.medianscaled.heatmap', dimensions=c(10,8))
+```
+Look at PCA of samples;
+Looks like the plasmid and sample 17, which seems to have clearly low counts are driving the clustering..
+Drop these two and regenerate
+
+```{r}
+pcaOut <- prcomp(t(count.mat))
+colInfo <- data.table(colname = colnames(count.mat))
+colInfo[, group := str_extract(colnames(submat), 'BAFA1|Lib|DOXO|CTRL[123]|STARVE|TORIN|GPN|plasmid_BE|gRNA_noBE')]
+colInfo[, cas9 := ifelse(grepl('Abe8e|Bemax', colnames(submat)), str_extract(colnames(submat), 'Abe8e|Bemax'), 'Ctrl')]
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = cas9)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "rawCounts.PC12.pca.plot")
+```
+```{r}
+# drop the two outlier samples
+pcaOut <- prcomp(t(count.mat[, !colnames(count.mat) %in% c('plasmid_BE_38', 'Abe8eDMSO_CTRL1_17')] ))
+
+colInfo <- data.table(colname = colnames(count.mat))
+colInfo[, group := str_extract(colnames(submat), 'BAFA1|Lib|DOXO|CTRL[123]|STARVE|TORIN|GPN|plasmid_BE|gRNA_noBE')]
+colInfo[, cas9 := ifelse(grepl('Abe8e|Bemax', colnames(submat)), str_extract(colnames(submat), 'Abe8e|Bemax'), 'Ctrl')]
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = cas9)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "rawCounts.rmOutliers.PC12.pca.plot")
+```
+Normalise the data, regenerate the plots with the normalised data and look at sample-sample correlations
+Method
+normalized reads per million = gRNA reads/total reads for the sample x 1,000,000 + 1 pseudocount
+
+
+Redo: try normalizing using median ratio
+
+```{r}
+samples = as.data.frame(colnames(count.mat))
+# one sample is sequenced a lot deeper than others, but in general look quite even
+# still need to normalize
+apply(count.mat, 2, sum)  %>%  barplot()
+
+counts.dt.long[, normalizedCounts := counts/sum(counts)*1e+06 + 1, by=sample]
+
+# lets try another approach; use the median ratio normalization method
+count.mat <- as.matrix(counts.dt[, -c('sgRNA', 'Gene')], rownames='sgRNA_Gene')
+
+# calculate the geometric means of the sgRNA
+geomeans <- exp(apply(count.mat, 1, function(x) mean(log(x), na.rm=T)))
+# get the per sample scaling factors (this method assumes most things are not moving)
+sizes <- apply(count.mat, 2, function(cnts) median((cnts/geomeans)[geomeans > 
+	            0]))
+
+median.ratio.mat <-  t(t(count.mat)/sizes)
+
+# compare to DESeq2 method
+library(DESeq2)
+
+# size estimates look the same as the DESeq2 size factors
+dds <- DESeqDataSetFromMatrix(countData=count.mat, colData = samples, design = ~1)
+dds <- estimateSizeFactors(dds)
+des.norm.mat <- counts(dds, normalized=T)
+```
+
+write out the raw data and normalized data (two approaches)
+
+```{r}
+# convert to long format dor plotting
+counts.dt.long <- melt(counts.dt[, -c('sgRNA_Gene')], id.vars = c('sgRNA', 'Gene'))
+counts.dt.long[, cas9 := ifelse(grepl('Abe8e|Bemax', variable), str_extract(variable, 'Abe8e|Bemax'), 'Ctrl')]
+counts.dt.long[, group := sub("_[0-9]{1,2}$","", variable)]
+
+# fix some of the labels
+counts.dt.long[group %like% 'Bemax_Lib', group := 'Bemax_Lib']
+counts.dt.long[group %like% 'Abe8e_Lib', group := 'Abe8e_Lib']
+
+counts.dt.long[, sample_no := str_extract(variable, "[0-9]{1,2}$")]
+counts.dt.long[, treatment := sub("Abe8e_|Bemax_|Abe8eDMSO_|Abe8eSerum_|BemaxDMSO_|BemaxSerum_", "", group)]
+
+#fwrite(counts.dt.long, ScriptAndDatedFileName('rawCounts.csv'))
+
+# add the tmo norm data 
+tmo.dt.long <- setDT(melt(median.ratio.mat))
+setnames(tmo.dt.long, new=c('sgRNA_Gene', 'sample', 'tmo.normCounts'))
+counts.dt.long[,sgRNA_Gene := paste0(sgRNA, '_', Gene)]
+
+
+comb.dt <- merge(x=tmo.dt.long, y=counts.dt.long, by.y=c('sgRNA_Gene', 'variable'), by.x=c('sgRNA_Gene', 'sample'), all.y=T)
+comb.dt[, CPM.normCounts := value/sum(value)*1e+06 + 1, by=sample]
+setnames(comb.dt, old='value', new='rawCounts')
+
+fwrite(comb.dt, ScriptAndDatedFileName('sampleCounts.csv'))
+```
+
+```{r}
+g <- ggplot(comb.dt, aes(x=sample, y=log2(tmo.normCounts), fill=treatment)) +
+  geom_boxplot() +
+  labs(title='Normalized sample count distribution') +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~cas9, scales='free') +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'tmo.normalized.count.distribution.boxplots',  dimensions=c(14,8))
+```
+Lets look at sample clustering etc. with the normalized data
+
+```{r}
+# cast the normalized counts to wide format 
+counts.dt.long[, sgRNA_Gene := paste0(sgRNA, '_', Gene)]
+
+norm.mat <- dcast(counts.dt.long[, c('sgRNA_Gene', 'sample', 'normalizedCounts')], sgRNA_Gene~sample, value.var = 'normalizedCounts') %>% 
+  as.matrix(rownames='sgRNA_Gene')
+
+# log transformed matrix
+norm.mat <-  log2(norm.mat)
+
+# grab a subset of the rows for visualising
+submat <- norm.mat[sample(rownames(norm.mat), 2000), ]
+
+# median scale
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+
+
+
+# color annotation for the plot
+
+# create annotation
+ann <- data.table(group=str_extract(colnames(submat), 'BAFA1|Lib|DOXO|CTRL[123]|STARVE|TORIN|GPN|plasmid_BE|gRNA_noBE'),
+                  cas9=ifelse(grepl('Abe8e|Bemax', colnames(submat)), str_extract(colnames(submat), 'Abe8e|Bemax'), 'Ctrl'))
+
+colours <- list('cas9' = c('Abe8e' = '#4477AA', 'Bemax'="#228833", 'Ctrl'="#CCBB44"),
+                'group' =c('BAFA1' = col.pal[1], 'Lib'=col.pal[2], 'DOXO'=col.pal[3], 'CTRL1'=col.pal[4], 'CTRL2'=col.pal[5], 'CTRL3'=col.pal[6],
+                           'STARVE' = col.pal[7], 'TORIN'=col.pal[8], 'GPN'=col.pal[9], 'plasmid_BE'=col.pal[10], 'gRNA_noBE'=col.pal[11]))
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+hm <- Heatmap(submat, 
+              cluster_rows=T, 
+              show_row_names = F, 
+              cluster_columns =T, 
+              top_annotation = colAnn, 
+              name='Log2(Counts+1)/Median',  
+              column_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm, 'normCounts.clustered.medianscaled.heatmap', dimensions=c(10,8))
+```
+PCA of normalized samples
+Not much total variance explained by PC1 & 2; not sufficent to summarise the data..
+
+```{r}
+pcaOut <- prcomp(t(norm.mat))
+colInfo <- data.table(colname = colnames(norm.mat))
+colInfo[, group := str_extract(colnames(submat), 'BAFA1|Lib|DOXO|CTRL[123]|STARVE|TORIN|GPN|plasmid_BE|gRNA_noBE')]
+colInfo[, cas9 := ifelse(grepl('Abe8e|Bemax', colnames(norm.mat)), str_extract(colnames(norm.mat), 'Abe8e|Bemax'), 'Ctrl')]
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = cas9)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "normalizedCounts.PC12.pca.plot")
+```
+Generate pw correlations of the raw and normalized data
+
+```{r}
+# create a correlation matrix
+cor.mat <-  cor(norm.mat)
+
+#set ordering for diagonal mat
+od =  hclust(dist(cor.mat))$order
+cm = cor.mat[od, od]
+
+hm <- Heatmap(cm, 
+        name='Sample Pearson Corr.',
+        rect_gp = gpar(type = "none"), 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=8),
+        col=colorRamp2(breaks=c(0.8,1), colors=c('yellow', 'red')),
+	cell_fun = function(j, i, x, y, w, h, fill) {
+		if(i >= j) {
+			grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='black'))
+		}
+	})
+
+hm
+
+BackupAsPDF(draw(hm, column_title='normalized counts correlation matrix'), 'normalizedCounts.sampleCor.corHeatmap', dimensions=c(14,10))
+```
+Repeat the same for the raw counts
+
+```{r}
+# create a correlation matrix
+cor.mat <-  cor(count.mat)
+
+#set ordering for diagonal mat
+od =  hclust(dist(cor.mat))$order
+cm = cor.mat[od, od]
+
+hm <- Heatmap(cm, 
+        name='Sample Pearson Corr.',
+        rect_gp = gpar(type = "none"), 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=8),
+        col=colorRamp2(breaks=c(0.8,1), colors=c('yellow', 'red')),
+	cell_fun = function(j, i, x, y, w, h, fill) {
+		if(i >= j) {
+			grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='black'))
+		}
+	})
+
+hm
+
+BackupAsPDF(draw(hm, column_title='raw counts correlation matrix'), 'rawCounts.sampleCor.corHeatmap', dimensions=c(14,10))
+```
+Plot sample correlations 
+
+```{r}
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+pairs.dt <- UniqueFactorCombos(counts.dt.long$sample, sep=',', allow.dups = F)
+#  subset the dt to replicate pairs
+pairs.dt <- pairs.dt[sub('[_][0-9]{1,2}$', '', Var1) == sub('[_][0-9]{1,2}$', '', Var2),]
+
+# what samples are we missing?
+setdiff(unique(counts.dt.long$sample), unique(c(pairs.dt$Var1,pairs.dt$Var2)))
+
+# add these back into the dt
+pairs.dt <- rbind(rbind(rbind(pairs.dt, c("Abe8e_Lib1_35", "Abe8e_Lib2_36")), c("Bemax_Lib1_33", "Bemax_Lib2_34")), c("gRNA_noBE_37",  "plasmid_BE_38"))
+
+pairs.dt <- rbind(pairs.dt, data.table(Var1= "Abe8e_Lib1_35", Var2="Abe8e_Lib2_36"))
+pairs.dt <- rbind(pairs.dt, data.table(Var1= "Bemax_Lib1_33", Var2="Bemax_Lib2_34"))
+pairs.dt <- rbind(pairs.dt, data.table(Var1= "gRNA_noBE_37", Var2="plasmid_BE_38"))
+
+```
+
+
+Low counts look weird... often with RNAseq we dont trust low counts and remove below a threshold (eg 10)
+
+```{r}
+# normalised counts
+apply(pairs.dt, 1,  function(x){
+  
+  dt <- dcast(counts.dt.long[sample %in% x,], sgRNA+Gene~sample, value.var = c('normalizedCounts'))
+  # print
+  setnames(dt, new=c('sgRNA', 'Gene', 'Counts.x', 'Counts.y'))
+
+  g <- ggplot(dt, aes(x=log2(Counts.x), y=log2(Counts.y))) +
+    geom_point() +
+    geom_density2d() +
+    geom_abline(aes(intercept=0, slope=1), color='darkred') +
+    xlab(paste(x[1], 'Normalized Counts', sep=' ')) +
+    ylab(paste(x[2], 'Normalized Counts', sep=' ')) +
+    ggtitle(paste(x[1], x[2], 'Comparisons', sep=' ')) + 
+    theme_bw()
+  
+  g
+  BackupAsPDF(g, paste0('normalizedScatterplots/',x[1], 'vs', x[2],'.normCounts.scatterplots.'))
+})
+
+
+counts.dt.long
+
+# raw counts for the samples
+apply(pairs.dt, 1,  function(x){
+  
+  dt <- dcast(counts.dt.long[sample %in% x,], sgRNA+Gene~sample, value.var = c('counts'))
+  # print
+  setnames(dt, new=c('sgRNA', 'Gene', 'Counts.x', 'Counts.y'))
+
+  g <- ggplot(dt, aes(x=log2(Counts.x+1), y=log2(Counts.y+1))) +
+    geom_point() +
+    geom_density2d() +
+    geom_abline(aes(intercept=0, slope=1), color='darkred') +
+    xlab(paste(x[1], 'Raw Counts', sep=' ')) +
+    ylab(paste(x[2], 'Raw Counts', sep=' ')) +
+    ggtitle(paste(x[1], x[2], 'Comparisons', sep=' ')) + 
+    theme_bw()
+  
+  g
+  BackupAsPDF(g, paste0('rawScatterplots/',x[1], 'vs', x[2],'.rawCounts.scatterplots.'))
+})
+
+```
+
+Read in the tmo normalized data and look at the counts
+
+Lets look at sample clustering etc. with the normalized data
+
+```{r}
+comb.dt <- fread('~/Documents/projects/032124_RBabu_CRISPRMutantScreen/032824_MAGECK_DE_firstPass_data/2024_03_28_sampleCounts.csv')
+
+norm.mat <- dcast(comb.dt[, c('sgRNA_Gene', 'sample', 'tmo.normCounts')], sgRNA_Gene~sample, value.var = 'tmo.normCounts') %>% 
+  as.matrix(rownames='sgRNA_Gene')
+
+# log transformed matrix
+norm.mat <-  log2(norm.mat+1)
+
+# grab a subset of the rows for visualising
+submat <- norm.mat[sample(rownames(norm.mat), 2000), ]
+
+# median scale
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+
+# color annotation for the plot
+
+# create annotation
+ann <- data.table(group=str_extract(colnames(submat), 'BAFA1|Lib|DOXO|CTRL[123]|STARVE|TORIN|GPN|plasmid_BE|gRNA_noBE'),
+                  cas9=ifelse(grepl('Abe8e|Bemax', colnames(submat)), str_extract(colnames(submat), 'Abe8e|Bemax'), 'Ctrl'))
+
+colours <- list('cas9' = c('Abe8e' = '#4477AA', 'Bemax'="#228833", 'Ctrl'="#CCBB44"),
+                'group' =c('BAFA1' = col.pal[1], 'Lib'=col.pal[2], 'DOXO'=col.pal[3], 'CTRL1'=col.pal[4], 'CTRL2'=col.pal[5], 'CTRL3'=col.pal[6],
+                           'STARVE' = col.pal[7], 'TORIN'=col.pal[8], 'GPN'=col.pal[9], 'plasmid_BE'=col.pal[10], 'gRNA_noBE'=col.pal[11]))
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+hm <- Heatmap(submat, 
+              cluster_rows=T, 
+              show_row_names = F, 
+              cluster_columns =T, 
+              top_annotation = colAnn, 
+              name='Log2(NormCounts+1)/Median',  
+              column_names_gp = gpar(fontsize=6))
+hm
+BackupAsPDF(hm, 'tmo.normCounts.clustered.medianscaled.heatmap', dimensions=c(10,8))
+```
+sample coorelation matrix
+```{r}
+norm.mat <- dcast(comb.dt[, c('sgRNA_Gene', 'sample', 'tmo.normCounts')], sgRNA_Gene~sample, value.var = 'tmo.normCounts') %>% 
+  as.matrix(rownames='sgRNA_Gene')
+
+# log transformed matrix
+#norm.mat <-  log2(norm.mat+1)
+
+# create a correlation matrix; use spearman as data not normally distributed (negBinomial)
+cor.mat <-  cor(norm.mat, method='spearman')
+
+#set ordering for diagonal mat
+od =  hclust(dist(cor.mat))$order
+cm = cor.mat[od, od]
+
+hm <- Heatmap(cm, 
+        name='Sample Spearman Corr.',
+        rect_gp = gpar(type = "none"), 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=8),
+        col=colorRamp2(breaks=c(0.75,1), colors=c('yellow', 'red')),
+	cell_fun = function(j, i, x, y, w, h, fill) {
+		if(i >= j) {
+			grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='black'))
+		}
+	})
+
+hm
+
+BackupAsPDF(draw(hm, column_title='tmo.normalized counts correlation matrix'), 'tmo.normalizedCounts.spearmanCor.corHeatmap', dimensions=c(14,10))
+```
+
+Read in the count matrix, write out normalised mat to file 
+Also write out the raw matrix to file 
+
+```{r}
+
+input.dt <- fread("/Users/martingordon/Documents/projects/032124_RBabu_CRISPRMutantScreen/032824_MAGECK_DE_firstPass_data/2024_03_28_sampleCounts.csv")
+
+norm.count.mat <- dcast(input.dt, sgRNA+Gene~sample, value.var = 'tmo.normCounts')
+fwrite(norm.count.mat, ScriptAndDatedFileName('normalizedCounts.matrix.csv'))
+
+
+
+input.dt <- fread("/Users/martingordon/Documents/projects/032124_RBabu_CRISPRMutantScreen/032824_MAGECK_DE_firstPass_data/2024_03_28_rawCounts.csv")
+input.dt
+raw.count.mat <- dcast(input.dt, sgRNA+Gene~variable, value.var = 'value')
+
+fwrite(raw.count.mat, ScriptAndDatedFileName('rawCounts.matrix.csv'))
+
+```
+
+Create design matrix
+----
+Create a design matrix to perform PW comparisons across the conditions
+
+The design matrix file (Table 5) is a binary matrix indicating which sample (contained in the first column) is affected by which condition (contained in the second and subsequent columns). Values under the headers are binary. The element in the design matrix, dij, equals ‘1’ if sample i is affected by condition j, and 0 if it is not. Each column of the design matrix file should be separated by a tab character. This file can be created with a text-editing software and saved as a plain-text file.
+
+The following rules apply to the design matrix file:
+
+The design matrix file must include a header line of condition labels.
+
+The first column consists of the sample labels, which must match the sample labels in the read-count file.
+
+The non-header values in columns 2 and beyond must be either ‘0’ or ‘1’.
+
+The second column defines an initial condition that affects all samples and must be ‘1’ for all rows (except the header row).
+
+The design matrix file must contain at least one sample representing the ‘initial state’ (e.g., day 0) that has only a single ‘1’ in the corresponding row. That single ‘1’ must be in the ‘initial condition’ column (the second column). MAGeCK MLE will calculate the beta score by comparing the other conditions.
+
+We need to use the RRA package, which performs a treatment vs control comparison
+
+
+If using MLE, will need to produce a different baseline each time
+
+```{r}
+# first column is sample names, other samples are conditions
+# columns need to be tab seperated
+
+design.mat <- data.table(Samples = sort(unique(input.dt$variable)),
+                         Baseline = rep(1, length((unique(input.dt$variable)))),
+                         Abe8e_BAFA1 = rep(0, length((unique(input.dt$variable)))),
+                         Abe8e_DOXO = rep(0, length((unique(input.dt$variable)))),
+                         Abe8e_GPN = rep(0, length((unique(input.dt$variable)))),
+                         Abe8e_Lib = rep(0, length((unique(input.dt$variable)))),
+                         Abe8e_TORIN = rep(0, length((unique(input.dt$variable)))),
+                         Abe8eDMSO_CTRL1 = rep(0, length((unique(input.dt$variable)))),
+                         Abe8eDMSO_CTRL2 = rep(0, length((unique(input.dt$variable)))),
+                         Abe8eDMSO_CTRL3 = rep(0, length((unique(input.dt$variable)))),
+                         Abe8eSerum_STARVE = rep(0, length((unique(input.dt$variable)))),
+                         Bemax_BAFA1 = rep(0, length((unique(input.dt$variable)))),
+                         Bemax_DOXO = rep(0, length((unique(input.dt$variable)))),
+                         Bemax_GPN =  rep(0, length((unique(input.dt$variable)))),
+                         Bemax_Lib = rep(0, length((unique(input.dt$variable)))),
+                         Bemax_TORIN = rep(0, length((unique(input.dt$variable)))),
+                         BemaxDMSO_CTRL1 = rep(0, length((unique(input.dt$variable)))),
+                         BemaxDMSO_CTRL2 = rep(0, length((unique(input.dt$variable)))),
+                         BemaxDMSO_CTRL3 = rep(0, length((unique(input.dt$variable)))),
+                         BemaxSerum_STARVE = rep(0, length((unique(input.dt$variable)))),
+                         gRNA_noBE  = rep(0, length((unique(input.dt$variable)))),
+                         plasmid_BE = rep(0, length((unique(input.dt$variable))))
+                         )
+
+
+
+design.mat
+getwd()
+```
+
+Prepare data for gene essentiality analysis
+----
+
+read in the count matrix
+```{r}
+norm.mat.dt <- fread("/Users/martingordon/Documents/projects/032124_RBabu_CRISPRMutantScreen/032824_MAGECK_DE_firstPass_data/2024_04_02_normalizedCounts.matrix.csv")
+
+norm.mat.dt$Gene %>%  unique()
+
+colnames(norm.mat.dt)
+
+# first thing we need to do is write to each file a subset of the mat of interest
+selectCols <- function(dt, colPatterns=c('sgRNA', 'Gene', 'Abe8eDMSO','Abe8eSerum')){
+  cols.oi <- grep(paste(colPatterns, collapse = '|'), colnames(dt), value = T)
+  
+  print(cols.oi)
+  dt[, ..cols.oi]
+}
+
+# first grp is fitness analysis after base editing
+cols.oi <- list(c('sgRNA', 'Gene', 'Bemax_Lib', 'BemaxDMSO_CTRL1'),
+                c('sgRNA', 'Gene', 'Bemax_Lib', 'BemaxDMSO_CTRL2'),
+                c('sgRNA', 'Gene', 'Abe8e_Lib', 'Abe8eDMSO_CTRL1'),
+                c('sgRNA', 'Gene', 'Abe8e_Lib', 'Abe8eDMSO_CTRL2'),
+                # drug sensitivity analysis
+                #bemax set
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL1', 'Bemax_TORIN'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL1', 'Bemax_BAFA1'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL1', 'BemaxSerum_STARVE'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL2', 'Bemax_GPN'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL3', 'Bemax_DOXO'),
+                #abe8e set
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL1', 'Abe8e_TORIN'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL1', 'Abe8e_BAFA1'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL1', 'Abe8eSerum_STARVE'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL2', 'Abe8e_GPN'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL3', 'Abe8e_DOXO'))
+#
+
+comparisons.list <- lapply(cols.oi, function(x){
+  
+   selectCols(norm.mat.dt, colPatterns = x)
+})
+
+names(comparisons.list) <- lapply(cols.oi, function(x){ paste(x[c(3:4)], collapse='-')  })
+
+# wrrite the datatables to file
+lapply(seq_along(comparisons.list), function(x,n,i){
+  
+  fwrite(x[[i]], paste0('./output/matrices/', n[[i]], '.norm.count.tsv'), sep='\t')
+  
+}, x=comparisons.list, n=names(comparisons.list))
+```
+
+
+
+```{r}
+
+```
+

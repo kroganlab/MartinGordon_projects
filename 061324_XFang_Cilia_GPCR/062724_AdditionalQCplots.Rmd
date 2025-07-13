@@ -1,0 +1,418 @@
+---
+title: "062724_PWComparisons_Review"
+author: "Martin Gordon"
+date: "2024-06-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Analysis Review
+Want to review the analysis performed presented at the cilia GPCR meeting 06-27-24
+I think the first question is our normalization method... can we adjust this to correct for the effect
+i) Do the included samples make sense? Could we take the avg of the techRep groups?
+ii) Look at comparisons with more 'gentle' normalization. (check out the SMO group and visualise the PKA interaction; can we see more obvious differences between the groups with the different normalization methods)
+
+
+Tidy the plots and produce the final set of PW comparisons for Aaron
+
+
+Sare these plots with the group
+Also share overlaps with Max Nauchery annotated cilia proteins (high confidence and 2021 proteins only for now) 
+
+```{r cars}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+#source("../../utils/mg_utils/r_utils/IDmapping.R") functions dependent on dplyr package that has been broken by being uploaded.
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+Read in the raw and normalized datasets and look at the output for PKA proteins and peptides
+
+```{r}
+dp.out <- readRDS('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_24_dp.out.rds')
+old.pQuant <- setDT(dp.out$ProteinLevelData)
+old.pQuant[, gene := multiUniprots2multiGenes(as.character(Protein), species='MOUSE')]
+
+p.Quant <- fread('./062424_PWComparisons_data/2024_06_26_ProteinLevelQuant.renorm.csv')
+p.Quant[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+
+spec <-  fread('./data/CR1/Re-run/20240618_164945_CR1_rep5_Report.tsv')
+# create some new ID columns 
+spec[, agonist := ifelse(grepl('_ag$', Condition), 'Yes','No')]
+
+spec <- spec[Intensity > 2^4,]
+
+spec[, gene := multiUniprots2multiGenes(ProteinName, species='MOUSE')]
+```
+
+plot a comparison of the impact of normalization
+I think we want to extract to look at 
+i) distributions of the cilia annotated proteins in all 3 sets and 
+ii) the Pkaca subunit
+
+interactors of Pkaca
+
+## first look at the Pka subunit
+```{r}
+genes.oi <- c('Prkaca') #, 'Prkar1a')
+```
+
+we want to combine the 3 datasets into one, first subsettting to the things we are interested in
+
+```{r}
+spec[gene %in% genes.oi, .(GROUP = Condition, SUBJECT = BioReplicate, gene, LogIntensities = log2(Intensity))]
+
+ints.dt <- list('equilizeMedians'= old.pQuant[gene %in% genes.oi, .(Protein, GROUP, SUBJECT, gene, LogIntensities)],
+                  'additionalProteinLvlNormalization'= p.Quant[gene %in% genes.oi, .(Protein, GROUP, SUBJECT, gene, LogIntensities = newLogInts)],
+                  'Raw' = spec[gene %in% genes.oi, .(GROUP = Condition, SUBJECT = BioReplicate, gene, Protein = ProteinName, PeptideSequence, LogIntensities = log2(Intensity))]
+                  ) %>% rbindlist(idcol='source', fill=T)
+
+col.pal <-  randomcoloR::distinctColorPalette(k=length(unique(ints.dt$GROUP)))
+
+
+#add a status col
+ints.dt[, probe := gsub('[+-]{1}cilia_|[.][0-9]{1}','', GROUP)]
+ints.dt[, cilia_present := ifelse(grepl('[+]cilia', GROUP), 'yes', 'no')]
+ints.dt[, agonist_present := ifelse(grepl('_ag', GROUP), 'yes', 'no')]
+
+#plot the intensity values of the different approaches
+g <- ggplot(ints.dt[(gene %in% genes.oi & probe %like% 'SMO'),], aes(x=source, y=IntsVsMedian, fill=cilia_present)) +
+  geom_boxplot(outliers=F) +
+  geom_point(aes(fill = cilia_present), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge()) +
+  ggtitle('PKA interaction') +
+  xlab('Normalization approach') +
+  facet_wrap(~probe, scales = 'free_y') +
+  scale_fill_brewer(type='qual', palette=1) +
+  #scale_y_continuous(breaks=seq(1,20,1)) +
+  theme_bw()
+g
+BackupAsPDF(g, 'smo.posControl.normalizationComparision.boxplot', dimensions=c(10,8))
+
+
+# now plot the protein on ciliated cells only
+#plot the intensity values of the different approaches
+g <- ggplot(ints.dt[(gene %in% genes.oi & probe %like% 'SMO' & cilia_present == 'yes'),], aes(x=source, y=LogIntensities, fill=agonist_present)) +
+  geom_boxplot(outliers = F) +
+  geom_point(aes(fill = agonist_present), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge()) +
+  xlab('Normalization approach') +
+  ggtitle('SMO probe PKA interaction in ciliated cells') +
+  scale_fill_brewer(type='qual', palette=1) +
+ scale_y_continuous(breaks=seq(4,18,1)) +
+  theme_bw()
+g
+BackupAsPDF(g, 'smo.posControl.ciliaOnly.normalizationComparision.boxplot', dimensions=c(10,8))
+```
+Visualize the literature annotated cilia proteins from GO
+For SMO, we would expect a shift in the intensity distributions of the ciliated proteins with the addition of agonist to SMO probe
+
+center the distributions as want to see how they differentiate from 0
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+cilium.genes <- gmt.go[ont == 'cilium', gene]
+
+
+ints.dt <- list('equilizeMedians'= old.pQuant[, .(Protein, GROUP, SUBJECT, gene, LogIntensities)],
+                  'additionalProteinLvlNormalization'= p.Quant[, .(Protein, GROUP, SUBJECT, gene, LogIntensities = newLogInts)],
+                  'Raw' = spec[, .(GROUP = Condition, SUBJECT = BioReplicate, gene, Protein = ProteinName, PeptideSequence, LogIntensities = log2(Intensity))]
+                  ) %>% rbindlist(idcol='source', fill=T)
+
+#add a status col
+ints.dt[, probe := gsub('[+-]{1}cilia_|[.][0-9]{1}','', GROUP)]
+ints.dt[, cilia_present := ifelse(grepl('[+]cilia', GROUP), 'yes', 'no')]
+ints.dt[, agonist_present := ifelse(grepl('_ag|_Ih', GROUP), 'yes', 'no')]
+
+
+# this isnt what we want... we dont want to normalize by row, we want to normalize by col (maybe plot Zscore of distributions?)
+ints.dt[ GROUP %like% '[+]cilia_SMO', IntsVsMean := LogIntensities - median(LogIntensities), by=.(Protein)]
+
+#plot the intensity values of the different approaches
+g <- ggplot(ints.dt[(Protein %in% cilium.genes & probe %like% 'SMO' & cilia_present == 'yes'),], aes(x=source, y=IntsVsMean, fill=agonist_present)) +
+  geom_boxplot() +
+ # geom_point(aes(fill = cilia_present), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge()) +
+  ggtitle('SMO probe cilia protein distributions before/after activation') +
+  xlab('Normalization') +
+  ylab('logIntensities (median subtracted)') +
+  scale_y_continuous(n.breaks = 10) +
+  scale_fill_manual(values=col.pal[c(3,6)]) +
+  theme_bw()
+g
+BackupAsPDF(g, 'smo.posControl.ciliaOnly.ciliaProteinDistributions.medianScaled.boxplot', dimensions=c(10,8))
+```
+
+
+Generate the same plot with all ligand activated groups; just show our normalization data and show before 
+
+```{r}
+ints.dt[, ligand_present := ifelse(grepl('_ag|_In', GROUP), 'yes', 'no')]
+ints.dt[, ligand := ifelse(grepl('_ag|_In', GROUP), str_extract(GROUP,'ag$|In$'), 'no')]
+ints.dt[, bait := gsub('_ag$|_In$', '', probe)]
+
+
+ints.dt[ GROUP %in% grep('[+]cilia_SMO|[+]cilia_GPR161|[+]cilia_Pde8A|[+]cilia_Pde8B|[+]cilia_Pth2r|[+]cilia_Crhr2', GROUP, value = T), IntsVsMean := LogIntensities - median(LogIntensities), by=Protein]
+
+
+#plot the intensity values of the different approaches
+g <- ggplot(ints.dt[(Protein %in% cilium.genes & probe %in% grep('Crhr2|GPR161|Pth2r|SMO|Pde8A|Pde8B', probe, value=T) & cilia_present == 'yes'),], aes(x=bait, y=IntsVsMean, fill=ligand_present)) +
+  geom_boxplot() +
+  scale_y_continuous(breaks=seq(-10,12, by=1)) +
+  xlab('Probe') +
+  ggtitle('Impact of ligand binding on cilia protein distributions') +
+  ylab('logIntensities (median subtracted)') +
+  scale_fill_manual(values=col.pal[c(3,5,7)]) +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'ligandbaits.ciliaOnly.ciliaProteinDistributions.medianScaled.boxplot', dimensions=c(10,8))
+```
+Regenerate the PCA of the expression profiles with the treatmen conditions dropped
+
+```{r}
+p.mat <-dcast(p.Quant, Protein~interaction(GROUP,SUBJECT), value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+p.mat <- p.mat[complete.cases(p.mat), grep('cilia_PM|[-]cilia_ARL13b[.]', colnames(p.mat), invert=T, value = T)]
+
+pca <- prcomp(t(p.mat))
+
+# create annotation dt
+ann <- data.table(group = colnames(p.mat))
+ann[, cilia_present := ifelse(grepl('-cilia', group), 'No', 'Yes')]
+ann[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', group), 'Yes', 'No')]
+ann[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', group)]
+ann[, rep := str_extract(group, '[0-9]$')]
+
+pca.dt <- data.table(pca$x, keep.rownames = T)
+pca.dt <- merge(x=pca.dt, y=ann, by.x='rn', by.y='group')
+pca.dt[, group := gsub('.[0-9]$','', rn)]
+
+# calculate variance explained
+pcaPercentVar <- round(100 * (pca$sdev^2)/sum(pca$sdev^2), 1)
+
+#plot first two components
+p <- ggplot (pca.dt, aes(x=PC1, y=PC2,  fill = status, shape = cilia_present)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab(sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab(sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle(sprintf ("PCA using %d features (log intensity)", nrow(pca$rotation))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'proteins.probCol.noControls.', dimensions=c(12,9))
+```
+
+
+
+```{r}
+ints.dt <- list('MSSNorm'= old.pQuant[Protein %in% cilium.genes, .(Protein, GROUP, SUBJECT, gene, LogIntensities)],
+                  'AdditionalRoundNorm'= p.Quant[Protein %in% cilium.genes, .(Protein, GROUP, SUBJECT, gene, LogIntensities = newLogInts)],
+                  'Raw' = spec[ProteinName %in% cilium.genes, .(GROUP = Condition, SUBJECT = BioReplicate, gene, Protein = ProteinName, PeptideSequence, LogIntensities = log2(Intensity))]
+                  ) %>% rbindlist(idcol='source', fill=T)
+
+#add a status col
+ints.dt[, probe := gsub('[+-]{1}cilia_|[.][0-9]{1}','', GROUP)]
+ints.dt[, cilia_present := ifelse(grepl('[+]cilia', GROUP), 'yes', 'no')]
+ints.dt[, agonist_present := ifelse(grepl('_ag', GROUP), 'yes', 'no')]
+
+
+#plot the intensity values of the different approaches
+g <- ggplot(ints.dt[Protein %in% cilium.genes,], aes(x=source, y=LogIntensities, fill=cilia_present)) +
+  geom_boxplot() +
+ # geom_point(aes(fill = cilia_present), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge()) +
+  ggtitle(sprintf('GO annotated cilia protein distributions (n=%s)', sum(cilium.genes %in% unique(spec$ProteinName)))) +
+  facet_wrap(~probe, ncol=3, scales = 'free_y') +
+  scale_fill_manual(values=col.pal[c(3,6)]) +
+  theme_bw()
+g
+BackupAsPDF(g, 'GOcilia.distributions.boxplot', dimensions=c(12,18))
+```
+Now plot the distributions of Max Nauchery cilia annotated protein distributions (high confidence ones)
+
+```{r}
+read_xlsx(path='./docs/ciliaProteins.Nachury.etal.2021.xlsx', sheet=1, skip = 1)
+#read in literature sig hits
+cilia.Nachury.2021 <- read_xlsx(path='./docs/ciliaProteins.Nachury.etal.2021.xlsx', sheet=1, skip = 1)$`Gene Symbol`
+cilia.Nachury.2021 <- cilia.Nachury.2021[!is.na(cilia.Nachury.2021)]
+
+cilia.Nachury.2015.highConf <- read_xlsx(path='./docs/Nachury.etal.2015cilliaProteins.xlsx', sheet=1)$`Uniprot accession number`
+cilia.Nachury.2015.highConf <- multiUniprots2multiGenes(cilia.Nachury.2015.highConf, species='MOUSE')
+
+cilia.literature <- list('Nachury et al 2021' = cilia.Nachury.2021,
+                         'Nachury et al 2015 (High Conf)' = cilia.Nachury.2015.highConf)
+```
+```{r}
+ints.dt <- list('MSSNorm'= old.pQuant[, .(Protein, GROUP, SUBJECT, gene, LogIntensities)],
+                  'AdditionalRoundNorm'= p.Quant[, .(Protein, GROUP, SUBJECT, gene, LogIntensities = newLogInts)],
+                  'Raw' = spec[, .(GROUP = Condition, SUBJECT = BioReplicate, gene, Protein = ProteinName, PeptideSequence, LogIntensities = log2(Intensity))]
+                  ) %>% rbindlist(idcol='source', fill=T)
+
+#add a status col
+ints.dt[, probe := gsub('[+-]{1}cilia_|[.][0-9]{1}','', GROUP)]
+ints.dt[, cilia_present := ifelse(grepl('[+]cilia', GROUP), 'yes', 'no')]
+ints.dt[, agonist_present := ifelse(grepl('_ag', GROUP), 'yes', 'no')]
+
+
+lapply(names(cilia.literature), function(i,x){
+
+  g <- ggplot(x[gene %in% cilia.literature[[i]],], aes(x=source, y=LogIntensities, fill=cilia_present)) +
+  geom_boxplot() +
+  ggtitle(paste0(i, ' cilla protein distributions')) +
+  facet_wrap(~probe, scales = 'free_y', ncol=3) +
+  scale_fill_brewer(type='qual', palette='Dark2') +
+  theme_bw()
+  g
+  BackupAsPDF(g, paste0(i, '.curatedCilla.boxplots'), dimensions=c(14,22))
+},x=ints.dt)
+
+```
+
+ToDo
+--
+Regenerate the control SMO plots to ensure it is correctly calculated
+
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(k=length(unique(p.Quant$GROUP)))
+
+#add a status col
+p.Quant[, probe := gsub('[+-]{1}cilia_|[.][0-9]{1}','', GROUP)]
+p.Quant[, cilia_present := ifelse(grepl('[+]cilia', GROUP), 'yes', 'no')]
+p.Quant[, agonist_present := ifelse(grepl('_ag|_Ih', GROUP), 'yes', 'no')]
+p.Quant[, ligand_present := ifelse(grepl('_ag|_In', GROUP), 'yes', 'no')]
+p.Quant[, ligand := ifelse(grepl('_ag|_In', GROUP), str_extract(GROUP,'ag$|In$'), 'no')]
+p.Quant[, bait := gsub('_ag$|_In$', '', probe)]
+p.Quant[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+
+```
+plot for the ligand data the distributions of all the
+
+```{r}
+p.Quant[probe %in% grep('Crhr2|GPR161|Pth2r|SMO|Pde8A|Pde8B', probe, value=T), IntsVsMean := newLogInts - median(newLogInts), by=Protein]
+
+#plot the intensity values of the different approaches
+g <- ggplot(p.Quant[(Protein %in% cilium.genes & probe %in% grep('Crhr2|GPR161|Pth2r|SMO|Pde8A|Pde8B', probe, value=T) & cilia_present == 'yes'& IntsVsMean < 7),], aes(x=bait, y=IntsVsMean, fill=ligand_present)) +
+  geom_boxplot() +
+  scale_y_continuous(breaks=seq(-5,5, by=1)) +
+  xlab('Probe') +
+  ggtitle('Impact of ligand binding on cilia protein distributions') +
+  ylab('logIntensities (median subtracted)') +
+  scale_fill_manual(values=col.pal[c(3,5,7)]) +
+  theme_bw()
+g
+
+
+
+# try average and then plot the distribution
+p.Quant[, meanInts := mean(newLogInts, na.rm=T), by=.(GROUP,Protein)]
+
+
+g <- ggplot(p.Quant[(Protein %in% cilium.genes & probe %in% grep('Crhr2|GPR161|Pth2r|SMO|Pde8A|Pde8B', probe, value=T) & cilia_present == 'yes'& IntsVsMean < 7),], aes(x=bait, y=IntsVsMean, fill=ligand_present)) +
+  geom_boxplot() +
+  scale_y_continuous(breaks=seq(-5,5, by=1)) +
+  xlab('Probe') +
+  ggtitle('Impact of ligand binding on cilia protein distributions') +
+  ylab('logIntensities (median subtracted)') +
+  scale_fill_manual(values=col.pal[c(3,5,7)]) +
+  theme_bw()
+
+
+BackupAsPDF(g, 'ligandedProbes.cillaProt.boxplots', dimensions=c(6,5))
+
+
+# confirm by plotting the median sweep
+p.mat <- dcast(p.Quant[Protein %in% cilium.genes,], Protein~paste0(GROUP,'.',SUBJECT), value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+
+submat <- sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T))
+
+sub.dt <- setDT(reshape2::melt(submat))
+setnames(sub.dt, new=c('Protein', 'sample', 'newLogInts'))
+sub.dt[, c('GROUP', 'SUBJECT') :=  tstrsplit(sample, '[.]', keep = c(1,2))]
+sub.dt[, probe := gsub('[+-]{1}cilia_|[.][0-9]{1}','', GROUP)]
+sub.dt[, cilia_present := ifelse(grepl('[+]cilia', GROUP), 'yes', 'no')]
+sub.dt[, agonist_present := ifelse(grepl('_ag|_Ih', GROUP), 'yes', 'no')]
+sub.dt[, ligand_present := ifelse(grepl('_ag|_In', GROUP), 'yes', 'no')]
+sub.dt[, ligand := ifelse(grepl('_ag|_In', GROUP), str_extract(GROUP,'ag$|In$'), 'no')]
+sub.dt[, bait := gsub('_ag$|_In$', '', probe)]
+sub.dt[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+
+
+g <- ggplot(sub.dt[(probe %in% grep('Crhr2|GPR161|Pth2r|SMO|Pde8A|Pde8B', probe, value=T) & cilia_present == 'yes' & newLogInts < 7),], aes(x=bait, y=newLogInts, fill=ligand_present)) +
+  geom_boxplot() +
+  scale_y_continuous(breaks=seq(-10,12, by=1)) +
+  xlab('Probe') +
+  ggtitle(sprintf('Impact of ligand binding on cilia protein distributions (n=%s)',  sum(cilium.genes %in% unique(p.Quant$Protein)))) +
+  ylab('logIntensities (median subtracted)') +
+  scale_fill_manual(values=col.pal[c(3,5,7)]) +
+  theme_bw()
+g
+BackupAsPDF(g, 'ligandProbes.cillaProt.boxplots', dimensions=c(6,5))
+```
+Look at the SMO proteins 
+
+```{r}
+#plot the intensity values of the different approaches
+g <- ggplot(p.Quant[Protein %in% cilium.genes & bait == 'SMO',], aes(x=GROUP, y=meanInts, fill=GROUP)) +
+  geom_boxplot() +
+ # geom_point(aes(fill = cilia_present), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge()) +
+  ggtitle(sprintf('SMO probe cilia protein distributions (n=%s)', sum(cilium.genes %in% unique(p.Quant$Protein)))) +
+  scale_fill_manual(values=col.pal[c(3:7)]) +
+  xlab('Probe') +
+  ylab('LogIntensities (median subtracted)') +
+  theme_bw() +
+  theme(axis.text.x = element_blank())
+g
+BackupAsPDF(g, 'SMOprobes.cillaProt.boxplots', dimensions=c(6,5))
+```
+
+```{r}
+
+```
+
+
+
+
+Regenerate the plots to adjust the label sizes
+
+
+
+Differences in the log2FC changes between cilia/non ciliated? Lets look at venn diagrams, and maybe better is a correlation plot
+Redo the plot with the noCilia denominator enrichment (seems to be the wrong log2FC thresholds)
+Redo the no-ligand denominator comparisons plots
+
+The ciliated vs non-ciliated background plots comparison. 

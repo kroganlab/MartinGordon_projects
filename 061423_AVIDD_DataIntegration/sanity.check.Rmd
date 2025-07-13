@@ -1,0 +1,334 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+To do
+We are interested in EV+ vs WT+ and WT+ vs N1062D+ (where first item is denominator)
+
+
+
+```{r}
+library(data.table)
+library(ComplexHeatmap)
+library(magrittr)
+library(ggplot2)
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/bp_utils/PPINetworkModularized.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+source ("../../utils/bp_utils/NetworkPropagation.R")
+
+
+# Attach the `umap` library
+library(umap)
+
+library(cluster) #k-mediod clustering
+library(factoextra) #estimate optimal k
+
+```
+For the rna, the first item is the denominator,
+For the prot & ab the second label is the denominator
+
+Question is, do I swap the RNA? or redo ours? Maybe redo ours so comparable and regenerate the 
+
+
+Sanity check results
+For Log2FC changes, confirm direction of change is same aas the expression values indicate:
+
+```{r}
+#exp results
+exp.sig <- fread('./output/sig-genes/experimental-omics-sig-genes.csv')
+
+#cleaned files
+```
+
+
+```{r}
+p.ab.quant <- fread('~/Documents/projects/051623_DSwaney/2023_05_16_DSwaney_AA08_AB_data/2023_05_25_ProteinLevelData.csv.gz') 
+p.ph.quant <- fread('~/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_protein-lvl-data.csv.gz')
+rna.quant <- fread('~/Library/CloudStorage/Box-Box/Mac1_omics_data/CellLines_RNAseq/Expression/gene_expression.xls')
+
+box.loc <- '~/Library/CloudStorage/Box-Box/Mac1_omics_data/'
+rna.ab.core <- fread(paste0(box.loc, 'CellLines_RNAseq/core_table_gene.xls.gz'), fill=T)
+
+cols.OI <- grep("^read_count|gene_symbol",colnames(rna.ab.core), value=T)
+
+rna.mat <- rna.ab.core[, colnames(rna.ab.core) %in% cols.OI, with=F] %>% 
+  .[,-25, with=F] %>% #rm dup gene_symbol
+  as.matrix(rownames='gene_symbol')
+
+```
+
+```{r}
+exp.sig[omics == 'rna.ab.sig', .(gene,log2FC_prot_ab, log2FC_rna_ab,Label)]
+
+exp.sig[omics == 'rna.ab.sig' & Label == 'WT_IFNg-vs-ND_IFNg',]
+
+#lets compare to the new contrast files 
+ab.prot.new.contrasts <- fread('/Users/martingordon/Documents/projects/051623_DSwaney/2023_06_15_MSstats_newcontrasts_data/2023_06_15_ab-mssstats_groupcomparisons_newcontrasts.csv.gz')
+
+ab.prot.new.contrasts <- ab.prot.new.contrasts[ Label %in% c("EV_IFNg-vs-WT_IFNg", "WT_IFNg-vs-ND_IFNg"),]
+
+ph.prot.new.contrasts <- 
+fread('/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/2023-06-15_MSstats_newcontrasts_data/2023_06_15_ph-mssstats_groupcomparisons_newcontrasts.csv.gz')
+
+ph.prot.new.contrasts <- ph.prot.new.contrasts[ Label %in% c("EV_IFNg-vs-WT_IFNg", "WT_IFNg-vs-ND_IFNg"),]
+```
+
+Now lets create a new sig gene output:
+
+```{r}
+# read in the clean omics files
+rna.ab.clean <- fread('./output/rna_ab.clean.csv.gz')
+prot.ab.clean <- fread('./output/prot_ab.clean.csv.gz')
+prot.ph.clean <- fread('./output/prot_ph.clean.csv.gz')
+
+omics.clean <- list(rna_ab = rna.ab.clean,
+                    prot_ab = prot.ab.clean,
+                    prot_ph = prot.ph.clean)
+
+unique(prot.ab.clean$Label)
+```
+
+
+
+```{r}
+
+ab.prot.new.contrasts[gene_symbol == 'VIL1',]
+
+# VIL1
+#EV_IFNg-vs-WT_IFNg
+#-0.8849885 prot fc
+
+# 1.153512 rna fc
+ #0.006835806 prot.adj
+
+# 1.986508e-13 rna.adj
+
+
+# dot plots of the genes below
+#CPS1, CLDN2, ASS1, MUC13
+
+genes.oi <- c('CPS1', 'ASS1', 'VIL1', 'ANPEP', 'CLDN2','CEACAM5')
+
+cond.oi <- c('read_count_EV_IFNg_A','read_count_EV_IFNg_B','read_count_EV_IFNg_C',
+             'read_count_WT_IFNg_A','read_count_WT_IFNg_B','read_count_WT_IFNg_C',
+             'read_count_ND_IFNg_A', 'read_count_ND_IFNg_B', 'read_count_ND_IFNg_C') 
+             
+
+
+  unique(rna.df$Var2)
+  
+
+rna.df <- melt(rna.mat, id.vars = c("gene_symbol"),
+     measure.vars = colnames(rna.mat)[colnames(rna.mat) != 'gene_symbol']) %>% 
+     as.data.table()
+
+
+# looks good; for example there is a negative score  of 1.5 for EV-WT label, log2(2000/6000) so EV is the denominator
+ggplot(rna.df[Var1 %in% genes.oi & Var2 %in% cond.oi,], aes(x=Var2, y=value, color=Var2)) +
+  geom_point() +
+  theme(
+    axis.text.x = element_text(angle=90, size=6)
+  ) +
+  facet_wrap(~Var1, scales = 'free')
+
+unique(exp.sig$Label)
+
+p.ab.quant[, gene := multiUniprots2multiGenes(uniprots = Protein, simplify=T)]
+p.ab.quant[, label := interaction(GROUP,SUBJECT)]
+
+unique(colnames(p.ab.quant))
+
+label.oi <- c('EVpos.1','EVpos.2','EVpos.3','EVpos.4',
+              'N10t20pos.5', 'N10t20pos.6', 'N10t20pos.7', 'N10t20pos.8',
+              'WTpos.17', 'WTpos.18',   'WTpos.19',    'WTpos.20'
+              )
+
+# so for the proteomics data the opposite is true; the sign of the log2FC needs to be changed
+ggplot(p.ab.quant[gene %in% genes.oi & label %in% label.oi,], aes(x=label, y=LogIntensities, color=label)) +
+  geom_point() +
+  theme(
+    axis.text.x = element_text(angle=90, size=6)
+  ) +
+  facet_wrap(~gene, scales = 'free')
+
+p.ab.quant[gene == 'CPS1',]
+
+log2(15/17)
+```
+create sig genes file
+*Contrastsd formatted correlctly here; take these files and adjust thresholds*
+```{r}
+
+# read in the clean omics files
+rna.ab.clean <- fread('./output/rna_ab.1907.clean.csv.gz')
+prot.ab.clean <- fread('./output/prot_ab.1907.clean.csv.gz')
+prot.ph.clean <- fread('./output/prot_ph.1907.clean.csv.gz')
+
+omics.clean <- list(rna_ab = rna.ab.clean,
+                    prot_ab = prot.ab.clean,
+                    prot_ph = prot.ph.clean)
+
+
+```
+
+clean-up of ab and ph
+
+```{r}
+#ph
+omics.clean[['prot_ph']][, uniprot := gsub("_[STY][0-9]+", "", Protein) %>% #strip phosphosite info
+          strsplit (";") %>%  #split multiprots; creates a list of vectors of each element
+          lapply (unique) %>% #removes any duplicate elements in list
+          lapply (paste, collapse = ";") %>% #colapses back to unique prot names
+          unlist]
+
+omics.clean[['prot_ph']] <- omics.clean[['prot_ph']][,uniprot := sub("\\;.*","", uniprot)]
+
+# using gene symbols as identifiers
+omics.clean[['prot_ph']][, gene := translateUniprot2GeneName(uniprot, species = "HUMAN")]
+
+#ab
+omics.clean[['prot_ab']] <- omics.clean[['prot_ab']][,uniprot := sub("\\;.*","",Protein)] #take only first name with multi uniprots
+#omics_list[['prot_ab']] <- omics_list[['prot_ab']][,!grepl(";", Protein),] #only select rows w/o multiuniprots
+
+# using gene symbols as identifiers
+omics.clean[['prot_ab']][, gene := translateUniprot2GeneName(uniprot, species = "HUMAN")] # or "MOUSE" or "RAT"
+
+
+# have multi uniprot/gene vlaues for each PH site. Calculate gm.lfc.pval and take the max value
+omics.clean[['prot_ph']][, gm.lfc.fdr := sqrt(abs(log2FC) * fdr)] 
+omics.clean[['prot_ph']][,gene := multiUniprots2multiGenes(uniprot, simplify = F)]
+
+omics.clean[['prot_ph']] <- omics.clean[['prot_ph']][sig != 'not', .SD[which.max(gm.lfc.fdr)], by = .(Label,gene)]
+```
+
+
+Look at the number of genes in all 3 that are significant
+(maybe fold change is too significant a change)
+
+
+Collapse the 3 lists to one data.table, and split on contrast
+```{r}
+merge.omics <- rbindlist(omics.clean, fill = T,idcol = T)
+
+#Add sig column for venn diagram visualisation of differentially expressed features
+
+merge.omics[, sig := 'not']
+merge.omics[ fdr < 0.05 & abs(log2FC) > log2(1.5), sig := ifelse(log2FC < 0, "down", "up")]
+merge.omics[, sig := factor(sig, levels = c("up", "not", "down"))]
+
+merge.omics.list <- split(merge.omics, merge.omics$Label)
+```
+
+# redundancy in prot_ph
+Break down of sig results among the three datasets; most sig results in phosphoproteomics?
+# ph data: 1111 unique sig in cond 1, 272 unique sig in condition 2
+
+```{r}
+lapply(seq_along(merge.omics.list), function(x,n,i){
+  x[[i]][sig != 'not', .N, by=.(.id)][order(-N)]
+}, x=merge.omics.list, n=names(merge.omics.list))
+```   
+Redundancy in the phospho dataset
+Proceed as is for now, just identify genes that are significant in all 3
+```{r}
+lapply(seq_along(merge.omics.list), function(x,n,i){
+  x[[i]][sig!= 'not', .N, by=.(.id)]
+}, x=merge.omics.list, n=names(merge.omics.list))
+```
+
+
+```{r}
+
+sig.genes.list <- lapply(merge.omics.list, function(x){
+  x[sig != 'not',]
+})
+```
+
+```{r}
+
+
+exp.all.omics.sig <- lapply(sig.genes.list, function(x){
+   Reduce(intersect, list(x[.id == 'rna_ab', gene],
+                       x[.id == 'prot_ab', gene],
+                       x[.id == 'prot_ph', gene]))
+})
+
+exp.rna.ab.sig <- lapply(sig.genes.list, function(x){
+   intersect(x[.id == 'rna_ab', gene],
+              x[.id == 'prot_ab', gene])
+
+})
+
+exp.rna.ph.sig <- lapply(sig.genes.list, function(x){
+   intersect(x[.id == 'rna_ab', gene],
+              x[.id == 'prot_ph', gene])
+
+})
+
+exp.ab.ph.sig <- lapply(sig.genes.list, function(x){
+   intersect(x[.id == 'prot_ph', gene],
+              x[.id == 'prot_ab', gene])
+
+})
+
+# combine all the different comparisons
+exp.list <- list(all = exp.all.omics.sig,
+                 rna.ab =exp.rna.ab.sig,
+                 rna.ph = exp.rna.ph.sig,
+                 ab.ph = exp.ab.ph.sig)
+
+
+# extract relevant sections of the raw data
+all.sig <- lapply(seq_along(sig.genes.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, fdr, log2FC) ]
+}, x=sig.genes.list, y=exp.all.omics.sig, n=names(sig.genes.list))
+
+rna.ab.sig <- lapply(seq_along(sig.genes.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, fdr, log2FC) ]
+}, x=sig.genes.list, y=exp.rna.ab.sig, n=names(sig.genes.list))
+
+rna.ph.sig <- lapply(seq_along(sig.genes.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, fdr, log2FC) ]
+}, x=sig.genes.list, y=exp.rna.ph.sig, n=names(sig.genes.list))
+
+ab.ph.sig <-  lapply(seq_along(sig.genes.list), function(x,y,n,i){
+  x[[i]][Label == n[[i]] & gene %in% y[[i]], .(.id, Label, gene, fdr, log2FC) ]
+}, x=sig.genes.list, y=exp.ab.ph.sig, n=names(sig.genes.list))
+
+
+sig.list <- list(all.sig = all.sig,
+                 rna.ab.sig = rna.ab.sig,
+                 rna.ph.sig = rna.ph.sig,
+                 ab.ph.sig = ab.ph.sig)
+
+exp.sig <- lapply(sig.list, function(x){ rbindlist(x)})
+
+
+exp.sig <- lapply(exp.sig, function(x){
+  dcast(x, gene+Label~.id, value.var=c('log2FC','fdr'))
+})
+
+
+
+#add label where the dataset came from
+lapply(seq_along(exp.sig), function(x,n,i){
+  x[[i]][, omics := n[[i]] ] 
+
+},x=exp.sig, n=names(exp.sig))
+
+
+#collapse the dataset into one 
+#fwrite(rbindlist(exp.sig), './output/17.06.experimental-omics-sig-genes.csv')
+
+test <- rbindlist(exp.sig)
+```

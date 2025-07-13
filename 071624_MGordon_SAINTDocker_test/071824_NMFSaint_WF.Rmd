@@ -1,0 +1,205 @@
+---
+title: "071824_NMF_SAINT_WF"
+author: "Martin Gordon"
+date: "2024-07-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## NMF-SAINT workflow
+
+```{r packages}
+library(nnls)
+library(ggplot2)
+library(data.table)
+library(NMF)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+library(ComplexHeatmap)
+```
+
+read in and tidy data
+```{r}
+spec.mat <- fread("./data/2024_06_25_PCMI_spectral_count.csv", header=T) %>% 
+  as.matrix(rownames='V1')
+
+
+colnames(spec.mat)
+
+# batch14 contrast mat
+batch14.int <- fread('./data/2021Nov_PCMI_emptyGFPbatch14-saint-baits-spc.txt', header = F)
+setnames(batch14.int, new=c('IP', 'Bait', 'Condition'))
+
+#batch14 interaxctions
+batch14.spc <- fread('./data/2021Nov_PCMI_emptyGFPbatch14-saint-interactions-spc.txt', header = F)
+setnames(batch14.spc, new=c('IP', 'Bait', 'Prey', 'Spc'))
+
+# match mat names
+batch14.dt[, IP := sub('[.]', '-', IP)]
+
+# remove batch 14
+f.mat <- spec.mat[, !colnames(spec.mat) %in% batch14.dt$IP]
+```
+
+Filtering out rows with no measurements (why are these in the table?)
+```{r}
+# filter rows with no values
+f.mat <- f.mat[rowSums(f.mat) != 0,] 
+# convert 0 to NA
+f.mat[f.mat == 0] <- NA
+```
+
+Normalization using tmp 
+```{r}
+# calc scaling factors using prey/rows with < 50% missingness
+NormalizationVec <- apply(f.mat, 1, function(x){sum(is.na(x)) < (ncol(f.mat)/2) })
+
+#calculate offset and convert back to linear space
+offsetCol <- 2^(medpolish(log2(f.mat[NormalizationVec,]), na.rm=T)$col)
+
+#normalize IPs
+f.mat <- sweep(f.mat, 2, offsetCol, "/")
+
+ggplot(reshape2::melt(f.mat), aes(x=Var2, y=log2(value))) +
+  geom_boxplot()
+```
+
+```{r}
+f.mat[is.na(f.mat)] <- 0
+
+# sqrt('completeness')/rowmaxCounts
+# weighting 'fullness' of protein detection across grps in conversion to linear scale
+SAINTScalingFactor <- sqrt(apply(f.mat, 1, function(x)sum(x!=0)) /
+      ncol(f.mat)) / 
+      apply(f.mat, 1, max)
+
+scaled.f.mat <- sweep(f.mat, 1, SAINTScalingFactor, "*")
+
+# scaled 0-1
+apply(scaled.f.mat,1, max)
+```
+
+```{r}
+SAINTnmf.out <- NMF::nmf(scaled.f.mat, rank = 6)
+```
+
+```{r}
+SAINT.BV <- SAINTnmf.out@fit@W
+
+# coeff matrix n * r;
+Heatmap(coef(SAINTnmf.out))
+# basis vec r * n
+Heatmap((SAINT.BV))
+```
+
+Now have our NMF basis vectors; assume these capture binding background patterns 
+Want to use this as bg for our test set; scale batch 14 to match our matrix
+
+Need to rescale this data
+
+```{r}
+batch14.mat <- dcast(batch14.spc, Prey~IP, value.var='Spc')
+
+merged.Batch14 <- merge(batch14.mat, 
+                        SAINTScalingFactor |> as.data.table(keep.rownames = TRUE), by.x= "Prey", by.y = "rn") 
+
+rownames(merged.Batch14) <- merged.Batch14$Prey
+merged.Batch14$Prey <- NULL
+
+scaled.Batch14 <- sweep(merged.Batch14, 1, merged.Batch14$SAINTScalingFactor, '*')
+```
+
+filtering out stuff not found in batch 14
+
+Worry with incorrect scaling is that when identifying the contribution of 
+```{r}
+# also not sure about this filtering.. d
+SAINT.BV <- SAINTnmf.out@fit@W[row.names(scaled.Batch14),]
+
+scaled.Batch14[is.na(scaled.Batch14)] <- 0
+
+SAINT.nnls <- apply(scaled.Batch14, 2, function(coln) nnls(SAINT.BV, coln)$x)
+
+
+SAINT.nnls
+
+
+SAINT.BV
+
+scaled.Batch14[,2]
+
+
+help(nnls)
+```
+
+```{r}
+dim(scaled.Batch14)
+
+
+23.2998058 * 
+
+dim(SAINT.Pseudo.Control)
+SAINT.Pseudo.Control <- SAINT.BV %*% SAINT.nnls
+
+SAINT.Pseudo.Control %>% View()
+SAINT.PC.long <- melt(SAINT.Pseudo.Control, variable.name = "run", id.vars = "rn", value.name = "PC spc") |> setDT()
+
+
+SAINT.Pseudo.Control[rownames(SAINT.Pseudo.Control) =='Q8NFD5',]
+
+SAINT.PC.long[, c("bait", "replicate") := tstrsplit(Var2, "\\-")]
+
+setnames(SAINT.PC.long, old = "Var1", new = "prey")
+
+setnames(SAINT.PC.long, old = "Var2", new = "run")
+
+SAINT.PC.long$replicate <- NULL
+```
+ first test 
+
+filter baits used in the SAINT test 
+```{r}
+preys.txt <- fread('./data/SAINTinput_batches/2021Nov_PCMI_emptyGFPbatch14-saint-preys-spc.txt')
+
+out.int <- fread('./data/merged.Batch14.interactions.txt')
+out.bait <- fread('./data/merged.Batch14.Baits.txt')
+
+fwrite(out.int[,.(V2,V3,V1,V4)], './data/reordered.merged.Batch14.interactions.txt', sep='\t', col.names = F)
+
+# writes to output, but need to filter to a smaller set
+fwrite(out.int[,.(V2,V3,V1,V4)], './data/minimal.Batch14.interactions.txt', sep='\t')
+
+min.ints <- rbind(out.int[grep('[-]14', V2)],out.int[grep('[-]14', V2, invert=T)][grep('GFP|EmptyVector', V2)])
+fwrite(min.ints[,.(V2,V3,V1,V4)], './data/reduced.Batch14.interactions.txt', sep='\t', col.names = F)
+```
+ Interactions with 0 counts must be removed from file in manual
+ 
+```{r}
+out.int[V1 == 'Q14192']
+preys.txt[V1 == 'Q14192',]
+
+
+
+fwrite(out.int[V4 != 0,.(V2,V3,V1,V4)], './data/reordered.merged.Batch14.interactions.txt', sep='\t', col.names = F)
+
+ 
+fread('./data/reordered.merged.Batch14.interactions.txt')
+
+# what about if we try this with the other files
+fread('./data/SAINTinput_batches/2021Nov_PCMI_emptyGFPbatch14-saint-interactions-spc.txt')
+```
+ 
+
+
+
+
+Considerations: 
+need to normalize the batch14 input for comparisons (can reuse median polish proceedure)
+Also, I think you have a problem with your reuse of scaling factors for the test batch;these values dont range between 0-1
+Rounding: do we want our values to be 0??
+
+Why in 0-1 scale? Beacuse we don't want proteins with different ranges of ints to have similar weight; interested in recovering patterns, but we dont want to test in this space

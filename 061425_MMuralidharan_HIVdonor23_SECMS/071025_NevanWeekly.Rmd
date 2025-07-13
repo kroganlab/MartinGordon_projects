@@ -1,0 +1,402 @@
+---
+title: "071025_NevanWeekly"
+author: "Martin Gordon"
+date: "2025-07-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Produce enrichment plots and scatterplots of the GO BP enirhcment scores for 
+Do a PCA of the delta scores of infected vs uninfected to compare the samples
+
+Just do a simple enrihcment for now and compare
+Use donor2 and 
+
+```{r}
+library(MSstats)
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+library(parallel)
+library(pbapply)
+
+# useful utility scripts
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+Read in the Ben Prophet and PCprophet pipeline
+
+```{r}
+sec.long <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_sec.long.normalized.interpolated.filtered.csv.gz')
+pcp.res <- fread('~/Library/CloudStorage/Box-Box/HIV_Infection_CD4T_cells/Analysis/PCProphet_newProteinMatrices/062325_DEcomparisons_donor2/DifferentialProteinReport.txt')
+
+bp.res <- fread('~/Library/CloudStorage/Box-Box/HIV_Infection_CD4T_cells/Analysis/Ben_pipeline/Tables/2025_06_26_hiv.d123.bestPeakperProtein.anova.wNsigpeaksLabel.csv')
+bp.res <- bp.res[grepl('_2$', contrast)]
+```
+
+combine the results
+
+```{r}
+pcp.res[, contrast := 'PCProphet_Challenged-vs-Uninfected']
+pcp.res[Sample_ID == 'INF', contrast := 'PCProphet_Infected-vs-Uninfected']
+        
+pcp.res[ ,sig := 'not']
+pcp.res[Probability_differential_abundance > .8, sig := 'yes']
+
+bp.res[, newContrast := paste0('BenPipeline_', gsub('_2$', '', contrast))]
+bp.res[, newContrast :=  gsub('_Uninfected', '-vs-Uninfected', newContrast)]
+bp.res <- bp.res[newContrast != "BenPipeline_Challenged_Infected"]
+
+bp.res[, sig := 'not']
+bp.res[treatmentDiff.padj < 0.0005, sig := 'yes']
+
+comb.res <- rbind(bp.res[, .(contrast=newContrast, gene, sig)],
+      pcp.res[, .(contrast, gene=GeneName, sig)])
+```
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+universe <- sec.long$gene %>% 
+  unique()
+```
+
+Run enrichment on the different groups to see what is found in our significant set
+```{r}
+comb.enrich <- enricherOnGroups(comb.res[sig != 'not'],
+                                groupColumns = 'contrast', 
+                                geneColumn = "gene", 
+                                term2gene.gmt = gmt.go, 
+                                universe = universe)
+```
+
+```{r}
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(comb.enrich,
+                                                         gmt.go, 
+                                                         groupColumn = 'contrast',
+                                                         max_pAdjust = 0.1)
+```
+
+```{r, heatmap, fig.height=7, fig.width=7}
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified,
+                                  groupColumn = 'contrast', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  border=T,
+                                  column_split = c('Ben Pipeline', 'Ben Pipeline', 'PCprophet', 'PCprophet'),
+                                  upperThreshold = 10,
+                                  topN=20,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+
+BackupAsPDF(draw(ht$hmList), 'hiv.d2.diffElutingProteins.GO.BP.enrichment.heatmap')
+
+```
+take top 100
+```{r}
+setorder(bp.res, treatmentDiff.p)
+setorder(pcp.res, -Probability_differential_abundance)
+
+comb.res <- rbind(bp.res[, .SD[1:100], by=contrast][, .(contrast=newContrast, gene, sig)],
+                  pcp.res[, .SD[1:100], by=contrast][,.(contrast, gene=GeneName, sig)])
+```
+```{r}
+comb.enrich <- enricherOnGroups(comb.res,
+                                groupColumns = 'contrast', 
+                                geneColumn = "gene", 
+                                term2gene.gmt = gmt.go, 
+                                universe = universe)
+```
+
+```{r}
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(comb.enrich,
+                                                         gmt.go, 
+                                                         groupColumn = 'contrast',
+                                                         max_pAdjust = 0.1)
+```
+
+```{r, heatmap, fig.height=7, fig.width=7}
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified,
+                                  groupColumn = 'contrast', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  border=T,
+                                  column_split = c('Ben Pipeline', 'Ben Pipeline', 'PCprophet', 'PCprophet'),
+                                  upperThreshold = 10,
+                                  topN=20,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+BackupAsPDF(draw(ht$hmList), 'hiv.d2.diffElutingProteins.GO.BP.top100.enrichment.heatmap')
+
+```
+match the number of sig hits 
+
+```{r}
+bp.res[, sig := 'not']
+
+setorder(bp.res, treatmentDiff.p)
+setorder(pcp.res, -Probability_differential_abundance)
+pcp.res <- pcp.res[GeneName %in% bp.res$gene,]
+
+comb.res <- rbind(bp.res[, .SD[1:400], by=contrast][,.(contrast=newContrast, gene, sig)],
+                  pcp.res[, .SD[1:400], by=contrast][, .(contrast, gene=GeneName, sig)])
+```
+
+```{r}
+comb.enrich <- enricherOnGroups(comb.res,
+                                groupColumns = 'contrast', 
+                                geneColumn = "gene", 
+                                term2gene.gmt = gmt.go, 
+                                universe = universe)
+
+```
+
+```{r}
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(comb.enrich,
+                                                         gmt.go, 
+                                                         groupColumn = 'contrast',
+                                                         max_pAdjust = 0.1)
+```
+
+```{r, heatmap, fig.height=7, fig.width=7}
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified,
+                                  groupColumn = 'contrast', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  border=T,
+                                  column_split = c('Ben Pipeline', 'Ben Pipeline', 'PCprophet', 'PCprophet'),
+                                  upperThreshold = 10,
+                                  topN=20,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+
+ht
+BackupAsPDF(draw(ht$hmList), 'hiv.d2.diffElutingProteins.GO.BP.top400.enrichment.heatmap')
+```
+
+```{r, fig.width=7, fig.height=10}
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = comb.enrich,
+                                  groupColumn = 'contrast', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  border=T,
+                                  column_split = c('Ben Pipeline', 'Ben Pipeline', 'PCprophet', 'PCprophet'),
+                                  upperThreshold = 10,
+                                  topN=30,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+
+ht
+BackupAsPDF(draw(ht$hmList), 'hiv.d2.diffElutingProteins.GO.BP.top400.enrichmentExpanded.heatmap')
+```
+
+```{r}
+fwrite(comb.enrich, ScriptAndDatedFileName('go.bp.enrich.top400.BPAndPCPpipeline.csv'))
+
+```
+
+One other thing; lets look at a PCA of the differential results for the Ben pipeline; how do things tend to cluster
+```{r}
+bp.res <- fread('~/Library/CloudStorage/Box-Box/HIV_Infection_CD4T_cells/Analysis/Ben_pipeline/Tables/2025_06_26_hiv.d123.bestPeakperProtein.anova.wNsigpeaksLabel.csv')
+
+#
+bp.res[, diffScore := -log10(treatmentDiff.p)]
+```
+
+create a matrix of the differential results from the bp.res
+```{r}
+bp.mat <- dcast(bp.res, protein~contrast, value.var='diffScore') %>% 
+  as.matrix(rownames='protein')
+
+bp.mat[, !grepl('Challenged_[.+]_1$', colnames(bp.mat))]
+
+bp.mat <- bp.mat[, !grepl('Challenged_[UI].+_1$', colnames(bp.mat))]
+
+bp.mat <- bp.mat[complete.cases(bp.mat),]
+```
+
+```{r}
+pcaOut <- prcomp(t(bp.mat))
+
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT$rn
+
+pcaDT[,contrast := gsub('_[123]$','', rn)]
+pcaDT[, donor := gsub('.+_','', rn)]
+
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(pcaDT$condition)))
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = donor, shape=contrast)) + 
+  geom_point(size=4) +
+  ggrepel::geom_text_repel(aes(label=gsub('[.]quant[.]sf', '', rn)), show.legend = FALSE, size = 2) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("Sample clustering based on protein differential elution scores\n%s shared protein IDs across conditions",nrow(bp.mat))) +
+  scale_fill_brewer(type = "qual", palette = 2) +
+  scale_shape_manual(values = 21:25) +
+ # scale_fill_manual(values=col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+
+
+BackupAsPDF(p, 'pca.diffScore.rmMissingVals.pca')
+```
+limit the PCA a set of consistent genes
+What are consistent/high quality genes? phageoome/ribosome set?
+
+
+# 
+
+```{r}
+samples.oi <- sec.long$sample %>%
+  unique()
+samples.oi <- grep('D1-Challenged', samples.oi, invert=T, value = T)
+
+sec.long <- sec.long[sample %in% samples.oi,]
+sec.long[, total.intensity := sum(intensity, na.rm=T), by=.(sample, protein)]
+```
+subset to shared genes,get the 1000 most abundfance
+```{r}
+setorder(sec.long, -total.intensity)
+
+shared.genes <- sec.long[, .SD[,.(protein=unique(protein))], by='sample'][,.N, by=protein][N== 7, protein]
+sec.long <- sec.long[protein %in% shared.genes,]
+
+# for ranking could just have used intensity, dont need actual rank
+gene.rank.dt <- sec.long[,.(sample, protein, gene, total.intensity, consecutiveDetections)] %>% 
+  unique()
+gene.rank.dt[, abundanceRank := rank(-total.intensity,na.last = T), by=.(sample)]
+
+setorder(gene.rank.dt, sample, abundanceRank)
+
+goodGenes <- gene.rank.dt[, .SD[1:1000,], by=.(sample)][consecutiveDetections >= 5, unique(protein)]
+```
+
+1296 made it to complete cases differential test
+
+```{r}
+bp.mat <- dcast(bp.res[protein %in% goodGenes,], protein~contrast, value.var='diffScore') %>% 
+  as.matrix(rownames='protein')
+
+bp.mat[, !grepl('Challenged_[.+]_1$', colnames(bp.mat))]
+
+bp.mat <- bp.mat[, !grepl('Challenged_[UI].+_1$', colnames(bp.mat))]
+bp.mat <- bp.mat[complete.cases(bp.mat),]
+```
+
+```{r}
+pcaOut <- prcomp(t(bp.mat))
+
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT$rn
+
+pcaDT[,contrast := gsub('_[123]$','', rn)]
+pcaDT[, donor := gsub('.+_','', rn)]
+
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = donor, shape=contrast)) + 
+  geom_point(size=4) +
+  ggrepel::geom_text_repel(aes(label=gsub('[.]quant[.]sf', '', rn)), show.legend = FALSE, size = 2) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("Sample clustering based on protein differential elution scores\n%s shared protein IDs across conditions",nrow(bp.mat))) +
+  scale_fill_brewer(type = "qual", palette = 2) +
+  scale_shape_manual(values = 21:25) +
+ # scale_fill_manual(values=col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+
+BackupAsPDF(p, 'pca.diffScore.highABundaceproteins.rmMissingVals.pca')
+```
+look at breakdown of the  differential set
+
+```{r}
+bigMovers <- bp.res[protein %in% goodGenes & treatmentDiff.padj < 0.005, unique(protein)]
+
+bigMovers %>% length()
+rownames(bp.mat) %>% length()
+```
+
+
+```{r}
+bigMovers <- bp.res[protein %in% goodGenes & treatmentDiff.padj < 0.005, unique(protein)]
+
+bigMovers %in% rownames(bp.mat) %>% length()
+ 
+bp.mat <- dcast(bp.res[gene %in% goodGenes & treatmentDiff.padj < 0.005,,], protein~contrast, value.var='diffScore') %>% 
+  as.matrix(rownames='protein')
+
+bp.mat <- bp.mat[, !grepl('Challenged_[UI].+_1$', colnames(bp.mat))]
+bp.mat <- bp.mat[complete.cases(bp.mat),]
+
+pca.loadings <- as.data.table(pcaOut$rotation, keep.rownames = T)
+setorder(pca.loadings, -PC1)
+
+
+fgsea::fgseaMultilevel()	
+```
+
+
+```{r}
+pcaOut <- prcomp(t(bp.mat))
+
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT$rn
+
+pcaDT[,contrast := gsub('_[123]$','', rn)]
+pcaDT[, donor := gsub('.+_','', rn)]
+
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = donor, shape=contrast)) + 
+  geom_point(size=4) +
+  ggrepel::geom_text_repel(aes(label=gsub('[.]quant[.]sf', '', rn)), show.legend = FALSE, size = 2) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("Sample clustering based on protein differential elution scores\n%s shared protein IDs across conditions",nrow(bp.mat))) +
+  scale_fill_brewer(type = "qual", palette = 2) +
+  scale_shape_manual(values = 21:25) +
+ # scale_fill_manual(values=col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+
+BackupAsPDF(p, 'pca.diffScore.highABundaceproteins.rmMissingVals.pca')
+```
+

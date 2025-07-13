@@ -1,0 +1,990 @@
+---
+title: "060325_coelutionDetection"
+author: "Martin Gordon"
+date: "2025-06-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+Coelution detection of the SEC-MS datasets
+After qucik overview of QC and tidy of missing fractions, run BP pipeline to detect co-eluting proteins in the data
+Our focus here should be to detect co-eluting viral and host proteins, and then see if any of these proteins shift in one condition vs another
+
+```{r cars}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+library(eulerr)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# flag consec proteins
+source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+```
+
+Read in the fitlered normalized and interpolated protein set
+```{r}
+sec.long <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_poxSECMS_firstLook_data/2025_06_03_sec.long.normalized.interpolated.filtered.csv.gz')
+sec.long[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+```
+
+Viral protein set (I think??)
+
+```{r}
+viral.prots <- fread('./data/2024_10_25_SEC_MS_Input_Long.csv.gz') %>% 
+  .[!grepl('HUMAN|mCherry', Protein.Names), unique(Protein.Names)]
+```
+
+
+```{r, peakDetection}
+# to be safe drop the empty rows
+normInt.mats <- scaledIntensityMatrices(sec.long[protein != 'MCHERRY'])
+
+peakTables <- lapply(normInt.mats, goodPeaksTableFromIntensityMatrix, minCV = -Inf)
+allPeaks <- rbindlist(peakTables, idcol = "sample")
+fwrite(allPeaks, ScriptAndDatedFileName('poxInf.detectedPeaks.csv.gz'))
+
+allPeaks <- fread('~/Documents/projects/043025_MGordon_SECMS_QCplotsWork/060325_coelutionDetection_data/2025_06_03_poxInf.detectedPeaks.csv.gz')
+```
+
+```{r goodpeaks, fig.height=8, fig.width=10}
+# udpate height for more samples
+p <- ggplot(allPeaks, aes(x= peakLocation, fill = goodPeak)) + 
+  geom_bar() + 
+  facet_grid(sample~.) +
+  theme_bw()
+p
+BackupAsPDF(p, "peakCountsPerFraction.barchart")
+```
+```{r, peak-fraction-adjustments}
+standardizeAllPeakTablesToStandard(peakTables, sec.long, standardIdx = "Mock_R1", fitPortion = 0.65, minPeaksPerFraction = 45, startFitAtPeak = 20)
+fwrite(sec.long, ScriptAndDatedFileName('pox.sec.ms.wStandardisedFractions.csv.gz'))
+```
+No molecular weight standards for this data, so we just have to go forward with peak detection; 
+I guess as we have replicates for this data, if we can find a consistent shift across replicates, then that would be great validation
+
+```{r, gs-decoy-sets eval = FALSE}
+# id mapper for protein -> string ID
+huString.mapper <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_protein.string.idMapper.csv.gz')
+
+#need to merge our protein ids with 
+gs.interactors <- goldStandardPairs(huString.mapper[protein %in% sec.long$protein, unique(stringID)], 
+                                    corum.path = NULL,
+                                    string.links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                                    string.info.path =  NULL,
+                                    stringCombinedScoreThreshold = 250)
+gs.decoys <- decoysFromString(huString.mapper[protein %in% sec.long$protein, unique(stringID)], 
+                              links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                              info.path =  NULL)
+gs.decoys[, source := 'string']
+
+gs.comb.interactors <- rbind(gs.interactors, gs.decoys)
+```
+
+## peak-peak correlations
+
+```{r, peak-correlations}
+# just ensure a refresh
+
+View(scaledIntensityMatrices)
+sec.long$intensity_totalScaled <- NULL
+intMats <- scaledIntensityMatrices(sec.long)
+intensityHeatmaps(intMats, border=T)
+
+saveRDS(intMats, ScriptAndDatedFileName('poxVirus.norm.totalScaled.intsMats.rds'))
+intMats <- readRDS('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_03_poxVirus.norm.totalScaled.intsMats.rds')
+
+peakMatrices <- purrr::map2(intMats, peakTables, goodPeaksMatFromPeaksTable)
+corPeaks.ls <- purrr::map2(intMats, peakMatrices, windowedCorrelation, outerRadius = 6)
+allPeakCorrs <- rbindlist(purrr::map(corPeaks.ls, "cor"), idcol = "sample")
+```
+
+```{r annotate-peakDT}
+anno.dt <- fread('./data/2024_10_25_SEC_MS_Input_Long.csv.gz') %>% 
+  .[, .(protein=Protein.Ids, gene=Genes)] %>% 
+  unique()
+
+sec.long[anno.dt, gene := i.gene, on=.(protein)]
+
+allPeakCorrs[huString.mapper, gene1 := i.stringID, on = c(protein1 = "protein")]
+allPeakCorrs[huString.mapper, gene2 := i.stringID, on = c(protein2 = "protein")]
+allPeakCorrs[anno.dt, alias1 := i.gene, on = c(protein1 = "protein")]
+allPeakCorrs[anno.dt, alias2 := i.gene, on = c(protein2 = "protein")]
+
+
+# for now use protein as gene for the NA gene
+allPeakCorrs[is.na(gene1), gene1 := protein1]
+allPeakCorrs[is.na(gene2), gene2 := protein2]
+
+#fwrite(allPeakCorrs, ScriptAndDatedFileName('secms.pox.allByallPeakCorr.csv.gz'))
+allPeakCorrs <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_04_secms.pox.allByallPeakCorr.csv.gz')
+
+```
+
+```{r}
+allPeakCorrs
+allPeakCorrs[, gs := "unknown"]
+allPeakCorrs[gs.interactors ,gs := "interactor" , on = c("gene1", "gene2")]
+allPeakCorrs[gs.decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+```
+
+plot the recovery of peaks in each
+Looks terrible; ~50% FDR; cant distinguish between TP and FP detection
+What could be the issue? my imputation/interpolation? Maybe later rerun with the normalized only and see id we get the same issues... I think the zeroing out of bum fractions is an issue, but not the key one..
+
+This is also possibly an issue with my imputation technique.. I think zeroing out all outlier fractions is an issue if these are flanking as we cant resolve them, unless we expand our N consecutive fractions?
+Options for now? proceed as is and just take proteins that are correlated across >= 2 replicates to remove these high number of FP detections
+
+r > .9 is not stringent enough to distinuigh, lets see how GS enrihcment works...
+
+```{r,plot-correlations, fig.width=9,fig.height=6}
+
+g <- ggplot(allPeakCorrs[gene1 < gene2 & gs != 'unknown'], aes(x = sample, fill = gs)) +
+    geom_bar() + 
+    labs(title=paste0('Breakdown of detected interactors (R >= .9)')) +
+    theme_bw() + 
+    scale_fill_manual(values=c('decoy'='grey70', 'interactor'='gold'))
+g
+BackupAsPDF(g, 'interactorSet.breakdown.barplot')
+
+g <- ggplot(allPeakCorrs[gene1 < gene2 & pearsonR >= 0.99 & gs != 'unknown'], aes(x = sample, fill = gs)) +
+    geom_bar() + 
+    labs(title=('Breakdown of detected interactors'), subtitle='pearson R > 0.99') +
+    theme_bw() + 
+    scale_fill_manual(values=c('decoy'='grey70', 'interactor'='gold'))
+g
+BackupAsPDF(g, 'interactorSet.breakdown.r99.barplot')
+```
+Interesting thing is the samples with the huge number of detections... What fractions are these edits found in?
+```{r}
+samples.oi <- c('Mock_R2', 'VacV_R3')
+
+g <- ggplot(allPeakCorrs[gene1 < gene2 & gs != 'unknown' & sample %in% samples.oi,.N, by=.(prot1Peak, sample)], aes(x=prot1Peak, y=N)) +
+  geom_bar(stat='Identity') +
+  facet_grid(sample~.) +
+  theme_bw()
+g
+BackupAsPDF(g, 'peakLocations.problematicFractions.barplot')
+
+g <- ggplot(allPeakCorrs[,.N, by=.(prot2Peak, sample)], aes(x=prot2Peak, y=N)) +
+  geom_bar(stat='Identity') +
+  facet_grid(sample~.) +
+  theme_bw()
+g
+```
+
+```{r}
+allGenes <- huString.mapper$stringID %>% 
+  unique()
+denomInteractor <- nrow(gs.interactors[gene1 %in% allGenes & gene2 %in% allGenes])
+denomDecoy <- nrow(gs.decoys[gene1 %in% allGenes & gene2 %in% allGenes])
+```
+Using log-likihood ratio approach; how more likey is the PPI derived from the truth set than the random set
+Looks liek a lot of decoys also correlate with
+```{r ppi-scoring}
+scoreByGS(allPeakCorrs, denomDecoy, denomInteractor, column = "corScore", groupByVariable = c("sample", "start"))
+```
+plot the LLR to see how; distance between lines is what is being scored
+```{r}
+g <- ggplot(allPeakCorrs, aes(x = corScore, y = log10RateRatioID, color = start)) + geom_hline(yintercept = 0.0, lty = "dotted") + 
+    geom_line(aes(group = start)) + 
+    facet_wrap(~sample, ncol=3) + 
+    scale_color_viridis_c(option = "H", name = "fraction") + 
+    theme_bw()
+g
+BackupAsPDF(g, 'LLR.samples.linechart')
+```
+summarize to protein level and order pairs
+```{r}
+stoichDevThreshold <- log2(1 + 0.2)
+setorder(allPeakCorrs, sample, -log10RateRatioID )
+summary <- allPeakCorrs[, .SD[1], by= .(sample, protein1, protein2, gene1, gene2, alias1=gsub('[.].+','',alias1), alias2=sub('[.].+','',alias2), prot1Peak, prot2Peak, gs) # best correlation per pair of peaks
+                          ][, .(sumLLRatio = sum(log10RateRatioID[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]), # only sum peaks that are within 20% of the first
+                                numPeaks = .N,
+                                numSameStoichPeaks  = sum (abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold)),
+                            by = .(sample, protein1, protein2, gene1, gene2, alias1, alias2, gs)
+                            ]
+setorder(summary, sample, -sumLLRatio)
+
+summary[, ppi := paste0(alias1, '_', alias2)]
+summary[, ppi_ordered := {
+  strsplit(ppi, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+fwrite(summary[gene1 < gene2], ScriptAndDatedFileName("fullSet.peakSimilarityScores.csv.gz"))
+```
+
+# considering the high FP rate, we can use the info in replicates to help reduce this FP detection (I wonder if we look at the truth/decoy recovery for those with >=2 detections per group would it improve?)
+```{r}
+summary <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_04_fullSet.peakSimilarityScores.csv.gz')
+summary[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+
+# only keep those that are reported in>=2 replicates
+keepPairs <- summary[,.N, by=.(protein1, protein2,treatment)][N>=2, .(protein1, protein2, treatment)]
+keepPairs
+
+summary.subset <- summary[keepPairs, , on=.(treatment,protein1, protein2)]
+
+# even after only including those with 2+ reps the FDR is ~50%
+ggplot(summary.subset[gs != 'unknown',.N, by=.(sample, gs)], aes(x=sample, y=N, fill=gs)) +
+  geom_bar(stat='identity', position = 'stack')
+
+#fwrite(summary.subset, ScriptAndDatedFileName("min2RepsSet.peakSimilarityScores.csv.gz"))
+```
+
+In addition to this, considering the high FP detections, we can also look at those that passed a high LLR ratio 
+Set a LLR that controls the FP discovery at ~ 5-10% and then subset to that, then look for PPI found in +1 replicate
+```{r}
+plotProportionDecoysOverLLR <- function(dt, LLRvec=seq(0,3,0.1)){
+  
+  score.dt <- lapply(LLRvec, function(thres){
+     summary[gs != 'unknown' & sumLLRatio >= thres,.N, by=.(sample,gs)] %>% 
+  .[, .(FDR = N[gs == 'decoy']/sum(N), LLR_thresh=thres), by=sample]
+  }) %>% rbindlist()
+
+  ggplot(score.dt, aes(x=LLR_thresh, y=FDR, group=sample, color=sample)) +
+    geom_line() +
+    geom_hline(yintercept=0.1, linetype=2, color='red') +
+    geom_vline(xintercept=1.75, linetype=2, color='red') +
+    labs(y='N decoy/N total') +
+    theme_bw()
+}
+
+g <- plotProportionDecoysOverLLR(dt=summary, LLRvec = seq(0,3,0.1))
+BackupAsPDF(g, 'LLRthresholdDecoyRecovery.linechart')
+```
+Based on above, set 1.75 sumLLR as the threshold for subsetting and select from those the PPI that are identified in at least two replicates (try both sets and see which ones recover hits from the APMS)
+
+```{r}
+fwrite(summary[sumLLRatio >= 1.75,], ScriptAndDatedFileName("minLLR.1.75.peakSimilarityScores.csv.gz"))
+summary.LLR <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_04_minLLR.1.75.peakSimilarityScores.csv.gz')
+
+# inner join; only matching rows
+summary.LLR.subset <- summary.LLR[keepPairs, on = .(treatment, protein1, protein2), nomatch = 0] #drop rows with no match
+# right join; keep all rows in summary.LLR
+#keepPairs[summary.LLR, on = .(treatment, protein1, protein2)]
+# cool; all of this high scoring set was detected in at least two replicates
+```
+
+Try the more significant set first; any of these co-elute?
+Look at the ordered gene info 
+```{r}
+summary.LLR.subset[, ppi := paste0(alias1, '_', alias2)]
+summary.LLR.subset[, ppi_ordered := {
+  strsplit(ppi, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+#fwrite(summary.LLR.subset, ScriptAndDatedFileName('minLLR.1.75.2reps.peakSimilarityScores.csv.gz'))
+summary.LLR.subset <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_04_minLLR.1.75.2reps.peakSimilarityScores.csv.gz')
+```
+
+```{r}
+summary.subset <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_04_min2RepsSet.peakSimilarityScores.csv.gz')
+summary.subset[, ppi := paste0(alias1, '_', alias2)]
+
+# each of these are found in at least two replicates; group by treatment so we can see which 
+
+summary.subset[(protein1 %in% viralIDs & !protein2 %in% viralIDs)]
+summary.subset[(protein2 %in% viralIDs & !protein1 %in% viralIDs)]
+
+# host-viral PPI detected in >=2 replicates per treatment
+host.viral <- summary.subset[(protein1 %in% viralIDs & !protein2 %in% viralIDs) | (!protein1 %in% viralIDs & protein2 %in% viralIDs),]
+viral.viral <- summary.subset[(protein1 %in% viralIDs & protein2 %in% viralIDs),]
+
+```
+barplot of number of host viral PPI in each 
+```{r}
+g <- ggplot(host.viral[, length(unique(ppi)), by=.(sample)], aes(x=sample, y=V1)) +
+  geom_bar(stat='identity') +
+  theme_bw()
+g
+```
+List of host-viral and viral-viral complexes from Adrian; do any of these interactors have a LLR > 3 in our data and/or recovered in >2 samples?
+
+```{r}
+viral.viral.sec <- "H4L;D11L
+H4L;A24R
+D1R;D7R
+D7R;A24R
+G5.5R;A24R
+E4L;J6R
+D6R;A7L
+J6R;D11L
+E4L;H4L
+A29L;A24R
+A27L;H3L
+A17L;H3L
+A26L;A27L
+A27L;A17L
+G3L;L5R
+H3L;VACWR148
+A26L;H3L
+A27L;A16L
+A13L;A32L
+A32L;I6L
+A20L;D4R
+A20L;E9L
+A28L;H2R
+A16L;G9R
+A16L;A26L
+G9R;J5L
+A56R;A16L
+A56R;G9R
+G2R;H5R
+H5R;A18R
+A18R;G2R
+E2L;F12L
+K2L;A16L
+K2L;G9R
+A56R;K2L
+F12L;A36R
+A26L;G9R
+A20R;D4R
+A20R;E9L"
+
+
+vv.apms <- data.table(pair=gsub(';', '_', strsplit(viral.viral.sec, '\n')[[1]]))
+vv.apms[, c('protein1', 'protein2') := tstrsplit(pair, '_', keep=c(1,2))]
+
+# now alphabetically order the pairs and name it paired ordered. Do for our SEC-MS data also
+vv.apms[, ppi_ordered := {
+  strsplit(pair, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+vv.apms
+fwrite(vv.apms[,.(ppi_ordered, protein1, protein2)], ScriptAndDatedFileName('viral.viral.apms.csv.gz'))
+```
+Do the same for human-virus set
+
+```{r}
+viral.host.sec <- "A36R;P33176;KIF5B
+A46R;Q15629;TRAM1
+A55R;Q13618;CUL3
+C10L;Q9GZT9;EGLN1
+C10L;P13010;XRCC5
+C10L;P12956;XRCC6
+C4L;O75369;FLNB
+C4L;P13010;XRCC5
+C4L;P12956;XRCC6
+C6L;P56524;HDAC4
+C6L;Q9UQL6;HDAC5
+C6L;Q9C035;TRIM5
+E3L;Q14444;CAPRIN1
+F14L;Q92793;CREBBP
+F1L;Q16611;BAK1
+F1L;Q07812;BAX
+F1L;P55957;BID
+H1L;P42224;STAT1
+K1L;Q15057;ACAP2
+K3L;P19525;EIF2AK2
+K7R;O00571;DDX3X
+K7R;Q9H9C1;VIPAS39
+K7R;Q4G0F5;VPS26B
+K7R;Q9H267;VPS33B
+K7R;Q96QK1;VPS35
+K7R;Q08AE8;SPIRE1
+VACWR018;P42224;STAT1
+B18R;Q13616;CUL1
+B18R;P63208;SKP1
+N2L;P52292;KPNA2
+C9L;Q13616;CUL1
+C11R;P00533;EGFR"
+
+
+vh.apms <- data.table(id=strsplit(viral.host.sec, '\n')[[1]])
+vh.apms[, c('protein1', 'protein2') := tstrsplit(id, ';', keep=c(1,2))]
+vh.apms[anno.dt, gene2 := i.gene, on = c(protein2 = "protein")]
+vh.apms[, pair := paste0(protein1, '_', gene2)]
+
+vh.apms[, ppi_ordered := {
+  strsplit(pair, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+fwrite(vh.apms[,.(ppi_ordered, protein1, protein2)], ScriptAndDatedFileName('viral.host.apms.csv.gz'))
+```
+
+Read in the subset LLR set and see how many of the sig SEC-MS overlap with the other two sets
+
+```{r}
+vh.apms <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_04_viral.host.apms.csv.gz')
+vv.apms <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_04_viral.viral.apms.csv.gz')
+
+summary.LLR.subset <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_04_minLLR.1.75.2reps.peakSimilarityScores.csv.gz')
+```
+
+Lets look at a venn diagram of overlapping coeluting sets
+V poor overlap; XRCC5_C10L only. When we drop the min two replicates filter we recover XRCC6_C10L
+```{r}
+library(eulerr)
+
+summary.LLR.subset
+data.list <- list(`SEC-MS ppi` = summary.LLR.subset[treatment != 'Mock', unique(ppi_ordered)],
+     `viral-viral APMS ppi`=vv.apms[, unique(ppi_ordered)],
+     `viral-host APMS ppi`=vh.apms[, unique(ppi_ordered)]
+     )
+
+p <- plot(eulerr::euler(data.list, quantities = TRUE))
+BackupAsPDF(p, 'apms.secms.highConf.overlaps')
+
+# only one overlap; XRCC5 and C10L... not v promising
+summary.LLR[ppi_ordered %in% vh.apms[,unique(ppi_ordered)]]
+```
+Not great; drop the threshold to just those scoring over 1.75 (dont filter for presence in different replicates)
+
+```{r}
+# 71 ppi in total
+nrow(vv.apms) + nrow(vh.apms)
+
+data.list <- list(`SEC-MS ppi` = summary.LLR[treatment != 'Mock', unique(ppi_ordered)],
+     `viral-viral APMS ppi`=vv.apms[, unique(ppi_ordered)],
+     `viral-host APMS ppi`=vh.apms[, unique(ppi_ordered)]
+     )
+
+p <- plot(eulerr::euler(data.list, quantities = TRUE))
+p
+# only 20 things in summary appear, and some of these have a terrible LLR 
+apms.subset <- rbind(summary[ppi_ordered %in% vh.apms$ppi_ordered, ], summary[ppi_ordered %in% vv.apms$ppi_ordered, ])
+apms.subset[, source := ifelse(protein1 %in% viralIDs & protein2 %in% viralIDs, 'viral-viral', 'viral-host')]
+
+ggplot(apms.subset, aes(x=sumLLRatio, fill=source)) +
+  geom_histogram() +
+  theme_bw()
+```
+
+Look at the viral proteins expression across all the samples
+Looking at their profiles, its possible a lot of these viral proteins are quite 'smudgy' and dont have clearly definied peaks
+```{r}
+subMats <- lapply(intMats, function(x){
+  return(x[rownames(x) %in% viralIDs,])
+})
+
+g <- intensityHeatmaps(subMats)
+g
+BackupAsPDF(g, 'viralProts.heatmaps')
+```
+## cosine sim
+Whats interesting looking at this set of proteins is that they look kind of 'blotchy'
+Maybe cosine similarity might be a better indicator of interaction?
+```{r}
+cosMats <- pbapply::pblapply(intMats, cosineMatrix)
+
+
+View(cosineMatrix)
+names(cosMats)
+plot(density(cosMats[[1]],  na.rm = TRUE))
+lines(density(cosMats[[2]], na.rm = TRUE),  col= "red")
+lines(density(cosMats[[3]], na.rm = TRUE),  col= "orange")
+ lines(density(cosMats[[4]], na.rm = TRUE),  col= "forestgreen")
+ lines(density(cosMats[[5]], na.rm = TRUE),  col= "blue")
+ lines(density(cosMats[[6]], na.rm = TRUE),  col= "purple")
+ lines(density(cosMats[[7]], na.rm = TRUE),  col= "magenta")
+ lines(density(cosMats[[8]], na.rm = TRUE),  col= "firebrick")
+
+```
+
+
+
+```{r}
+cosineMat2Table <- function(mat, threshold = 0.9){
+  idx <- which(mat > threshold , arr.ind = TRUE)
+  
+  dt <- as.data.table(idx,
+                    keep.rownames = TRUE)
+  setnames(dt, "rn", "protein1")
+  dt[, protein2 := colnames(mat)[col]]
+  dt[, cosSim := mat[idx]]
+  dt[, c("row", "col") := NULL ]
+  return (dt[protein1 != protein2,])
+}
+
+cosSim.dt <- pbapply::pblapply(cosMats, cosineMat2Table, threshold = -1) %>% 
+  rbindlist(idcol = "sample")
+
+```
+add annotation info
+```{r}
+# for now use protein as gene for the NA gene
+cosSim.dt[, gene1 := protein1]
+cosSim.dt[, gene2 := protein2]
+
+cosSim.dt[huString.mapper, gene1 := i.stringID, on = c(protein1 = "protein")]
+cosSim.dt[huString.mapper, gene2 := i.stringID, on = c(protein2 = "protein")]
+cosSim.dt[anno.dt, alias1 := i.gene, on = c(protein1 = "protein")]
+cosSim.dt[anno.dt, alias2 := i.gene, on = c(protein2 = "protein")]
+
+cosSim.dt[, gs := "unknown"]
+cosSim.dt[gene1 > gene2, gs := "reverse"]
+cosSim.dt[gs.interactors, gs := "interactor" , on = c("gene1", "gene2")]
+cosSim.dt[gs.decoys, gs := "decoy" , on = c("gene1", "gene2")]
+```
+Looks to be pretty decent sepration between the groups compared to the peak based method.
+```{r, cosSim-histogram, fig.width=12, fig.height=7}
+g <- ggplot(cosSim.dt[gs %in% c("decoy", "interactor")], aes (x = cosSim, fill=gs)) + 
+  geom_histogram(boundary = 1.0, binwidth = 0.003) +
+  scale_fill_manual(values=c('interactor'='gold', 'decoy'='grey70')) +
+  facet_grid(gs~sample, scales = "free_y") +
+  theme_bw()
+g
+BackupAsPDF(g, 'cosineSimilarity.decoyVsinteractor.histogram')
+
+
+g <- ggplot(cosSim.dt[gs %in% c("decoy", "interactor")], aes (x = cosSim, color=gs)) + 
+  #geom_histogram(boundary = 1.0, binwidth = 0.003) +
+  geom_density() +
+  scale_color_manual(values=c('interactor'='gold', 'decoy'='grey70')) +
+  facet_wrap(~sample, scales = "free_y") +
+  theme_bw()
+g
+BackupAsPDF(g, 'cosineSimilarity.decoyVsinteractor.density')
+```
+
+Save the cosine similarity results
+```{r}
+cosSim.dt <- cosSim.dt[cosSim > 0.8][gene1 < gene2]
+fwrite(cosSim.dt, ScriptAndDatedFileName('pox.cosineSimilarity.highScores.csv.gz'))
+
+cosSim.dt <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_05_pox.cosineSimilarity.highScores.csv.gz')
+```
+
+score by GS; need to review how this function works
+```{r}
+scoreByGS(cosSim.dt, denomDecoy, denomInteractor, column = "cosSim", groupByVariable = c("sample" ))
+```
+
+```{r}
+sub.dt <- unique(cosSim.dt[, .(sample, cosSim = round (cosSim, 4), log10RateRatioID =  signif(log10RateRatioID,3), interactorCount)])
+
+ggplot(sub.dt, aes(x = -log10(1-cosSim), y = log10RateRatioID, color = sample)) + geom_line()
+ggplot (sub.dt, aes(x = -log10(interactorCount), y = log10RateRatioID, color = sample)) + geom_line()
+```
+Combine this scoring with peak based similarity 
+```{r}
+allScores <- merge(summary[gene1 < gene2][, .(sample, protein1, protein2, peakLLRatio = sumLLRatio, numPeaksScored = numSameStoichPeaks)],
+                   cosSim.dt[, .(sample, protein1, protein2, cosLLRatio = log10RateRatioID )],
+                   by = c("sample", "protein1", "protein2"),
+                   all = TRUE)
+
+```
+
+add annotation info and select the best LLR as the score per pair
+```{r}
+## for now use protein as gene for the NA gene
+allScores[, gene1 := protein1]
+allScores[, gene2 := protein2]
+
+allScores[huString.mapper, gene1 := i.stringID, on = c(protein1 = "protein")]
+allScores[huString.mapper, gene2 := i.stringID, on = c(protein2 = "protein")]
+allScores[anno.dt, alias1 := i.gene, on = c(protein1 = "protein")]
+allScores[anno.dt, alias2 := i.gene, on = c(protein2 = "protein")]
+
+allScores[, gs := "unknown"]
+allScores[gene1 > gene2, gs := "reverse"]
+allScores[gs.interactors ,gs := "interactor" , on = c("gene1", "gene2")]
+#allPeakCorrs[falsePairs,gs := "decoy" , on = c("gene1", "gene2")]
+allScores[gs.decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+
+allScores[is.na(peakLLRatio), peakLLRatio := 0]
+allScores[is.na(cosLLRatio), cosLLRatio := 0]
+allScores[, bestLLRatio := ifelse(peakLLRatio > cosLLRatio, peakLLRatio, cosLLRatio)]
+setorder(allScores, -bestLLRatio)
+```
+
+save the score and write it to file 
+```{r}
+#fwrite(allScores[gene1 < gene2], ScriptAndDatedFileName('pox.combined.peakCosine.scores.csv.gz'))
+allScores <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_05_pox.combined.peakCosine.scores.csv.gz')
+```
+
+## SECMS overlap with APMS datasets 
+
+# ok, now we want to assess the overlap of PPI with Adrians dataset APMS scoring 
+Focus on host-viral, but viral-viral may also be of interest in both cases here
+
+
+```{r}
+viral.apms <- list(MPXV=fread('./data/MPXV_PPI.SAINT-COMPASS-MiST.Spec-0.48.Human.table'),
+                   VacV=fread('./data/VacV_PPI_Exp05_SAINT-COMPASS-MiST.Spec-0.2.Human.table')) %>% 
+  rbindlist(idcol='virus')
+# this must just be the sifgnificant srt of results
+
+viral.apms<- viral.apms[, .(virus, alias1=Bait,alias2=GeneName, protein2=Prey)]
+
+
+viral.prots
+
+viral.apms
+p <- euler(list(`AP-MS`=viral.apms[, unique(alias1)],
+           `SEC-MS`=viral.prots
+                  )) %>%  
+  plot(quantities=T, fills = list(fill = c("red", "steelblue4"), alpha = 0.5),
+     labels = list(col = "white", font = 4))
+
+BackupAsPDF(p, 'viralProts.secms.apms.overlap.eluerr')
+
+
+
+viral.prots %>% length()
+viral.apms$alias1 %>%  unique() %>% length()
+BackupAsPDF(p, )
+
+
+# more proteins in the viral apms than in the SEC-MS... do we detectt hem all or are they different IDs?
+viral.apms$alias1 %>% unique() %>% length()
+viral.prots %>% length()
+```
+134/196 of the proteins match between the two datasets. Enough to get a good estimate of overlap of groups
+Determine if what is missing are mutants or renamed things?
+```{r}
+# in our raw, we have 136 proteins from the APMS detected
+anno.dt[gene %in% unique(viral.apms$alias1), unique(gene)] %>% 
+  length()
+
+# 134 in the filtered/tidied SEC set 
+sec.long[gene %in% unique(viral.apms$alias1), unique(gene)] %>% 
+  length()
+
+# list of IDs mssing in SECm set from the APMS
+missingProts <- setdiff(viral.apms$alias1, sec.long[gene %in% unique(viral.apms$alias1), unique(gene)])
+missingProts
+
+# have 2032 sig hits in the apms set for viral proteins in our SEC MS data
+viral.apms[!alias1 %in% missingProts,.N ]
+```
+
+have 2032 sig hits in the apms set for viral proteins in our SEC MS data
+how many of these are present in the SEC-MS data? Safest search will be pairing viral to uniprot
+
+Finding nothing overlaps at LLR >=3... nothing.
+At LLR >=2 2 things overlap...this is really poor findings
+```{r}
+# viral gene to host gene
+viral.apms[, pair := paste0(alias1, '_', alias2)]
+viral.apms[, ppi_ordered := {
+  strsplit(pair, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+
+# subset to high conf ppi; those with a LLR >= 3
+goodScores <- allScores[bestLLRatio >= 1,]
+
+
+# gene-gene pairing 
+goodScores[, pair := paste0(alias1, '_', alias2)]
+goodScores[, ppi_ordered := {
+  strsplit(pair, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+# non overlap..
+goodScores[ppi_ordered %in% viral.apms$ppi_ordered,]
+
+# possibly due to alias of matching gene names rather than uniprots? Try change ID to uniprot and repeat
+goodScores[, pair_uniprot := paste0(protein1, '_', protein2)]
+goodScores[, ppi_uniprot_ordered := {
+  strsplit(pair_uniprot, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+
+# now look at the apms set; mapp to the anno dt 
+viral.apms[anno.dt, protein1 := protein, on=c(alias1='gene')]
+viral.apms[, pair_uniprot := paste0(protein1, '_', protein2)]
+viral.apms[, ppi_uniprot_ordered := {
+  strsplit(pair_uniprot, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+
+#fwrite(viral.apms[,.(virus, protein1, protein2, alias1, alias2, ppi_ordered, ppi_uniprot_ordered)], ScriptAndDatedFileName('viralAPMS.sigHits.anno.csv.gz'))
+viral.apms <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_05_viralAPMS.sigHits.anno.csv.gz')
+
+# no overlap
+goodScores[ppi_uniprot_ordered %in% (viral.apms$ppi_uniprot_ordered)]
+```
+Look at a LLR > 1
+```{r}
+# subset to high conf ppi; those with a LLR >= 3
+goodScores <- allScores[bestLLRatio >= 1,]
+
+# gene-gene pairing 
+goodScores[, pair := paste0(alias1, '_', alias2)]
+goodScores[, ppi_ordered := {
+  strsplit(pair, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+# non overlap..
+goodScores[ppi_ordered %in% viral.apms$ppi_ordered,]
+
+```
+Look at the distributions of cosine and peak LLRs.. seems that peak score is much better at distinguishing the sets
+The cosineLLR bimodal which is interesting... either no difference or some confidence? 3 may be far too stringent of a threshold though....
+
+```{r}
+score.dt <- melt(goodScores, id.vars=c('sample', 'ppi_ordered'), measure.vars=c('peakLLRatio', 'cosLLRatio'), variable.name = 'type')
+score.dt[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+
+g <- ggplot(score.dt, aes(x=value, fill=type)) +
+  geom_density() +
+  #facet_grid(type~treatment, scales='free') +
+  facet_grid(treatment~., scales='free') +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'LLR.density')
+```
+
+w/o even summarizing, looking at the peak correlations how many with peak R> 0.9 are in the APMS data?
+```{r}
+viralPeakCorrs <- allPeakCorrs[protein1 %in% viralIDs | protein2 %in% viralIDs ,]
+
+
+allPeakCorrs[which.min(log10RateRatioID)]
+# gene-gene pairing 
+viralPeakCorrs[, pair_uniprot := paste0(protein1, '_', protein2)]
+viralPeakCorrs[, ppi_uniprot_ordered := {
+  strsplit(pair_uniprot, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+```
+Just looking at the APMS set, what are the LLRs of the various different peak distributions
+
+```{r}
+viralPeakCorrs[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+
+g <- ggplot(viralPeakCorrs[ppi_uniprot_ordered %in% viral.apms$ppi_uniprot_ordered,], aes(x=log10RateRatioID, color=sample)) +
+  geom_density() +
+  labs(title='all apms viral-host peaks', subtitle='LLR ratios') +
+  facet_grid(~treatment) +
+  theme_bw()
+
+
+
+viralPeakCorrs
+BackupAsPDF(g, 'allPeak.LLRratios.viralhost.density')
+```
+It just looks like v few of the viral host ppi co-elutions score very well..
+I think for now just take all the coeluting ppi, and after running differential analysis find which ones move
+
+```{r}
+# possibly due to alias of matching gene names rather than uniprots? Try change ID to uniprot and repeat
+allScores[, pair_uniprot := paste0(protein1, '_', protein2)]
+allScores[, ppi_uniprot_ordered := {
+  strsplit(pair_uniprot, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+# massive file... 
+#fwrite(allScores, ScriptAndDatedFileName('pox.combinedCosinePeakSimilarity.scores.csv.gz'))
+```
+look at the overlap of the allScores file and see which ppi from the APMS are in our data and how they score 
+
+```{r, fig.width=10, fig.height=6}
+allScores <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_coelutionDetection_data/2025_06_05_pox.combinedCosinePeakSimilarity.scores.csv.gz')
+viral.apms
+
+
+allScores[ppi_uniprot_ordered %in% viral.apms$ppi_uniprot_ordered]#2.25 is our best scoring interator
+
+allScores[bestLLRatio >= 1, unique(ppi_uniprot_ordered)] %in% viral.apms[, unique(ppi_uniprot_ordered)] %>% 
+  sum()
+
+
+p <- euler(list(`HC AP-MS`=viral.apms[, unique(ppi_uniprot_ordered)],
+           `HC SEC-MS PPI`=allScores[bestLLRatio >= 1, unique(ppi_uniprot_ordered)]
+                  )) %>%  
+  plot(quantities=T, fills = list(fill = c("red", "steelblue4"), alpha = 0.5),
+     labels = list(col = "black", font = 4))
+
+p
+BackupAsPDF(p, 'viralProts.secms.apms.HC.ppi.overlap.eluerr')
+
+
+p <- eulerr::venn(list(`HC AP-MS`=viral.apms[, unique(ppi_uniprot_ordered)],
+           `HC SEC-MS PPI`=allScores[, unique(ppi_uniprot_ordered)]
+                  )) %>%  
+  plot(quantities=T, fills = list(fill = c("red", "steelblue4"), alpha = 0.5),
+     labels = list(col = "black", font = 4))
+
+p
+BackupAsPDF(p, 'viralProts.secms.apms.all.ppi.overlap.venn')
+
+
+g <- ggplot(allScores[ppi_uniprot_ordered %in% viral.apms$ppi_uniprot_ordered], aes(x=bestLLRatio, color=sample)) +
+  geom_density() +
+  theme_bw()
+
+BackupAsPDF(g, 'apms.goldStandards.density')
+
+
+allScores[bestLLRatio > 0 & bestLLRatio < 0.001]
+```
+
+Ge the best PPI and generate the elution plots
+
+tidy the SEC-MS data
+```{r}
+sec.long <- fread('~/Documents/projects/060325_APelin_POX_SECMS/060325_poxSECMS_firstLook_data/2025_06_03_sec.long.normalized.interpolated.filtered.csv.gz')
+sec.long[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+
+# annotation datatable
+anno.dt <- fread('./data/2024_10_25_SEC_MS_Input_Long.csv.gz') %>% 
+  .[, .(protein=Protein.Ids, gene=Genes)] %>% 
+  unique()
+
+sec.long[anno.dt, gene := i.gene, on=.(protein)]
+```
+
+align the fractions for plotting
+
+```{r}
+allPeaks <- fread('~/Documents/projects/043025_MGordon_SECMS_QCplotsWork/060325_coelutionDetection_data/2025_06_03_poxInf.detectedPeaks.csv.gz')
+peakTables <- split(allPeaks, allPeaks$sample)
+
+standardizeAllPeakTablesToStandard(peakTables, sec.long, standardIdx = "Mock_R1", fitPortion = 0.65, minPeaksPerFraction = 45, startFitAtPeak = 20)
+```
+
+scale intensities
+```{r}
+# now we need to interpolate the intensity values 
+sec.long[, intensity_totalScaled := intensity/(sum(intensity, na.rm=TRUE)), by=.(protein,sample)]
+```
+
+interpolate intensities to the new fractions. This way we can see the elution profiles
+
+```{r}
+sec.long[!is.na(intensity), range(intensity)]
+sec.long[, interpolatedIntensity := approx(standardFraction, ifelse(is.na(intensity_totalScaled), 0, intensity_totalScaled), xout = fraction)$y, by = .(sample, protein) ]
+
+```
+
+
+
+```{r}
+goodPPI <- allScores[ppi_uniprot_ordered %in% viral.apms[, unique(ppi_uniprot_ordered)] ] %>% 
+  .[bestLLRatio > 1, ]
+
+ppiSet <- unique(goodPPI$ppi_uniprot_ordered)
+goodPPI
+
+setToplot <- goodPPI[alias2 %in% viral.prots, .N, by=alias2][N >= 2]$alias2
+
+setToplot
+
+# plot C10L & A18R
+
+goodPPI[alias2 %in% 'C10L']
+
+sec.long
+lapply(setToplot, function(ppi){
+  
+  proteinOI <- goodPPI[alias1 == ppi | alias2 == ppi, c(protein1,protein2)]
+      
+  p <- ggplot(sec.long[protein %in% proteinOI], aes(x = fraction, y=gene, fill=replicate)) +
+    ggridges::geom_ridgeline(aes(height = intensity_totalScaled),alpha=0.3,  scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=2, aes(color='maroon'), alpha=0.4) +
+    #scale_fill_manual(values=status.col) +
+    scale_y_discrete(expand=c(0,0)) + 
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) + # to reorder colnames
+    facet_grid(.~treatment, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  guides(linetype=guide_legend('donor'))
+
+  print(p)
+  BackupAsPDF(p, paste0(ppi,'.set.sigAPMSOverlaps.ints.ridgeplots'))
+})
+  
+
+
+sec.long
+
+lapply(setToplot, function(ppi){
+  
+  proteinOI <- goodPPI[alias1 == ppi | alias2 == ppi, c(protein1,protein2)]
+      
+  p <- ggplot(sec.long[protein %in% proteinOI], aes(x = fraction, y=gene, fill=replicate)) +
+    ggridges::geom_ridgeline(aes(height = interpolatedIntensity),alpha=0.3,  scale = 8) +
+    geom_vline(xintercept=c(10,20,30,40,50,60), linetype=2, aes(color='maroon'), alpha=0.4) +
+    #scale_fill_manual(values=status.col) +
+    scale_y_discrete(expand=c(0,0)) + 
+    #scale_y_discrete(name = "protein", limits=rev(robyn.complexes[complexID == 'CCC/WASH', gene])) + # to reorder colnames
+    facet_grid(.~treatment, scales='free_y') + 
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  guides(linetype=guide_legend('donor'))
+
+  print(p)
+  BackupAsPDF(p, paste0(ppi,'.set.sigAPMSOverlaps.interpolated.ridgeplots'))
+})
+
+
+fwrite(sec.long, ScriptAndDatedFileName('secdata.forplotting.csv.gz'))
+```
+Look at the overlap of the AP-MS in the SEC-MS
+No overlap in the significant hits between both datasets... check the IDs I am using to merge before expanding to a full set
+
+```{r}
+# subset to those things with a LLR >= 3
+goodScores <- allScores[bestLLRatio > 3,]
+
+goodScores[, pair := paste0(alias1, '_', alias2)]
+goodScores[, ppi_ordered := {
+  strsplit(pair, '_')[[1]] %>% 
+    sort() %>% 
+    paste(., collapse='_')
+}, by=.I]
+
+
+# just 21 records above LLR > 3 even have a viral protein in the ppi
+goodScores[alias1 %in% unique(viral.apms$protein1)| alias2 %in% unique(viral.apms$protein1)]
+
+# just 21 records above LLR > 3 even have a APMS viral protein in the ppi
+allScores[alias1 %in% unique(viral.apms$protein1)| alias2 %in% unique(viral.apms$protein1)]
+
+
+viral.apms[alias1 == 'C10L', unique(alias2)] %>% 
+  sort()
+unique(viral.apms$protein1)
+
+# of the ppi scoring above 3, only 37 overlap the APMS data
+goodScores[alias1 %in% unique(viral.apms$protein1) | alias2 %in% unique(viral.apms$protein1)]
+
+data.list <- list(`SEC-MS ppi` = goodScores[treatment != 'Mock', unique(ppi_ordered)],
+                  `viral-viral APMS ppi`=vv.apms[, unique(ppi_ordered)],
+                  `viral-host APMS ppi`=vh.apms[, unique(ppi_ordered)])
+```
+

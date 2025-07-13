@@ -1,0 +1,404 @@
+---
+
+title: "PWcomparisons_LM"
+author: "Martin Gordon"
+date: "2024-05-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+As an alternative to the MAGECK pipeline, try the approach favoured by the other Genome-wide screen assays
+Read in the raw count tables, drop  log normalize
+
+Not the output I expected at all... still seems that most of the contrasts comparing the group to the treatment groups to baseline at 
+
+## packages
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(ggrepel)
+library(ggridges) # ridgeline plots
+library(eulerr) # for venn diagram plots
+library(ggvenn)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/LinearModels.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+read in the count matrices, log normalize and perform the PW comparisons
+
+```{r}
+counts.dt <- fread('/Users/martingordon/Documents/projects/032124_RBabu_CRISPRMutantScreen/output/mageck_count_comb_sgRNA/240424_RBabu_CRISPRe.count.txt')
+norm.dt <- fread('/Users/martingordon/Documents/projects/032124_RBabu_CRISPRMutantScreen/output/mageck_count_comb_sgRNA/240424_RBabu_CRISPRe.count_normalized.txt')
+```
+Perform lognormalization of the raw counts
+```{r}
+# convert to long format 
+counts.long <- melt(counts.dt, id.vars = c('sgRNA', 'Gene'), value.name = 'counts', variable.name = 'sample')
+counts.long[, logNorm_counts := round(log2(counts/sum(counts)*1e+06 + 1),2), by=sample]
+```
+Add additional annotation info to the dt
+```{r}
+counts.long[, .N, .(cas9, sample, group)]
+
+counts.long[, group := sub("_[0-9]{1,2}$","", sample)]
+counts.long[, cas9 := ifelse(grepl('Abe8e|Bemax', group), str_extract(sample, 'Abe8e|Bemax'), 'Ctrl')]
+
+counts.long[, .N, .(cas9, sample, group)]
+
+# fix some of the labels
+counts.long[group %like% 'Bemax_Lib', group := 'Bemax_Lib']
+counts.long[group %like% 'Abe8e_Lib', group := 'Abe8e_Lib']
+
+counts.long[, sample_no := str_extract(sample, "[0-9]{1,2}$")]
+counts.long[, treatment := sub("Abe8e_|Bemax_|Abe8eDMSO_|Abe8eSerum_|BemaxDMSO_|BemaxSerum_", "", group)]
+```
+Get how many sd each sgRNA expression is from the sample mean
+Filter out groups +/- 3SD from mean in the plasmid condition
+```{r}
+counts.long[, logNorm_zscore := scale(counts), by=.(sample)]
+
+# these are the 
+drop.sgRNA %>%  length()
+drop.sgRNA <- counts.long[sample == 'plasmid_BE_38' & abs(logNorm_zscore) > 3, sgRNA]
+
+counts.long[sample == 'plasmid_BE_38' & abs(logNorm_zscore) > 3,]
+
+counts.mat <- dcast(counts.long, interaction(sgRNA)~sample, value.var = 'counts') %>% 
+  as.matrix(rownames='sgRNA')
+```
+
+I guess for our PW comparisons, we want to compare all conditions to plasmid, then do a contrast of contrasts to compare the difference in differences and I guess this is what we want to work with
+
+filter out noisy sgRNA by i) removing sgRNA with extreme counts (+/- 3SD) in the plasmid condition 
+```{r}
+counts.f <- counts.long[!sgRNA %in% drop.sgRNA,]
+
+zeros.sgRNA <- counts.f[counts == 0, .N, by=.(sgRNA, group)] %>%
+  .[group =='plasmid_BE', sgRNA]
+
+counts.f <- counts.f[!sgRNA %in% zeros.sgRNA,]
+```
+
+# now that we have the normalised counts, lets run LM of each of the groups
+
+Setup a custom contrast comparing each group against plasmid
+
+```{r}
+counts.f$treatment %>%  unique()
+counts.f[, treatment := factor(treatment, levels=c("plasmid_BE","Lib","gRNA_noBE","CTRL1","CTRL2","CTRL3","GPN","TORIN","BAFA1","STARVE","DOXO"))]
+counts.f[, cas9 := factor(group,levels=c('Ctrl',"Bemax" ,"Abe8e"))]
+counts.f[, group := factor(group, levels=c("plasmid_BE","Bemax_Lib","Abe8e_Lib","gRNA_noBE","BemaxDMSO_CTRL1","BemaxDMSO_CTRL2","Bemax_GPN","Bemax_TORIN","Bemax_BAFA1",
+                                              "BemaxSerum_STARVE","BemaxDMSO_CTRL3","Bemax_DOXO","Abe8eDMSO_CTRL1","Abe8eDMSO_CTRL2","Abe8e_GPN","Abe8e_TORIN","Abe8eSerum_STARVE",
+                                              "Abe8e_BAFA1","Abe8eDMSO_CTRL3","Abe8e_DOXO"))]
+```
+
+Create a custom contrast matrix of the contrasts we want
+```{r}
+contrast.mat <- sapply(levels(counts.f$group), function(x){
+  sample.vec <- rep(0, length(levels(counts.f$group)))
+  sample.vec[1] <-  -1 
+  sample.idx <- which(levels(counts.f$group) == x)
+  sample.vec[sample.idx] <-  1
+  return(sample.vec)
+}) %>%  cbind()
+
+contrast.mat
+
+colnames(contrast.mat) <- paste0(colnames(contrast.mat), '-plasmid_BE')
+contrast.mat <- contrast.mat[,-1] %>% 
+  as.matrix()
+
+rownames(contrast.mat)  <- levels(counts.f$group)
+```
+
+Run the PW comparisons
+
+
+```{r}
+
+list(contrast.mat)
+
+# interaction contrasts functions
+em.interactionContrast <-  function (l, factorFormula = ~group){  # assuming an interaction of timepoint and status
+  emm <- emmeans::emmeans(l, factorFormula) # obtain the estimated marginal means for each timepoint per group (WT, mut, treatment) from the model
+ # contrast1 <- contrast(emm, interaction = c("pairwise"), by = NULL) #interaction contrast, or contrasts of contrasts; compare response between groups
+  contrast1 <- contrast(emm, method=as.list(as.data.table(contrast.mat)))
+  return (as.data.table(contrast1))
+}
+
+em.contrastOfContrasts <- function (l, factorFormula = ~status|timepoint){  # how does the drug effect change per tissue
+  emm <- emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+formulas = list(full = logNorm_counts~group)
+
+
+## testing 
+lm.out <- linearModelsAllProteins(counts.f, 
+                                  formulaList = formulas, 
+                                  splitColumn = "sgRNA", postProcessFunction = em.interactionContrast, cl = 12) |> suppressWarnings()
+
+
+lm.out$postProcess[, p.adj := p.adjust(p.value, method='BH'), by=contrast]
+lm.out$postProcess[abs(estimate) > 0.58 & p.value < 0.001,] %>% 
+  .[order(p.value)]
+
+```
+
+22-05-24
+----
+Recovering very few hits; possibly due to dynamic range of log2 normalized scores??
+Need to use the normalized data to run the PW comparisons
+Use the control normalized data for the comparisons
+
+
+```{r}
+norm.dt <- fread('/Users/martingordon/Documents/projects/032124_RBabu_CRISPRMutantScreen/output/mageck_count_comb_sgRNA/240424_RBabu_CRISPRe.count_normalized.txt')
+```
+
+
+```{r}
+# convert to long format 
+counts.long <- melt(norm.dt, id.vars = c('sgRNA', 'Gene'), value.name = 'counts', variable.name = 'sample')
+
+ggplot(counts.long, aes(x=sample, y=log2(counts+1))) +
+  geom_boxplot()
+```
+Add additional annotation info to the dt
+```{r}
+counts.long[, cas9 := ifelse(grepl('Abe8e|Bemax', sample), str_extract(sample, 'Abe8e|Bemax'), 'Ctrl')]
+counts.long[, group := sub("_[0-9]{1,2}$","", sample)]
+
+counts.long[, .N, .(cas9, sample, group)]
+
+# fix some of the labels
+counts.long[group %like% 'Bemax_Lib', group := 'Bemax_Lib']
+counts.long[group %like% 'Abe8e_Lib', group := 'Abe8e_Lib']
+
+counts.long[, sample_no := str_extract(sample, "[0-9]{1,2}$")]
+counts.long[, treatment := sub("Abe8e_|Bemax_|Abe8eDMSO_|Abe8eSerum_|BemaxDMSO_|BemaxSerum_", "", group)]
+```
+Get how many sd each sgRNA expression is from the sample mean
+Filter out groups +/- 3SD from mean in the plasmid condition
+```{r}
+counts.long[, NormCounts_zscore := scale(counts), by=.(sample)]
+
+# these are the 
+drop.sgRNA <- counts.long[sample == 'plasmid_BE_38' & abs(NormCounts_zscore) > 3, sgRNA]
+drop.sgRNA %>%  length()
+
+counts.long[sample == 'plasmid_BE_38' & abs(NormCounts_zscore) > 3,]
+
+counts.mat <- dcast(counts.long, interaction(sgRNA)~sample, value.var = 'counts') %>% 
+  as.matrix(rownames='sgRNA')
+```
+
+I guess for our PW comparisons, we want to compare all conditions to plasmid, then do a contrast of contrasts to compare the difference in differences and I guess this is what we want to work with
+
+filter out noisy sgRNA by i) removing sgRNA with extreme counts (+/- 3SD) in the plasmid condition 
+```{r}
+counts.f <- counts.long[!sgRNA %in% drop.sgRNA,]
+
+zeros.sgRNA <- counts.f[counts == 0, .N, by=.(sgRNA, group)] %>%
+  .[group =='plasmid_BE', sgRNA]
+
+counts.f <- counts.f[!sgRNA %in% zeros.sgRNA,]
+```
+
+# now that we have the normalised counts, lets run LM of each of the groups
+
+Setup a custom contrast comparing each group against plasmid
+
+```{r}
+counts.f[, treatment := factor(treatment, levels=c("plasmid_BE","Lib","gRNA_noBE","CTRL1","CTRL2","CTRL3","GPN","TORIN","BAFA1","STARVE","DOXO"))]
+counts.f[, cas9 := factor(group,levels=c('Ctrl',"Bemax" ,"Abe8e"))]
+counts.f[, group := factor(group, levels=c("plasmid_BE","Bemax_Lib","Abe8e_Lib","gRNA_noBE","BemaxDMSO_CTRL1","BemaxDMSO_CTRL2","Bemax_GPN","Bemax_TORIN","Bemax_BAFA1",
+                                              "BemaxSerum_STARVE","BemaxDMSO_CTRL3","Bemax_DOXO","Abe8eDMSO_CTRL1","Abe8eDMSO_CTRL2","Abe8e_GPN","Abe8e_TORIN","Abe8eSerum_STARVE",
+                                              "Abe8e_BAFA1","Abe8eDMSO_CTRL3","Abe8e_DOXO"))]
+```
+
+Run the PW comparisons on just the normalized data
+```{r}
+# interaction contrasts functions
+em.interactionContrast <-  function (l, factorFormula = ~group){  # assuming an interaction of timepoint and status
+  emm <- emmeans::emmeans(l, factorFormula) # obtain the estimated marginal means for each timepoint per group (WT, mut, treatment) from the model
+ # contrast1 <- contrast(emm, interaction = c("pairwise"), by = NULL) #interaction contrast, or contrasts of contrasts; compare response between groups
+  contrast1 <- contrast(emm, method=as.list(as.data.table(contrast.mat)))
+  return (as.data.table(contrast1))
+}
+
+
+em.contrastOfContrasts <- function (l, factorFormula = ~status|timepoint){  # how does the drug effect change per tissue
+  emm <- emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+formulas = list(full = counts~group)
+
+
+## testing 
+lm.out <- linearModelsAllProteins(counts.f, 
+                                  formulaList = formulas, 
+                                  splitColumn = "sgRNA", postProcessFunction = em.interactionContrast, cl = 12)
+
+lm.out$postProcess
+
+lm.out$postProcess[, p.adj := p.adjust(p.value, method='BH'), by=contrast]
+lm.out$postProcess[abs(estimate) > 1 & p.value < 0.01,] %>% 
+  .[order(p.value)]
+
+lm.out$postProcess[, sig := 'not']
+lm.out$postProcess[abs(estimate) > 0.58 & p.value < 0.01, sig := ifelse(abs(estimate) > 0, 'up', 'down')]
+```
+
+```{r}
+lapply(unique(lm.out$postProcess$contrast), function(x){
+  
+  ggplot(lm.out$postProcess[contrast == x,], aes(x=estimate, y=-log10(p.value), color=sig, label=sgRNA)) +
+    geom_point() +
+    geom_text_repel(data=lm.out$postProcess[contrast == x & sig != 'not',]) +
+    ggtitle(x)
+  
+})
+```
+```{r}
+counts.f[sgRNA == 'BE_5341' & group %in% c('plasmid_BE', 'BemaxDMSO_CTRL3'),]
+```
+Maybe a single guide RNA condition is not a good baseline comparison... 
+Lets try compare the different groups
+
+
+Lets try BeMax Lib and Abe8e Lib as the baseline groups
+Split the datatables into two and create two contrast matricies
+
+```{r}
+counts.f[, cas9 := ifelse(grepl('Abe8e|Bemax', group), str_extract(sample, 'Abe8e|Bemax'), 'Ctrl')]
+counts.f[,.N, by=.(group,cas9)]
+
+counts.list <- split(counts.f, counts.f$cas9)
+
+counts.list[['Abe8e']] <-  rbind(counts.list[['Abe8e']], counts.list[['Ctrl']])
+counts.list[['Bemax']] <-  rbind(counts.list[['Bemax']], counts.list[['Ctrl']])
+counts.list[['Ctrl']] <-  NULL
+
+counts.list[['Abe8e']][, group := factor(group, levels=c('Abe8e_Lib', 'gRNA_noBE', 'plasmid_BE', 'Abe8eDMSO_CTRL1', 'Abe8eDMSO_CTRL2', 'Abe8eDMSO_CTRL3',
+                                          'Abe8e_GPN', 'Abe8e_TORIN', 'Abe8eSerum_STARVE', 'Abe8e_BAFA1', 'Abe8e_DOXO'))]
+
+counts.list[['Bemax']][, group := factor(group, levels=c('Bemax_Lib', 'gRNA_noBE', 'plasmid_BE', 'BemaxDMSO_CTRL1', 'BemaxDMSO_CTRL2', 'BemaxDMSO_CTRL3',
+                                          'Bemax_GPN', 'Bemax_TORIN', 'BemaxSerum_STARVE', 'Bemax_BAFA1', 'Bemax_DOXO'))]
+
+
+# contrast matrices
+contrast.list <- lapply(counts.list, function(x){
+  
+  contrast.mat <- sapply(levels(x$group), function(i){
+  sample.vec <- rep(0, length(levels(x$group)))
+  sample.vec[1] <-  -1 
+  sample.idx <- which(levels(x$group) == i)
+  sample.vec[sample.idx] <-  1
+  return(sample.vec)
+  
+  }) %>%  cbind()
+  
+  rownames(contrast.mat) <- levels(x$group)
+  colnames(contrast.mat) <- paste0(levels(x$group), '-', levels(x$group)[1])
+                             
+  return(contrast.mat[,-1])
+})
+  
+# check names are the same 
+names(counts.list) == names(contrast.list)
+```
+Run the comparisons vs the Library at D0 (with BE added)
+Want to contrast all groups at D0
+Lets see how the output looks, then we can try a contrast of contrasts
+
+```{r}
+library(scales)
+# interaction contrasts functions
+# return both results from individual contrasts and also contrast of contrast
+formulas = list(full = counts~group)
+
+lm.list <- lapply(seq_along(counts.list), function(x,n,i){
+  
+  editor <- n[[i]]
+  print(paste0('Working on editor ', editor, '....'))
+  
+  # set up the interaciton contrast function
+  em.interactionContrast <-  function (l, factorFormula = ~group){  # assuming an interaction of timepoint and status
+    emm <- emmeans::emmeans(l, factorFormula) # obtain the estimated marginal means for each timepoint per group (WT, mut, treatment) from the model
+    contrast1 <- as.data.table(contrast(emm, method=as.list(as.data.table(contrast.list[[editor]]))))
+    return (contrast1)
+  }
+  
+  lm.out <- linearModelsAllProteins(x[[editor]], 
+                                  formulaList = formulas, 
+                                  splitColumn = "sgRNA", postProcessFunction = em.interactionContrast, cl = 12)
+  
+  print(paste0('Finshed working on editor ', editor, '....'))
+  return(lm.out)
+  
+},x=counts.list,n=names(counts.list))
+
+names(lm.list) <- names(counts.list)
+
+
+lapply(lm.list, function(x){
+  
+  dt <- copy(x$postProces)
+  dt[, sig := 'not']
+  dt[p.value < 0.01 & abs(estimate) > 0.58, sig := ifelse((estimate) > 0, 'up', 'down')]
+  
+  lapply(unique(dt$contrast), function(i){
+   g <-   ggplot(dt[contrast==i,], aes(x=estimate, y=-log10(p.value), color=sig, label=sgRNA)) +
+    geom_vline(xintercept=c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept=c(-log10(0.01)), linetype=2, alpha=0.4) +
+    geom_text_repel(data=dt[contrast==i & sig != 'not']) +
+    geom_point() +
+    xlab('Fold Change') +
+    scale_color_manual(values=c('down'=muted('blue'), 'up'=muted('red'), 'not'='grey')) +
+    ggtitle(i) +
+    theme_bw()
+   
+   BackupAsPDF(g, paste0(i, 'lm.Lib_baseline.volcanoplot'))
+  })
+})
+```
+
+Save these output tables
+
+```{r}
+lm.list[['Abe8e']]$postProcess[, fdr := p.adjust(p.value, method='BH'), by=contrast]
+lm.list[['Bemax']]$postProcess[, fdr := p.adjust(p.value, method='BH'), by=contrast]
+
+fwrite(lm.list[['Abe8e']]$anova, ScriptAndDatedFileName('abe8e.Lib_baseline_anova.csv'))
+fwrite(lm.list[['Bemax']]$anova, ScriptAndDatedFileName('bemax.Lib_baseline_anova.csv'))
+fwrite(lm.list[['Abe8e']]$postProcess, ScriptAndDatedFileName('abe8e.Lib_baseline_LMContrasts.csv'))
+fwrite(lm.list[['Bemax']]$postProcess, ScriptAndDatedFileName('bemax.Lib_baseline_LMContrasts.csv'))
+```
+

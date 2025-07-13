@@ -1,0 +1,683 @@
+---
+title: "differentialExpression.210923"
+author: "Martin Gordon"
+date: "2023-09-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  results = 'asis',
+  fig.pos='H', 
+  fig.wide=TRUE)
+```
+
+```{r load-packages, message=FALSE, warning=FALSE, echo=TRUE}
+library(gtools)
+library(tidyverse)
+library(ggplot2)
+library(tximport)
+library(DESeq2)
+library(ashr) #adaptive shrinkage estimator to improve lFC estimates in DESEq2
+library(apeglm)
+library(IHW) # Independent Hypothesis Weighting 
+library(magrittr)
+
+# visualisation
+library(EnhancedVolcano) 
+library(RColorBrewer)
+library(data.table)
+library(ComplexHeatmap)
+library(dplyr)
+
+library(genefilter) # not available 
+library(biomaRt)
+
+# annotations
+#library(biomaRt)
+
+# load helper functions in other packages
+#source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.old.R")
+
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+#source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+## Differential Expression Analysis using DESeq2 
+### 21-09-23
+### Contacts: Martin Gordon, Krogan lab; Paddy O Leary, Ashworth Lab
+
+### Synopsis
+Processing murine mouse data : https://www.biorxiv.org/content/10.1101/2023.04.06.535927v1.full
+Mac1 mutants & WT infected murine samples
+Perform a DEA between the two conditions and identify genes that are upregulated in the mutant relative to WT 
+
+
+```{r input-files}
+path <- 'output/nf.rnaseq.out'
+
+input <- dir(path=path, pattern = "_quant.sf$", recursive = T, full.names = TRUE) %>% 
+  data.table() %>% 
+  setnames('.', 'path') %>% 
+  .[, file.names := gsub("output/nf.rnaseq.out/|_quant.sf", "", path) ]
+
+rm(path)
+```
+
+Creating metadata file
+
+```{r create-metadata}
+
+# set WT as base level for comparisons
+sample_meta <- input %>% 
+  .[, `:=`(condition = factor(str_extract(file.names, 'WT|Mac1'), levels = c('WT','Mac1')),
+            replicate = factor(str_extract(file.names, '[0-4]$')) )]
+           
+# need file names as row names for the metadata 
+# convert to tibble
+sample_meta <- sample_meta %>% 
+  as_tibble() %>% 
+  column_to_rownames('file.names')
+
+```
+Creating txt2gene file for tximport using bioMArt
+BioMart is a great package, but mismatches between txt2g and count file, likely due to versioning
+Best apporach if using NF-core is to extract the txt2gene from the pipeline run, or even better, provide your own reference/gtf so you are sure of the verison used
+
+
+```{r bioMArt eval=FALSE}
+# query emsembl bioMart Databases
+ensembl <- useMart("ensembl")
+
+# list all different species datasets (1 dataset per species)
+listDatasets(ensembl)
+
+# select a species dataset
+ensembl <- useDataset("mmusculus_gene_ensembl",mart=ensembl)
+listAttributes(ensembl)
+# List available attributes; gene id transcript id etc..
+
+
+#The getBM() function has three arguments that need to be introduced: filters, attributes and values. Filters define a restriction on the query.
+
+#listAttributes(ensembl) # what we want
+#listFilters(ensembl) # how to filter attributes
+# values : vector of values for the filters
+# mart: the mart object created by useMart()
+
+# Get gene-to-transcript mappings for a specific gene
+mm.txt2gene <- getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "external_gene_name"), filters = "ensembl_gene_id", values = 'ENSMUSG00000000001', mart = ensembl) 
+
+
+counts.dt$rn
+
+
+# reorder for trasncripts first
+mm.txt2gene <- mm.txt2gene[, .(ensembl_transcript_id, ensembl_gene_id, external_gene_name) ] %>%  as.data.frame()
+```
+test
+
+```{r}
+library(biomaRt)
+
+# Connect to the appropriate BioMart database
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Specify the Ensembl IDs you want to convert
+ensembl_ids <- c("ENSG00000012048", "ENSG00000139618", "ENSG00000157764")
+
+# Get the gene names using the getBM function
+gene_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                   filters = "ensembl_gene_id",
+                   values = ensembl_ids,
+                   mart = ensembl)
+
+# Print the result
+print(gene_info)
+```
+
+
+```{r}
+
+# txt2gene from nf pipeline run - no lost transcripts
+nf.txt2g <- fread('./output/salmon_tx2gene.tsv', col.names = c('transcript', 'gene', 'symbol'))
+# need to drop gene using new delimiter 
+nf.txt2g <- nf.txt2g[,.(transcript, gene)]
+```
+
+Summarising transcript level abundances to the gene level using tximport
+
+```{r tximport-txt2gene}
+txi_files <- input$path
+names(txi_files) <- input$file.names
+
+
+#tximport: convert transcript level abundances to gene
+txi <- tximport(files = txi_files, type = "salmon", tx2gene = nf.txt2g, importer=read.delim) 
+
+# safety check; assert that col in txi match order and rownames in metadata table. # TRUE
+all(rownames(sample_meta) == colnames(txi[["counts"]])) 
+```
+
+## Differential Expression Analysis using DESEq2
+
+Group means comparison; identify the DEGs and compare to our list 
+
+For first pass, I've kept it simple and combined timepoint and cell type factors into a single factor. The drawback here is we can't tease apart effects of different co-variates (ie is timepoint or cell type driving the expression difference) but it does indicate differences between groups at a quick glance. 
+
+```{r run dds, echo=FALSE, message=FALSE, warning=FALSE}
+
+dds <- DESeqDataSetFromTximport(txi = txi, 
+                                colData = sample_meta, 
+                                design = ~ condition)
+
+mingrpsize <- 4
+keep <- rowSums(counts(dds) >= 10) >= 4
+dds <- dds[keep, ]
+rm(keep, mingrpsize)
+
+
+dds <- DESeq(dds)
+
+dds
+```
+
+EDA generate a PCA plot of the data 
+
+```{r pca}
+# variance stabilising transformatiions
+dds_vst <- vst(dds, blind =F)
+
+# ge tthe normalised count matrix
+dds.vst.mat <- assay(dds_vst)
+
+#data.table(dds.vst.mat, keep.rownames = T) %>% 
+#  fwrite('./output/vst.countMat.csv')
+
+save_plot(PCA_fun, list(x=dds_vst, grouping="condition"), "PCA_conditions.png", "./output/plots/EDA")
+```
+
+use all data rather than an subset
+```{r}
+pcaOut <- prcomp(t(dds.vst.mat))
+
+colInfo <- data.table(colname = colnames(dds.vst.mat))
+colInfo[, c("condition", "rep") := tstrsplit(colname, "[_.]", keep = c(2,3)) ] # v useful fucntion
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = condition, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+          color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA.fullset")
+```
+lets plot samples and subset of genes matrix
+Clear WT_1 sample is distinct to others, but based on full st PCA still clusters seperately from mutant conditiion 
+
+
+```{r}
+submat <- dds.vst.mat[sample(dds.vst.mat,2000),]
+
+colnames(submat)
+
+# add annotation fot sample type and 
+ha <- HeatmapAnnotation(condition = str_extract(colnames(submat),'WT|Mac1'), col=list(condition=c('Mac1'='orange', 'WT'='black')))
+set.seed(123)
+hm <- Heatmap (submat, 
+               clustering_distance_rows = 'euclidean',
+               cluster_columns = TRUE,
+               show_row_names = F,
+               top_annotation = ha,
+               #column_split = ifelse(grepl('WT', colnames(submat)), 'wild type', 'Mac1 mut'),
+               column_names_gp  = gpar(fontsize= 5)
+              # column_split = tstrsplit(colnames(subMat), "_")[[1]],
+
+    )
+  
+ht <- draw(hm,  column_title=sprintf("subsample %s genes", nrow(submat)),
+           column_title_gp=grid::gpar(fontsize=16))
+
+ht
+BackupAsPDF(ht, 'heatmap.subsample.colanno')
+```
+
+Run the differential expression analysis of both conditiions
+
+```{r extract-res}
+dds <- DESeq(dds)
+res05 <- results(dds, alpha=0.05)
+summary(res05)
+ 
+#res <- results(dds, contrast=c("condition","Mac1","WT")) # no need to specify contrasts as only 1 
+
+# for visualisation/ranking?
+resLFC <- lfcShrink(dds, coef="condition_Mac1_vs_WT", type="apeglm")
+
+```
+volcano plot and heatmaps of the DEGs
+
+```{r id-sig-genes} 
+
+de.out <- as.data.table(res05, keep.rownames=T)
+nf.txt2g <- as.data.table(nf.txt2g)
+
+setnames(de.out, old=colnames(de.out), new=c('gene',"baseMean","log2FoldChange","lfcSE","stat","pvalue","padj"))
+de.out[nf.txt2g, symbol := i.symbol, on=c('gene', 'gene')]
+
+de.out[, sig := 'not']
+de.out[ abs(log2FoldChange) > log2(1.5) & padj < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')]
+
+
+##1195 genes DE
+de.out[sig != 'not', .N,]
+
+
+#write out results to file
+fwrite(de.out, './output/DESeq2.results.csv')
+```
+Create a volcano plot and heatmap of the hits
+
+
+Check for hits in the preprint to ensure we are analysing correctly
+
+So the upregulated things here are the ones over-expressed in the mac1 mutant, 
+we expect a large number of immune response related stuff
+
+Downregulated stuff is things overexpressed in WT relative to the mutant
+
+```{r volcano}
+g <- ggplot(de.out, aes(x=log2FoldChange, y=-log10(padj), col=sig, label=gene, alpha=0.8)) +
+  geom_point() +
+  scale_color_manual(values=c('up'='red', 'down'= 'blue', 'not' = 'grey')) +
+  geom_vline(xintercept = c(-log2(1.5),log2(1.5)), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=de.out[sig == 'down',], max.overlaps = 20) +
+  ggtitle('log2(Mac1 Mut) - log2(WT)')
+  theme_classic()
+g
+
+#BackupAsPDF(g, 'padj<0.05.volcanoplot')
+```
+Heatmap of DE genes
+
+```{r}
+sig.genes <- de.out[sig != 'not', .(gene,symbol)]
+
+
+# to plot expression vals
+submat <- dds.vst.mat[rownames(dds.vst.mat) %in% sig.genes$gene,]
+# add symbol as rowname
+rownames(submat) <- sig.genes$symbol
+
+
+# lets subtract the median expression value of each row 
+submat <- sweep(submat, 1, STAT=apply(submat, 1, median, na.rm=T), FUN = '-')
+
+# add annotation fot sample type and 
+ha <- HeatmapAnnotation(condition = str_extract(colnames(submat),'WT|Mac1'), col=list(condition=c('Mac1'='orange', 'WT'='black')))
+
+set.seed(123)
+
+hm <- Heatmap (submat, 
+               clustering_distance_rows = 'euclidean',
+               cluster_columns = TRUE,
+               split = 5,
+               show_row_names = F,
+               top_annotation = ha,
+               name = 'exp - row median',
+               #column_split = ifelse(grepl('WT', colnames(submat)), 'wild type', 'Mac1 mut'),
+               column_names_gp  = gpar(fontsize= 5)
+          )
+  
+ht <- draw(hm,  column_title=sprintf("%s DE genes (LOG2FC > 0.58 & adj.pval < 0.05)", nrow(submat)),
+           column_title_gp=grid::gpar(fontsize=16))
+
+BackupAsPDF(ht, 'deg.eulidDist.5clust.heatmap')
+
+```
+run enrichment analysis on the gene sets
+run enrichment seperately on the clusters and see what they are enriched for 
+```{r}
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(dbName = 'org.Mm.eg.db', ontology = "ALL", keyType = "SYMBOL")
+universe <- de.out$symbol %>%  unique() # all genes detected and submitted for DEA
+
+
+enrich.dt <- enricherOnGroups(de.out[sig != 'not',], groupColumns = 'sig', geneColumn = "symbol", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'sig')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'sig', topN = 20, title='GO enrichment up & down reg gene sets', 
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 10)
+
+BackupAsPDF(ht, 'go.enrichment.deg.sets', dimensions=c(8,12))
+
+```
+
+write out the enrichment table to file incase want to inspect later
+
+```{r}
+fwrite(enrich.dt, './output/enrichment.table.sigDEgs')
+```
+
+now running enrichment on the different gene clusters  generated above
+
+
+```{r}
+euclid.5.clust <- extractClustersfromHeatmap(draw(hm),submat)
+
+enrich.dt <- enricherOnGroups(euclid.5.clust, groupColumns = 'cluster', geneColumn = "feature", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'cluster')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'cluster.x', topN = 10, title='GO enrichment up & down reg gene sets', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 10)
+
+ht
+```
+have identified interesting clusters in the data. Now want to map mouse to human IDs and look for overlap in our dataset
+
+```{r}
+# frustrating; seems to not be working with new verison of db so used archived one (or mod Bens function)
+mouse2HumanEnsemblTable <- function(genelist){
+
+  # get the human to mouse mapping from ensembl bioMart, 
+  # frustrating asseems to not be working with new verison of db so used archived one: see here https://support.bioconductor.org/p/9143401/ 
+  # issue still not resolved it seems..
+  
+  #human <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl", host="useast.ensembl.org",mirror="useast") # not working so use older verison of DB
+  human <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl",  host = "https://dec2021.archive.ensembl.org/")  #
+  mouse <- biomaRt::useMart("ensembl", dataset = "mmusculus_gene_ensembl", host = "https://dec2021.archive.ensembl.org/") 
+  
+  # get linked database function; with Ensembl this translates to homology mapping 
+  # see biostars post: https://www.biostars.org/p/149115/
+  # here i just match ensembl IDs, will convert to genenames later 
+  genesDT = getLDS(attributes = c("ensembl_gene_id"), filters = "ensembl_gene_id", 
+                   values = genelist, mart = mouse, 
+                   attributesL = c('ensembl_gene_id', 'hgnc_symbol','external_gene_name'), 
+                   martL = human, uniqueRows=T) %>%  as.data.table()
+  
+  return(genesDT)
+}
+
+# get gene mapping
+hs.sig.mapping <- mouse2HumanEnsemblTable(de.out[,gene])
+#fwrite(hs.sig.mapping, './output/mouse.human.gene.mapping.csv')
+
+# mapping looks good, its just how I have mapped to gene names is the issue I think
+hs.sig.mapping[symbol.hs == 'PTGER4',]
+
+hs.sig.mapping
+```
+
+checkout number of remaining genes; seems most are preserved.. now want to check overlapping DEGs with our sig results
+TODO, modify function to keep genes where homolog not found and just mark
+
+```{r}
+de.out <- fread('./output/murineRNAseq.prelim/DESeq2.results.csv')
+hs.sig.mapping <- fread('./output/mouse.human.gene.mapping.csv')
+
+
+```
+
+
+now compare to the DEG list from the ms and rnaseq experiments: what genes are differentially expressed in both? Check the data
+
+```{r}
+hs.sig.mapping %>%  colnames()
+
+setnames(hs.sig.mapping, old=colnames(hs.sig.mapping), new=c('gene', 'gene.hs', 'hgnc.hs', 'symbol.hs'))
+
+# get names for the sig DEGs
+de.genes <- de.out[sig != 'not', ]
+
+# get mapping to both
+de.genes[hs.sig.mapping,  symbol.hs := i.symbol.hs, on=c('gene', 'gene') ]
+de.out[hs.sig.mapping,  symbol.hs := i.symbol.hs, on=c('gene', 'gene') ]
+```
+
+read in the sig results from the cell line experiments (sig in both)
+
+```{r}
+exp.sig <- fread('/Users/martingordon/Documents/projects/061423_AVIDD_DataIntegration/output/17.06.experimental-omics-sig-genes.csv')
+
+sig.genes.cellline <- exp.sig[omics %in% c('all.sig', 'rna.ab.sig'), unique(gene)]
+```
+
+overview
+of the significant genes identified in the cellline RNAseq and MS AB data, how many homologs are present in the mouse RNAseq data?
+27 out of 33 DE genes in cell-line identified in mouse 
+Out of these only 5 are differentially expressed in mouse
+
+```{r}
+exp.sig[omics %in% c('all.sig', 'rna.ab.sig'), unique(gene)] %>%  length()
+de.out[ symbol.hs %in% exp.sig[omics %in% c('all.sig', 'rna.ab.sig'), gene]] %>% nrow()
+
+de.out[ symbol.hs %in% exp.sig[omics %in% c('all.sig', 'rna.ab.sig'), gene] & sig != 'not' ,]
+```
+generate a heatmap of these overlapping genes and inspect how they look
+
+```{r}
+homologs <- de.out[ symbol.hs %in% exp.sig[omics %in% c('all.sig', 'rna.ab.sig'), gene], ]
+
+homologs
+
+cols.oi <-  c('symbol.hs', colnames(dds.vst.mat))
+
+mat <-  data.table(dds.vst.mat, keep.rownames = T) %>% 
+  setnames(., old='rn', new='gene') %>% 
+  .[hs.sig.mapping,  symbol.hs := i.symbol.hs, on=c('gene', 'gene')] %>% 
+  .[, ..cols.oi] %>%  
+  as.matrix(rownames='symbol.hs')
+
+submat <- mat[rownames(mat) %in% homologs$symbol.hs,]
+
+# subtract median expression per gene to better visualise differences between conditions
+submat <- sweep(submat, 1, STATS = apply(submat, 1, median, na.rm=T), FUN='-')
+
+
+# get human gene symbols
+# get order of names in heatmap for matching
+#name.order <- match(rownames(submat), hs.sig.mapping[gene %in% rownames(submat), gene ])
+# add genenames as rownames
+#rownames(submat) <- hs.sig.mapping[gene %in% rownames(submat), symbol.hs][name.order]
+
+set.seed(123)
+#hm <- Heatmap(submat, row_names_gp = gpar(fontsize=8), show_row_names = T, name='Counts - Median', column_split = ifelse(grepl('WT', colnames(submat)), 'WT', 'Mac1'))
+hm <- Heatmap(submat, row_names_gp = gpar(fontsize=8), show_row_names = T, name='Counts - Median')
+
+hm
+BackupAsPDF(draw(hm, column_title=sprintf("%s candidates profile in K18-ACE2", nrow(submat))), 'sig.ab.rna.expression.nocolsplit.heatmap')
+
+```
+look at the differential expression profiles for each of these geens
+
+```{r}
+homologs
+de.out[symbol.hs %in% homologs$symbol.hs & (abs(log2FoldChange) > 0.58)]
+
+```
+
+
+
+
+inspect the genes
+
+```{r}
+de.out[ symbol.hs %in% exp.sig[omics %in% c('all.sig', 'rna.ab.sig'),gene] & symbol.hs == 'ASS1', ]
+
+plotCounts(dds, gene='ENSMUSG00000076441')
+
+```
+
+find the sig genes in our data
+5 genes identified but not moving in the same diretion, except for ASS1. Likely fundamental to mechanism. Up
+
+L1CAM, PGM2L1, CD46 down in mutant relative to WT all fold change of ~75%
+ASS1 v significant but unfortunately moving in opposite direction to our dataset.. see heatmap attached
+
+```{r}
+dt.long <- reshape2::melt(assay(dds), id.vars=(rownames(assay(dds)))) %>% 
+  as.data.table()
+
+colnames(dt.long) <- c('gene', 'sample', 'counts')
+dt.long[, gene := as.character(gene)]
+
+de.out[hs.sig.mapping,  symbol.hs := i.symbol.hs, on=c('gene', 'gene') ]
+
+
+de.out[symbol.hs == 'CD46']
+#expression doubled in Mac1 mut relative to WT
+#assay(dds)[rownames(assay(dds)) %in% 'ENSMUSG00000076441', ]
+
+dt.long <- reshape2::melt(assay(dds), id.vars=(rownames(assay(dds)))) %>% 
+  as.data.table()
+
+colnames(dt.long) <- c('gene', 'sample', 'counts')
+dt.long[, gene := as.character(gene)]
+
+dt.long[hs.sig.mapping, symbol.hs :=  symbol.hs, on=c('gene','gene')]
+dt.long[,condition := str_extract(sample, 'WT|Mac1')]
+dt.long[, rep := str_extract(sample, '[0-9]{1}$')]
+
+sig.overlaps <- de.genes[symbol.hs %in% sig.genes.cellline,]
+
+46 
+
+```
+options go the other direction and look what is up in murine and same in our data? Also could look at just overlap in individual datasets with murine?
+
+```{r}
+
+```
+
+
+
+plot these genes with a very large fold change 
+the downregulated one looks suspect
+
+```{r}
+large.lfc <- de.out[abs(log2FoldChange) > 5, gene]
+rm(large.lfc)
+
+assay(dds)[rownames(assay(dds)) %in% 'ENSMUSG00000076441', ]
+
+g <- plotCounts(dds, gene='ENSMUSG00000076441', intgroup="condition", returnData = T)# + ggtitle('ASS1 expression')
+
+g <- ggplot(g,  aes(x=condition, y=count, col=condition)) + 
+  geom_point(position=position_jitter(w=0.1,h=0)) + 
+  ggtitle('ASS1 gene expression') + 
+  theme_minimal()
+
+g
+BackupAsPDF(g, 'ASS1.gene.expression')
+
+
+de.out[symbol.hs == 'ASS1']
+
+```
+A little disappointing that only one gene appears as differentially expressed, but at least that is the most interesting gene.
+Plot all sig overlapping genes (unfortunately moving in a different direction)
+
+CPS1, L1CAM, 
+
+```{r}
+dt.long <- reshape2::melt(assay(dds), id.vars=(rownames(assay(dds)))) %>% 
+  as.data.table()
+
+colnames(dt.long) <- c('gene', 'sample', 'counts')
+dt.long[, gene := as.character(gene)]
+
+dt.long[hs.sig.mapping, symbol.hs :=  symbol.hs, on=c('gene','gene')]
+dt.long[,condition := str_extract(sample, 'WT|Mac1')]
+
+# plot the sig genes overlapping 
+dt.long[symbol.hs %in% exp.sig[omics %in% c('all.sig', 'rna.ab.sig'), gene] ]
+
+dt.long[symbol.hs == 'ASS1',]
+
+de.out[ symbol.hs %in% exp.sig[omics %in% c('all.sig', 'rna.ab.sig'), gene]]
+```
+
+130224
+----
+Look at the ISG profiles for the RNAseq data
+
+```{r}
+fread()
+isgs <- fread('/Users/martingordon/Documents/projects/020524_AVIDD_ABproteomics/docs/ISGs.txt', header = F)
+de.out <- fread('./output/murineRNAseq.prelim/DESeq2.results.csv')
+hs.sig.mapping <- fread('./output/mouse.human.gene.mapping.csv')
+
+counts.dt <- merge(x=counts.dt, y=hs.sig.mapping, by.x='rn', by.y='Gene.stable.ID')
+
+cols.oi <- grep("SC2_", colnames(counts.dt), value = T)
+cols.oi <-  c(cols.oi, 'Gene.name')
+
+
+submat <- counts.dt[HGNC.symbol %in% isgs$V1, ..cols.oi] %>% 
+  as.matrix(rownames='Gene.name')
+
+#
+submat <- sweep(submat, 1, STAT=apply(submat, 1, median, na.rm=T))
+
+
+BackupAsPDF(Heatmap(submat, name='Counts/Median'), dimensions=c(8,12))
+counts.dt[,genename := transla]
+
+
+mart <- useMart('ensembl')
+listDatasets(mart)
+
+# Connect to the appropriate BioMart database
+ensembl <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+
+
+# Specify the Ensembl IDs you want to convert
+ensembl_ids <- c("ENSG00000012048", "ENSG00000139618", "ENSG00000157764")
+
+# Get the gene names using the getBM function
+gene_info <- getBM(attributes = c("ensembl_gene_id", "external_gene_name"),
+                   
+                   mart = ensembl)
+
+
+
+getBM
+# Print the result
+print(gene_info)
+
+
+names.vec <- counts.dt[,rn]
+```
+
+
+```{r}
+isgs
+```
+

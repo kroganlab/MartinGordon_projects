@@ -1,0 +1,1683 @@
+---
+title: "310731_QLi_GPCR.correlations"
+author: "Martin Gordon"
+date: "2023-07-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(GGally)
+library(ggrepel)
+library(ggbeeswarm)
+library(ComplexHeatmap)
+library(UpSetR)
+library(lattice)
+library(circlize)
+library(readxl)
+library(ggvenn)
+
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+
+```
+
+
+
+## 
+i) Identify the 90/95 percentile
+ii) Scatterplots for all the data (hexagonal plots for density and also the GGally plot)
+iii) UpSet plot to see overlapping genes
+iv) enrichment of the sets (up and downregulated seperately)
+
+
+# copy file to local directory and extract just the rows needed into sub-files
+```{bash, eval = FALSE}
+cd ./data
+
+grep -E "Uniq_ID|LogRIA" Precog_11GPCRs_Gprotein_scores.txt > experimentalScores.txt
+grep -E "Uniq_ID|P\(WT\)" Precog_11GPCRs_Gprotein_scores.txt > predictionScores.txt
+
+```
+
+```{r}
+
+pred <- fread("./data/predictionScores.txt")
+
+exp <- fread ("./data/experimentalScores.txt")
+
+exp.long <- melt(exp, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+pred.long <- melt(pred, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+```
+
+```{r}
+gp <- dcast (exp.long, GProtein~GPCR, value.var = "score") |> as.matrix(rownames = "GProtein")
+
+dim(t(gp))
+dim(t(log2FC))
+
+log2FC <- dcast (mss.out, gene~receptor, value.var  = "log2FC") |> as.matrix(rownames = "gene")
+
+str(log2FC)
+
+cor.mat <- cor(t(log2FC), t(gp), use = "pairwise.complete.obs")
+
+colnames(gp)
+colnames(log2FC)
+colnames(log2FC) %in% colnames(gp)
+
+cor.long <- melt(as.data.table(cor.mat, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+setnames(cor.long, old = "rn", new = "gene")
+
+obs.counts <- nice.out.power3[!is.na(log2FC), .N, by = gene]
+
+cor.long[obs.counts, numObservations := N,  on = "gene"]
+setorder(cor.long, -numObservations, -R, na.last = TRUE)
+
+
+```
+
+```{r}
+scores.list <- list(exp = exp.long,
+                    pred = pred.long)
+
+```
+
+Convert the scores to a matrix
+
+```{r}
+scores.mat <- lapply(scores.list, function(x){
+  dcast(x, GProtein~GPCR, value.var = 'score') %>% 
+    as.matrix(rownames = 'GProtein')
+})
+
+```
+
+Create a matrix of the exp data; gene by receptor matrix
+
+```{r}
+mss.out <- fread('./data/2022_08_31_NiceFitsPower3.csv')
+
+
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+```
+Perform pairwise correlations between both matrices
+
+```{r}
+
+cor.list <- lapply(scores.mat, function(x){
+  cor(t(exp.mat), t(x), use= "pairwise.complete.obs")
+})
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "gene")
+  return(x)
+})
+
+```
+
+Of all all genes, how many receptors were they associated with
+Nearly all genes detected by all receptors
+
+```{r}
+
+obs.counts <- mss.out[!is.na(log2FC) & receptor != 'MOR.LG94', .N, by = gene]
+hist(obs.counts$N, breaks=seq(1,11))
+
+```
+
+add this info to the correlation res
+
+```{r}
+lapply(cor.long, function(x){
+  
+  x[obs.counts, numObservations := N, on = 'gene']
+  setorder(x, -numObservations, -R, na.last = TRUE) #strongest associations at top
+})
+```
+
+Define percentile rank per GProtein (those will measurements in all receptors)
+
+```{r}
+lapply(cor.long, function(x) hist(x$numObservations))
+
+lapply(cor.long, function(x){
+  
+  x[, direction := ifelse(R > 0, 'pos', 'neg')]
+  x[!is.na(R) & numObservations == 11, percentile.rank := rank(R)/length(R), by=GProtein] # only interested in those found in all
+    
+})
+
+lapply(cor.long, function(x) hist(x$numObservations))
+```
+
+Beeswarm plot of the correlations (add labels for strongest cor)
+
+```{r}
+
+names(cor.long) <- c('experimental', 'predicted')
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+ g <- ggplot(x[[i]][!is.na(R) & numObservations == 11,], aes(x=GProtein, y=R, fill=GProtein, label=gene)) +
+    geom_beeswarm(aes(color=GProtein), size=0.3, cex=0.2) +
+    ggrepel::geom_text_repel(data = x[[i]][abs(R) > .8,],  size = 2, max.overlaps = 20) 
+    ggtitle(paste0('R values for ', n[[i]], ' data')) +
+    theme_classic()
+  
+ # BackupAsPDF(g, paste0(n[[i]], 'corr.dotplot'))
+ g   
+},x=cor.long, n=names(cor.long))
+
+```
+Label the top ranking genes ( 90th and 10th percentile) found in all receptors
+GGally plots to look at correlation over all
+Plots? Upset plot to check overlap
+Enrichment of the different groups 90.gprotein up & down
+
+Also if significant overlap in some sets, look at this and plot individual dot plots for those genes to track expression across the receptors
+Review other suitable plots tomorrow
+
+Take the 95th percentile for each GProtein
+
+```{r}
+
+lapply(seq_along(cor.long), function(x,n,i){
+  x <- x[[i]][numObservations == 11 & (percentile.rank > .95),.(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x[!is.na(x)] <- 1 
+  x[is.na(x)]  <- 0 
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x) 
+
+  # just visualise sets with intersection greater than 10
+  ht <- UpSet(m[comb_size(m) >= 10],
+              column_title=paste0(n[[i]], ' GProtein +ve correlated gene sets'))
+  
+  BackupAsPDF(ht, paste0(n[[i]], 'pos.cor.upset'))
+  
+}, x=cor.long, n=names(cor.long))
+
+
+
+lapply(seq_along(cor.long), function(x,n,i){
+  x <- x[[i]][numObservations == 12 & (percentile.rank < .05),.(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x[!is.na(x)] <- 1 
+  x[is.na(x)]  <- 0 
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x) 
+
+  # just visualise sets with intersection greater than 10
+  ht <- UpSet(m[comb_size(m) >= 10],
+              column_title=paste0(n[[i]], ' GProtein -ve correlated gene sets'))
+  
+  BackupAsPDF(ht, paste0(n[[i]], 'neg.cor.upset'))
+  
+}, x=cor.long, n=names(cor.long))
+
+
+geom_bees
+```
+Combine both onto the one plot
+
+```{r}
+lapply(seq_along(cor.long), function(x,n,i){
+  x.n <- x[[i]][numObservations == 12 & (percentile.rank < .05),.(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x.p <- x[[i]][numObservations == 12 & (percentile.rank > .95),.(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x.n[!is.na(x.n)] <- 1 
+  x.n[is.na(x.n)]  <- 0 
+  
+
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x.n) 
+  m <- m[comb_size(m) >= 10]
+  cs = comb_size(m)
+  
+  #use sam set order for both + & -
+  ss = set_size(m)
+  set.order = order(ss) ## use same set order for both
+  
+
+  # just visualise sets with intersection greater than 10
+  ht.n <- UpSet(m[comb_size(m) >= 10],
+                comb_order = order(comb_degree(m), -cs),
+                set_order = set.order,
+               # comb_col = "#0000FF", bg_col = "#F0F0FF", bg_pt_col = "#CCCCFF",
+                top_annotation = HeatmapAnnotation(
+                "Intersection size" = anno_barplot(cs, 
+                                  ylim = c(0, max(cs)*1.1),
+                                  border = FALSE, 
+                                  gp = gpar(fill = "black"), 
+                                  height = unit(4, "cm")
+        ), 
+        annotation_name_side = "left", 
+        annotation_name_rot = 90),
+                column_title=paste0(n[[i]], ' GProtein -ve correlations'))
+  
+  
+  x.p[!is.na(x.p)] <- 1 
+  x.p[is.na(x.p)]  <- 0 
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x.p) 
+  m <- m[comb_size(m) >= 10]
+  
+  cs = comb_size(m)
+
+  # just visualise sets with intersection greater than 10
+  ht.p <- UpSet(m,
+                comb_order = order(comb_degree(m), -cs),
+                set_order = set.order,
+               # comb_col = "red", bg_col = "#F0F0FF", bg_pt_col = "lightpink",
+                top_annotation = HeatmapAnnotation(
+                "Intersection size" = anno_barplot(cs, 
+                                  ylim = c(0, max(cs)*1.1),
+                                  border = FALSE, 
+                                  gp = gpar(fill = "black"), 
+                                  height = unit(4, "cm")
+        ), 
+        annotation_name_side = "left", 
+        annotation_name_rot = 90),
+                column_title=paste0(n[[i]], ' GProtein +ve correlations'))
+  
+  
+  draw(ht.p + ht.n)
+  
+  BackupAsPDF(draw(ht.p + ht.n), paste0(n[[i]], 'comb.cor.upset'))
+  
+}, x=cor.long, n=names(cor.long))
+```
+
+
+Redo the correlations; take only rows with significant genes hits (FC.1.5, adj.pval < 0.05) to avoid spurious correlations
+
+```{r}
+sig.genes <- mss.out[pvalue < 0.05 & abs(log2FC) > log2(1.5) & receptor != 'MOR.LG94', unique(gene) ]
+
+
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+
+exp.mat <- exp.mat[rownames(exp.mat) %in% sig.genes,]
+```
+
+repeat pairwise correlations between both matrices
+
+```{r}
+
+cor.list <- lapply(scores.mat, function(x){
+  cor(t(exp.mat), t(x), use= "pairwise.complete.obs")
+})
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "gene")
+  return(x)
+})
+
+```
+
+Of all all genes, how many receptors were they associated with
+Nearly all genes detected by all receptors
+
+```{r}
+
+obs.counts <- mss.out[!is.na(log2FC) & receptor != 'MOR.LG94', .N, by = gene]
+hist(obs.counts$N, breaks=seq(1,11))
+
+```
+
+add this info to the correlation res
+
+```{r}
+lapply(cor.long, function(x){
+  
+  x[obs.counts, numObservations := N, on = 'gene']
+  setorder(x, -numObservations, -R, na.last = TRUE) #strongest associations at top
+})
+
+```
+
+Define percentile rank per GProtein
+
+```{r}
+lapply(cor.long, function(x){
+  
+  x[, direction := ifelse(R > 0, 'pos', 'neg')]
+  x[!is.na(R) & numObservations == 11, percentile.rank := rank(R)/length(R), by=GProtein]
+    
+})
+
+```
+Beeswarm plots w labels of the correlations (add labels for strongest cor)
+
+```{r}
+
+names(cor.long) <- c('experimental', 'predicted')
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+ g <- ggplot(x[[i]][!is.na(R) & numObservations == 11,], aes(x=GProtein, y=R, fill=GProtein, label=gene)) +
+    geom_beeswarm(aes(color=GProtein), size=0.3, cex=0.3) +
+    geom_text_repel(data = x[[i]][!is.na(R) & numObservations == 11 & (percentile.rank > 0.98 | percentile.rank < 0.02),], aes(x=GProtein, y=R),  size = 2, max.overlaps = 20)  +
+    ggtitle(paste0(n[[i]], ' data')) +
+    guides(colour = guide_legend(override.aes = list(size=3))) +
+    theme_bw()
+
+  g
+  BackupAsPDF(g, paste0(n[[i]], 'sig.corr.dotplot'))
+ 
+},x=cor.long, n=names(cor.long))
+
+```
+
+Histogram of R values 
+gaussian but some heavy tailed
+
+```{r}
+lapply(seq_along(cor.long), function(x,n,i){
+  
+ g <- ggplot(x[[i]][!is.na(R) & numObservations == 11,], aes(x=R)) +
+    geom_histogram() +
+    facet_wrap(~GProtein) +
+    ggtitle(paste0('R values for ', n[[i]], ' data')) +
+    theme_bw()
+  
+ BackupAsPDF(g, paste0(n[[i]], 'sig.R.histograms'))
+ 
+},x=cor.long, n=names(cor.long))
+```
+
+Boxplots of the R distributions per GProtein
+
+```{r}
+lapply(seq_along(cor.long), function(x,n,i){
+  
+ g <- ggplot(x[[i]][!is.na(R) & numObservations == 11,], aes(x=GProtein, y=R, fill=GProtein)) +
+    geom_boxplot() +
+    ggtitle(paste0('R values for ', n[[i]], ' data')) +
+    theme_bw()
+  
+ BackupAsPDF(g, paste0(n[[i]], 'R.boxplots'))
+ 
+},x=cor.long, n=names(cor.long))
+```
+
+Combo UpSet plot
+
+```{r}
+lapply(seq_along(cor.long), function(x,n,i){
+  x.n <- x[[i]][numObservations == 11 & (percentile.rank < .05),.(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x.p <- x[[i]][numObservations == 11 & (percentile.rank > .95),.(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x.n[!is.na(x.n)] <- 1 
+  x.n[is.na(x.n)]  <- 0 
+  
+
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x.n) 
+  m <- m[comb_size(m) >= 10]
+  cs = comb_size(m)
+  
+  #use sam set order for both + & -
+  ss = set_size(m)
+  set.order = order(ss) ## use same set order for both
+  
+
+  # just visualise sets with intersection greater than 10
+  ht.n <- UpSet(m,
+                comb_order = order(comb_degree(m), -cs),
+                set_order = set.order,
+               # comb_col = "#0000FF", bg_col = "#F0F0FF", bg_pt_col = "#CCCCFF",
+                top_annotation = HeatmapAnnotation(
+                "Intersection size" = anno_barplot(cs, 
+                                  ylim = c(0, max(cs)*1.1),
+                                  border = FALSE, 
+                                  gp = gpar(fill = "black"), 
+                                  height = unit(4, "cm")
+        ), 
+        annotation_name_side = "left", 
+        annotation_name_rot = 90),
+                column_title=paste0(n[[i]], ' GProtein -ve correlations'))
+  
+  
+  x.p[!is.na(x.p)] <- 1 
+  x.p[is.na(x.p)]  <- 0 
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x.p) 
+  m <- m[comb_size(m) >= 10]
+  
+  cs = comb_size(m)
+
+  # just visualise sets with intersection greater than 10
+  ht.p <- UpSet(m,
+                comb_order = order(comb_degree(m), -cs),
+                set_order = set.order,
+               # comb_col = "red", bg_col = "#F0F0FF", bg_pt_col = "lightpink",
+                top_annotation = HeatmapAnnotation(
+                "Intersection size" = anno_barplot(cs, 
+                                  ylim = c(0, max(cs)*1.1),
+                                  border = FALSE, 
+                                  gp = gpar(fill = "black"), 
+                                  height = unit(4, "cm")
+        ), 
+        annotation_name_side = "left", 
+        annotation_name_rot = 90),
+                column_title=paste0(n[[i]], ' GProtein +ve correlations'))
+  
+  
+  draw(ht.p + ht.n)
+  
+  BackupAsPDF(draw(ht.p + ht.n), paste0(n[[i]], '.95prc.cor.sig.comb.upset'))
+  
+}, x=cor.long, n=names(cor.long))
+```
+
+Cor plot taking strongly correlated values (> abs(0.7)) & .6
+
+```{r}
+
+lapply(seq_along(cor.long), function(x,n,i){
+  x.n <- x[[i]][numObservations == 11 & R < -.7, .(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x.p <- x[[i]][numObservations == 11 & R > .7, .(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x.n[!is.na(x.n)] <- 1 
+  x.n[is.na(x.n)]  <- 0 
+  
+
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x.n) 
+  m <- m[comb_size(m) >= 5]
+  cs = comb_size(m)
+  
+  #use sam set order for both + & -
+  ss = set_size(m)
+  set.order = order(ss) ## use same set order for both
+  
+
+  # just visualise sets with intersection greater than 10
+  ht.n <- UpSet(m,
+                comb_order = order(comb_degree(m), -cs),
+                set_order = set.order,
+               # comb_col = "#0000FF", bg_col = "#F0F0FF", bg_pt_col = "#CCCCFF",
+                top_annotation = HeatmapAnnotation(
+                "Intersection size" = anno_barplot(cs, 
+                                  ylim = c(0, max(cs)*1.1),
+                                  border = FALSE, 
+                                  gp = gpar(fill = "black"), 
+                                  height = unit(4, "cm")
+        ), 
+        annotation_name_side = "left", 
+        annotation_name_rot = 90),
+                column_title=paste0(n[[i]], ' GProtein -ve corr (R < .7)'))
+  
+  
+  x.p[!is.na(x.p)] <- 1 
+  x.p[is.na(x.p)]  <- 0 
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x.p) 
+  m <- m[comb_size(m) >= 5]
+  
+  cs = comb_size(m)
+
+  # just visualise sets with intersection greater than 10
+  ht.p <- UpSet(m,
+                comb_order = order(comb_degree(m), -cs),
+                set_order = set.order,
+               # comb_col = "red", bg_col = "#F0F0FF", bg_pt_col = "lightpink",
+                top_annotation = HeatmapAnnotation(
+                "Intersection size" = anno_barplot(cs, 
+                                  ylim = c(0, max(cs)*1.1),
+                                  border = FALSE, 
+                                  gp = gpar(fill = "black"), 
+                                  height = unit(4, "cm")
+        ), 
+        annotation_name_side = "left", 
+        annotation_name_rot = 90),
+                column_title=paste0(n[[i]], ' GProtein +ve corr (R > .7)'))
+  
+  
+  draw(ht.p + ht.n)
+  
+  BackupAsPDF(draw(ht.p + ht.n), paste0(n[[i]], '.7r.cor.sig.comb.upset'))
+  
+}, x=cor.long, n=names(cor.long))
+
+
+```
+.6 & .5 correlaitons
+
+
+```{r}
+lapply(seq_along(cor.long), function(x,n,i){
+  x.n <- x[[i]][numObservations == 11 & R < -.5, .(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x.p <- x[[i]][numObservations == 11 & R > .5, .(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x.n[!is.na(x.n)] <- 1 
+  x.n[is.na(x.n)]  <- 0 
+  
+
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x.n) 
+  m <- m[comb_size(m) >= 5]
+  cs = comb_size(m)
+  
+  #use sam set order for both + & -
+  ss = set_size(m)
+  set.order = order(ss) ## use same set order for both
+  
+
+  # just visualise sets with intersection greater than 10
+  ht.n <- UpSet(m,
+                comb_order = order(comb_degree(m), -cs),
+                set_order = set.order,
+               # comb_col = "#0000FF", bg_col = "#F0F0FF", bg_pt_col = "#CCCCFF",
+                top_annotation = HeatmapAnnotation(
+                "Intersection size" = anno_barplot(cs, 
+                                  ylim = c(0, max(cs)*1.1),
+                                  border = FALSE, 
+                                  gp = gpar(fill = "black"), 
+                                  height = unit(4, "cm")
+        ), 
+        annotation_name_side = "left", 
+        annotation_name_rot = 90),
+                column_title=paste0(n[[i]], ' GProtein -ve corr (R < .5)'))
+  
+  
+  x.p[!is.na(x.p)] <- 1 
+  x.p[is.na(x.p)]  <- 0 
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x.p) 
+  m <- m[comb_size(m) >= 5]
+  
+  cs = comb_size(m)
+
+  # just visualise sets with intersection greater than 10
+  ht.p <- UpSet(m,
+                comb_order = order(comb_degree(m), -cs),
+                set_order = set.order,
+               # comb_col = "red", bg_col = "#F0F0FF", bg_pt_col = "lightpink",
+                top_annotation = HeatmapAnnotation(
+                "Intersection size" = anno_barplot(cs, 
+                                  ylim = c(0, max(cs)*1.1),
+                                  border = FALSE, 
+                                  gp = gpar(fill = "black"), 
+                                  height = unit(4, "cm")
+        ), 
+        annotation_name_side = "left", 
+        annotation_name_rot = 90),
+                column_title=paste0(n[[i]], ' GProtein +ve corr (R > .5)'))
+  
+  
+  draw(ht.p + ht.n)
+  
+  BackupAsPDF(draw(ht.p + ht.n), paste0(n[[i]], '.5r.cor.sig.comb.upset'))
+  
+}, x=cor.long, n=names(cor.long))
+
+```
+
+
+correlation plots for all R values (does this make sense? Should we just look at the log2FC values?)
+Not sure if these plots make sense
+
+```{r}
+lapply(seq_along(cor.long), function(x,n,i){
+  # take the correlation vlaues and plot
+  x <- dcast(x[[i]], gene~GProtein, value.vars='R') 
+    
+  g <-  ggcorr(x, 
+           method = c("pairwise.complete.obs",'pearson'),
+           hjust = 0.75, 
+           size = 2.5, 
+           color = "grey50",
+           label = T,
+           label_size = 2
+           ) + 
+    
+  ggtitle(paste0(n[[i]], ' GProtein correlation matrix'))
+  
+  BackupAsPDF(g, paste0(n[[i]], '.R.sig.cor.matrix'))
+          
+}, x=cor.long, n=names(cor.long))
+```
+
+Generate correlation matrix of the log2FC values for each receptor
+Does this make sense? massively inflated cor values
+
+```{r}
+lapply(seq_along(cor.long), function(x,n,i){
+  # take the correlation vlaues and plot
+  x <- dcast(x[[i]], gene~GProtein, value.vars='R') 
+    
+  g <-  ggcorr(x, 
+           method = c("pairwise.complete.obs",'pearson'),
+           hjust = 0.75, 
+           size = 2.5, 
+           color = "grey50",
+           label = T,
+           label_size = 2
+           ) + 
+    
+  ggtitle(paste0(n[[i]], ' GProtein correlation matrix'))
+  
+  BackupAsPDF(g, paste0(n[[i]], '.R.sig.cor.matrix'))
+  
+}, x=cor.long, n=names(cor.long))
+
+```
+
+Generate scatterplots of R values for each comparison
+
+```{r}
+#unique combinations 
+gprots.dt <- do.call(expand.grid, rep(list(unique(cor.long[[1]]$GProtein)), 2)) %>% 
+  as.data.table() %>% 
+  .[Var1 != Var2,]
+
+gprots.dt
+
+ggplot(cor.long[[1]], aes(x=cor.long[[1]][GProtein == 'GNAI1' & gene , R], y=cor.long[[1]][GProtein == 'GNAI2', R]))
+
+cor.long[GProtein == 'GNAI1', R]
+
+plot(cor.long[[1]][GProtein == 'GNAI1', R], cor.long[[1]][GProtein == 'GNAI2', R])
+```
+
+Run enrichment of the top 5 % of genes (up and down seperately)
+Similar to top 10% not super promising...
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+
+lapply(cor.long, function(x){
+  x[, sig := 'not']
+  x[(percentile.rank > .95| percentile.rank <.05), sig := ifelse(percentile.rank > .95, 'up', 'down')]
+  x[,enrich_grp := NULL]
+})
+
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+  x[[i]][, enrich_grp := interaction(GProtein,sig)]
+  
+  universe <- unique(mss.out$gene)
+  
+  enrich.dt <- enricherOnGroups(x[[i]][x[[i]]$sig != 'not'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+  
+  simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+  
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 10, title=n[[i]], 
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 8) 
+
+ BackupAsPDF(ht, paste0(n[[i]], '.5perc.go.enrichment')) 
+
+},x=cor.long, n=names(cor.long))
+
+```
+
+Heatmap of abs(R) scores > 4
+Cor and anti-cor groups considered seperately
+
+
+```{r}
+
+lapply(cor.long, function(x){
+  x[, sig := 'not']
+  x[abs(R) > .4, sig := ifelse(R > 0, 'up', 'down')]
+})
+
+
+lapply(cor.long, head)
+
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+  x[[i]][, enrich_grp := interaction(GProtein,sig)]
+  
+  universe <- unique(mss.out$gene)
+  
+  enrich.dt <- enricherOnGroups(x[[i]][x[[i]]$sig != 'not'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+  
+  simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+  
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 10, title=n[[i]], 
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 8) 
+
+ BackupAsPDF(ht, paste0(n[[i]], '.r>.4.go.enrichment')) 
+
+},x=cor.long, n=names(cor.long))
+```
+
+Extract the gene sets  (this only returns the N in each set, not the set itself)
+Looked at some of the biggest voerlap sets and no significant results...
+
+```{r}
+sets <- lapply(seq_along(cor.long), function(x,n,i){
+  x.n <- x[[i]][numObservations == 12 & (percentile.rank < .05),.(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x.p <- x[[i]][numObservations == 12 & (percentile.rank > .95),.(GProtein,gene,R)] %>% 
+    dcast(gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames = 'gene') 
+  
+  x.n[!is.na(x.n)] <- 1 
+  x.n[is.na(x.n)]  <- 0 
+  
+  # combination matrix to visualise set combinations
+  m <- make_comb_mat(x.n) 
+  return(m)
+  
+  }, x=cor.long, n=names(cor.long))
+
+```
+
+Maybe a heatmap? Cluster the R values and see which genes pop out 
+
+```{r}
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+  x <- dcast(x[[i]], gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames='gene')
+  
+  type <- colnames(x)
+  ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('GNAI1'='red', 'GNAI3' = 'blue', 'GNAZ'='green', 'GNAO1'='orange', 'GNA12'='cyan', 'GNA13'='darkgrey' ,'GNAQ'='purple', 'GNA14'='yellow', 'GNA15'='pink',
+                                                                                          'GNAS'='black', GNAL='white')))
+
+
+  rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+  #generate heatmap
+  hm <- Heatmap(x,
+        column_title = paste0('sig prots GProtein ', n[[i]], ' data'), 
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(x),
+        show_row_names = FALSE,
+        row_title = sprintf("%d proteins", nrow(x)),
+        na_col = 'grey',
+        column_names_gp = gpar(fontsize = 10),
+       # column_title = paste0(' heatmap'),
+        name = "R")
+
+  BackupAsPDF(hm, paste0(n[[i]], '.gprotein.heatmap'))
+  
+},x=cor.long, n=names(cor.long))
+
+```
+
+Check if the list of FBX11 associated proteins are significantly correlated with the groups and if they are differential correlated
+
+find all prots associations with NPFFR1 proteins
+
+```{r}
+NPFFR1.associated <- mss.out[receptor == "NPFFR1" & pvalue < 0.05 & abs(log2FC) > log2(1.5), unique(gene)]
+
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+  mat <- dcast(x[[i]], gene~GProtein, value.var = 'R') %>% 
+    as.matrix(rownames='gene')
+  
+  
+  NPFFR1.associated <- mss.out[receptor == "NPFFR1" & pvalue < 0.05 & abs(log2FC) > log2(1.5), unique(gene)]
+
+  submat <- mat[rownames(mat) %in% NPFFR1.associated,]
+  print(submat)
+  
+  type <- colnames(submat)
+  ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('GNAI1'='red', 'GNAI3' = 'blue', 'GNAZ'='green', 'GNAO1'='orange', 'GNA12'='cyan', 'GNA13'='darkgrey' ,'GNAQ'='purple', 'GNA14'='yellow', 'GNA15'='pink',
+                                                                                          'GNAS'='black', GNAL='white')))
+
+
+  rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+  #generate heatmap
+  hm <- Heatmap(submat,
+        column_title = paste0('NPFFR1 assoc. ', n[[i]], ' data'), 
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(submat),
+        show_row_names = T,
+        row_title = sprintf("%d proteins", nrow(submat)),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 4),
+        column_names_gp = gpar(fontsize = 10),
+       # column_title = paste0(' heatmap'),
+        name = "R")
+
+  BackupAsPDF(hm, paste0(n[[i]], 'npffr1.assoc.gprotein.heatmap'), dimensions = c(7,10))
+  
+},x=cor.long, n=names(cor.long))
+
+```
+
+Beeswarm plot of the different NPFFR1 asssociated proteins and how correlated they are with other GPCRs
+
+```{r}
+lapply(seq_along(cor.long), function(x,n,i){
+  
+ g <- ggplot(x[[i]][!is.na(R) & numObservations >= 11 & gene %in% NPFFR1.associated,], aes(x=GProtein, y=R, fill=GProtein, label=gene)) +
+    geom_beeswarm(aes(color=GProtein), size=1.5, cex=0.8) +
+    geom_text_repel(data = x[[i]][!is.na(R) & numObservations >= 11 & gene %in% NPFFR1.associated & abs(R) > .6,], aes(x=GProtein, y=R),  size = 2, max.overlaps = 20)  +
+    ylim(-1, 1) +
+    ggtitle(paste0('NPFFR1 assoc. ', n[[i]], ' data')) +
+    theme_bw()
+  g
+  BackupAsPDF(g, paste0(n[[i]], 'sig.corr.npffr1.assoc.dotplot'))
+ 
+},x=cor.long, n=names(cor.long))
+
+```
+Generate matrix of scatterplots using ggally
+
+```{r}
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+  x <-  dcast(x[[i]], gene~GProtein, value.var='R') %>% 
+  .[,c(-1)]
+  
+  pdf(paste0('~/Documents/projects/310723_QLi_GPCR.correlations/310723_QLi_GPCR.correlations_data/pdfs/',n[[i]],'.scatterplot.mat.pdf'), height=9, width=9)
+  g <- ggpairs(x)
+  print(g)
+  dev.off()
+  #BackupAsPDF(g, paste0(n[[i]],'.scatterplot.mat'), dim=c(9,9))
+  
+},x=cor.long, n=names(cor.long))
+
+```
+
+Notes share the cor matrix, the ggally the upset plots etc, the GO enrichment results and also generate a log2FC heatmap of the top 100 most strongly correlated genes with any receptor
+generate a heatmap of the top 100 genes across all receptors, maybe a second heatmap of the R values per receptor per GProtein (like our heatmap but collapse the 11 col value to 1)
+
+```{r}
+
+top.100 <- lapply(seq_along(cor.long), function(x,n,i){
+  
+   x <- x[[i]][numObservations == 11,] %>% 
+  .[order(-abs(R)),] %>% 
+  .[, R := max(abs(R)), by=gene] %>% # collapse genes to max abs val
+  .[, .(unique(gene))] %>% 
+  .[1:100,]
+  
+  return(x)
+  
+},x=cor.long, n=names(cor.long))
+
+names(top.100) <- c('experimental', 'predicted')
+```
+
+Subset the log2FC values and plot heatmaps
+
+Have vector n 11 of log2FC values vs each receptor and vector n11 of predicted and exp values of each G protein per receptor
+```{r}
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+colnames(scores.mat$pred)
+
+  
+
+lapply(seq_along(top.100), function(x, n,i ){
+  
+  #subset mat for the top 100 genes
+  submat <- exp.mat[rownames(exp.mat) %in% x[[i]]$V1,]
+  
+  type <- colnames(submat)
+  ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('DOR'='red', 'KOR' = 'blue', 'MOR.DAMGO'='green', 'MRX2'='orange', 'NK1R'='cyan', 'NPFFR1'='darkgrey' ,'NPY1R'='purple', 'PTGER1'='yellow', 'PTGER4'='pink',
+                                                                                          'QRFPR'='black', 'MRX4'='white')))
+  
+  rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+  
+  col.order <- rowClusterWithNA(submat)
+  
+  #generate heatmap
+  hm <- Heatmap(submat,
+        column_title = paste0('Top R proteins ', n[[i]], ' data'), 
+        top_annotation = ha,
+        cluster_rows = col.order,
+        show_row_names = T,
+        row_title = sprintf("%d proteins", nrow(submat)),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 4),
+        column_names_gp = gpar(fontsize = 10),
+       # column_title = paste0(' heatmap'),
+        name = "Log2FC")
+  
+  #submat of the cor data 
+ #  submat <- cor.list$pred[rownames(cor.list$pred) %in% x[[i]]$V1,]
+ # 
+ #    
+ #  type <- colnames(submat)
+ #  
+ #  ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c( 'GNAI1'='red', 'GNAI3' = 'blue', 'GNAZ'='green', 'GNAO1'='orange', 'GNA12'='cyan', 'GNA13'='darkgrey' ,'GNAQ'='purple', 'GNA14'='yellow', 'GNA15'='pink',
+ #                                                                                          'GNAS'='black', GNAL='white')))
+ #  
+ #  rowClusterWithNA <- function(mat, na.value = 0, ...){
+ #    mat[is.na(mat)] <- na.value
+ #    hclust(dist(mat), ...)
+ #  }
+ #  
+ #  col.order <- rowClusterWithNA(submat)
+ #  
+ #  #generate heatmap
+ #  hm2 <- Heatmap(submat,
+ #        column_title = paste0('Top R proteins ', n[[i]], ' data'), 
+ #        top_annotation = ha,
+ #        cluster_rows = col.order,
+ #        show_row_names = T,
+ #        row_title = sprintf("%d proteins", nrow(submat)),
+ #        na_col = 'grey',
+ #        row_names_gp = gpar(fontsize = 4),
+ #        column_names_gp = gpar(fontsize = 10),
+ #       # column_title = paste0(' heatmap'),
+ #        name = "Log2FC")
+ # 
+BackupAsPDF(hm, paste0(n[[i]], '.n100R.log2FC.heatmap'), dimensions = c(7,10))
+ #  
+ #  draw(hm + hm2 )
+  
+},x=top.100, n=names(top.100))
+
+
+lapply(cor.list, head)
+```
+Lets include a matrix of the predicted scores and see if these also cluster
+Inlcude with the predicted data
+
+```{r}
+pred[GPCR == 'MRGPRX2', GPCR := 'MRX2']
+pred[GPCR == 'MRGPRX4', GPCR := 'MRX4']
+pred[GPCR == 'OPRM1', GPCR := 'MOR']
+pred[GPCR == 'OPRD1', GPCR := 'DOR']
+pred[GPCR == 'OPRK1', GPCR := 'KOR']
+pred[GPCR == 'TACR1', GPCR := 'NK1R']
+
+sort(unique(pred$GPCR))
+```
+
+```{r}
+scores.mat <- lapply(scores.mat, function(x){
+  
+  colnames(x) <- c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR", "MOR", "PTGER1", "PTGER4", "QRFPR", "NK1R") 
+  return(x)})
+
+#sanity check
+lapply(scores.mat, colnames)
+
+names(scores.mat) <- c('experimental', 'predicted')
+
+lapply(scores.mat, print)
+```
+Order adjusted accoring to hm1, change both heatmaps to keep same order
+
+```{r}
+
+   rowClusterWithNA <- function(mat, na.value = 0, ...){
+     mat[is.na(mat)] <- na.value
+     hclust(dist(mat), ...)
+   }
+
+lapply(seq_along(top.100), function(x, y, n, i ){
+  
+  # #subset mat for the top 100 genes
+   submat <- exp.mat[rownames(exp.mat) %in% x[[i]]$V1,] %>%  t()
+
+   type <- rownames(submat)
+   ha <- HeatmapAnnotation(receptor = type, which="row", col= list(receptor = c('DOR'='red', 'KOR' = 'blue', 'MOR.DAMGO'='green', 'MRX2'='orange', 'NK1R'='cyan', 'NPFFR1'='darkgrey' ,'NPY1R'='purple', 'PTGER1'='yellow', 'PTGER4'='pink',
+                                                                                           'QRFPR'='black', 'MRX4'='white')))
+  
+  # #generate heatmap
+   hm <- Heatmap(submat,
+         column_title = paste0('Top 100 proteins (R)'), 
+         left_annotation = ha,
+         show_column_dend = T,
+         cluster_rows = T,
+         show_row_names = T,
+         show_column_names = F,
+         na_col = 'grey',
+         row_names_gp = gpar(fontsize = 4),
+        column_names_gp = gpar(fontsize = 10),
+        name = "Log2FC")
+  
+  #mat of the pred data 
+  mat <- scores.mat$predicted %>%  t()
+
+  
+col.set <- rownames(mat)
+ col_fun = colorRamp2(c(0, 1), c("white", "orange"))
+ 
+ ha2 <- HeatmapAnnotation(receptor = col.set, which="row",  col= list(receptor = c('DOR'='red', 'KOR' = 'blue', 'MOR'='green', 'MRX2'='orange', 'NK1R'='cyan', 'NPFFR1'='darkgrey' ,'NPY1R'='purple', 'PTGER1'='yellow', 'PTGER4'='pink',
+                                                                                                                                                            'QRFPR'='black', 'MRX4'='white')))
+ #  #generate heatmap
+  hm.2 <- Heatmap(mat,
+          column_title = 'predicted scores', 
+          show_column_dend = T,
+          col = col_fun,
+      #   left_annotation = ha2,
+         show_row_names = T,
+         na_col = 'grey',
+         row_names_gp = gpar(fontsize = 4),
+         column_names_gp = gpar(fontsize = 8),
+        # column_title = paste0(' heatmap'),
+         name = "R")
+  
+  
+   #hm + hm.2
+  hm3 = Heatmap(submat, name='log2FC',
+                column_title='Top 100 proteins (abs(R))',
+                show_row_names = T)
+  hm4 = Heatmap(mat, name='R',
+                col=col_fun, column_title='prediction scores',)
+  
+  ht_list <- hm3 + hm4
+  draw(ht_list,auto_adjust=F)
+
+  # draw(ht_list, ht_gap = unit(0.3, "cm"))
+   
+  # print(row_order(hm))
+  # print(row_order(hm.2))
+   
+  # BackupAsPDF(draw(ht_list, ht_gap = unit(0.3, "cm")), paste0(n[[i]], 'int.pred.log2FC.heatmap'), dimensions = c(14,6))
+  
+},x=top.100, y=scores.mat, n=names(top.100))
+
+scores.mat$predicted %>%  t()
+
+t(exp.mat) %>%  rownames()
+t(scores.mat$predicted) %>%  rownames()
+
+
+sample(c(11), size=11, replace = F)
+
+sample
+
+t(scores.mat$predicted)
+
+```
+Prepare both matrices; subset and set common row order
+```{r}
+
+pred.scores.mat <- scores.mat$pred
+
+colnames(pred.scores.mat)
+
+log2FC.mat <- exp.mat[rownames(exp.mat) %chin% top.100$predicted$V1,] #%>% t()
+colnames(log2FC.mat)[3] <- 'MOR' # change for now
+
+# sanity check
+colnames(log2FC.mat) == colnames(pred.scores.mat)
+
+col.ord <- c("DOR", "KOR","MOR","MRX2","MRX4","NK1R","NPFFR1","NPY1R","PTGER1","PTGER4","QRFPR") 
+pred.scores.mat <- pred.scores.mat[, col.ord]
+
+# sanity check
+colnames(log2FC.mat) == colnames(pred.scores.mat)
+
+
+type <- colnames(log2FC.mat)
+ha <- HeatmapAnnotation(receptor = type, which="row", col= list(receptor = c('DOR'='red', 'KOR' = 'blue', 'MOR'='green', 'MRX2'='orange', 'NK1R'='cyan', 'NPFFR1'='darkgrey' ,'NPY1R'='purple', 'PTGER1'='yellow', 'PTGER4'='pink',
+                                                                                           'QRFPR'='black', 'MRX4'='white')))
+  
+  # #generate heatmap
+   hm <- Heatmap(t(log2FC.mat),
+         column_title = paste0('Top 100 proteins (abs(R))'), 
+         left_annotation = ha,
+         show_column_dend = T,
+         show_column_names = T,
+         na_col = 'grey',
+         column_names_gp = gpar(fontsize = 6),
+         name = "Log2 FC")
+  
+col_fun = colorRamp2(c(0, 1), c("white", "orange"))
+ 
+ #ha2 <- HeatmapAnnotation(receptor = col.set, which="row",  col= list(receptor = c('DOR'='red', 'KOR' = 'blue', 'MOR'='green', 'MRX2'='orange', 'NK1R'='cyan', 'NPFFR1'='darkgrey' ,'NPY1R'='purple', 'PTGER1'='yellow', 'PTGER4'='pink',
+                                                                                                                                          #                  'QRFPR'='black', 'MRX4'='white')))
+ #  #generate heatmap
+  hm.2 <- Heatmap(t(pred.scores.mat),
+          column_title = 'P(WT)', 
+          show_column_dend = T,
+          col = col_fun,
+      #   left_annotation = ha2,
+         na_col = 'grey',
+          row_names_gp = gpar(fontsize = 6),
+         column_names_gp = gpar(fontsize = 6),
+        # column_title = paste0(' heatmap'),
+         name = "R")
+  
+
+hm.list <- hm+hm.2
+
+BackupAsPDF(draw(hm.list), 'top100R.pred.WT.heatmap', dimensions = c(10,6))
+pred
+```
+
+Write out the correlations of each gene to the different G proteins
+
+```{r}
+cor.tab <- cor.long$pred[numObservations == 11,]
+
+cor.table <- dcast(cor.tab, gene~GProtein, value.var = c("R", "percentile.rank"))
+
+#fwrite(cor.table, './data/gene.correlation.scores.csv.gz')
+
+
+```
+31-08-23
+----
+Redo the correlations with the binary scoring IUPAC classification
+Produce similar set of plots and table with correlation scores. 
+multiple testing correction using the cor.test function?
+
+
+05/09/23 
+----
+Redo the correlations, issue with IUPAR labelling
+Ask Qiongyu to check results; lets see what the 
+
+```{r}
+# read in the expression data 
+mss.out <- fread('./data/2022_08_31_NiceFitsPower3.csv')
+
+head(mss.out)
+
+pred <- fread("./data/predictionScores.txt")
+exp <- fread ("./data/experimentalScores.txt")
+iupar <- data.table(read_xlsx("./data/IUPHAR_11GPCRs_Gprotein_class_primary.xlsx"))
+
+
+exp.long <- melt(exp, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+pred.long <- melt(pred, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+
+# convert to long format
+iupar.long <- melt(iupar, id.vars = 'GPCR', measure.vars = grep('GPCR', colnames(iupar), invert=T),  variable.name = "GProtein", value.name = "score") %>% 
+  .[, score := as.numeric(score)] 
+
+```
+
+
+
+```{r}
+gp <- dcast (exp.long, GProtein~GPCR, value.var = "score") |> as.matrix(rownames = "GProtein")
+
+dim(t(gp))
+dim(t(log2FC))
+
+log2FC <- dcast (mss.out, gene~receptor, value.var  = "log2FC") |> as.matrix(rownames = "gene")
+
+str(log2FC)
+
+cor.mat <- cor(t(log2FC), t(gp), use = "pairwise.complete.obs")
+
+colnames(gp)
+colnames(log2FC)
+colnames(log2FC) %in% colnames(gp)
+
+cor.long <- melt(as.data.table(cor.mat, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+setnames(cor.long, old = "rn", new = "gene")
+
+obs.counts <- nice.out.power3[!is.na(log2FC), .N, by = gene]
+
+cor.long[obs.counts, numObservations := N,  on = "gene"]
+setorder(cor.long, -numObservations, -R, na.last = TRUE)
+
+
+```
+
+```{r scores.list}
+scores.list <- list(exp = exp.long,
+                    pred = pred.long,
+                    iupar = iupar.long)
+```
+Convert the scores to a matrix
+
+```{r}
+scores.mat <- lapply(scores.list, function(x){
+  dcast(x, GProtein~GPCR, value.var = 'score') %>% 
+    as.matrix(rownames = 'GProtein')
+})
+```
+
+change the  colnames to reflect the mss nomenclature
+
+```{r}
+scores.mat <- lapply(scores.mat, function(x){
+  colnames(x) <- c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+  return(x)
+})
+
+```
+
+reorder the mss columns to follow the order above 
+```{r}
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+
+mss.out <- fread('./data/2022_08_31_NiceFitsPower3.csv')
+
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+# filter to sig genes and reorder
+sig.genes <- mss.out[pvalue < 0.05 & abs(log2FC) > log2(1.5) & receptor != 'MOR.LG94', unique(gene) ]
+exp.mat <- exp.mat[rownames(exp.mat) %in% sig.genes,]
+
+# renanme MOR DAMGO to MOR
+colnames(exp.mat) <- c('DOR', 'KOR', 'MOR', 'MRX2', 'MRX4', 'NK1R', 'NPFFR1', 'NPY1R','PTGER1', 'PTGER4','QRFPR')
+
+
+# reorder the cols
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+exp.mat <- exp.mat[, col.order]
+
+# sanity check; looks good
+head(exp.mat.reorder)
+lapply(scores.mat, colnames)
+```
+
+run the correlations for each of the datasets
+
+
+```{r}
+cor.list <- lapply(scores.mat, function(x){
+  cor(t(exp.mat), t(x), use= "pairwise.complete.obs")
+})
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "gene")
+  return(x)
+})
+
+```
+
+
+Of all all genes, how many receptors were they associated with
+Nearly all genes detected by all receptors
+
+```{r}
+
+obs.counts <- mss.out[!is.na(log2FC) & receptor != 'MOR.LG94', .N, by = gene]
+hist(obs.counts$N, breaks=seq(1,11))
+
+```
+
+add this info to the correlation res
+
+```{r}
+lapply(cor.long, function(x){
+  
+  x[obs.counts, numObservations := N, on = 'gene']
+  setorder(x, -numObservations, -R, na.last = TRUE) #strongest associations at top
+})
+
+```
+```{r}
+lapply(cor.long, function(x) hist(x$numObservations))
+
+lapply(cor.long, function(x){
+  
+  x[, direction := ifelse(R > 0, 'pos', 'neg')]
+  x[!is.na(R) & numObservations == 11, percentile.rank := rank(R)/length(R), by=GProtein] # only interested in those found in all
+    
+})
+```
+dot plots with the correlations labelled
+```{r dotplots.cor}
+names(cor.long) <- c('experimental', 'predicted', 'IUPHAR')
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+ g <- ggplot(x[[i]][!is.na(R) & numObservations == 11,], aes(x=GProtein, y=R, fill=GProtein, label=gene)) +
+    geom_beeswarm(aes(color=GProtein), size=0.3, cex=0.3) +
+    geom_text_repel(data = x[[i]][!is.na(R) & numObservations == 11 & (percentile.rank > 0.95 | percentile.rank < 0.05),], aes(x=GProtein, y=R),  size = 2, max.overlaps = 30)  +
+    ggtitle(paste0(n[[i]], ' data')) +
+    guides(colour = guide_legend(override.aes = list(size=3))) +
+    theme_bw()
+
+  g
+ BackupAsPDF(g, paste0(n[[i]], 'sig.corr.dotplot.top5perc.'))
+ 
+},x=cor.long, n=names(cor.long))
+
+```
+venn diagram: look at onverlap in strong correlations (+/- 0.6 R); how many in each set/
+
+extracxt genes with connections +/- R 0.6
+```{r}
+genes <- cor.long[['IUPHAR']] %>% 
+  .[numObservations == 11 & abs(R) > 0.6] %>% 
+  split(., list(.$GProtein, .$direction))
+
+# extract vector of genes
+genes <- lapply(genes, function(x){
+  return(x$gene)
+})
+
+```
+No overlap in strongly correlated genes r (0.6 threshold)
+```{r strong.venn}
+# plot up and down sets seperately and use an upset plot to combine
+
+g <- genes[names(genes) %like% '*.pos'] %>% 
+  ggvenn(text_size=3, set_name_size = 2.5) + 
+  ggtitle('N Proteins positively correlated (r > 0.6) with IUPHAR classification') +
+      theme(plot.title = element_text(size = 10, face = "bold"))
+  
+BackupAsPDF(g, 'strong.pos.cor.IUPHAR.overlap')
+
+
+g <- genes[names(genes) %like% '*.neg'] %>% 
+  ggvenn(text_size=3, set_name_size = 2.5) + 
+  ggtitle('N Proteins negatively correlated (r < -0.6) with IUPHAR classification') +
+      theme(plot.title = element_text(size = 10, face = "bold"))
+
+BackupAsPDF(g, 'strong.neg.cor.IUPHAR.overlap')
+
+```
+venn diagram: look at overlap in moderate correlations (0,4 and above)
+
+```{r}
+genes <- cor.long[['IUPHAR']] %>% 
+  .[numObservations == 11 & abs(R) > 0.4] %>% 
+  split(., list(.$GProtein, .$direction))
+
+# extract vector of genes
+genes <- lapply(genes, function(x){
+  return(x$gene)
+})
+```
+
+```{r mod.venn}
+# plot up and down sets seperately and use an upset plot to combine
+
+g <- genes[names(genes) %like% '*.pos'] %>% 
+  ggvenn(text_size=3, set_name_size = 2.5) + 
+  ggtitle('N Proteins positively correlated (r > 0.4) with IUPHAR classification') +
+      theme(plot.title = element_text(size = 10, face = "bold"))
+  
+BackupAsPDF(g, 'moderate.up.sig.protein.overlap')
+
+
+g <- genes[names(genes) %like% '*.neg'] %>% 
+  ggvenn(text_size=3, set_name_size = 2.5) + 
+  ggtitle('N Proteins negatively correlated (r < -0.4) with IUPHAR classification') +
+      theme(plot.title = element_text(size = 10, face = "bold"))
+
+BackupAsPDF(g, 'moderate.down.sig.protein.overlap')
+```
+
+Run enrichment on both strongly and moderately correlated gene sets; lets see what genes these are enriched for 
+- look at the strong enrichments (none for IUPHAR scoring scheme)
+
+
+```{r}
+
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# look at strong correlations first
+lapply(cor.long, function(x){
+  x[, sig := 'not']
+  x[(R > 0.6| R < -0.6), sig := ifelse(R > 0, 'pos', 'neg')]
+})
+
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+  x[[i]][, enrich_grp := interaction(GProtein,sig)]
+  
+  universe <- unique(mss.out$gene)
+  
+  enrich.dt <- enricherOnGroups(x[[i]][sig != 'not',], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+  
+  simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+  
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 10, title=paste0(n[[i]], ' strong correlations (abs(r) > 0.6)'), 
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('neg', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 10) 
+
+ BackupAsPDF(ht, paste0(n[[i]], '.strong.cor.go.enrichment')) 
+
+},x=cor.long, n=names(cor.long))
+
+
+```
+
+moderate enrichment?
+Looks to be good signal here for all 3 samples
+```{r}
+# look at strong correlations first
+lapply(cor.long, function(x){
+  x[, sig := 'not']
+  x[(R > 0.4| R < -0.4), sig := ifelse(R > 0, 'pos', 'neg')]
+})
+
+
+lapply(seq_along(cor.long), function(x,n,i){
+  
+  x[[i]][, enrich_grp := interaction(GProtein,sig)]
+  
+  universe <- unique(mss.out$gene)
+  
+  enrich.dt <- enricherOnGroups(x[[i]][sig != 'not',], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+  
+  simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+  
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 10, title=paste0(n[[i]], ' moderate correlations (abs(r) > 0.4)'), 
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('neg', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 8) 
+
+ BackupAsPDF(ht, paste0(n[[i]], '.mod.cor.go.enrichment'), dimensions=c(8,10)) 
+
+},x=cor.long, n=names(cor.long))
+```
+r score correlations with the different scoring systems
+
+```{r}
+lapply(seq_along(cor.long), function(x,n,i){
+  
+  x <-  dcast(x[[i]], gene~GProtein, value.var='R') %>% 
+  .[,c(-1)]
+  
+  #pdf(paste0('~/Documents/projects/310723_QLi_GPCR.correlations/310723_QLi_GPCR.correlations_data/pdfs/',n[[i]],'.scatterplot.mat.pdf'), height=9, width=9)
+  g <- ggpairs(x)
+  g
+  #dev.off()
+  #BackupAsPDF(g, paste0(n[[i]],'.scatterplot.mat'), dim=c(9,9))
+  
+},x=cor.long, n=names(cor.long))
+```
+Subset the log2FC values to the top100 r scores per classification and plot heatmap
+
+Notes share the cor matrix, the ggally the upset plots etc, the GO enrichment results and also generate a log2FC heatmap of the top 100 most strongly correlated genes with any receptor
+generate a heatmap of the top 100 genes across all receptors, maybe a second heatmap of the R values per receptor per GProtein (like our heatmap but collapse the 11 col value to 1)
+
+```{r}
+top.100 <- lapply(seq_along(cor.long), function(x,n,i){
+  
+   x <- x[[i]][numObservations == 11,] %>% 
+  .[order(-abs(R)),] %>% 
+  .[, R := max(abs(R)), by=gene] %>% # collapse genes to max abs val
+  .[, .(unique(gene))] %>% 
+  .[1:100,]
+  
+  return(x)
+  
+},x=cor.long, n=names(cor.long))
+
+names(top.100) <- c('experimental', 'predicted', 'IUPHAR')
+```
+
+Have vector n 11 of log2FC values vs each receptor and vector n11 of predicted and exp values of each G protein per receptor
+problem is based on top 100 scoring proteins, receptors cluster differently
+
+```{r}
+# exp.mat
+lapply(seq_along(top.100), function(x, n,i ){
+  
+  #subset mat for the top 100 genes
+  submat <- exp.mat[rownames(exp.mat) %in% x[[i]]$V1,]
+  
+  type <- colnames(submat)
+  ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('DOR'='red', 'KOR' = 'blue', 'MOR'='green', 'MRX2'='orange', 'NK1R'='cyan', 'NPFFR1'='darkgrey' ,'NPY1R'='purple', 'PTGER1'='yellow', 'PTGER4'='pink',
+                                                                                          'QRFPR'='black', 'MRX4'='white')))
+  
+  rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+  
+  col.order <- rowClusterWithNA(submat)
+  
+  #generate heatmap
+  hm <- Heatmap(submat,
+        column_title = paste0('Top 100 r scoring proteins ', n[[i]], ' data'), 
+        top_annotation = ha,
+        cluster_rows = col.order,
+        show_row_names = T,
+        row_title = sprintf("%d proteins", nrow(submat)),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 4),
+        column_names_gp = gpar(fontsize = 10),
+       # column_title = paste0(' heatmap'),
+        name = "Log2FC")
+
+
+  BackupAsPDF(hm, paste0(n[[i]], '.n100R.log2FC.heatmap'), dimensions = c(7,10))
+
+},x=top.100, n=names(top.100))
+
+
+lapply(cor.list, head)
+```
+# write out the files of the IUPAC results
+```{r}
+# cor table of experimental  gene scores
+cor.tab <- cor.long$experimental[numObservations == 11,]
+cor.table <- dcast(cor.tab, gene~GProtein, value.var = c("R", "percentile.rank"))
+fwrite(cor.table, './data/gene.correlation.scores.experimental.csv.gz')
+
+# cor table of IUPAR gene scores
+cor.tab <- cor.long$IUPHAR[numObservations == 11,]
+cor.table <- dcast(cor.tab, gene~GProtein, value.var = c("R", "percentile.rank"))
+fwrite(cor.table, './data/gene.correlation.scores.iupar.csv.gz') 
+
+
+cor.tab <- cor.long$predicted[numObservations == 11,]
+cor.table <- dcast(cor.tab, gene~GProtein, value.var = c("R", "percentile.rank"))
+fwrite(cor.table, './data/gene.correlation.scores.predicted.csv.gz') 
+
+iupar <- fread( "/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/GPCR.correlations.310823/gene.correlation.scores.iupar.csv.gz")
+
+
+```
+
+Show heatmap of the top 100 genes and the predicted & IUPHAR scores
+# TODO drop for now; think just need to enforce order of columns in the exp mat on these 3   
+# rename cols to match the expression data 
+
+```{r}
+scores.mat <- lapply(scores.mat, function(x){
+  
+  colnames(x) <- c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR", "MOR", "PTGER1", "PTGER4", "QRFPR", "NK1R") 
+  return(x)})
+
+names(scores.mat) <- c('experimental', 'predicted', 'IUPHAR')
+```
+inspect the correlation scores for each 
+```{r}
+iupar <- fread( "/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/GPCR.correlations.310823/gene.correlation.scores.iupar.csv.gz")
+iupar[gene == 'PRKCA',]
+
+
+mss.out
+```
+regenerate the correlations and check the results
+
+```{r}
+cor_matrix <- matrix(NA, nrow = nrow(exp.mat), ncol = nrow(scores.mat$iupar))
+
+for (i in 1:nrow(exp.mat)) {
+  # Loop through each row in matrix B
+  for (j in 1:nrow(scores.mat$iupar)) {
+    # Calculate the Pearson correlation between row i in A and row j in B
+    correlation <- cor(exp.mat[i, ], scores.mat[j, ])
+    # Store the correlation in the result matrix
+    cor_matrix[i, j] <- correlation
+  }
+}
+
+colnames(exp.mat)
+colnames(scores.mat$iupar)
+
+
+
+colnames(scores.list)
+lapply(scores.mat, colnames)
+
+var.x <- c('MRX2','MRX4','NPFFR1','NPY1R','DOR','KOR','MOR','PTGER1','PTGER4','QRFPR','NK1R')
+var.x
+```
+
+

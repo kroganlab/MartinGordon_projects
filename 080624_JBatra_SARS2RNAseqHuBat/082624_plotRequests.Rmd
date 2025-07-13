@@ -1,0 +1,677 @@
+---
+title: "082624_plotRequests"
+author: "Martin Gordon"
+date: "2024-08-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Load in the packages and prepare the files requested by Jyoti
+
+```{r packages}
+
+library(DESeq2)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(circlize)
+library(ComplexHeatmap)
+library(ggrepel)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj; eg facet_grid allow x/y axis to vary
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+library(viridis)
+library(readxl)
+library(viridis)
+
+library(biomaRt)
+
+# RNAseq DE functions
+library(tximport)
+library(DESeq2)
+library(IHW)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+```
+
+Load relevant datasets
+```{r}
+id.mapping.dt <- read_xlsx('./docs/human_to_RFE_gene_conversion_table_FINAL.xlsx')
+
+isGenes <- fread('/Users/martingordon/Documents/projects/022624_AViDD_AB_PH_data/docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+
+viralGenes <- c('orf1ab', 'S', 'orf3a', 'E', 'M',  'orf6', 'orf7a', 'orf8', 'N', 'orf10')
+
+# need to highlight these 3 genes in the heatmap
+proinflam <- readxl::read_xlsx('./docs/List of ISGs and cytokines.xlsx', sheet=1, col_names = T)$Proinflammatory
+isg <- readxl::read_xlsx('./docs/List of ISGs and cytokines.xlsx', sheet=2, col_names = T)$ISG
+ckines <- readxl::read_xlsx('./docs/List of ISGs and cytokines.xlsx', sheet=3, col_names = T)$GENES
+
+
+# id mapper
+idMap.txt <- readxl::read_xlsx('./docs/human_to_RFE_gene_conversion_table_FINAL.xlsx', sheet=2) %>% 
+  setDT()
+
+genes.oi <- c(isg, proinflam, ckines)
+
+# some overlap in the sets
+length(genes.oi)
+length(unique(genes.oi))
+```
+metadata
+
+```{r}
+meta.data <- data.table(sample=dir('./output/salmonOut', full.names = F, pattern='quant.sf'))
+meta.data[, `:=`(host=ifelse(grepl('MRC5', sample), 'human', 'bat'),
+                 timepoint=ifelse(grepl('Mock', sample), '', str_extract(sample, '[0-9]{1,2}h')),
+                 virus=ifelse(grepl('Mock', sample), 'Mock', gsub('MRC5_|RFe_|_[0-9]{1,2}h.+', '', sample))
+                 )]
+
+# now want to set T0 and Mock as baseline for factor levels
+meta.data[, `:=`(virus=factor(virus, levels=c('Mock','WA', 'N_P80T', '9bI_N_P80T')),
+                 timepoint=factor(timepoint, levels=c('','6h', '12h', '24h', '48h'))
+                 )]
+
+
+# another fix; tp and virus are confounded for Mock, so we need to create a 'group' variable 
+meta.data[, condition := factor(ifelse(virus=='Mock', 'Mock', paste(virus, timepoint, sep='.')))]
+meta.data[, condition := relevel(condition, ref='Mock')]
+
+bat.meta <- data.frame(meta.data[host=='bat',], row.names = 'sample')
+hu.meta <- data.frame(meta.data[host=='human',], row.names = 'sample')
+
+# reset the tp levels for human as missing 6hr
+hu.meta$timepoint <-  factor(hu.meta$timepoint, levels=c('12h', '24h', '48h'))
+bat.meta$timepoint <-  factor(bat.meta$timepoint, levels=c('6h', '12h', '24h', '48h'))
+```
+
+Count matrices 
+Also include the output with the viral counts
+
+```{r}
+dds.bat <- readRDS('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/080824_PWcomparisons_data/2024_08_13_dds.bat.vsMock.rds')
+dds.hu <- readRDS('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/080824_PWcomparisons_data/2024_08_13_dds.human.vsMock.rds')
+
+# get count matrices with viral counts
+dds.viral.bat <- readRDS('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/viralProteinPlots_data/2024_08_26_dds.bat.vsMock.featureCountswVirus.rds')
+dds.viral.hu <- readRDS('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/viralProteinPlots_data/2024_08_26_dds.human.vsMock.featureCountswVirus.rds')
+```
+
+**Creating output tables**
+PWcontrasts
+(write out the contrasts in wide format)
+```{r}
+tp.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/PWComparisonsTimepoint_data/2024_08_13_PWcomparisons.viralTimepoint.csv')
+vsMock.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/080824_PWcomparisons_data/2024_08_08_PWcomparisonsvsMock.PostProc.csv')
+
+# combine the two datasets to make it easier to analyse
+tp.dt[, Label := 'SARS2 strain contrasts']
+vsMock.dt[, Label := 'Vs Mock contrasts']
+
+comb.dt <- rbind(tp.dt, vsMock.dt)
+
+# tp 
+fwrite(dcast(tp.dt[species=='human',], gene~contrast, value.var = c('log2FoldChange', 'lfcSE', 'pvalue', 'padj')), ScriptAndDatedFileName('_humanPWcomparisons.viralTimepoint.wide.csv'))
+fwrite(dcast(tp.dt[species=='bat',], gene~contrast, value.var = c('log2FoldChange','lfcSE', 'pvalue', 'padj')), ScriptAndDatedFileName('_batPWcomparisons.viralTimepoint.wide.csv'))
+
+# vs mock
+fwrite(dcast(vsMock.dt[species=='human',], gene~contrast, value.var = c('log2FoldChange','lfcSE', 'pvalue', 'padj')), ScriptAndDatedFileName('_humanPWcomparisons.vsMock.wide.csv'))
+fwrite(dcast(vsMock.dt[species=='bat',], gene~contrast, value.var = c('log2FoldChange','lfcSE', 'pvalue', 'padj')), ScriptAndDatedFileName('_batPWcomparisons.vsMock.wide.csv'))
+
+```
+
+```{r}
+hu.counts <- assay(vst(dds.hu, blind=F))
+bat.counts <- assay(vst(dds.bat, blind=F))
+```
+
+get the viral protein counts for use with the heatmaps
+
+```{r}
+#CoV2
+sars2.gtf <- fread(cmd = "grep -v '#' ./output/annoFiles/SARS2_WA.gtf") %>% 
+  .[V3 == 'gene', .(ref=V1,start=V4, stop=V5, info=V9)]
+sars2.gtf[, c('gene_id', 'gene') := tstrsplit(gsub('\\"|gene_id\\s|gene\\s', '', info), ';', keep=c(1,5))]
+
+viral.genes <- sars2.gtf[, gene_id]
+
+# assay and counts are the same, provided normalize is set to false for counts,
+assay(dds.viral.hu)[rownames(assay(dds.viral.hu)) %in% viral.genes,][, ] %>% head()
+counts(dds.viral.hu, normalize=T)[rownames(assay(dds.viral.hu)) %in% viral.genes,][, ] %>%  head()
+
+# the rlog and vst transformations are strange with thiese lo counts..seem to impute values... just use log2 + pseudocount
+# look into why or how it does this.. definitely dont trust the rlog values, but I gues
+
+# look into why... for now 
+# for now take the normalized coutns so we can compare across groups
+hu.viral.mat <-  counts(dds.viral.hu, normalized=T)[rownames(counts(dds.viral.hu, normalized=T)) %in% viral.genes,]
+bat.viral.mat <- counts(dds.viral.bat, normalized=T)[rownames(counts(dds.viral.bat, normalized=T)) %in% viral.genes,]
+
+# convert the names 
+rownames(hu.viral.mat)[rownames(hu.viral.mat) %in% viral.genes] <- sars2.gtf[, .(gsub('\\s','',gene))]$V1
+rownames(bat.viral.mat)[rownames(bat.viral.mat) %in% viral.genes] <- sars2.gtf[, .(gsub('\\s','',gene))]$V1
+
+```
+
+Initally finding only ~50% of genes in the dataset; could be due to non-stranded? low coverage etc??
+Update: looked at aliases not the issue
+Query the org.db structure, filter on the names of the genes in the list
+```{r}
+library(org.Hs.eg.db)
+
+id.map <- mapIds(org.Hs.eg.db, 
+       keys=genes.oi,
+       column='ALIAS',
+       keytype = 'SYMBOL',multiVals = 'list')
+
+
+# lets make a datatable of the output
+ids.dt <- lapply(id.map, function(x) paste(x, collapse=';')) %>% 
+  do.call(rbind, .) %>% 
+  as.data.table(., keep.rownames=T)
+
+setnames(ids.dt, new=c('symbol', 'alias'))
+
+# doesnt work as rbindlist expects list of dt or list of list, doesnt know how to handle list of char vectors
+##lapply(id.map, function(x) paste(x, collapse=';')) %>% 
+#  rbindlist()
+```
+```{r}
+rownames(hu.counts) %in% genes.oi %>%  sum()
+# just recovered 10 more genes... looks like we just arent picking up most of these
+rownames(hu.counts) %in% do.call(c, strsplit(ids.dt$alias, ';')) %>%  sum()
+
+genes.oi <- unique(c(genes.oi, do.call(c, strsplit(ids.dt$alias, ';'))))
+bat.genes.oi <- unique(c(genes.oi, idMap.txt[Human_gene_name %in% genes.oi, RFE_gene_name]))
+```
+
+add identifier so can plot these
+```{r}
+# subset to the genes of interest and write these out as a table
+tp.dt[, info := ifelse(gene %in% genes.oi, 'proinflammatory/ISG/chemokine/cytokine', NA)]
+vsMock.dt[, info := ifelse(gene %in% genes.oi, 'proinflammatory/ISG/chemokine/cytokine', NA)]
+```
+plot the requested ISGs and cytokines, I’m particularly interested in looking at specific genes in the attached file. Could you make a heatmap and a wide-format file for these?
+
+```{r}
+# all tables with the different gene sets
+fwrite(dcast(vsMock.dt[species=='bat' & !is.na(info),], gene~contrast, value.var = c('log2FoldChange', 'lfcSE', 'pvalue', 'padj')), ScriptAndDatedFileName('_batPWcomparisons.vsMock.genesOI.wide.csv'))
+fwrite(dcast(vsMock.dt[species=='human' & !is.na(info),], gene~contrast, value.var = c('log2FoldChange', 'lfcSE', 'pvalue', 'padj')), ScriptAndDatedFileName('_humanPWcomparisons.vsMock.genesOI.wide.csv'))
+fwrite(dcast(tp.dt[species=='bat' & !is.na(info),], gene~contrast, value.var = c('log2FoldChange', 'lfcSE', 'pvalue', 'padj')), ScriptAndDatedFileName('_batPWcomparisons.viralTimepoints.genesOI.wide.csv'))
+fwrite(dcast(tp.dt[species=='human' & !is.na(info),], gene~contrast, value.var = c('log2FoldChange', 'lfcSE', 'pvalue', 'padj')), ScriptAndDatedFileName('_humanPWcomparisons.viralTimepoints.genesOI.wide.csv'))
+```
+ok, now to produce the different plots of the data
+combine all the datatables and process this as unique combos of species/comparison
+
+```{r}
+# create heatmap annotation 
+col.pal <- randomcoloR::distinctColorPalette(k=4)
+```
+
+```{r}
+submat <- hu.counts[rownames(hu.counts) %in% genes.oi,]
+
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+colnames(submat) <- gsub('[.]quant[.]sf','', colnames(submat)) # tidy colnames
+
+# column annotation with counts of a SARS protein
+colours <- list('timepoint' = c('12h'="#228833", '24h'="#CCBB44", '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3], 'Mock'=col.pal[4]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'human',.(virus)],
+                            'SARS2 Spike protein counts' = anno_barplot(log2(hu.viral.mat[rownames(hu.viral.mat) == 'S',] + 1)),  # axis=T, axis_param = list(at=seq(0, 20, by=5), labels=seq(0, 20, by=5))),
+                                                        col = colours)
+
+# row annotation; identify proteins belonging to the different groups
+proinflam_bar <- as.numeric(rownames(submat) %in% proinflam) #logical vec
+isg_bar <- as.numeric(rownames(submat) %in% isg)
+ckine_bar <-  as.numeric(rownames(submat) %in% ckines)
+
+#matrix rownames
+names_bar <-  rownames(submat) %in% c(proinflam, isg, ckines)
+
+
+#sanity check
+colnames(submat) ==colnames(hu.viral.mat)
+
+ht_list <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns = F,
+        show_column_names = T,
+        column_names_gp = gpar(fontsize=7),
+        name = 'norm counts/median',
+        border=T,
+        show_row_names = T,
+        column_split =  list(#meta.data[host == 'human',.(virus)],
+                             meta.data[host == 'human',.(timepoint)]) ) +
+  Heatmap(proinflam_bar, name = "proinflammatory", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(isg_bar, name = "interferon stimulated genes (ISGs)", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(ckine_bar, name = "cytokines/chemokines", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(submat)[names_bar], 
+        labels_gp = gpar(fontsize = 4), padding = unit(0.2, "mm"))) 
+
+hm <- draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="right")
+BackupAsPDF(hm, 'human.genes.oi.medianScaled.heatmap', dimensions = c(12,9))
+```
+Now plot vs Mock and remove that group from the contrasts
+
+```{r}
+submat <- sweep(hu.counts, 1, apply(hu.counts[, grepl('Mock', colnames(hu.counts))], 1, mean, na.rm=T), FUN='-')
+submat <- submat[rownames(submat) %in% genes.oi, grep('Mock', colnames(submat), invert=T)]
+colnames(submat) <- gsub('[.]quant[.]sf','', colnames(submat)) # tidy colnames
+
+# row annotation; identify proteins belonging to the different groups
+proinflam_bar <- as.numeric(rownames(submat) %in% proinflam) #logical vec
+isg_bar <- as.numeric(rownames(submat) %in% isg)
+ckine_bar <-  as.numeric(rownames(submat) %in% ckines)
+
+#matrix rownames
+names_bar <-  rownames(submat) %in% c(proinflam, isg, ckines)
+
+#sanity check
+colnames(submat) ==colnames(hu.viral.mat[, grep('Mock', colnames(hu.viral.mat), invert=T)])
+
+# lets make a color vectoe
+colours <- list('timepoint' = c('12h'="#228833", '24h'="#CCBB44", '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'human' & virus != 'Mock',.(virus)],
+                            'SARS2 Spike protein counts' = anno_barplot(log2(hu.viral.mat[rownames(hu.viral.mat) == 'S', grep('Mock', colnames(hu.viral.mat), invert=T)] + 1)), 
+                                                        col = colours)
+
+ht_list <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =F,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+        column_split = factor(str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(-2,0,2), colors=c('blue','white','red')),
+        name=('Counts vs Mock'),
+        border=T,
+        show_row_names = T) +
+  Heatmap(proinflam_bar, name = "proinflammatory", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(isg_bar, name = "interferon stimulated genes (ISGs)", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(ckine_bar, name = "cytokines/chemokines", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(submat)[names_bar], 
+        labels_gp = gpar(fontsize = 4), padding = unit(0.2, "mm"))) 
+
+hm <- draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="right")
+BackupAsPDF(hm, 'human.genes.oi.vsMock.heatmap', dimensions = c(12,9))
+```
+
+
+
+
+
+Now produce the plot with the bat samples
+
+```{r}
+submat <- bat.counts[rownames(bat.counts) %in% genes.oi,]
+
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+colnames(submat) <- gsub('[.]quant[.]sf','', colnames(submat)) # tidy colnames
+
+# create heatmap annotation 
+#col.pal <- randomcoloR::distinctColorPalette(k=4)
+
+# column annotation with counts of a SARS protein
+colours <- list('timepoint' = c('6h'="#66CCEE", '12h'="#228833", '24h'="#CCBB44", '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3], 'Mock'=col.pal[4]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'bat',.(virus)],
+                            'SARS2 Spike protein counts' = anno_barplot(log2(bat.viral.mat[rownames(bat.viral.mat) == 'S',] + 1)),  # axis=T, axis_param = list(at=seq(0, 20, by=5), labels=seq(0, 20, by=5))),
+                                                        col = colours)
+
+# row annotation; identify proteins belonging to the different groups
+proinflam_bar <- as.numeric(rownames(submat) %in% proinflam) #logical vec
+isg_bar <- as.numeric(rownames(submat) %in% isg)
+ckine_bar <-  as.numeric(rownames(submat) %in% ckines)
+
+#matrix rownames
+names_bar <-  rownames(submat) %in% c(proinflam, isg, ckines)
+
+#sanity check
+colnames(submat) ==colnames(hu.viral.mat)
+
+ht_list <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns = F,
+        show_column_names = T,
+        column_names_gp = gpar(fontsize=7),
+        name = 'norm counts/median',
+        border=T,
+        show_row_names = T,
+        column_split =  list(#meta.data[host == 'human',.(virus)],
+                             meta.data[host == 'bat',.(timepoint)]) ) +
+    Heatmap(proinflam_bar, name = "proinflammatory", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(isg_bar, name = "interferon stimulated genes (ISGs)", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(ckine_bar, name = "cytokines/chemokines", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(submat)[names_bar], 
+        labels_gp = gpar(fontsize = 4), padding = unit(0.2, "mm"))) 
+
+hm <- draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="right")
+BackupAsPDF(hm, 'bat.genes.oi.medianScaled.heatmap', dimensions = c(12,9))
+```
+```{r}
+submat <- sweep(bat.counts, 1, apply(bat.counts[, grepl('Mock', colnames(bat.counts))], 1, mean, na.rm=T), FUN='-')
+submat <- submat[rownames(submat) %in% genes.oi, grep('Mock', colnames(submat), invert=T)]
+colnames(submat) <- gsub('[.]quant[.]sf','', colnames(submat)) # tidy colnames
+
+
+# row annotation; identify proteins belonging to the different groups
+proinflam_bar <- as.numeric(rownames(submat) %in% proinflam) #logical vec
+isg_bar <- as.numeric(rownames(submat) %in% isg)
+ckine_bar <-  as.numeric(rownames(submat) %in% ckines)
+
+#matrix rownames
+names_bar <-  rownames(submat) %in% c(proinflam, isg, ckines)
+
+#sanity check
+colnames(submat) ==colnames(bat.viral.mat[, grep('Mock', colnames(bat.viral.mat), invert=T)])
+
+# lets make a color vectoe
+colours <- list('timepoint' = c('12h'="#228833", '24h'="#CCBB44", '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'bat' & virus != 'Mock',.(virus)],
+                            'SARS2 Spike protein counts' = anno_barplot(log2(bat.viral.mat[rownames(hu.viral.mat) == 'S', grep('Mock', colnames(bat.viral.mat), invert=T)] + 1)), 
+                                                        col = colours)
+
+ht_list <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =F,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+        column_split = factor(str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(-2,0,2), colors=c('blue','white','red')),
+        name=('Counts vs Mock'),
+        border=T,
+        show_row_names = T) +
+  Heatmap(proinflam_bar, name = "proinflammatory", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(isg_bar, name = "interferon stimulated genes (ISGs)", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(ckine_bar, name = "cytokines/chemokines", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(submat)[names_bar], 
+        labels_gp = gpar(fontsize = 4), padding = unit(0.2, "mm"))) 
+
+hm <- draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="right")
+hm
+BackupAsPDF(hm, 'bat.genes.oi.vsMock.heatmap', dimensions = c(12,9))
+```
+Lets collapse the counts for each replicate and plot vs Mock for both, but warn Jyoti that this hides differences between the group
+
+```{r}
+
+hu.counts %>%  colnames()
+
+submat <- sweep(hu.counts, 1, apply(hu.counts[, grepl('Mock', colnames(hu.counts))], 1, mean, na.rm=T), FUN='-')
+submat <- submat[rownames(submat) %in% genes.oi, grep('Mock', colnames(submat), invert=T)]
+colnames(submat) <- gsub('[.]quant[.]sf','', colnames(submat)) # tidy colnames
+
+# row annotation; identify proteins belonging to the different groups
+proinflam_bar <- as.numeric(rownames(submat) %in% proinflam) #logical vec
+isg_bar <- as.numeric(rownames(submat) %in% isg)
+ckine_bar <-  as.numeric(rownames(submat) %in% ckines)
+
+#matrix rownames
+names_bar <-  rownames(submat) %in% c(proinflam, isg, ckines)
+
+#sanity check
+colnames(submat) ==colnames(hu.viral.mat[, grep('Mock', colnames(hu.viral.mat), invert=T)])
+
+# lets make a color vectoe
+colours <- list('timepoint' = c('12h'="#228833", '24h'="#CCBB44", '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'human' & virus != 'Mock',.(virus)],
+                            'SARS2 Spike protein counts' = anno_barplot(log2(hu.viral.mat[rownames(hu.viral.mat) == 'S', grep('Mock', colnames(hu.viral.mat), invert=T)] + 1)), 
+                                                        col = colours)
+
+ht_list <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =F,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+        column_split = factor(str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(-2,0,2), colors=c('blue','white','red')),
+        name=('Counts vs Mock'),
+        border=T,
+        show_row_names = T) +
+  Heatmap(proinflam_bar, name = "proinflammatory", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(isg_bar, name = "interferon stimulated genes (ISGs)", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(ckine_bar, name = "cytokines/chemokines", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(submat)[names_bar], 
+        labels_gp = gpar(fontsize = 4), padding = unit(0.2, "mm"))) 
+
+hm <- draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="right")
+BackupAsPDF(hm, 'human.genes.oi.vsMock.heatmap', dimensions = c(12,9))
+```
+Get average of each group
+
+```{r}
+hu.dt <- setDT(reshape2::melt(hu.counts))
+hu.dt$Var2 %>%  unique(0)
+hu.dt[, Var2 := gsub('_T1[.]quant[.]sf|[.]quant[.]sf','', Var2)]
+hu.dt[, `:=`(timepoint=ifelse(grepl('Mock', Var2), '', str_extract(Var2, '[0-9]{1,2}h')),
+             virus=ifelse(grepl('Mock', Var2), 'Mock', gsub('MRC5_|RFe_|_[0-9]{1,2}h.+', '', Var2)))]
+hu.dt[, replicate := str_extract(Var2,'[123]$'),]
+
+# convert to long and summarise by group
+summary.mat <- dcast(hu.dt, Var1~interaction(virus, timepoint), value.var = 'value', fun.aggregate = mean) %>% 
+  as.matrix(rownames='Var1')
+
+submat <- summary.mat[rownames(summary.mat) %in% genes.oi,]
+submat <- sweep(submat, 1, submat[, grep('Mock', colnames(submat))])
+submat <-  submat[, grep('Mock', colnames(submat), invert=T)]
+
+
+# row annotation; identify proteins belonging to the different groups
+proinflam_bar <- as.numeric(rownames(submat) %in% proinflam) #logical vec
+isg_bar <- as.numeric(rownames(submat) %in% isg)
+ckine_bar <-  as.numeric(rownames(submat) %in% ckines)
+
+#matrix rownames
+names_bar <-  rownames(submat) %in% c(proinflam, isg, ckines)
+
+ht_list <- Heatmap(submat, 
+        cluster_column_slices = F,
+        name = 'Counts vs Mock (avg)',
+       top_annotation = HeatmapAnnotation(virus=gsub('[.][0-9]{1,2}h','', colnames(submat)),
+                                           col=list(virus=c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3]))
+                                          ),
+        column_split=str_extract(colnames(submat), '[0-9]{1,2}h')) +
+  Heatmap(proinflam_bar, name = "proinflammatory", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(isg_bar, name = "interferon stimulated genes (ISGs)", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(ckine_bar, name = "cytokines/chemokines", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(submat)[names_bar], 
+        labels_gp = gpar(fontsize = 4), padding = unit(0.2, "mm"))) 
+
+hm <- draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="right")
+BackupAsPDF(hm, 'human.genes.oi.vsMock.meanCollapsed.heatmap', dimensions = c(9,9))
+```
+replot the viral samples now
+
+```{r}
+bat.dt <- setDT(reshape2::melt(bat.counts))
+bat.dt$Var2 %>%  unique()
+
+bat.dt[, Var2 := gsub('_T1[.]quant[.]sf|[.]quant[.]sf','', Var2)]
+bat.dt[, `:=`(timepoint=ifelse(grepl('Mock', Var2), '', str_extract(Var2, '[0-9]{1,2}h')),
+             virus=ifelse(grepl('Mock', Var2), 'Mock', gsub('MRC5_|RFe_|_[0-9]{1,2}h.+', '', Var2)))]
+bat.dt[, replicate := str_extract(Var2,'[123]$'),]
+
+# convert to long and summarise by group
+summary.mat <- dcast(bat.dt, Var1~interaction(virus, timepoint), value.var = 'value', fun.aggregate = mean) %>% 
+  as.matrix(rownames='Var1')
+
+submat <- summary.mat[rownames(summary.mat) %in% genes.oi,]
+submat <- sweep(submat, 1, submat[, grep('Mock', colnames(submat))])
+submat <-  submat[, grep('Mock', colnames(submat), invert=T)]
+
+
+# row annotation; identify proteins belonging to the different groups
+proinflam_bar <- as.numeric(rownames(submat) %in% proinflam) #logical vec
+isg_bar <- as.numeric(rownames(submat) %in% isg)
+ckine_bar <-  as.numeric(rownames(submat) %in% ckines)
+
+#matrix rownames
+names_bar <-  rownames(submat) %in% c(proinflam, isg, ckines)
+
+submat <- submat[,c( "9bI_N_P80T.6h","N_P80T.6h","WA.6h", "9bI_N_P80T.12h", "N_P80T.12h",     "WA.12h" ,  "9bI_N_P80T.24h" ,"N_P80T.24h" ,    "WA.24h", "9bI_N_P80T.48h" ,"N_P80T.48h" ,"WA.48h")]         
+
+Heatmap(submat,
+        cluster_columns = F)
+
+ht_list <- Heatmap(submat, 
+        cluster_column_slices = F,
+        column_order = colnames(submat),
+        name = 'Counts vs Mock (avg)',
+       top_annotation = HeatmapAnnotation(virus=gsub('[.][0-9]{1,2}h','', colnames(submat)),
+                                           col=list(virus=c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3]))),
+        column_split = factor(ifelse(grepl('Mock', colnames(submat)), 'Na', str_extract(colnames(submat), '[0-9]{1,2}h')), levels=c('Na', '6h','12h', '24h','48h'))) +
+  Heatmap(proinflam_bar, name = "proinflammatory", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(isg_bar, name = "interferon stimulated genes (ISGs)", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(ckine_bar, name = "cytokines/chemokines", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7, fontface='bold'), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(submat)[names_bar], 
+        labels_gp = gpar(fontsize = 4), padding = unit(0.2, "mm"))) 
+
+hm <- draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="right")
+
+
+BackupAsPDF(hm, 'bat.genes.oi.vsMock.meanCollapsed.heatmap', dimensions = c(9,9))
+```
+
+
+More important plot; plot proportion of viral reads in each of the matrices; is this increasing overtime?
+Strange; no obvious increase in viral proteins over time it seems?
+```{r}
+test <- log2(hu.viral.mat+1)
+
+subtest <- sweep(test, 1, apply(test, 1, median, na.rm=T))
+
+hm <- Heatmap(subtest,
+              top_annotation = HeatmapAnnotation(virus=gsub('_[123]','', gsub('MRC5_|RFe_|[_][0-9].+','', colnames(subtest))),
+                                           col=list(virus=c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3], 'Mock'=col.pal[4]))),
+              column_split = meta.data[host == 'human',.(timepoint)],
+              name='log2 Counts/Median',
+              border=T,
+              column_names_gp = gpar(fontsize=6),
+              col=colorRamp2(breaks=c(-2,0,2), col=c('blue','white','red')))
+
+hm
+BackupAsPDF(hm, 'human.viralCounts.medianScale.heatmap')
+
+
+# do the bat 
+test <- log2(bat.viral.mat+1)
+subtest <- sweep(test, 1, apply(test, 1, median, na.rm=T))
+
+
+hm <- Heatmap(subtest,
+              cluster_column_slices = F,
+              top_annotation = HeatmapAnnotation(virus=gsub('_[123]','', gsub('MRC5_|RFe_|[_][0-9].+','', colnames(subtest))),
+                                           col=list(virus=c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3], 'Mock'=col.pal[4]))),
+             # column_split = meta.data[host == 'bat',.(timepoint)],
+              column_split = factor(ifelse(grepl('Mock', colnames(subtest)), '', str_extract(colnames(subtest), '[0-9]{1,2}h')), levels=c('', '6h','12h', '24h','48h')),
+              name='log2 Counts/Median',
+              border=T,
+              column_names_gp = gpar(fontsize=6),
+              col=colorRamp2(breaks=c(-4,0,4), col=c('blue','white','red')))
+
+hm
+BackupAsPDF(hm, 'bat.viralCounts.medianScale.heatmap')
+
+
+ sort(meta.data[host == 'bat',.(timepoint)]
+
+colnames(subtest)
+gsub('_[123]','', gsub('MRC5_|RFe_|[_][0-9].+','', colnames(subtest)))
+
+
+
+2^10
+```
+Lets just try the unnormalized to inspect
+
+```{r}
+counts(dds.viral.hu, normalized=F)
+
+
+# these are raw counts no obvious trend related to timepoint
+test <- log2(counts(dds.viral.hu, normalized=F)+1)
+
+subtest <- sweep(test, 1, apply(test, 1, median, na.rm=T))
+
+Heatmap(subtest[rownames(subtest) %in% viral.genes,],
+        column_split = meta.data[host == 'human',.(timepoint)],
+        name='log2 Counts/Median',
+        col=colorRamp2(breaks=c(-4,0,4), col=c('blue','white','red')))
+
+
+
+
+
+tp.dt
+2^4
+```
+
+

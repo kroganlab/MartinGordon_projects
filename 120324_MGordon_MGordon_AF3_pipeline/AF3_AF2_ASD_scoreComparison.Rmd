@@ -1,0 +1,310 @@
+---
+title: "AF3_AF2_ASD_scoreComparison"
+author: "Martin Gordon"
+date: "2025-01-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(showtext)
+library(readxl)
+library(pROC) #ROC curves
+
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+
+
+customTheme <- theme_ipsum_rc() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+#get col palette
+col.pal <- getQualitativePalette(n=13)
+```
+
+Read in the AF2 scores and the AF3 scores for the comparison
+
+```{r}
+asd.ppi <- fread('./output/asd_ppi_summaryScores.csv')
+asd.random <- fread('./output/asd_random_summaryScores.csv')
+asd.af2 <- fread('./output/asd_AF2.ppi.csv')
+
+# subset the AF2 set to bait-interaction and bait-random
+asd.af2 <- asd.af2[asdppi_disjoint_group %in% c('bait_random', 'bait_int'),]
+
+asd.ppi[, asdppi_disjoint_group := 'bait_int']
+asd.random[, asdppi_disjoint_group := 'bait_random']
+asd.af3 <- rbind(asd.ppi, asd.random)
+
+asd.af3[,.N, by=asdppi_disjoint_group]
+
+asd.af3[, pairOrdered := toupper(gsub('[.]seed.+$', '', model))]
+summary.asd.af3 <- asd.af3[, .(mean_iptm=mean(iptm, na.rm=T), sd_iptm=sd(iptm, na.rm=T), mean_ptm=mean(ptm, na.rm=T), sd_ptm=sd(ptm, na.rm=T)), by=.(pairOrdered, asdppi_disjoint_group)]
+```
+
+join the two
+```{r}
+summary.asd.af3[, model := 'AF3']
+asd.af2[, model := 'AF2']
+
+comb.dt <-  rbind(x=summary.asd.af3[, .(pairOrdered, asdppi_disjoint_group, mean_iptm, sd_iptm, model)], 
+                  y=asd.af2[, .(pairOrdered, asdppi_disjoint_group, mean_iptm, sd_iptm, model)])
+
+```
+
+```{r}
+
+# af2 pairs are alphabetically ordered; match this for AF3
+summary.asd.af3[pairOrdered == 'CELF4__AUP1']
+asd.af2[pairOrdered == 'AUP1__CELF4']
+
+comb.dt[, pair := pairOrdered]
+comb.dt[, pairOrdered := paste0(sort(unlist(strsplit(pairOrdered, '__'))), collapse='__'), by=.I]
+comb.dt[pair == 'CELF4__AUP1'] # sanity check 
+
+
+# accidentally modelled one ppip in both directions... scores vs similar.. remove one row
+comb.dt <- comb.dt[!pair %in% c('FOXP2__FOXP1', 'TCF7L2__CTNNB1')]
+
+comb.dt[, label := '< 0.5 iPTM']
+comb.dt[mean_iptm >= 0.5, label := '> 0.5 iPTM']
+
+# find the pairs that overlap
+sharedIDs <- intersect(comb.dt[model=='AF3', pairOrdered], comb.dt[model=='AF2', pairOrdered])
+
+comb.dt[,inBothModels := ifelse(pairOrdered %in% sharedIDs, 'yes', 'no')]
+#fwrite(comb.dt, ScriptAndDatedFileName('af3.af2.ASD.iptmScores.csv'))
+```
+
+```{r}
+comb.dt<- fread('~/Documents/projects/120324_MGordon_MGordon_AF3_pipeline/AF3_AF2_ASD_scoreComparison_data/2025_01_27_af3.af2.ASD.iptmScores.csv')
+
+comb.wide.dt <- dcast(comb.dt, pairOrdered~interaction(model, asdppi_disjoint_group), value.var = c('mean_iptm', 'sd_iptm', 'label'))
+```
+
+plot a scatterplot of the random and ppi set
+
+```{r}
+# add a sig identifier
+comb.wide.dt[, bait_int.sig := ifelse(label_AF2.bait_int ==  '> 0.5 iPTM' & label_AF3.bait_int == '> 0.5 iPTM', 'AF2 & AF3 > 0.5 iPTM',
+                                      ifelse(label_AF2.bait_int ==  '> 0.5 iPTM' & label_AF3.bait_int != '> 0.5 iPTM',  'AF2 > 0.5 iPTM',
+                                              ifelse(label_AF2.bait_int !=  '> 0.5 iPTM' & label_AF3.bait_int == '> 0.5 iPTM',  'AF3 > 0.5 iPTM',
+                                                     'AF2 & AF3 < 0.5 iPTM')))]
+
+
+comb.wide.dt[, bait_random.sig := ifelse(label_AF2.bait_random ==  '> 0.5 iPTM' & label_AF3.bait_random == '> 0.5 iPTM', 'AF2 & AF3 > 0.5 iPTM',
+                                      ifelse(label_AF2.bait_random ==  '> 0.5 iPTM' & label_AF3.bait_random != '> 0.5 iPTM',  'AF2 > 0.5 iPTM',
+                                              ifelse(label_AF2.bait_random !=  '> 0.5 iPTM' & label_AF3.bait_random == '> 0.5 iPTM',  'AF3 > 0.5 iPTM',
+                                                     'AF2 & AF3 < 0.5 iPTM')))]
+                                            
+
+g <- ggplot(comb.wide.dt[!is.na(bait_int.sig)], aes(x=mean_iptm_AF2.bait_int, y=mean_iptm_AF3.bait_int)) +
+  geom_point(aes(color=bait_int.sig)) +
+  geom_density_2d() +
+  geom_hline(yintercept=0.5, linetype=2, alpha=0.4) +
+  geom_vline(xintercept=0.5, linetype=2, alpha=0.4) +
+  geom_abline(intercept=0, slope=1) +
+  scale_color_ipsum() +
+  ggtitle('AF2m vs AF3 iptm scores ASD bait-interactor set') +
+  customTheme 
+g
+BackupAsPDF(g, 'asd.baitInt.scatterplot')
+
+g <- ggplot(comb.wide.dt[!is.na(bait_random.sig)], aes(x=mean_iptm_AF2.bait_random, y=mean_iptm_AF3.bait_random)) +
+  geom_point(aes(color=bait_random.sig)) +
+  geom_density_2d() +
+  geom_hline(yintercept=0.5, linetype=2, alpha=0.4) +
+  geom_vline(xintercept=0.5, linetype=2, alpha=0.4) +
+  geom_abline(intercept=0, slope=1) +
+  scale_color_ipsum() +
+  ggtitle('AF2m vs AF3 iptm scores ASD bait-random set') +
+  customTheme 
+g
+
+BackupAsPDF(g, 'asd.baitRandom.scatterplot')
+```
+barplot of the number of sig things in each set
+
+```{r}
+summary.dt <- comb.dt[pairOrdered %in% sharedIDs,.N, by=.(model,asdppi_disjoint_group,label)][,.(prop=N/sum(N),label), by=.(model, asdppi_disjoint_group)][label != '< 0.5 iPTM']
+
+g <- ggplot(summary.dt, aes(x=model, y=prop, fill=asdppi_disjoint_group)) +
+  geom_bar(stat='identity',position='dodge') +
+  ggtitle('Proportion of pairs mean iPTM > 0.5') +
+  scale_fill_manual(values=col.pal) +
+  customTheme 
+g
+BackupAsPDF(g, 'prop.ModelsPassiPTM.barplot')
+```
+boxplots of the average iptm scores for each
+Want a grouped boxplot with bait/random side-by-side
+
+```{r}
+library(ggbeeswarm)
+
+g <- ggplot(comb.dt, aes(x=model, y=mean_iptm, color=asdppi_disjoint_group)) +
+  geom_hline(yintercept=0.5, linetype=2, alpha=0.3) +
+  geom_boxplot() +
+  #geom_point(data=comb.dt[mean_iptm > 0.5], aes(fill =  asdppi_disjoint_group), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('iPTM distributions') +
+  scale_color_manual(values=col.pal) +
+  scale_fill_manual(values=col.pal) +
+  customTheme 
+g
+BackupAsPDF(g, 'af.iptm.distributions.boxplot')
+```
+Lets look at the empirical cumulative distribution function and see the curves
+
+```{r}
+g <- ggplot(comb.dt, aes(x=mean_iptm, color=interaction(model,asdppi_disjoint_group))) +
+         stat_ecdf(pad=T) +
+  customTheme +
+  scale_fill_ipsum() +
+  guides(color=guide_legend("dataset"))
+
+BackupAsPDF(g, 'iptm.iptm.ecdf.linechart')
+```
+
+create a ROC curve and plot the two against each other; see which score is better at distinguishing FP from TP 
+Take only the shared baits cateogry
+
+
+```{r}
+# first run for af2
+subdt <- comb.dt[pairOrdered %in% sharedIDs,]
+subdt[, asdppi_disjoint_group := factor(asdppi_disjoint_group, levels=c('bait_random', 'bait_int'))]
+
+roc.af2 <- roc(subdt[model == 'AF2',]$asdppi_disjoint_group, subdt[model == 'AF2',]$mean_iptm)
+roc.af3 <- roc(subdt[model == 'AF3',]$asdppi_disjoint_group, subdt[model == 'AF3',]$mean_iptm)
+
+
+roc.af2.dt <- data.table(tpp=roc.af2$sensitivities*100, ## tpp = true positive percentage
+                         fpp=(1 - roc.af2$specificities)*100, ## fpp = false positive percentage
+                         thresholds=roc.af2$thresholds,
+                         model='AF2')
+                        
+roc.af3.dt <- data.table(tpp=roc.af3$sensitivities*100, ## tpp = true positive percentage
+                         fpp=(1 - roc.af3$specificities)*100, ## fpp = false positive percentage
+                          thresholds=roc.af3$thresholds,
+                          model='AF3')
+
+roc.comb <- rbind(roc.af2.dt, roc.af3.dt)
+
+
+g <- ggplot(roc.comb, aes(x=fpp, y=tpp, color=model)) +
+  geom_step(linewidth=1, alpha=0.75) +
+  ggtitle('Full dataset: iPTM as predictor of PPI/random set') +
+  labs(x="False Positive Percentage", y="True Postive Percentage") +
+  scale_color_manual(values=col.pal) +
+  coord_cartesian(xlim=c(0,100), ylim=c(0,100)) + 
+  customTheme
+
+BackupAsPDF(g, 'full.data.roc.linechart')
+```
+Ok, using the full dataset, we see no seperation; what about looking at > .25?
+
+```{r}
+roc.af2 <- roc(subdt[model == 'AF2' & mean_iptm >= 0.25,]$asdppi_disjoint_group, subdt[model == 'AF2' & mean_iptm >= 0.25,]$mean_iptm)
+roc.af3 <- roc(subdt[model == 'AF3' & mean_iptm >= 0.25,]$asdppi_disjoint_group, subdt[model == 'AF3' & mean_iptm >= 0.25,]$mean_iptm)
+
+roc.af2.dt <- data.table(tpp=roc.af2$sensitivities*100, ## tpp = true positive percentage
+                         fpp=(1 - roc.af2$specificities)*100, ## fpp = false positive percentage
+                         thresholds=roc.af2$thresholds,
+                         model='AF2')
+                        
+roc.af3.dt <- data.table(tpp=roc.af3$sensitivities*100, ## tpp = true positive percentage
+                         fpp=(1 - roc.af3$specificities)*100, ## fpp = false positive percentage
+                          thresholds=roc.af3$thresholds,
+                          model='AF3')
+
+roc.comb <- rbind(roc.af2.dt, roc.af3.dt)
+
+
+g <- ggplot(roc.comb, aes(x=fpp, y=tpp, color=model)) +
+  geom_step(linewidth=1, alpha=0.75) +
+  ggtitle(' iPTM > .25: iPTM as predictor of PPI/random set') +
+  labs(x="False Positive Percentage", y="True Postive Percentage") +
+  scale_color_manual(values=col.pal) +
+  coord_cartesian(xlim=c(0,100), ylim=c(0,100)) + 
+  customTheme
+g
+BackupAsPDF(g, 'iptm25threshold.data.roc.linechart')
+```
+```{r}
+
+roc.af2 <- roc(subdt[model == 'AF2' & mean_iptm >= 0.5,]$asdppi_disjoint_group, subdt[model == 'AF2' & mean_iptm >= 0.5,]$mean_iptm)
+roc.af3 <- roc(subdt[model == 'AF3' & mean_iptm >= 0.5,]$asdppi_disjoint_group, subdt[model == 'AF3' & mean_iptm >= 0.5,]$mean_iptm)
+
+roc.af2.dt <- data.table(tpp=roc.af2$sensitivities*100, ## tpp = true positive percentage
+                         fpp=(1 - roc.af2$specificities)*100, ## fpp = false positive percentage
+                         thresholds=roc.af2$thresholds,
+                         model='AF2')
+                        
+roc.af3.dt <- data.table(tpp=roc.af3$sensitivities*100, ## tpp = true positive percentage
+                         fpp=(1 - roc.af3$specificities)*100, ## fpp = false positive percentage
+                          thresholds=roc.af3$thresholds,
+                          model='AF3')
+
+roc.comb <- rbind(roc.af2.dt, roc.af3.dt)
+
+
+g <- ggplot(roc.comb, aes(x=fpp, y=tpp, color=model)) +
+  geom_step( alpha=0.75) +
+  geom_point() +
+  ggtitle(' iPTM > .50: iPTM as predictor of PPI/random set') +
+  labs(x="False Positive Percentage", y="True Postive Percentage") +
+  scale_color_manual(values=col.pal) +
+  coord_cartesian(xlim=c(0,100), ylim=c(0,100)) + 
+  customTheme
+g
+BackupAsPDF(g, 'iptm50threshold.data.roc.linechart')
+```
+plot the ratio of the ecdf for af3 and af2
+
+```{r}
+af.mat <- dcast(comb.dt[inBothModels == 'yes' & model=='AF2', ], pairOrdered~paste0(model,'.',asdppi_disjoint_group), value.var = 'mean_iptm') %>% 
+  as.matrix(rownames='pairOrdered')
+
+comb.dt[asdppi_disjoint_group == 'bait_int' & model=='AF2', unique(pairOrdered)] %>% length()
+comb.dt[asdppi_disjoint_group == 'bait_random' & model=='AF3', unique(pairOrdered)] %>% length()
+
+apply(af.mat, 2, ecdf)
+
+decdf <- function(x, baseline, treatment)  ecdf(baseline)(x) - ecdf(treatment)(x)
+
+ecdf(comb.dt[asdppi_disjoint_group == 'bait_random' & model=='AF3', mean_iptm])
+ecdf(comb.dt[asdppi_disjoint_group == 'bait_int' & model=='AF3', mean_iptm])
+ecdf(comb.dt[asdppi_disjoint_group == 'bait_random' & model=='AF3', mean_iptm]) - ecdf(comb.dt[asdppi_disjoint_group == 'bait_int' & model=='AF3', mean_iptm])
+
+
+
+ecdf(comb.dt[asdppi_disjoint_group == 'bait_int' & model=='AF3', mean_iptm])()
+```
+

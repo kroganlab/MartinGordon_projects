@@ -1,0 +1,83 @@
+---
+title: "050725_newplots"
+author: "Martin Gordon"
+date: "2025-05-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview 
+
+Generate plots for HARC meeting tomorrow morningn
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+library(RColorBrewer)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# flag consec proteins
+source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+```
+
+color palette 
+```{r, col}
+donor.col <- brewer.pal(n=2,name='Pastel2')
+
+status.col <-  c("#E41A1C","#377EB8","#4DAF4A")
+names(status.col) <-  c('infected', 'uninfected', 'challenged')
+```
+data
+```{r}
+# using BPs normalized interpolated data
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/docs/2025_05_07_OutlierFractionsRemoved_interpNorm_sec.csv.gz')
+apms.int <-  fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_yager.ints.toCompare.csv.gz') # Yager paper data
+yager.hits <- apms.int[bestMistScore > .75, .(protein1, protein2, gene1, gene2)]
+
+viral.prots <- sec.long[org != 'Homo sapiens', unique(protein)]
+
+robyn.complexes <- setDT(readxl::read_xlsx('./docs/Complexes_Database_RMK_20250506.xlsx', sheet = 1))
+#filter to just described complexes 
+robyn.complexes <- robyn.complexes[, (.SD), .SDcols = !patterns('[.]PG[.]Quantity')]
+robyn.complexes <- robyn.complexes[, .(protein=PG.ProteinAccessions, gene=PG.Genes, org=PG.Organisms, 
+                    complexID=`Complex ID...84`, subcomplexID=`SubComplex ID...85`)]
+complexes.oi <- unique(robyn.complexes$complexID)
+robyn.complexes <- robyn.complexes[complexID %in% complexes.oi & !is.na(complexID)]
+robyn.complexes[is.na(subcomplexID), subcomplexID := complexID]
+
+# differential peaks
+peakClusters <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_donor1donor2.de.anova.results.csv.gz')
+peakClusters[treatmentDiff.p < 0.05 & protein %in% viral.prots]
+```
+
+```{r}
+hiv.set <- setDT(readxl::read_xlsx('./docs/Complexes_Database_RMK_20250506.xlsx', sheet = 2))
+setnames(hiv.set, new=c('mw', 'protein', 'gene', 'org'))
+
+hiv.complexes.set <-  setDT(readxl::read_xlsx('./docs/Complexes_Database_RMK_20250506.xlsx', sheet = 3))
+setnames(hiv.complexes.set, new=c('mw', 'protein', 'gene', 'org', 'descriptions', 'complexID', 'subcomplexID'))
+```
+
+
+Make a plotting data table that contains the  relevant col fields
+```{r}
+plot.dt <- merge(sec.long[, .(sample, protein, gene, org, mw, fraction, status, donor, normInts, intensity_totalScaled)], robyn.complexes, by=c('protein', 'gene', 'org'), all.x=T)
+plot.dt[, donor := as.character(donor)]
+plot.dt[, status := factor(status, levels=c('uninfected', 'challenged', 'infected'))]
+```
+

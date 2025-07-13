@@ -1,0 +1,424 @@
+---
+title: "Antonie_SECMS_firstPass"
+author: "Martin Gordon"
+date: "2024-10-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## First pass of Antoine's SEC-MS data; lets look at the data quality and some other QC metrics as a first pass
+
+
+Note for SEC-MS data, we work in linear space
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+
+
+#source('~/Documents/utils/bp_utils/SEC_MS_utils.R')
+source('~/Documents/utils/mg_utils/r_utils/plottingHelperFunctions.R')
+source('~/Documents/utils/mg_utils/r_utils/SEC_MS_utils.mg.R')
+source('~/Documents/utils/bp_utils/UniprotIDMapping.R')
+```
+# read in data; 3 different files; neurons, carido cells and control
+Want a comparison of the different cell lines
+```{r}
+input.list <- list(cardio = fread('./data/2024_SECMS_Sample_Data/Antoine_Neuron_Cardio_Ctrl/20240707_110005_Biosep-KOLF2-Cardio-F07-052824_Report.tsv'),
+                   neuro = fread('./data/2024_SECMS_Sample_Data/Antoine_Neuron_Cardio_Ctrl/Biosep_KOLF2_Neur_Report.tsv'),
+                   ctrl = fread('data/2024_SECMS_Sample_Data/Antoine_Neuron_Cardio_Ctrl/Biosep_KOLF2_Ctrl_052324_Report.tsv'))
+
+```
+
+First look at the data; difficulty with the isoforms, cant seem to just sum as this is potentially double counting... ask for more info tomorrow
+```{r}
+# looks lik e 1/3 of the ids have isoforms 
+lapply(input.list, function(x){
+  print(nrow(x))
+  x[grep('-[0-9]{1,2}[;]{0,1}', PG.ProteinAccessions)] %>%  nrow() %>%  print()
+})
+
+
+# many isoforms available (~200 in each set),
+# just taking the protein groups with canonical ids and also then for only non-canonical, take the first row
+f.input.list <- lapply(input.list, function(x){
+  (head(x))
+  
+  # lets simplify the protein Names
+  x[, simplifiedProtein := paste0(unique(unlist(strsplit(gsub('-[0-9]{1,2}','', PG.ProteinAccessions), ';'))), collapse=';'), by=.I]
+  x[, .(PG.ProteinAccessions, simplifiedProtein)]
+  
+  # lets count by simplified protein; any proteins found more than once
+  dupProts <- x[,.N, by=simplifiedProtein][N>1, simplifiedProtein]
+  
+  # keep the canonical rows out of the dups
+  canonical.dt <-  x[simplifiedProtein %in% dupProts,] %>% 
+    .[grep('-[0-9]', PG.ProteinAccessions, invert=T), ]
+  
+  # also any rows with canonical transcript among other isoforms
+  canonical2.dt <- x[simplifiedProtein %in% dupProts,] %>% 
+    .[grepl('[A-Z0-9]{2}[;]', PG.ProteinGroups)]
+   #& grepl('[A-Z0-9]{2}[;]', PG.ProteinGroups)
+  
+  f.dt <- rbind(x[!simplifiedProtein %in% dupProts,],
+                canonical.dt, canonical2.dt)
+
+  # still 12 proteins missing out... just take the first protein row per group
+  non.cano.dt <- x[!simplifiedProtein %in% f.dt$simplifiedProtein, .SD[1,], by=simplifiedProtein]# isoform.no := tstrsplit(PG.ProteinAccessions, '-', keep = 2), by=.I] 
+  
+  f.dt <- rbind(f.dt, non.cano.dt)
+  
+  return(x)
+})
+
+
+f.input.list[[1]] %>%  colnames()
+```
+Proceed as is for now; convert to long format
+```{r}
+f.input.list <- lapply(f.input.list, function(x){
+  
+  x <- reshape2::melt(x, id.vars=c("PG.ProteinGroups", "PG.ProteinAccessions", "PG.Genes", "PG.UniProtIds", "PG.ProteinNames", 'simplifiedProtein')) %>% 
+    as.data.table()
+    
+  # drop redundant col names
+  #x[PG.ProteinGroups != PG.UniProtIds]
+  #x[PG.ProteinAccessions != PG.UniProtIds]
+  x[, c("PG.ProteinGroups","PG.UniProtIds") := NULL ] 
+  return(x)
+})
+```
+
+Extract info from the variable name
+```{r}
+input.dt <-  lapply(f.input.list, function(x){
+  # match numeric char followed by ']'
+  x[, fraction := stringr::str_extract(variable, '[0-9]{1,2}(?=])')]
+}) %>%  rbindlist(idcol='condition')
+```
+
+rename and tidy the dt
+Remember with SEC-MS we dont throw out 0 intensities as this is informative (assuming missing is biological not random)
+```{r}
+# create a copy to avoid
+colnames(input.dt)
+sec.ms.dt <-  copy(input.dt)
+sec.ms.dt <- sec.ms.dt[, .(protein=PG.ProteinAccessions, gene=PG.Genes, fraction=fraction, intensity=value, sample=condition)]
+
+# values are not log2 transformed
+sec.ms.dt[!is.na(intensity), range(intensity)]
+```
+
+All the SEC-MS work is performed int he linear scale
+Try a couple of scaling approaches to make different rows comparable
+
+```{r}
+# fix NAs as O; assuming all missing due to bio rather than randomness
+sec.ms.dt[is.na(intensity), intensity := 0]
+
+# try a couple of scalings to see their impact
+sec.ms.dt[, `:=`(intensity_maxScaled = intensity/max(intensity, na.rm=T),
+                 intensity_totalScaled = intensity/sum(intensity, na.rm=T)), by=.(sample,protein)]
+
+# rolling function to apply to consec rows. see here: https://stackoverflow.com/questions/37141277/diff-on-data-table-column
+sec.ms.dt[, intensity_diff := zoo::rollapplyr(intensity, 2, function(x){ diff(x,lag = 1)}, fill = NA), by =.(sample,protein)]
+
+```
+
+```{r}
+sec.ms.dt[sample == 'ctrl' & gene == 'NUP62',]
+
+library(patchwork)
+sec.ms.dt[, gene := multiUniprots2multiGenes(protein, species='HUMAN')]
+
+# just take a complex (nuclear pore complex)
+corum.dt <- fread('~/Documents/utils/mg_utils/data/corum_humanComplexes.txt')
+
+# nuc pore complex protesin; NUC62 is most common
+corum.test <- corum.dt[complex_id == 8674, unlist(strsplit(subunits_gene_name, ';'))]
+corum.subset <- grep('NUP[0-9]{2}$',corum.test, value=T) # subset to the NUC proteins
+
+nuc.select <- c('NUP37', 'NUP43', 'NUP62')
+
+p <- ggplot(sec.ms.dt[gene %in% nuc.select,], aes(x=reorder(fraction, as.numeric(fraction)), y=intensity_totalScaled, group=gene, color=gene)) +
+  geom_line() +
+  facet_grid(sample~.)
+
+q  <- ggplot(sec.ms.dt[gene %in% nuc.select,], aes(x=reorder(fraction, as.numeric(fraction)), y=intensity_maxScaled, group=gene, color=gene)) +
+  geom_line() +
+  facet_grid(sample~.) 
+
+r <- ggplot(sec.ms.dt[gene %in% nuc.select,], aes(x=reorder(fraction, as.numeric(fraction)), y=intensity, group=gene, color=gene)) +
+  geom_line() +
+  facet_grid(sample~.) 
+
+
+p/q/r
+
+
+mean(c(12.6574197, 5.5568914))
+```
+Need to do some kind of smoothing for peak detection
+Using loess regression at the moment, run seperately for each protein/sample combo
+
+```{r}
+
+ggplot(sec.ms.dt[gene == 'NUP62',], aes(x=reorder(fraction, as.numeric(fraction)), y=intensity_maxScaled, group=gene, color=gene)) +
+  geom_point() +
+  facet_grid(sample~.) 
+
+test.dt <- sec.ms.dt[gene == 'NUP62' & sample == 'ctrl',]
+
+
+fit.dt <- sec.ms.dt[gene %in% nuc.select,.(loess.fit=predict(loess(intensity_maxScaled ~ fraction, span=0.125, data=.SD)),
+                                           loess.residuals=residuals(loess(intensity_maxScaled ~ fraction, span=0.125, data=.SD)),
+                                           fraction= seq(1,72,1)
+                                 ), by=.(sample,gene)]
+
+
+ggplot(sec.ms.dt[gene %in% nuc.select,], aes(x=reorder(fraction, as.numeric(fraction)), y=intensity_maxScaled, group=gene, color=gene)) +
+  geom_point(size=1.5, alpha=0.4) +
+  geom_line(data=fit.dt, aes(x=reorder(fraction, as.numeric(fraction)), y=loess.fit, group=gene, color=gene)) +
+  facet_grid(sample~.) +
+  theme_bw()
+
+
+ggplot(sec.ms.dt[gene %in% nuc.select,], aes(x=reorder(fraction, as.numeric(fraction)), y=intensity_maxScaled, group=gene, color=gene)) +
+  #geom_point(size=1.5, alpha=0.4) +
+  geom_line(data=fit.dt, aes(x=reorder(fraction, as.numeric(fraction)), y=loess.fit, group=gene, color=gene)) +
+  facet_grid(sample~.) +
+  theme_bw()
+```
+Instead of scaling, lets try subtracting the consecutive values from this
+```{r}
+sec.ms.dt[, diff.intensity := diff()]
+```
+
+
+
+Use this fitted data as input for peak picking
+Maybe for a start use the loess
+
+
+Look at some packages for peak picking
+THis is from the 
+```{r}
+library(quantmod)
+
+# findpeaks function is pretty simple; find the consecutive differences, then find the sign of the differences, then find consecutive differences that are less than 0 (increase over 0 is for finding valleys)
+peaks <- fit.dt[, .(peaks = list(findPeaks(loess.fit, thresh = 0))), by=.(sample,gene)]
+
+fit.dt <- merge(x=fit.dt, y=peaks, by=c('sample', 'gene'))
+
+fit.dt[, is.peak := ifelse(as.numeric(fraction) %in% unlist(peaks), as.numeric(fraction-1), 0), by=.I]
+
+findPeaks
+```
+
+```{r}
+ggplot(fit.dt[gene == 'NUP62',], aes(x=reorder(fraction, as.numeric(fraction)), y=loess.fit, group=gene, color=gene)) +
+  geom_line() +
+  geom_vline(data=fit.dt[gene == 'NUP62',], aes(xintercept=is.peak)) +
+  facet_grid(sample~.) +
+  theme_bw()
+```
+
+
+# write a function to pick peaks in ts data
+# for 
+```{r}
+
+# taken from     
+argmax <- function(x, y, w=1, ...) {
+      require(zoo)
+      n <- length(y)
+      y.smooth <- loess(y ~ x, ...)$fitted
+      y.max <- rollapply(zoo(y.smooth), 2*w+1, max, 
+                align="center")
+      delta <- y.max - y.smooth[-c(1:w, n+1-1:w)]
+      i.max <- which(delta <= 0) + w
+      list(x=x[i.max], i=i.max, y.hat=y.smooth)
+}
+
+
+
+test <- fit.dt[gene == 'NUP37' & sample =='cardio', loess.fit]
+
+
+plot(test, col='black', pch=15) +
+plot(diff(test), col='red', pch=15)
+
+
+test
+
+# diff function just takes the differences from each of the consecutive value
+
+# findPeaks function; takes the consecutive differences; takes the sign of the differences, then takes the differences of the signs
+# taking the consecutive differences, then the sign of the differences
+# the peaks will be the indexes with diff < 0
+diff(sign(diff(test, lag=1)))
+# fin
+which(diff(sign(diff(test, lag=1))) < 0) + 2
+
+which(diff(sign(diff(test, lag=1))) < 0) +2
+
+0.043387997 - -0.058102447
+
+findPeaks
+
+which(diff(sign(diff(x, na.pad = FALSE)), na.pad = FALSE) < 0) + 2
+
+
+findPeaks
+which(diff(sign(diff(test, lag=1))) < 0)
+
+
+# think of this finding increases, then looking for the 
+sign(diff(test, lag=1))
+diff(sign(diff(test, lag=1)))
+```
+
+```{r}
+findPeaks
+```
+
+```{r}
+ggplot(fit.dt[gene == 'NUP62',], aes(x=reorder(fraction, as.numeric(fraction)), y=loess.fit, group=gene, color=gene)) +
+  geom_line() +
+  geom_vline(data=fit.dt[gene == 'NUP62',], aes(xintercept=is.peak)) +
+  facet_grid(sample~.) +
+  theme_bw()
+```
+
+
+```{r}
+# this is removing the row effect, so trying to subtract differences between rows (still want to see peak differences)
+tmp.dt <- medPolishFractionIntensity(sec.ms.dt)
+
+# these are plots of median log2 intensities
+ggplot(tmp.dt, aes(x=reorder(fraction, as.numeric(fraction)), y=medPolishIntensity)) +
+  geom_bar(stat='Identity') +
+  facet_grid(sample~.) +
+  scale_fill_viridis_c() +
+  theme_bw()
+
+
+# this function looks for the number of different proteins with measured intensity 
+qc.dt <- qcSummaryTable(sec.ms.dt)
+
+ggplot(qc.dt, aes(x=reorder(fraction, as.numeric(fraction)), y=medIntensity, fill=numProteins)) +
+  geom_bar(stat='Identity') +
+  facet_grid(sample~.) +
+  scale_fill_viridis_c() +
+  theme_bw()
+
+ggplot(qc.dt, aes(x=reorder(fraction, as.numeric(fraction)), y=medPolishIntensity, fill=numProteins)) +
+  geom_bar(stat='Identity') +
+  facet_grid(sample~.) +
+  scale_fill_viridis_c() +
+  theme_bw()
+
+# number of proteins in each fraction
+ggplot(qc.dt, aes(x=reorder(fraction, as.numeric(fraction)), y=numProteins)) +
+  geom_point(stat='Identity') +
+  facet_grid(sample~.) +
+  scale_fill_viridis_c() +
+  theme_bw()
+
+# notice the tmp reduces the intensity of the later fractions
+qcPlotMedianInt(qc.dt)
+qcPlotProteinCount(qc.dt)
+```
+lets normalize intensities
+
+```{r}
+# convert 0s to NA
+sec.ms.dt[is.na(intensity) | intensity == 0, intensity := NA]
+
+# get our first complex
+tim.complex <-  c('Q99595', 'O14925', 'O43615')
+
+colnames(sec.ms.dt)
+
+# look at a complex in the raw data; can see we need some kind of scaling, otherwise these peaks just look very different
+ggplot(sec.ms.dt[protein %in% tim.complex, ], aes(x=reorder(fraction, as.numeric(fraction)), y=intensity_maxScaled, group=protein, color=protein)) +
+  geom_line() +
+  facet_grid(sample~.)
+
+
+ggplot(sec.ms.dt[protein %in% tim.complex, ], aes(x=reorder(fraction, as.numeric(fraction)), y=intensity_totalScaled, group=protein, color=protein)) +
+  geom_line() +
+  facet_grid(sample~.)
+
+colnames(sec.ms.dt)
+       
+
+
+sec.ms.dt[gene := m]
+       
+ggplot()
+
+mat.list <- scaledIntensityMatrices(sec.ms.dt,scaleDenom = 'total')
+
+
+hclustRowsMultiMatrix(matrixList = mat.list)
+
+Heatmap(mat.list[[1]], column_order = as.character(seq(1,72,1)), show_row_names = F) +
+  Heatmap(mat.list[[2]], column_order = as.character(seq(1,72,1)), show_row_names = F) 
+
+lapply(mat.list, function(x){Heatmap(x, show_row_names = F, cluster_columns=F)})
+
+
+fitLocalCubics(qc.dt,)
+```
+
+
+
+
+```{r}
+tmp.dt[, medPolishLinearIntensity := 2^medPolishIntensity]
+
+hclustRowsMultiMatrix(mat.list)
+
+
+
+sec.mat <- dcast(tmp.dt, fraction~sample, value.var = 'medPolishLinearIntensity') %>%  
+  as.matrix(rownames='fraction')
+
+col.order <- seq(1,72,1)
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+stringr::str_extract(f.input.list[[1]]$variable, '[0-9]{1,2}(?=])') %>% unique()
+f.input.list[[1]]$variable %>%  unique()
+```
+
+
+```{r}
+lapply(f.input.list, function(x) {
+  
+  # drop redundant col names
+  #x[PG.ProteinGroups != PG.UniProtIds]
+  #x[PG.ProteinAccessions != PG.UniProtIds]
+  x[, c("PG.ProteinGroups","PG.UniProtIds") := NULL ] 
+})
+```
+
+
+```{r}
+
+colnames(f.input.list[[1]])
+reshape2::melt(f.input.list[[1]], id.vars=c("PG.ProteinGroups", "PG.ProteinAccessions", "PG.Genes", "PG.UniProtIds", "PG.ProteinNames"))
+```
+

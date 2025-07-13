@@ -1,0 +1,338 @@
+---
+title: "012125_proteinSummarization"
+author: "Martin Gordon"
+date: "2025-01-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(MSstats)
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+library(ComplexHeatmap)
+library(viridis)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(readxl)
+
+
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+
+
+# useful utility scripts
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+
+
+# fucntions to remove proteins with less than N peptides
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+read in the spectronaut reports and share the summarized data
+```{r}
+lysisPrep.list <- list('sonic'=fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/data/Spectronaut_Final_010224/20250115_092735_MM_Sonic_Lysis_122724_MSStats_Report.tsv'),
+                       'FT'=fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/data/Spectronaut_Final_010224/20250114_172438_MM_FT_Lysis_122724_MSStats_Report.tsv'),
+                       'CL'=fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/data/Spectronaut_Final_010224/20250114_135820_MM_CL_Lysis_122724_MSStat_Report.tsv'))
+```
+
+Check that these proteins have more than one feature
+
+```{r}
+lapply(lysisPrep.list, head)
+
+lapply(lysisPrep.list, function(x){
+  x[,.N, by=.(Run,BioReplicate,Condition)]
+})
+```
+Ok, lets create some new col ids 
+```{r}
+lapply(lysisPrep.list, function(x){
+  
+  x[, Fraction := str_extract(Run, '(?<=Frac-)[0-9]{1,2}')]
+  x[, Condition :=  paste0(Condition, '.', Fraction)] 
+  x[, IsotopeLabelType := 'L']
+})
+
+# looking at some missing fractions in the two groups.. lets summarize first then remove
+lapply(lysisPrep.list, function(x){
+  x[,.N, by=.(BioReplicate,Condition)][,.N, by=Condition][N < 2,]
+})
+```
+
+```{r}
+lapply(lysisPrep.list, head)
+
+lapply(lysisPrep.list, function(x){
+
+  x[, Fraction := NULL]
+  return(x)
+})
+```
+
+Look at the distribution of intensity values; no -ve values so keep all
+
+```{r}
+lapply(lysisPrep.list, function(x){
+  
+  hist(log2(x$Intensity))
+})
+```
+
+Look at the intensity distributions
+
+```{r}
+lysisPrep.dt[, Fraction := factor(Fraction, levels=as.character(seq(1,72,1)))]
+lysisPrep.dt[, Group := paste0(prep, '.', BioReplicate)]
+
+
+g <- ggplot(lysisPrep.dt, aes(x=Fraction, y=log2(Intensity), fill=prep)) +
+  geom_boxplot() +
+  facet_wrap(~Group, ncol=2, scales='free') +
+  scale_fill_ipsum() +
+  theme_ipsum() +
+  customTheme
+g
+BackupAsPDF(g, 'log2Ints.hitogram', dimensions=c(20,8), format='png')
+```
+
+
+Sanity check qc plots
+
+```{r}
+lysisPrep.dt <- rbindlist(lysisPrep.list, idcol='prep')
+```
+
+
+```{r}
+lysisPrep.dt[, Fraction := factor(Fraction, levels=as.character(seq(1,72,1)))]
+lysisPrep.dt[, Group := paste0(prep, '.', BioReplicate)]
+
+
+g <- ggplot(lysisPrep.dt, aes(x=Fraction, y=log2(Intensity), fill=prep)) +
+  geom_boxplot() +
+  facet_wrap(~Group, ncol=2, scales='free') +
+  scale_fill_ipsum() +
+  theme_ipsum() +
+  customTheme
+g
+BackupAsPDF(g, 'log2Ints.hitogram', dimensions=c(20,8), format='png')
+```
+
+plot of N peptides detected per run
+
+```{r}
+# true; single feautre (pepseq + charge) elution per peak, so we can just count the number of rows
+lysisPrep.dt[,.N, by=.(prep,Run,Fraction, PeptideSequence, PrecursorCharge)]$N %>% unique() == 1
+
+g <- ggplot(lysisPrep.dt[,.(nFeaturesPerRun=.N), by=.(Group,prep,Fraction)], aes(x=Fraction, y=nFeaturesPerRun, fill=prep)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~Group, ncol=2, scales='free_x') +
+  scale_fill_ipsum() +
+  theme_ipsum() +
+  customTheme
+g
+BackupAsPDF(g, 'nFeaturesperRun.barplot', dimensions=c(20,8), format='png')
+```
+
+
+```{r,eval=FALSE}
+dp.out <- lapply(names(lysisPrep.list), function(x){
+
+  message('Running MSStats dataProcess on ', x)
+  
+  dp.out <- MSstats::dataProcess(lysisPrep.list[[x]], 
+                                MBimpute =  FALSE, 
+                                normalization = FALSE, # turn off for SECMS
+                                summaryMethod = "TMP",
+                                featureSubset = 'highQuality',
+                                remove_uninformative_feature_outlier=T)
+
+  saveRDS(dp.out, paste0('./output/', x, '.mss.dp.rds'))
+  return(dp.out)
+})
+```
+
+load in the completed runs
+
+```{r}
+dp.out <- list('sonic'= readRDS('./output/sonic.mss.dp.rds'),
+               'FT' = readRDS('./output/FT.mss.dp.rds'),
+               'CL' = readRDS('./output/CL.mss.dp.rds'))
+
+dp.dt <- rbindlist(dp.out)
+# a large number of proteins have very low intensity; want to include these as do
+dp.dt[LogIntensities < 0, .SD[which.min(LogIntensities)], by=.N]
+```
+Find  proteins with 1 feature measured across all fractions and remove 
+```{r}
+oneCountPeptides <- lapply(dp.out, function(x){
+  
+  dt <- setDT(x$ProteinLevelData)
+  print(dt)
+  mat <- dcast(dt, Protein~paste(GROUP, '.', SUBJECT), value.var='NumMeasuredFeature') %>% 
+    as.matrix(rownames='Protein')
+  
+  # convert NA to zero
+  mat[is.na(mat)] <-  0
+  
+  # identify proteins with max 1 feature ID per row
+  singlePeps <- apply(mat[1:10,],1, function(x){ max(x) == 1 })
+  return(singlePeps[singlePeps == TRUE])
+  
+})
+
+# filter out the 1 feature prots 
+prot.list <- lapply(names(dp.out), function(x){
+
+  dp.out[[x]]$ProteinLevelData <- dp.out[[x]]$ProteinLevelData[!Protein %in% names(oneCountPeptides[[x]]),]
+  return(dp.out[[x]]$ProteinLevelData)
+})
+names(prot.list) <- names(dp.out)
+```
+convert from long format to matrices
+```{r}
+p.mat.list <- lapply(prot.list,  function(x){
+  
+  p.quant <- setDT(x)
+  
+  mat.1 <- dcast(p.quant[SUBJECT == 1, ], Protein~GROUP, value.var='LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  mat.2 <- dcast(p.quant[SUBJECT == 2, ], Protein~GROUP, value.var='LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  colnames(mat.1) <- gsub('[A-Za-z]+[.]', '', colnames(mat.1))
+  colnames(mat.2) <- gsub('[A-Za-z]+[.]', '', colnames(mat.2))
+
+  colorder <- as.character(seq(1,72,1))
+  
+  message('reordering matrix columns and filling in missing fractions...') 
+  # fills in missing fractions with NA so easy to populate
+  mat.1 <- mat.1[,  match(colorder, colnames(mat.1))]
+  mat.2 <- mat.2[,  match(colorder, colnames(mat.2))]
+
+  colnames(mat.1) <- colorder
+  colnames(mat.2) <- colorder
+  
+  mat.1 <- 2^mat.1
+  mat.2 <- 2^mat.2
+  
+  # convert to 0
+  mat.1[is.na(mat.1)] <- 0
+  mat.2[is.na(mat.2)] <- 0
+  
+  return(list(biorep1=mat.1, biorep2=mat.2))
+})
+
+```
+
+flatten list to one level (sample=prep x biorep)
+```{r}
+# unlist 1 level
+p.mat.list <- unlist(p.mat.list, recursive = F)
+```
+
+Format to PCP specifications
+```{r}
+lapply(names(p.mat.list), function(x,i){
+
+  p.mat <- data.table(x[[i]], keep.rownames = T)
+  setnames(p.mat, old='rn', new='ID')
+  p.mat[, GN := multiUniprots2multiGenes(ID, species='HUMAN')]
+  
+  col.order <- c('GN', 'ID', as.character(seq(1,72,1)))
+  p.mat <-  p.mat[, ..col.order]
+  
+  fwrite(p.mat, sep='\t', ScriptAndDatedFileName(paste0(i, 'pcp.in.mat.txt')))
+  
+},x=p.mat.list)
+```
+
+**not used**
+
+Convert to log2 scale
+```{r}
+# plot heatmaps to quickly view the sample quality
+lapply((names(p.mat.list)), function(x,i) {
+  
+  print(i)
+  hm <- Heatmap(log2(x[[i]]), 
+         cluster_columns = F,
+         name = i,
+         col=viridis(20),
+         show_row_names = F,
+         cluster_rows = clusterWNA(x[[i]]))
+  
+  BackupAsPDF(draw(hm, column_title=i), paste0(i, 'Ints.heatmap'), format = 'png')
+  
+  }, x=p.mat.list)
+```
+
+Sanity check of results before pushing to Wynton for run
+```{r}
+clean.list <- list(CL.1 =fread('./012125_proteinSummarization_data/2025_01_23_CL.biorep1pcp.in.mat.txt', header = T),
+                   CL.2= fread('./012125_proteinSummarization_data/2025_01_23_CL.biorep2pcp.in.mat.txt', header=T),
+                   FT.1= fread('./012125_proteinSummarization_data/2025_01_23_FT.biorep1pcp.in.mat.txt', header=T),
+                   FT.2=fread('./012125_proteinSummarization_data/2025_01_23_FT.biorep2pcp.in.mat.txt', header=T),
+                   Sonic.1=fread('./012125_proteinSummarization_data/2025_01_23_sonic.biorep1pcp.in.mat.txt', header=T),
+                   Sonic.2=fread('./012125_proteinSummarization_data/2025_01_23_sonic.biorep2pcp.in.mat.txt', header=T))
+
+
+apply(clean.list[[1]][GN == 'DYRK1A',], 1,print)
+apply(clean.list[[5]][GN == 'DYRK1A',], 1,print)
+
+setDT(dp.out[[1]]$ProteinLevelData)[SUBJECT==1 & Protein =='Q13627', .(GROUP, 2^LogIntensities)]
+setDT(dp.out[[3]]$ProteinLevelData)[SUBJECT==1 & Protein =='Q13627', .(GROUP, 2^LogIntensities)]
+```
+
+# not using this filtered set for now to preserve proteins 
+After summary, read in the protein set, remove the proteins with less than 2 peptides, then convert to wide format, convert NA to 
+
+```{r}
+dp.out <- lapply(dp.out, function(x){
+  
+  x$FeatureLevelData <- setDT(x$FeatureLevelData)
+  x$ProteinLevelData <- setDT(x$ProteinLevelData)
+  
+  x$ProteinLevelData <- getNPeptidesPerProtein(proteinlvlDT = x$ProteinLevelData, x$FeatureLevelData, peptideThreshold = 2)
+  return(x)
+})
+
+names(dp.out) <- names(lysisPrep.list)
+```
+Remove proteins from each of the runs with just a single peptide
+
+```{r}
+# filter to just keep the set with two peptides
+dp.out[['sonic']]$ProteinLevelData <- dp.out[['sonic']]$ProteinLevelData[nPeptides >= 2,]
+dp.out[['FT']]$ProteinLevelData <- dp.out[['FT']]$ProteinLevelData[nPeptides >= 2,]
+dp.out[['CL']]$ProteinLevelData <- dp.out[['CL']]$ProteinLevelData[nPeptides >= 2,]
+```

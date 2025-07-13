@@ -1,0 +1,1538 @@
+---
+title: "GPCR_WGCNA.moduleAnalysis"
+author: "Martin Gordon"
+date: "2023-09-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## WGCNA module analysis
+
+##TODO correlate the Module Eigengene values with IUPHAR and Gprotein type classifications
+Question is, what are we validating here? If the module is reproducible, not if the module is biologically relevant/enriched for certain functions..
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(WGCNA)
+library(magrittr)
+library(preprocessCore) # quantile normalisation
+library(stringr)
+library(matrixStats)
+library(simplifyEnrichment)
+library(fmsb)
+library(readxl)
+library(ggbeeswarm)
+library(ggrepel)
+library(curl)
+library(plyr)
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+
+# helper scripts for module/network export etc
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+
+
+clusterwNa <- function(mat, na.val=0, ...){
+  
+  mat[is.na(mat)] <- na.val
+  return(hclust(dist(mat)))
+}
+```
+Read in the cluster assignment info and expression matrix
+
+```{r}
+# exp mat
+receptor.exp.mat <- readRDS('./output/gpcr.11.receptors.exp.mat.Rdata')
+
+# adj mat
+adj.mat <- readRDS('./output/gpcr.11.receptors.adj.mat.Rdata')
+
+# expression mat (col samples, rows gene)
+
+receptor.modules <- readRDS('./output/gpcr.11.receptors.moduleAssignment.Rdata')
+
+length(receptor.modules)
+dim(receptor.exp.mat)
+```
+
+Calculate module eigengenes; first principal component of each module
+Transforming so cols represent genes and rows represent 
+
+# warning on some rows missing values (presume this is genes with many NA meausres, need to remove these when repeating)
+```{r}
+receptor.exp.mat <- t(receptor.exp.mat)
+
+MElist <- moduleEigengenes(receptor.exp.mat, colors = receptor.modules) 
+MEs <- MElist$eigengenes
+MEs
+head(MEs)
+MElist$eigengenes
+
+# write out the module eigengene scores to file 
+#fwrite(MElist$eigengenes, './output/11.receptors.moduleEigengenes.wrownames.csv', row.names = T)
+MEs <- fread('./output/11.receptors.moduleEigengenes.wrownames.csv')
+
+MEs
+```
+Clear indication here that we are over splitting.. red line indicates 90% similarity
+
+```{r}
+ME.dissimilarity = 1-cor(MElist$eigengenes, use="complete") #Calculate eigengene dissimilarity
+
+pdf('./output/eigengene.dissimilarity.histogram.pdf')
+
+METree = hclust(as.dist(ME.dissimilarity), method = "average") #Clustering eigengenes 
+par(mar = c(0,4,2,0)) #seting margin sizes
+par(cex = 0.6);#scaling the graphic
+plot(METree)
+abline(h=.10, col = "red") 
+
+dev.off()
+```
+
+Proceed as is for now; lets just see if we can identify key hubs/drivers in each of the modules
+
+## module-trait associations
+
+Module trait matching; lets match each module to receptor, to timepoint to IUPAR status maybe??
+
+```{r}
+# read in the expression data
+protQuant <- fread('./data/2022_08_17_ProteinLevelData.lib.csv.gz')
+
+# fix the groups with an underscore in them MOR_LG and MOR_DAMGO to MOR.DAMGO
+protQuant[, GROUP := gsub ("_([A-Z])", ".\\1", GROUP)]
+# add some new identifier cols
+protQuant[, `:=`(timeStr = str_extract(GROUP,'[0-9]{2}$'),
+               receptor = gsub("_[0-9]{2}$", '', protQuant$GROUP),
+               batch = SUBJECT
+               )]
+
+group.noi <- protQuant[!GROUP %like% c("DOR|KOR|MOR|MRX2|MRX4|NK1R|NPFFR1|NPY1R|PTGER1|PTGER4|QRFPR|DOR"),unique(GROUP)]
+group.noi
+
+protQuant <- protQuant[!GROUP %in% group.noi, ]
+protQuant <- protQuant[!GROUP %like% "MOR.LG94",]
+
+
+sampleMeta <- protQuant[, .(paste0(GROUP, '_', SUBJECT), receptor, timeStr, str_extract(batch, '[0-9]{1,2}$'))] %>%  unique()
+colnames(sampleMeta) <- c('sample', 'receptor', 'timepoint','batch')
+
+```
+# match the trait and sample metadata 
+```{r}
+Samples <- rownames(receptor.exp.mat)
+traitRows <- match(Samples, sampleMeta$sample)
+
+# order by traitRows vector to match and drop the first col
+datTraits <- sampleMeta[traitRows] %>%  as.data.table()
+
+# add samples as rownames and remove
+rownames(datTraits) <- datTraits$sample
+
+# add a label for GPCR
+datTraits[, GPCR :=  fcase(
+  receptor == 'DOR', 1,
+  receptor == 'KOR', 2,
+  receptor == 'MOR.DAMGO', 3,
+  receptor == 'MRX2', 4,
+  receptor == 'MRX4', 5,
+  receptor == 'NK1R', 6,
+  receptor == 'NPFFR1', 7,
+  receptor == 'NPY1R', 8,
+  receptor == 'PTGER1', 9,
+  receptor == 'PTGER4', 10,
+  receptor == 'QRFPR', 11
+)]
+
+# sanity check
+Samples ==  rownames(datTraits)
+
+datTraits <- datTraits[, .(GPCR,timepoint)]
+```
+
+# module trait associations
+look at correlations for timepoint, GPCR and 
+Not very strong correlation
+```{r}
+# Define numbers of genes and samples
+nGenes = ncol(receptor.exp.mat)
+nSamples = nrow(receptor.exp.mat)
+
+module.trait.correlation = cor(MEs, datTraits, use = "pairwise.complete.obs", method='pearson') #p for pearson correlation coefficient 
+module.trait.Pvalue = corPvalueStudent(module.trait.correlation, nSamples) #calculate the p-value associated with the correlation
+
+module.trait.correlation
+```
+
+```{r}
+
+#reorder the modules
+#mod.order <- c("ME1","ME2","ME3","ME4","ME5","ME6","ME7","ME8","ME9","ME10","ME11")
+#module.trait.correlation <- module.trait.correlation[mod.order,]
+
+# Will display correlations and their p-values
+textMatrix = paste(signif(module.trait.correlation, 2), "\n(",
+signif(module.trait.Pvalue, 1), ")", sep = "");
+dim(textMatrix) = dim(module.trait.correlation)
+par(mar = c(6, 8.5, 3, 1))
+# Display the correlation values within a heatmap plot
+
+pdf('./output/mod.trait.corr.pdf')
+
+labeledHeatmap(Matrix = module.trait.correlation,
+xLabels = names(datTraits),
+yLabels = rownames(module.trait.correlation),
+ySymbols = names(MEs),
+colorLabels = FALSE,
+colors = blueWhiteRed(50),
+textMatrix = textMatrix,
+setStdMargins = FALSE,
+cex.text = 0.4,
+zlim = c(-1,1),
+main = paste("Module-trait relationships"))
+
+dev.off()
+```
+
+# identifying hub genes from WGCNA modules
+
+intramodular connectivity: calculate degree per gene in module
+for this take the adjacency matrix used to builf the network
+ 
+Not many genes with higher intramodular K; retry clustering laters
+For the many that do though, they seem to have FBXW11 related functionality
+
+```{r}
+adj.mat <- readRDS('./output/gpcr.11.receptors.adj.mat.Rdata')
+
+# compute network and module connectiity
+net.connectivity <- intramodularConnectivity(adjMat = adj.mat, colors = receptor.modules)
+
+setDT(net.connectivity, keep.rownames = T)
+
+# select all genes with higher intramodule K than between (does this make sense with the oversplitting issue?, maybe just rank by top 10 degree per module)
+top.intramod.genes <- net.connectivity[kDiff > 0, unique(rn)]
+
+```
+map cluster ID to gene name 
+```{r}
+
+receptor.exp.dt <- receptor.exp.mat %>% t() %>% as.data.table(keep.rownames = TRUE) 
+# add cluster info to the data table for matching
+# have checked and clusters map correctly
+receptor.exp.dt[, cluster := receptor.modules]
+
+cols.oi <- colnames(receptor.exp.dt)[c(-1,-167)]
+
+receptor.exp.dt <- melt(receptor.exp.dt, id.vars = c('rn','cluster'), measure.vars = cols.oi, variable.name = 'sample', value.name = 'log2FC')
+receptor.exp.dt[, `:=`(receptor = gsub( '_.*$', '', sample),
+                       timeStr = as.factor(str_extract(sample, '[0-9]{2}(?=_)')),
+                       batch  = as.factor(str_extract(sample, '[0-9]{1,2}$')) )]
+
+```
+map the connectivity statistics to the gene name and extract the most highly connected genes in each cluster
+
+```{r}
+# map cluster info to genes
+net.connectivity[receptor.exp.dt, i.cluster := cluster, on = c(rn  = 'rn')]
+
+# for each cluster, identifiy the top 10 most connected nodes
+top5.k.perclust <- net.connectivity[ , .SD[head(order(-kTotal),5)], by=i.cluster]
+top10.k.perclust <- net.connectivity[ , .SD[head(order(-kTotal),10)], by=i.cluster]
+
+# write out these two to file
+fwrite(top5.k.perclust, './output/top5.K.percluster.csv')
+fwrite(top10.k.perclust, './output/top10.K.percluster.csv')
+```
+
+
+extract the most strongly correlated genes with eigengene expression per module
+Signed eigengene-based connectivity: correlation of the gene with the corresponding module eigengene
+```{r}
+# measure of the correlation of each gene and the module eigengene
+datKME=signedKME(receptor.exp.mat, MEs, outputColumnName="MM.")
+
+hm <- Heatmap(datKME, 
+         cluster_columns = T, 
+         #show_row_names = FALSE,
+         name = "r",
+         na_col = 'darkgrey',
+         row_title =sprintf("%d Proteins",
+                            nrow(prot.mat)),
+         row_names_gp = gpar (fontsize= 1),
+         column_names_gp = gpar (fontsize= 8),
+         cluster_row_slices = F,
+         show_row_names = F,
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title="Protein ME correlations",
+           column_title_gp=grid::gpar(fontsize=14))
+
+BackupAsPDF(hm, 'protein.ME.correlations.heatmap.pdf')
+
+datKME
+```
+Definitely over-splitting the data... need to likely regenerate the matrix
+Extract top 10 genes per module (11 in total, maybe go with 5?)
+
+Issue with oversplitting dataset evident when trying to prioritise genes by ME correlation; we have genes belonging to different clusters more strongly correlated with another clusters ME..
+Solution ultimately is to build a better network, but for now just subset to 
+Check out these genes and confirm cluster assignment
+```{r}
+datKME <- data.table(datKME, keep.rownames = T)
+
+datKME[rn == 'ARRB2',]
+# map cluster info to genes
+datKME[receptor.exp.dt, cluster := cluster, on = c(rn  = 'rn')]
+
+cols.oi <- datKME[,  !c('rn','cluster'),] %>%  colnames()
+
+# melt dt to 3 cols
+ME.cor <- melt(datKME, id.vars = c('rn','cluster'), measure.vars = cols.oi, variable.name = 'ME', value.name = 'Pearson.r')
+
+# subtract the string from ME
+ME.cor[, ME := str_extract(ME,'[0-9]{1,2}$')]
+
+
+
+ME.cor[ , .SD[head(order(-Pearson.r),5)], by=.(cluster)]
+# for each cluster, identifiy the top 10 most correlated genes with that cluster eigengene profile
+top5.corME  <- ME.cor[ , .SD[head(order(-Pearson.r),5)], by=.(cluster,ME)]
+top10.corME <- ME.cor[ , .SD[head(order(-Pearson.r),10)], by=.(cluster,ME)]
+
+
+ME.cor
+
+top10.corME
+
+# write out these two to file - fitler for prots belonging to cluster
+fwrite(top5.corME[cluster == ME,], './output/top5.corME.percluster.csv')
+fwrite(top10.corME[cluster == ME,], './output/top10.corME.percluster.csv')
+
+
+<- top10.corME[cluster == ME,]$rn
+```
+
+Extract genes with high intramodule connectivity and module ME correlation
+Look for enrichment/overlap in these two sets
+
+check out top10, then look at the top 5 use all genes in the matrix as background (or all genes in the module)
+Most ME correlated are significantly enriched for high degree genes 
+
+```{r}
+# 63 out of 110 overlap, 19 out of 55
+sum(top5.corME[cluster == ME,]$rn %in% top5.k.perclust$rn)
+sum(top10.corME[cluster == ME,]$rn %in% top10.k.perclust$rn)
+
+# significantly enrichment 
+dhyper(sum(top10.corME[cluster == ME,]$rn %in% top10.k.perclust$rn), 
+       length(union(top10.corME[cluster == ME,]$rn, top10.k.perclust$rn)),  
+       length(unique(receptor.exp.dt$rn)),
+       k=110)
+
+# significant enrichment 
+dhyper(sum(top5.corME[cluster == ME,]$rn %in% top5.k.perclust$rn), 
+       length(union(top5.corME[cluster == ME,]$rn, top5.k.perclust$rn)),  
+       length(unique(receptor.exp.dt$rn)),
+       k=55)
+```
+
+
+
+```{r}
+GS1=as.numeric(cor(y,datExpr, use="p"))
+
+ME.mat <- signif(cor(MEs, use="p"), 2) %>%  as.matrix(rownames=rownames(MEs))
+
+hm <- Heatmap(ME.mat, 
+         cluster_columns = T, 
+         #show_row_names = FALSE,
+         name = "r",
+         na_col = 'darkgrey',
+         row_names_gp = gpar (fontsize= 1),
+         column_names_gp = gpar (fontsize= 8),
+         cluster_row_slices = F,
+         show_row_names = F,
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title="Module Eigengene Correlations",
+           column_title_gp=grid::gpar(fontsize=14))
+
+BackupAsPDF(hm, 'ME.correlations.heatmap.pdf')
+```
+Extract the top genes in each module most strongly correlated with the module eigengene
+Use these genes to build a high-confidence STRING network
+
+```{r}
+ME.mat
+```
+
+260923
+----
+
+Export the interesting modules to cytoscape (look at GO enrichments to inform)
+
+
+```{r}
+# exp mat
+receptor.exp.mat <- readRDS('./output/gpcr.11.receptors.exp.mat.Rdata')
+receptor.modules <- readRDS('./output/gpcr.11.receptors.moduleAssignment.Rdata')
+
+```
+
+identify clusters of interest (line charts)
+```{r}
+#gene by gene S matrix 
+receptor.mat <- readRDS('./output/gpcr.11.receptors.adj.mat.Rdata')
+mods <- c('1','2','3','4','6','7','8','9','11')
+
+# dt  of module-gene cluster assignments
+wgcna.clusters <- fread('./output/wgcna.clustergenes.adjmat.csv')
+
+
+wgcna.clusters[,Cluster := sub('cluster','',Cluster)]
+wgcna.clusters[, feature := GeneID]
+```
+
+function to export network per cluster/module
+(now in helper functions.R file)
+
+TODO: add log2FC, import only moderately strong connections (> 0.4) to cytoscape and visualise
+
+```{r}
+# add additional node info to this df, include fc, is hub gene
+top10.corME <- fread('./output/top10.corME.percluster.csv')
+
+wgcna.clusters[, top10.hubs := 'no']
+wgcna.clusters[GeneID %in% top10.corME$rn, top10.hubs := 'yes']
+
+setnames(top10.corME, old='rn', new='GeneID')
+wgcna.clusters[top10.corME, ME.cor := i.Pearson.r, on=.(GeneID)]
+
+#sanity check 
+wgcna.clusters[ top10.hubs == 'yes',]
+
+# now add log2FC
+
+
+wgcna.clusters[top10.hubs == 'yes']
+top10.corME
+
+networkToCytoscapeWrapper <- function(modules.oi, moduleGenes.df, mat, outdir='.', threshold=0.02, ...){
+  
+  #loop through the modules of interest, identify module genes 
+  lapply(modules.oi, function(mod){
+    # identify the genes in the module OI
+    modGenes <- moduleGenes.df[Cluster == mod, feature]
+    #subset the matrix to the genes of interest
+    export.mat <- mat[modGenes,modGenes]
+    
+    # cytoscape function
+    cyt <- WGCNA::exportNetworkToCytoscape(export.mat,
+                                           edgeFile = paste0(outdir, '/', mod, '-', threshold, "-CytoInput-edges.txt"),
+                                           nodeFile = paste0(outdir, '/', mod,  '-', threshold,"-CytoInput-nodes.txt"),
+                                           weighted = TRUE,
+                                           threshold = threshold, #export everything and filter in cytoscape, # dimnames(mat) default
+                                           nodeAttr = moduleGenes.df[Cluster == mod, Cluster]) # module/cluster assignment
+    })
+
+}
+
+
+networkToCytoscapeWrapper(modules=mods, moduleGenes.df=wgcna.clusters, mat=adj.mat, outdir = './data', threshold=0.2)
+```
+
+# now need to read in the node files and add additional info (log2FC), hubGene (top20KME), 
+
+```{r}
+
+```
+
+
+TODO
+---
+Maybe generate heatmap of gene expression and barplot annotation of module eigengene expression? 
+Maybe not NB now
+- extract vector of modules, filter to those genes generate a heatmap of that and a barplot above with eigengene expression per module
+
+```{r}
+
+```
+
+
+
+
+
+
+To assess gene significance, we need a trait of interest; GPCR timepoint?
+Unsure right now, so just pull out the genes most strongly correlated with a module eigengene
+
+
+
+```{r}
+
+module.id <- unique(receptor.modules)
+
+sizeGrWindow(9,6)
+par(mfrow=c(2,as.integer(0.5+length(module.id)/2)))
+par(mar = c(4,5,3,1))
+for (i in c(1:length(module.id)))
+{
+whichmodule=module.id[[i]];
+restrict1 = (receptor.modules==whichmodule);
+verboseScatterplot(net.connectivity$kWithin[restrict1],
+GeneSignificance[restrict1], col=colorh1[restrict1],
+main=whichmodule,
+xlab = "Connectivity", ylab = "Gene Significance", abline = TRUE)
+}
+
+```
+
+
+
+
+Convert dt to a vector of labels assigned and then give color name
+```{r}
+wgcna.clusters <- fread('./output/wgcna.clustergenes.adjmat.csv')
+
+wgcna.clusters[,.N, Cluster]
+
+
+# need colors for eigengene function
+wgcna.clusters <- wgcna.clusters[, module.col := fcase(
+  Cluster == 'cluster1', 'red',
+  Cluster == 'cluster2', 'blue',
+  Cluster == 'cluster3', 'green',
+  Cluster == 'cluster4', 'orange',
+  Cluster == 'cluster5', 'purple',
+  Cluster == 'cluster6', 'yellow',
+  Cluster == 'cluster7', 'darkred',
+  Cluster == 'cluster8', 'darkgreen',
+  Cluster == 'cluster9', 'black',
+  Cluster == 'cluster10', 'darkblue',
+  Cluster == 'cluster11', 'pink'
+)]
+
+# amed vector of gene: cluster id
+module.vec <- setNames(wgcna.clusters$Cluster, wgcna.clusters$GeneID)
+
+table(module.vec)
+
+module.vec
+```
+
+# recover the expression matrix
+
+```{r}
+# read in exp data
+p.quant <- fread('data/2022_08_17_ProteinLevelData.lib.csv.gz')
+
+# read in DEA results for filtering
+mss <- fread('data/2022_08_31_NiceFitsPower3.csv')
+
+```
+
+```{r}
+# fix the groups with an underscore in them MOR_LG and MOR_DAMGO to MOR.DAMGO
+p.quant[, GROUP := gsub ("_([A-Z])", ".\\1", GROUP)]
+# add some new identifier cols
+p.quant[, `:=`(timeStr = str_extract(GROUP,'[0-9]{2}$'),
+               receptor = gsub("_[0-9]{2}$", '', p.quant$GROUP)
+               )]
+```
+
+Does this data need a second round of normalisation?
+Assumption is the data is normalised
+```{r}
+group.noi <- p.quant[!GROUP %like% c("DOR|KOR|MOR|MRX2|MRX4|NK1R|NPFFR1|NPY1R|PTGER1|PTGER4|QRFPR|DOR"),unique(GROUP)]
+
+p.quant <- p.quant[!GROUP %in% group.noi, ]
+p.quant <- p.quant[!GROUP %like% "MOR.LG94",]
+#rm DAMGO flag
+p.quant[GROUP %like% "DAMGO", GROUP := sub(".DAMGO","", GROUP)]
+```
+Generate the expression matrix
+
+```{r}
+p.quant[, batchControlled := LogIntensities - median(LogIntensities, na.rm = TRUE), by = .(Protein, receptor, SUBJECT)]
+p.quant[, vsTimeZero := batchControlled - mean(batchControlled[timeStr == timeStr[!is.na(batchControlled)][1] ]), by = .(Protein, receptor)]
+
+
+p.mat <- dcast(p.quant, Protein~GROUP+SUBJECT, value.var = 'vsTimeZero') %>%  as.matrix(rownames="Protein")
+dim(p.mat)
+
+# remove rows with more than 33% missing values
+p.mat.f  <- p.mat[which(rowMeans(!is.na(p.mat)) > 0.66), ] # only keep prots present in 2/3 of the dataset
+
+```
+
+filter out the genes with more than 33% of NA values
+
+```{r}
+p.mat.f  <- p.mat[which(rowMeans(!is.na(p.mat)) > 0.66), ] # only keep prots present in 2/3 of the dataset
+```
+
+Extract only the significant genes for now
+
+```{r}
+sig.genes <- mss.out[pvalue < 0.05 & abs(log2FC) > log2(1.5) & receptor != 'MOR.LG94', unique(gene) ]
+sig.p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+colnames(sig.p.mat) <- sub(".DAMGO","", colnames(sig.p.mat))
+
+#saveRDS(sig.p.mat,file = './output/gpcr.11.receptors.exp.mat.Rdata')
+```
+
+
+```{r}
+# read in mss results
+mss.out <- fread("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations//data/2022_08_31_NiceFitsPower3.csv")
+
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+
+# filter to sig genes and reorder
+sig.genes <- mss.out[pvalue < 0.05 & abs(log2FC) > log2(1.5) & receptor != 'MOR.LG94', unique(gene) ]
+exp.mat <- exp.mat[rownames(exp.mat) %in% sig.genes,]
+
+# renanme MOR DAMGO to MOR
+colnames(exp.mat) <- c('DOR', 'KOR', 'MOR', 'MRX2', 'MRX4', 'NK1R', 'NPFFR1', 'NPY1R','PTGER1', 'PTGER4','QRFPR')
+
+# reorder the cols to match the scoring mat
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+exp.mat <- exp.mat[, col.order]
+
+# sanity check; looks good
+head(exp.mat)
+lapply(scores.mat, colnames)
+```
+
+071123
+----
+Module Eigengene Heatmap 
+Module stability analysis for module selection
+
+Read in the module eigengene data; not very strong correlations with 
+```{r}
+# need rownames
+MEs <- fread('./output/11.receptors.moduleEigengenes.wrownames.csv')
+
+# convert df to long format
+ME.df <- melt(MEs, id.vars = 'V1') 
+
+
+# annotation info
+ME.df[, `:=`(receptor = gsub('_[0-9]{2}_batch.[0-9]{1,2}', '', V1),
+             timeStr  = sub('_', '', str_extract(V1, "_[0-9]{2}")),
+             batch = str_extract(V1, '[0-9]{2}$')
+            )] 
+
+# convert df to long format
+setnames(ME.df, new=c('sample', 'ME', 'corr', 'receptor', 'timeStr' ,'batch'))
+
+
+# ggplot(ME.df, aes(x=receptor, y=ME, fill=corr)) +
+#   geom_tile() +
+#   theme_bw() +
+#   scale_fill_gradient2(
+#     low = "blue",
+#     high = "red",
+#     mid = "white",
+#     midpoint = 0,
+#     limit = c(-1,1)) +
+#   theme(axis.text.x = element_text(angle=90)) +
+#   labs(title = "Module-trait Relationships", y = "Modules", fill="corr")
+```
+091123
+----
+Assess module stability
+How to do this? use the module eigengene or median val and calculate correlation distance of each gene to its ME
+Get the distribution of these values; how do they look?
+
+load data
+
+```{r}
+p.mat <- readRDS('./output/gpcr.11.receptors.exp.mat.Rdata')
+rownames(p.mat) <-  multiUniprots2multiGenes(rownames(p.mat))
+
+MEs <- fread('./output/11.receptors.moduleEigengenes.wrownames.csv')
+wgcna.clusters <- fread('./output/wgcna.clustergenes.adjmat.csv')
+
+```
+
+format the ME data and then put 
+
+```{r}
+MEs.mat <-  MEs %>%  
+  as.matrix(rownames = 'V1') %>%  
+  t()
+
+colnames(MEs.mat) <- sub(".DAMGO","", colnames(MEs.mat))
+rownames(MEs.mat) <- sub('ME', 'cluster', rownames(MEs.mat))
+
+# sanity check
+identical(colnames(MEs.mat), colnames(p.mat))
+```
+
+now load in module identifications. We want to i) extract the genes in each module 
+
+```{r}
+# split the p.mat into each modules genes 
+clusters <- wgcna.clusters$Cluster %>%  unique()
+
+p.mat.mod.list <- lapply(clusters, function(clust){
+  # extract the  genes in each submat
+  subMat <-  p.mat[rownames(p.mat) %in% wgcna.clusters[Cluster == clust, GeneID], ]
+})
+names(p.mat.mod.list) <- clusters
+```
+
+match orders in lists
+```{r}
+ME.mat.list <- split(MEs.mat, rownames(MEs.mat))
+
+# snaity check
+names(ME.mat.list) %in% names(p.mat.mod.list)
+
+# match orders
+# get order from list 1 to match to list2
+idx.order <- match(names(p.mat.mod.list),names(ME.mat.list))
+
+ME.mat.list <- ME.mat.list[idx.order]
+
+names(ME.mat.list) == names(p.mat.mod.list)
+```
+
+Check correlation between each gene and the ME score
+```{r}
+
+cor.scores.list <- lapply(clusters, function(clust){
+  
+  cor.scores <-  cor(x=t(p.mat.mod.list[[clust]]), 
+      y=ME.mat.list[[clust]], 
+      method='pearson',
+      use="pairwise.complete.obs")
+    
+  return(data.table(cor.scores, keep.rownames = TRUE))
+
+})
+  
+names(cor.scores.list) <- clusters
+
+# sanity check; looks good
+#test.data <- p.mat[rownames(p.mat) %in% c('HGS'),]
+#ME.test <- MEs.mat[rownames(MEs.mat) %in% c('cluster1'),]
+#cor(ME.test, test.data, use = 'pairwise.complete.obs')
+
+#GEMIN2 0.1822923
+#HGS 0.9160856
+
+```
+
+Now that we have the mean correlation for each, lets plot the correlation scores for each module
+Check ordering.. looks weird after the first  5 that the dist looks more gaussian; effect of module size maybe?
+
+```{r, eval=FALSE}
+lapply(seq_along(cor.scores.list), function(x,n,i){
+ g <-  ggplot(x[[i]], aes(x=V1)) + 
+    geom_histogram(bins = 20) +
+    xlab('Pearson R') +
+    ylab(paste0('Count (module size ', sprintf("%s", nrow(x[[i]])), ')')) +
+    ggtitle(paste0(n[[i]], ' ME correlations')) +
+    theme_classic()
+ 
+ #BackupAsPDF(g, n[[i]],'.pearson.r.histogram')
+},x=cor.scores.list, n=names(cor.scores.list))
+```
+
+collapse all and then plot by facet plot or plot 
+```{r}
+rbindlist(cor.scores.list, idcol = T)
+
+cor.df <- rbindlist(cor.scores.list, idcol = T) 
+
+g <- ggplot(cor.df, aes(x=V1, color=.id)) + 
+  geom_freqpoly() +
+  geom_vline(data = ddply(cor.df, ".id", summarize, wavg = median(V1)), aes(xintercept=wavg)) +
+  xlab('Pearson R') +
+  facet_wrap(~.id, scales = 'free') +
+  theme_bw()
+
+g
+#BackupAsPDF(g, 'ModulepearsonsR.distribution.histogram', dimensions = c(9,4))
+```
+
+
+
+Looking at above two plots, I would say that clusters 1-6 look ok, but I would be sceptical of investigating the other as they seem quite noisy
+Check for normality; makes sense 'good' modules don't have extreme values as 
+```{r}
+lapply(cor.scores.list, summary)
+cor.scores.list
+
+lapply(cor.scores.list, function(x){
+  
+  hist(x$V1, freq = FALSE)
+  lines(density(x$V1))
+  qqnorm(x$V1)
+  qqline(x$V1)
+
+})
+```
+
+check for normality of the correlation scores
+as expected CDFs significantly different to theoretical normal distribution
+
+```{r}
+lapply(cor.scores.list, function(x){
+  print(ks.test(x$V1, 'pnorm'))
+})
+```
+
+plot of the empirical cumulative distribution scores for each module
+
+```{r}
+lapply(cor.scores.list, function(x){
+  ggplot(x, aes(x=V1)) +
+    stat_ecdf() +
+    theme_bw()
+})
+
+
+plot(ecdf(rnorm(1000)))
+```
+combine and plot; look at the distribution
+rm normal comparison, compare the distributions to each other
+```{r}
+lapply(cor.scores.list, function(x){
+  ggplot(x, aes(x=V1, col='red')) +
+    stat_ecdf() +
+    #stat_ecdf(data=as.data.table(rnorm(n=length(x$V1))), color='black', alpha=0.4) +
+    xlim(c(-3,3)) +
+    theme_bw()
+})
+
+```
+
+combine the ecdfs and plot - think this is a better way of portraying the correlation scores
+what does this say?
+cluster 1 and 2 are the most tightly correlated
+seems some modules have a low number of negatively correlated genes; what are these?
+
+```{r}
+col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD") 
+
+g <-  rbindlist(cor.scores.list, idcol=T) %>% 
+  .[,.id := factor(.id, levels=c(names(cor.scores.list)))] %>% 
+  ggplot(., aes(x=V1, col=.id)) +
+  stat_ecdf() +
+  geom_hline(yintercept = c(0.5, 0.75, 0.25), linetype=2, alpha=0.4) +
+  scale_color_manual(values=col.pal) +
+  xlab('Pearson correlation coefficient (r)') +
+  ggtitle('ECDF ME r coeff.') +
+  theme_bw()
+g
+BackupAsPDF(g, 'ecdf.MEcor.linegraph.')
+```
+plot each of the ECDFs seperately
+
+```{r}
+
+g <-  rbindlist(cor.scores.list, idcol=T) %>% 
+  .[,.id := factor(.id, levels=c(names(cor.scores.list)))] %>% 
+  ggplot(., aes(x=V1, col=.id)) +
+  stat_ecdf() +
+  geom_hline(yintercept = c(0.5, 0.75, 0.25), linetype=2, alpha=0.4) +
+  geom_vline(xintercept = c(0.5, 0.75, 0.25), linetype=2, alpha=0.4) +
+  scale_color_manual(values=col.pal) +
+  xlab('Pearson correlation coefficient (r)') +
+  ggtitle('ECDF ME r coeff.') +
+  facet_wrap(~.id, scales = 'free_x') +
+  theme_bw()
+g
+BackupAsPDF(g, 'ecdf.MEcor.linegraph.panels', dimensions=c(10,8))
+```
+Q. whats the rubbish in each cluster?
+To answer, lets run hierarchical clustering of the scores
+hierarchical clustering of ME correlation scores, should basically identify
+we have a cor score, get distance, then cluster and define a consistent cutheigth for nwo
+
+```{r}
+lapply(cor.scores.list, function(x){
+  
+
+# Convert mean correlation matrix to distances
+distance_matrix <- as.dist(1 - abs(mean_correlation_matrix))
+
+# Perform hierarchical clustering
+cluster_result <- hclust(distance_matrix, method = "complete")
+
+# Convert the result to a dendrogram
+dendrogram <- as.dendrogram(cluster_result)
+
+# Plot the dendrogram
+plot(dendrogram, main = "Dendrogram of Mean Correlation Scores")
+
+
+hclust()
+```
+
+
+
+plot each genes trend in the module, plot the module eigengene and plot the median summary of each to see if they agree
+
+```{r}
+# take p.quant and merge cluster ID
+setnames(wgcna.clusters, new=c('gene', 'Cluster'))
+
+p.quant[, gene := multiUniprots2multiGenes(Protein)]
+p.quant[wgcna.clusters, Cluster := i.Cluster, on=c('gene','gene')]
+```
+
+reduced dt for plotting
+
+```{r}
+# get the average exp per cluster,receptor,timeStr
+p.quant.dt <- p.quant[!is.na(Cluster), .(gene, GROUP, SUBJECT, timeStr, receptor, Cluster, vsTimeZero)] 
+p.quant.dt[, sample := paste0(GROUP,'_',SUBJECT)]
+
+```
+
+take the ME list an dplot the results
+
+```{r}
+MEs <- fread('./output/11.receptors.moduleEigengenes.wrownames.csv')
+#MEs[ V1 %like% c("DAMGO"), V1 := sub(".DAMGO","", V1)]
+#fwrite(MEs, './output/11.receptors.moduleEigengenes.wrownames.csv')
+
+ME.dt <- MEs %>%  
+  melt() %>% 
+  setnames(new=c('sample','ME', 'ME.score'))
+
+ME.dt[, c('GROUP','SUBJECT') := tstrsplit(sample, '\\.', keep=c(1,2))] %>% 
+  .[, `:=`(GROUP = sub("_batch", "", GROUP),
+           SUBJECT = paste0('batch.', SUBJECT),
+           ME = sub("ME", "cluster", ME))]
+#sanirt check
+#sort(unique(ME.dt$GROUP)) == sort(unique(p.quant.dt$GROUP))
+#sort(unique(ME.dt$SUBJECT)) == sort(unique(p.quant.dt$SUBJECT))
+#sort(unique(ME.dt$sample)) == sort(unique(p.quant.dt$sample))
+```
+set order for plotting
+```{r}
+sample.order <- unique(p.quant.dt$sample)
+
+p.quant.dt[, sample := factor(sample, levels=c(sample.order))]
+ME.dt[, sample := factor(sample, levels=c(sample.order))]
+```
+
+
+plot the results
+```{r}
+
+lapply(clusters, function(x){
+  
+  ggplot(p.quant.dt[Cluster == x,], aes(x=sample, y=vsTimeZero, group=gene))  +
+  geom_line(alpha=0.2) +
+    geom_line(data=ME.dt[ME == x,], aes(x=sample, y=ME.score,color='red', group=ME)) +
+    #geom_line(data=p.quant.dt[Cluster == x,], aes(x=sample, y=median.vsT0,color='blue',group=receptor)) +
+    guides(color=guide_legend(title='module summary')) +
+    theme_classic() +
+    ggtitle(paste0(x, ' expression profile')) +
+    theme(
+      axis.text.x = element_text(angle=90)
+    )
+})
+
+```
+how does this align with the median summarisation of each module?
+median summary much more pronounced, less overfit?
+
+```{r}
+p.quant.dt[, median.vsT0 := median(vsTimeZero, na.rm=T), by=.(sample, Cluster)]
+p.quant.dt
+lapply(clusters, function(x){
+  
+  g <- ggplot(p.quant.dt[Cluster == x,], aes(x=sample, y=vsTimeZero, group=gene))  +
+  geom_line(alpha=0.2) +
+    geom_line(data=p.quant.dt[Cluster == x,], aes(x=sample, y=median.vsT0,color='blue', group=Cluster)) +
+    geom_line(data=ME.dt[ME == x,], aes(x=sample, y=ME.score,color='red', group=ME)) +
+    scale_color_manual(values = c('blue' = 'blue', 'red' = 'red'), 
+                       name = 'Module Summary',
+                       labels = c('blue' = 'Median vsT0', 'red' = 'Module Eigenprotein')) +
+    guides(color=guide_legend(title=' module summary')) +
+    theme_classic() +
+    ggtitle(paste0('cluster ', x)) +
+    theme(
+      axis.text.x = element_text(angle=90, size=3)
+    )
+  BackupAsPDF(g, paste0(x,'.module.eigengene.medianvsT0.lineplot'), dimensions=c(10,6))
+})
+
+
+moduleEigengene
+
+```
+
+plot the distribution of the cor scores for each module
+Why do some appear bimodal? Good qual genes and some random noise?
+
+```{r}
+cor.scores.dt <-  rbindlist(cor.scores.list, idcol=T) %>% 
+  .[,.id := factor(.id, levels=clusters)]
+
+col.pal <-  randomcoloR::distinctColorPalette(k=length(clusters))
+
+g <-  ggplot(cor.scores.dt, aes(x=.id, y=V1, fill=.id)) +
+  geom_violin() +
+  ylab('Pearson R') +
+  xlab('WGCNA Module') +
+  ggtitle('Module Eigenprotein Correlation') +
+  scale_fill_manual(values=col.pal) +
+  theme_bw()
+
+g
+
+BackupAsPDF(g, 'moduleMECor.violin')
+```
+assess dispersion; MAD plot
+
+maximum absolute deviation
+```{r}
+sapply(cor.scores.list, function(x) mad(x$V1)) %>%  
+  data.table(names=names(.), 
+             mad=.) %>% 
+  ggplot(., aes(x=reorder(names,mad), y=mad, fill=names)) + 
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual(values=col.pal) + 
+  theme_bw()
+```
+
+
+calculate summary statistics for our data
+
+```{r}
+mod.summary <- lapply(cor.scores.list, function(dt){
+  
+  keys <-  'V1'
+  
+    # Calculate summary statistics
+     summaryStats <- dt[, .(
+                             mean_value = sapply(.SD, mean), 
+                             median_value = sapply(.SD, median),
+                             sd_value = sapply(.SD, sd)),
+                        .SDcols = keys]
+  
+  # Return summary statistics
+  #return(summaryStats)
+  return(summaryStats)
+  
+})
+
+mod.summary.dt <-  mod.summary.list %>%  rbindlist(idcol = T)
+mod.summary.dt
+
+```
+test stability
+as many of the modules cor value distributions dont look normal, we will need to perform a bootstrap approach
+for each module, randomly subsample proteins equal size to the module, calculate correlation with the moduleEigenprotein, record the result and then plot
+
+```{r}
+
+# function to randomly subsample a matrix for a given size
+bootstrapCorrelations <- function(input.mat, subsample.size, ntimes=1, corVec) {
+  
+  cor.dt <- data.table()
+  
+  for (i in 1:ntimes) {
+    subMat <- input.mat[sample(rownames(input.mat), subsample.size, replace=T),]
+    
+    #correlations <-  doMatrixCorrelation(mat=t(subMat), targetVector=corTargetVector, method='pearson', use='pairwise.complete.obs')
+    correlations <-  cor(x=t(subMat), y=corVec, method='pearson', use='pairwise.complete.obs')
+    
+    # add scores to cols
+    cor.dt[, paste0('sampling.', i) := correlations ] 
+  }
+  
+  keys <- colnames(cor.dt)
+  
+  # Calculate summary statistics
+  summaryStats <- cor.dt[, .(sampling = colnames(cor.dt),
+                             mean_value = sapply(.SD, mean), 
+                             median_value = sapply(.SD, median),
+                             sd_value = sapply(.SD, sd)),
+                        .SDcols = keys]
+  
+  # Return summary statistics dt
+  return(summaryStats)
+}
+
+#test.dt <- bootstrapCorrelations(p.mat, subsample.size = 10, ntimes=2, corVec = ME.mat.list[[1]])
+```
+repeat the resampling 1000x times per cluster, what do the mean distributions look like and how 
+```{r}
+summary.dt.list <- lapply(seq_along(clusters), function(x,y,i){
+  
+  # cluster name 
+  clust <- x[[i]]
+  # get cluster size
+  clust.size <-  wgcna.clusters[Cluster == clust, length(gene)]
+  
+  print(paste0('subsampling ', clust.size, ' & correlating with ', clust, ' eigenProtein values'))
+  
+  summary.dt <- bootstrapCorrelations(p.mat, subsample.size = clust.size, ntimes=1000, corVec = y[[clust]])
+  
+  return(summary.dt)
+  
+}, x=clusters, y=ME.mat.list)
+
+names(summary.dt.list) <-  clusters
+
+
+modulePreservation()
+```
+
+all look normally distributed, v different distribution to what we have, so not very useful for
+
+this looks weird... why are the correlation scores so low?
+If we subsampled 226 random genes from p.mat and checked out correlation to ME for module 1, we would expect by chance a couple of genes to sampling with no replacement as want to imagine what we get if we just draw 11 modules randomly for our genes
+
+
+```{r}
+lapply(seq_along(summary.dt.list), function(x, n,i){
+  
+
+  ggplot(data=x[[i]], aes(x=mean_value)) + 
+    geom_histogram() + 
+    ggtitle(n[[i]]) +
+    theme_classic()
+  
+},x=summary.dt.list, n=names(summary.dt.list))
+
+```
+summary scores of both; not really comparable
+```{r}
+# all of these values 
+lapply(summary.dt.list, function(x) summary(x$mean))
+lapply(cor.scores.list, function(x) summary(x$V1))
+```
+
+To me, seems moduleEigengene summary captures less of trend in data then the median... is this due to eigengene scaling?
+Recalculate w/o scaling and plot along with other values
+
+```{r}
+# exp mat
+receptor.exp.mat <- readRDS('./output/gpcr.11.receptors.exp.mat.Rdata')
+
+# asisgnment matched to rows in receptor.mat
+receptor.modules <- readRDS('./output/gpcr.11.receptors.moduleAssignment.Rdata')
+```
+
+Calculate module eigengenes; first principal component of each module
+Transforming so cols represent genes and rows represent 
+
+# warning on some rows missing values (presume this is genes with many NA meausres, need to remove these when repeating)
+```{r}
+receptor.exp.mat <- t(receptor.exp.mat)
+
+MElist.redo <- moduleEigengenes(receptor.exp.mat, colors = receptor.modules, scale=F)  #%>% 
+  
+ME.redo <-  MElist.redo$eigengenes %>% 
+  as.data.table(keep.rownames=T)
+
+ME.redo.dt <- ME.redo %>%  
+  melt() %>% 
+  setnames(new=c('sample','ME', 'ME.score'))
+
+ME.redo.dt[, c('GROUP','SUBJECT') := tstrsplit(sample, '\\.', keep=c(1,2))] %>% 
+  .[, `:=`(GROUP = sub("_batch", "", GROUP),
+           SUBJECT = paste0('batch.', SUBJECT),
+           ME = sub("ME", "cluster", ME))]
+
+ME.redo.dt
+```
+plot this new ME score alongside the ME ; not really much of an impact
+
+```{r}
+lapply(clusters, function(x){
+  
+  g <- ggplot(p.quant.dt[Cluster == x,], aes(x=sample, y=vsTimeZero, group=gene))  +
+  geom_line(alpha=0.2) +
+    geom_line(data=p.quant.dt[Cluster == x,], aes(x=sample, y=median.vsT0,color='blue', group=Cluster)) +
+    geom_line(data=ME.dt[ME == x,], aes(x=sample, y=ME.score,color='red', group=ME)) +
+    geom_line(data=ME.redo.dt[ME == x,], aes(x=sample, y=ME.score,color='green', group=ME)) +
+
+    scale_color_manual(values = c('blue' = 'blue', 'red' = 'red', 'green'='green'), 
+                       name = 'Module Summary',
+                       labels = c('blue' = 'Median vsT0', 'red' = 'Module Eigenprotein', 'green'='Module Eigenprotein (no scaling)')) +
+    guides(color=guide_legend(title=' module summary')) +
+    theme_classic() +
+    ggtitle(paste0('cluster ', x)) +
+    theme(
+      axis.text.x = element_text(angle=90, size=3)
+    )
+ # BackupAsPDF(g, paste0(x,'.module.eigengene.medianvsT0.lineplot'), dimensions=c(10,6))
+})
+
+
+
+```
+
+Module stability assessment
+Question on how sensitive these clusters are to the input set
+Build a consensus network
+
+-----
+Using the WGCNA function `sampledBlockwiseModules` as a template to subsample genes from our input and construct a matrix
+
+i) feed in a matrix (genes in col, samples in row)
+ii) subsample the matrix to fraction
+iii) run a full network construction;  
+iii) desired output would be dt with cols rownames(gene), mod.assignment.rep1, mod.assignment.rep2
+
+Good question to ask; what are the genes per module, that regularly get assigned to the same module?
+  - a way of identifying the central genes per module.. do these overlap with strong correlations with ME?
+  
+Just take 100 runs for now, 
+Idea is to look for a consensus network; the things that repeatedly reappear, seem to share a strong connection, so leverage this to build another WGCNA matrix
+
+Worth noting I am setting any NA dissimilarity to 1 (diss score) as failing on clustering otherwise
+
+```{r}
+# need gene x sample matrix (genes as cols)
+receptor.exp.mat <- readRDS('./output/gpcr.11.receptors.exp.mat.Rdata') %>% 
+  t()
+
+
+
+# genes in col, samples in rows; 
+#this is the input needed for clustering using cor function on matrix
+sampleWGCNAModules <-  function(mat, nRuns=1, 
+                                sampleFraction=0.8, 
+                                withReplacement=F, 
+                                corType='p', 
+                                softPower=5, 
+                                networkType='signed', 
+                                useTOM=T, 
+                                verbose=T,
+                                deepSplit=1, 
+                                minClusterSize=18, ...){
+  
+  # assign the data table names
+  mat.list <-  list()
+  
+  for (i in 1:nRuns) {
+    
+    modules.dt <- data.table()
+    
+    print(str_glue('subsampling {round(nrow(mat) * sampleFraction)} features { ifelse(withReplacement == T, "with replacement", "without replacement")}'))
+    
+    # subsample rows
+    subMat <- mat[sample(rownames(mat), round(sampleFraction * nrow(mat)),replace=withReplacement), ]
+    print(dim(subMat))
+  
+    #create adjacency matrix 
+    adjMat <-  adjacency(subMat, 
+                       power = softPower, 
+                       corFnc = corType,
+                       type=networkType)
+    
+    # use TOM?
+    if (useTOM %in% c('T','TRUE')){
+    
+      print(str_glue('generating network from TOM with soft threshold { softPower}'))
+      tomMat  <- TOMsimilarity(adjMat,
+                               networkType, 
+                               verbose=verbose)
+      inDist <-  1-tomMat
+    
+    } else {
+      print(str_glue('generating network from adjacency matrix with soft threshold { softPower}'))
+      inDist <-  1-adjMat
+    }
+    print('Network construction complete')
+    print('Identifying gene modules by hierarchical clustering')
+    
+    #creating the dendrogram convert NA values to 1 (means completely dissimiliar)
+    inDist[is.na(inDist)] <- 1
+    featTree <-  hclust(as.dist(inDist), method = "average") 
+
+    #identify the modules in each 
+    netModules <- cutreeDynamic(dendro = featTree, 
+                                distM = inDist, 
+                                deepSplit = deepSplit, 
+                                pamRespectsDendro = FALSE, 
+                                minClusterSize = minClusterSize) 
+    
+    
+    modules.dt[, `:=`(featureName = colnames(adjMat),
+                      modAssignment = as.character(netModules)) ]
+   # modules.dt[, paste0('modAssignment.', i) := as.character(netModules)]
+    
+    print(str_glue('Identified { length(unique(netModules)) } modules in the subsample..'))
+    
+    mat.list[[i]] <-  modules.dt
+  }
+  
+  names(mat.list) <-   paste0('iteration.', seq(1,nRuns,by=1))
+  return(mat.list)
+}
+    
+modAssignment.list <- sampleWGCNAModules(mat=receptor.exp.mat, sampleFraction=0.8, nRuns = 100, corType='bicor', withReplacement = F, useTOM=F, verbose=T, deepSplit = 1, minClusterSize = 18)
+```
+
+
+
+'For each re-sampled dataset, all reference modules are compared to all newly identified modules using the Jaccard similarity coefficient.' 
+For each reference module, the best match Jaccard similarity coefficient value is recorded (multiple testing problem?)
+
+```{r}
+#saveRDS(modAssignment.list, './output/moduleAssignment.100iters.RDS')
+modAssignment.list <- readRDS('./output/moduleAssignment.100iters.RDS')
+
+# asisgnment matched to rows in receptor.mat
+receptor.modules <- readRDS('./output/gpcr.11.receptors.moduleAssignment.Rdata')
+```
+
+get jaccard similarity function 
+write function to run an all-by-all jaccard similarity on each module
+Is this an MT problem? 
+
+```{r}
+jaccard <- function(a, b) {
+    intersection = length(intersect(a, b))
+    union = length(a) + length(b) - intersection
+    return (intersection/union)
+}
+
+expand.grid(origMods[,unique(modAssignment)],  modAssignment.list[[1]][, unique(modAssignment)])
+
+# function to calculate an all-by-all jaccard similarity 
+# returns list of vectors, one per reference mod with 
+# i) best jaccard score in test (bestScores) or vector of jaccard scores for all tests
+jaccardAllbyAll <- function(dt.ref, #reference modules
+                            dt.test, #sampling modules
+                            modAssignmentCol="modAssignment", 
+                            featureNames="featureName",
+                            bestScores=T) {
+  
+  #output dt
+  jaccard.dt <- data.table()
+  
+  # find all unique factor combos
+  modCombos <- expand.grid(unique(dt.ref[[modAssignmentCol]]), unique(dt.test[[modAssignmentCol]]) ) %>% 
+    as.data.table() #expand.grid out df by default
+  
+  # loop throught the reference modules and calculate
+  refMods <- unique(dt.ref[[modAssignmentCol]])
+
+  lapply(refMods, function(mod){
+    
+    #filter for  mod x rows when perfomring the calculation
+    modResults <- apply(modCombos[Var1 == mod, ], 1, function(x){
+      jaccard.score <- jaccard(dt.ref[get(modAssignmentCol) == x[1], get(featureNames)], dt.test[ get(modAssignmentCol) == x[2], get(featureNames)])
+      
+      iter.dt <-  data.table()
+      iter.dt[, `:=`(refModule = paste0(x[1],'.refMod'), 
+                     testModule = paste0(x[2], '.testMod'),
+                     jaccard = jaccard.score)]
+      
+      return(iter.dt)
+    })
+    # combine return vals to one dt per mod
+    jaccard.dt <- rbindlist(c(jaccard.dt, modResults))
+    
+    if ( bestScores %in% c('TRUE', 'T')) {
+      return(jaccard.dt[, .SD[which.max(jaccard)], by=refModule])
+      } else {
+    return(jaccard.dt)
+    }
+  })
+  
+} 
+```
+TODO
+---
+use this function to calculate the jaccard similarity over all subsamplings
+
+```{r}
+
+```
+
+
+
+```{r}
+
+expand.grid( odt.x[, unique(modAssignmentCol)], sampMods=dt.y[, unique(modAssignmentCol)])
+
+jaccardAllbyAll(dt.x=origMods, dt.y=modAssignment.list[[1]])
+#
+origMods
+
+origMods <- data.table(featureName=colnames(receptor.exp.mat), modAssignment = receptor.modules)
+
+
+
+
+
+origMods
+modAssignment.list[[1]]
+
+
+
+origMods[, modAssignment==1]
+
+
+jaccard(origMods[modAssignment==1, featureName], modAssignment.list[[1]][modAssignment==1,featureName])
+```
+
+
+
+```{r}
+
+
+# function to randomly subsample a matrix for a given size
+bootstrapCorrelations <- function(input.mat, subsample.size, ntimes=1, corVec) {
+  
+  cor.dt <- data.table()
+  
+  for (i in 1:ntimes) {
+    subMat <- input.mat[sample(rownames(input.mat), subsample.size, replace=T),]
+    
+    #correlations <-  doMatrixCorrelation(mat=t(subMat), targetVector=corTargetVector, method='pearson', use='pairwise.complete.obs')
+    correlations <-  cor(x=t(subMat), y=corVec, method='pearson', use='pairwise.complete.obs')
+    
+    # add scores to cols
+    cor.dt[, paste0('sampling.', i) := correlations ] 
+  }
+  
+  keys <- colnames(cor.dt)
+  
+  # Calculate summary statistics
+  summaryStats <- cor.dt[, .(sampling = colnames(cor.dt),
+                             mean_value = sapply(.SD, mean), 
+                             median_value = sapply(.SD, median),
+                             sd_value = sapply(.SD, sd)),
+                        .SDcols = keys]
+  
+  # Return summary statistics dt
+  return(summaryStats)
+}
+
+
+View(blockwiseModules)
+```
+
+
+
+
+
+# TODO 
+Confirm the module subsampling looks ok; 
+
+# Not needed 
+```{r}
+
+# function to randomly subsample a matrix for a given size
+subsampleMatrix <- function(input.mat, subsample.size, ntimes=1) {
+  
+  mat.list <- list()
+  
+  for (i in 1:ntimes) {
+    subMat <- input.mat[sample(rownames(input.mat), subsample.size, replace=T),]
+    mat.list[[i]] <-  subMat
+  }
+  return(mat.list)
+  
+}
+
+test <-  subsampleMatrix(p.mat, 100, 10)
+
+# function to calculate a correlation matrix between each gene in each matrix and supplied vector
+
+doMatrixCorrelation <-  function(mat, targetVector,...) {
+  
+  corScores <- cor(x=mat, y=targetVector,...)
+  return(data.table(corScores, keep.rownames = TRUE))
+  
+}
+
+# test
+lapply(test, function(mat){
+
+  doMatrixCorrelation(mat=t(mat), ME.mat.list[['cluster1']], method='pearson', use='pairwise.complete.obs')
+  
+})
+
+```
+
+
+
+
+
+```{r}
+ME.mat.list[['cluster1']]
+
+
+cor.scores.list <- lapply(clusters, function(clust){
+  
+  cor.scores <-  cor(x=t(p.mat.mod.list[[clust]]), 
+      y=ME.mat.list[[clust]], 
+      method='spearman',
+      use="pairwise.complete.obs")
+    
+  return(data.table(cor.scores, keep.rownames = TRUE))
+
+})
+
+```
+
+
+
+
+
+
+
+# Function to calculate correlation score for a given module
+calculate_module_correlation <- function(module_genes, ME_list) {
+  
+  
+  module_expression <- gene_matrix[module_genes, , drop = FALSE]
+  
+  # Calculate correlation scores for each gene in the module
+  correlations <- apply(module_expression, 1, function(gene_expression) {
+    cor(gene_expression, known_vector, method = "spearman")
+  })
+  
+  # Average correlation score for the module
+  return(mean(correlations))
+}
+
+
+
+cor.scores.list <- lapply(clusters, function(clust){
+  
+  cor.scores <-  cor(x=t(p.mat.mod.list[[clust]]), 
+      y=ME.mat.list[[clust]], 
+      method='pearson',
+      use="pairwise.complete.obs")
+    
+  return(data.table(cor.scores, keep.rownames = TRUE))
+
+})
+```
+
+
+

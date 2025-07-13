@@ -1,0 +1,160 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+This template file located at:
+/Applications/RStudio.app/Contents/Resources/resources/templates/notebook_osx.Rmd
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("../../../../utils/bp_utils/ManageScriptData.R")
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+
+```{r}
+spec <- fread ("~/Library/CloudStorage/Box-Box/hMOR_SHSY5Y/20230512_130517_hMOR_SHSY5Y_HEK_lib_Peptide_Report.xls")
+
+unique(spec$Condition)
+hist (log2(spec$Intensity), breaks = 100)
+```
+
+```{r}
+spec <- fread ("~/Library/CloudStorage/Box-Box/hMOR_SHSY5Y/20230512_130517_hMOR_SHSY5Y_HEK_lib_Peptide_Report.xls")
+spec <- spec[Intensity > 2^5,]
+
+
+spec[, IsotopeLabelType := "L"]
+dp.out <- MSstats::dataProcess(spec, MBimpute = FALSE, remove_uninformative_feature_outlier = TRUE, featureSubset = "highQuality")
+
+```
+
+
+```{r}
+fwrite (dp.out$FeatureLevelData, ScriptAndDatedFileName("FeatureLevelDataGT5.csv.gz"))
+fwrite (dp.out$ProteinLevelData, ScriptAndDatedFileName("ProteinLevelDataGT5.csv.gz"))
+```
+
+
+```{r}
+protQuant <- setDT(dp.out$ProteinLevelData)
+
+#protQuant <- fread ("~/Documents/projects/practise-scripts/Intro_To_Krogan_Analyses/darpa-timeseries-ms-dea/2023_SHSY5Y_timeSeriesFitting_demo_data/2023_05_25_ProteinLevelDataGT5.csv.gz")
+ggplot (protQuant, aes(x =paste0(GROUP, "_", SUBJECT), y = LogIntensities)) + geom_boxplot() + rotate.x.axis.text
+
+
+
+nicePolyFits.fullTableprot.mat <- dcast (protQuant, Protein~GROUP + SUBJECT, value.var = "LogIntensities") |> as.matrix (rownames = "Protein") #|> base r pipe
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat,1, median, na.rm = TRUE))
+
+# in this case, we need to "impute" missing values for the sake of getting a column clustering
+rowClusterWithNA <- function(mat, na.value = 0, ...){
+  mat[is.na(mat)] <- na.value
+  hclust(dist(mat), ...)
+}
+
+subMat <- prot.mat[sample.int(nrow(prot.mat), 1000),]
+
+Heatmap(subMat,
+        cluster_rows = rowClusterWithNA(subMat),
+        name = "Log2 Int.")
+
+
+```
+
+DAM_01_3, and DAM_30_3 are clear outliers.  Probably best to dump them now...
+Also, it looks like we need to renormalize the protein intensity.
+
+
+# renormalize using a tukey median polish procedure (second round of normalisation)
+```{r}
+#protQuant <- fread ("~/UCSF/kroganlab/BenPolacco/darpa2022/2023_05_15_SHSY5Y_MOR_APEX_data/2023_05_16_ProteinLevelDataGT5.csv.gz")
+prot.mat <- dcast (protQuant, Protein~GROUP + SUBJECT, value.var = "LogIntensities") |> as.matrix (rownames = "Protein") #transform into matrix w 
+tmp <- medpolish(prot.mat, na.rm = TRUE)
+
+tmp.dt <- data.table(offset = tmp$col, group_subject = names(tmp$col))
+protQuant[, group_subject := paste(GROUP, SUBJECT, sep = "_")]
+ggplot(tmp.dt, aes(x = group_subject, y= offset)) + geom_col() + rotate.x.axis.text
+protQuant[tmp.dt, normalize.offset := i.offset, on = "group_subject"]
+
+protQuant[, LogIntensities := LogIntensities - normalize.offset]
+ggplot (protQuant, aes(x =paste0(GROUP, "_", SUBJECT), y = LogIntensities)) + geom_boxplot() + rotate.x.axis.text
+
+protQuant <- protQuant[!(GROUP == "DAM_01" & SUBJECT == 3)]
+protQuant <- protQuant[!(GROUP == "DAM_30" & SUBJECT == 3)]
+
+
+fwrite(protQuant, ScriptAndDatedFileName("ProteinQuant.renormalised.csv"))
+
+```
+
+
+
+
+```{r}
+protQuant <- fread (GetLatestScriptFile("ProtQuant.normalized.csv"))
+
+# SUBJECT has to be character or factor, not numeric
+
+protQuant[, SUBJECT := sprintf("batch.%02d", as.integer(SUBJECT))]
+
+protQuant[, c("drug", "timeStr") := tstrsplit(GROUP, "_")]
+protQuant[, timeRank := as.integer(as.factor(timeStr))]
+protQuant[, .(timeRank, timeStr)] |> unique()
+
+source ("../../bp_utils/MS_ModelFitting_TimeSeries.R")
+
+# the "nice" function is a wrapper around my less-nice function that returns 
+
+fits.dt <- nicePolyFits.fullTable(protQuant = protQuant, polyColumn = "timeRank", splitColumn = "Protein")
+fwrite (fits.dt, ScriptAndDatedFileName("TimeCourseResults.csv.gz"))
+```
+
+# volcano plots, heatmaps, etc...
+
+
+```{r}
+fits.dt[, gene := multiUniprots2multiGenes(Protein)]
+fits.dt[, p.adjust := p.adjust(pvalue, method = "BH")]
+View(fits.dt)
+```
+
+
+
+```{r}
+fits.dt[, sig := "not"]
+fits.dt[p.adjust < 0.05  & abs(log2FC) > log2(1.5), sig := ifelse(log2FC > 0, "up", "down")]
+
+p <- ggplot (fits.dt, aes (x = log2FC, y= -log10(p.adjust), color = sig)) +
+  scale_color_manual(values = c(not = "gray", up = "red", down = "blue"))+
+geom_point(show.legend = FALSE) +
+  ggrepel::geom_text_repel(data = fits.dt[sig!= "not"],aes(label = gene), size = 2, show.legend = FALSE)+
+  coord_cartesian( xlim = c(-5,5)) +
+  theme_bw()
+
+BackupAsPDF(p)
+```
+
+
+```{r}
+sigProteins <- fits.dt[sig!= "not", Protein]
+
+prot.mat <- actualMatrixFromPolyFits(fits.dt)
+```
+
+
+```{r, fig.width = 2, fig.height = 8}
+sigProteins <- fits.dt[sig== "up", Protein]
+sub.mat <- prot.mat[sigProteins, ]
+rownames(sub.mat) <- multiUniprots2multiGenes(rownames(sub.mat))
+
+hm <- Heatmap (sub.mat, cluster_columns = FALSE, row_names_gp = gpar(fontsize =7), name = "log2FC", column_labels = c(0,1,5,10,30),
+               col = circlize::colorRamp2(breaks = c(-3, 0, 3), colors = c("blue", "white", "red")))
+BackupAsPDF(hm, dimensions = c(3,8))
+```
+

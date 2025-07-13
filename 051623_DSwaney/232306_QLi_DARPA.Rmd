@@ -1,0 +1,128 @@
+---
+title: "230623_QLi_DARPA"
+author: "Martin Gordon"
+date: "2023-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Summary
+Perform Differential Expression Analysis of MS-MS Spectronaut data using MSstats
+Data from DARPA project: Single timepoint with 6 conditions in total: 3 ligands vs NPFFR1, treated vs untreated with 30 min exposure to NPFF
+Perform pairwise contrasts for each of the conditions
+
+###: Contact: Qiongyu Li
+###: Date: 23-06-23
+
+```{r packages}
+library(purrr)
+library(tidyr)
+library(dplyr)
+library(data.table)
+library(MSstats)
+library(ggplot2)
+library(magrittr)
+library(circlize)
+library(ComplexHeatmap)
+library(parallelDist) #needed for some custom enrichment functions
+library(ggvenn)
+
+#source Bens utility scripts
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+Read in spectronaut data & metadata
+
+----
+```{r read-in}
+getwd()
+AB_input <- fread(paste0(path, '/docs/MartinGordon_MSAnalysis_forDanielle/AA08/AB/20230516_094910_AA08_AB_Report.csv'))
+AB_meta <- fread(paste0(path, '/docs/MartinGordon_MSAnalysis_forDanielle/AA08/AB/AA08_AB_ConditionSetup.xls'))
+AB_input$ProteinName <- sub(">", "", AB_input$ProteinName)
+```
+
+
+
+```{r data-inspection}
+summary(AB_input)
+
+AB_input$BioReplicate <- as.factor(AB_input$BioReplicate)
+AB_input$Run <- as.factor(AB_input$Run)
+AB_input$Condition <- as.factor(AB_input$Condition)
+```
+Data inspection
+---------
+
+```{r data structure}
+# order by Condition
+setorder(AB_input, Condition)
+# One run per condition per replicate
+AB_input[, .N, by = .(Run, Condition, BioReplicate)]
+```
+
+Remove '>' preceeding some ProteinNames
+```{r}
+AB_input$ProteinName <- sub(">", "", AB_input$ProteinName)
+```
+
+
+
+Bioreplicate numbers (1-4) are repeated across conditions. Modified as msstats assumes repeated bioreplicate ids indicate a time-series analysis.
+Asigned each cond/biorep combo a unique ID (1-20) for msstats to model as a case-control experiment.
+
+```{r}
+# create new ID col for pairwise comparisons
+AB_input[, ID:=.GRP, by=.(Condition,BioReplicate)]
+
+#reassign to biorep col and drop ID
+AB_input[, BioReplicate:=ID]
+AB_input[, ID:=NULL]
+
+#sanity check
+AB_input[, .N, by = .(Condition,BioReplicate)]
+```
+
+Removed spectronaut peptides with intensities < 2^5 as likely artifacts of the identification/quantification tool.
+
+```{r}
+ggplot(data=AB_input,  mapping=aes(x=log2(Intensity))) +
+  geom_histogram(binwidth = 0.1)
+
+AB_input <- AB_input[log2(Intensity) > 5] #filter out low abundance 
+
+ggplot(data=AB_input,  mapping=aes(x=log2(Intensity))) +
+  geom_histogram(binwidth = 0.1)
+
+```
+
+Identify if there any multiple-feature peptide ions in the runs. We expect one peptide feature per row per run, so identify duplicates.
+No multi-feature peptides detected
+
+```{r}
+any(AB_input[, .N, by = .(Run, PeptideSequence, PrecursorCharge)]$N) > 1
+```
+Plot of number of peptide ion measurements per run. Counts seem pretty consistent across replicates & conditions
+
+```{r}
+### plot of peptide ions per run
+p <- AB_input %>%  
+      ggplot(mapping=aes(x=reorder(interaction(Condition,BioReplicate)), fill=Condition)) +
+      geom_bar() + 
+      theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+BackupAsPDF(p, "BarPlot_NPeptides_")
+```
+Boxplots of distributions of raw intensity values per condition/replicate. Again abundances are pretty consistent and no real concerns with raw data quality. 
+```{r create contrasts}
+p <- ggplot(data = AB_input, mapping=aes(x=reorder(interaction(Condition, BioReplicate)), y=log2(Intensity), fill=Condition)) +
+      geom_boxplot() +
+      theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+BackupAsPDF(p, "BoxPlot_RawIntensities_")
+```

@@ -1,0 +1,347 @@
+---
+title: "062325_HIV.d123.ccprofiler.diffAnalysis"
+author: "Martin Gordon"
+date: "2025-06-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Continuing work from last week, we will run `CCprofiler` on the HIV donor set
+Past work focused on getting this running with the protein traces level information, but couldnt wrangle it to work. 
+Now will start from the peptide level and use a standard workflow
+I think for first pass, we focus on running the comparison between all 3 conditions all-by-all comparison
+
+For now we focus on the protein level differential analysis
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(viridis)
+library(pracma)
+library(magick)
+library(eulerr)
+library(CCprofiler)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+read in the peptide intensity files, format th
+
+```{r}
+pep.ls <- dir('./data/data_peptidelvlIDs', recursive = T, full.names = T, pattern="*Peptide_Report.tsv")
+pep.ls <- lapply(pep.ls, fread)
+paths <- dir('./data/data_peptidelvlIDs', recursive = T, full.names = T, pattern="*Peptide_Report.tsv")
+paths <- str_extract(paths, "D[123][-_][A-Za-z0-9]+[-_][A-Za-z0-9]+")
+
+# sanity check...
+paths
+names(pep.ls) <- c('Challenged_1', 'Infected_1', 'Uninfected_1', 'Infected_2', 'Challenged_2', 'Uninfected_2', 'Uninfected_3', 'Infected_3', 'Challenged_3')
+
+pep.dt <- rbindlist(pep.ls, idcol='sample')
+rm(pep.ls)
+```
+
+# tidy the input file format and prepare the input
+
+nasty format... lets tidy, remove unnessary colnames and combine in long format and save the files
+```{r}
+ints.cols <- grep('TargetQuantity', colnames(pep.dt), value=T)
+qval.cols <- grep('Qvalue', colnames(pep.dt), value=T)
+
+# make a id mapper file and save
+idMapper <- pep.dt[, .(protein=PG.ProteinAccessions, 
+           peptide=EG.PrecursorId,
+           gene=PG.Genes,
+           org=PG.Organisms,
+           mw=PG.MolecularWeight,
+           decoy=EG.IsDecoy
+           )] %>% 
+  unique()
+
+fwrite(idMapper, ScriptAndDatedFileName('id.mappers.csv.gz'))
+```
+
+Covert to long format and merge 
+```{r}
+cols.oi <- c('sample', 'PG.ProteinAccessions', 'EG.PrecursorId',grep('TargetQuantity', colnames(pep.dt), value=T))
+
+ints.dt  <- pep.dt[, ..cols.oi] %>% 
+  reshape2::melt(., idvars=c('sample', 'PG.ProteinAccessions', 'EG.PrecursorId')) %>% 
+  setDT()
+setnames(ints.dt, c('value'), c('intensity'))
+
+cols.oi <- c('sample', 'PG.ProteinAccessions', 'EG.PrecursorId', grep('EG.Qvalue', colnames(pep.dt), value=T))
+
+qvalue.dt  <- pep.dt[, ..cols.oi] %>% 
+  reshape2::melt(., idvars=c('sample', 'PG.ProteinAccessions', 'EG.PrecursorId')) %>% 
+  setDT()
+setnames(qvalue.dt, c('value'), c('qvalue'))
+```
+get fraction id and merge the files
+```{r}
+ints.dt[, c('fraction') := tstrsplit(variable, '[^0-9]+', keep=c(3))]
+qvalue.dt[, c('fraction') := tstrsplit(variable, '[^0-9]+', keep=c(3))]
+```
+
+merge the data and save to file
+
+```{r}
+#fwrite(merge(x=ints.dt[, -c('variable')], y=qvalue.dt[, -c('variable')], by=c('sample', 'PG.ProteinAccessions', 'EG.PrecursorId', 'fraction')), ScriptAndDatedFileName('pep.ccprofiler.input.csv.gz'))
+```
+
+example data; read in the decoy annotation
+
+```{r}
+idMapper <- fread('/Users/martingordon/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_23_id.mappers.csv.gz')
+idMapper[decoy == TRUE, protein_id := paste0('DECOY_', protein)]
+idMapper[decoy == FALSE ,protein_id := protein]
+idMapper[, protein_name := protein_id]
+
+idMapper[grepl('DECOY', protein_name)]
+idMapper
+```
+
+read in the peptide data, split into an annotation and ints datatable
+```{r}
+# annotation data after filtering out the low
+pep.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_23_pep.ccprofiler.input.csv.gz')[, .(protein_id=PG.ProteinAccessions, peptide_id=EG.PrecursorId, filename=paste0(sample, '.', fraction), intensity, qvalue)]
+
+# subset to proteotypic peptides
+pep.dt <- pep.dt[!grepl('[;]', protein_id),]
+
+pep.dt[qvalue < 0.05|is.na(qvalue)]
+```
+not sure if this is a good idea... Im going to drop all the non-decoy low q-val set
+```{r}
+comb.dt <- merge(pep.dt[qvalue < 0.05|is.na(qvalue),], unique(idMapper[, .(protein, peptide, protein_name)]), by.x=c('protein_id', 'peptide_id'), by.y=c('protein', 'peptide'), all.x=T)
+
+# drop the peptides eith no qvalye/ints and not flagged decoy
+comb.dt <- comb.dt[!(!grepl('DECOY_', protein_name) & is.na(qvalue))]
+
+#fwrite(comb.dt[, .(protein_id=protein_name, peptide_id, filename, intensity)], ScriptAndDatedFileName('ccprofiler.peptidesInt.input.csv.gz'))
+rm(comb.dt)
+```
+read in the intensity data
+```{r}
+pep.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_24_ccprofiler.peptidesInt.input.csv.gz')
+```
+
+prepare the fraction annotation info, include sample, condition and replicate id
+
+```{r}
+anno.dt <- pep.dt[, .(filename, fraction_number=filename)] %>% 
+  unique() %>% 
+  .[, c('sample', 'fraction_number') := tstrsplit(filename, '[.]', keep=c(1,2))]
+
+anno.dt[, c('condition_id', 'replicate_id') := tstrsplit(sample, '_', keep=c(1,2))]
+anno.dt[, fraction_number := as.integer(fraction_number)]
+```
+Design matrix; prepare this for the differential comparisons
+Should consist of i)Sample_name (chr), ii)Condition(chr) and iii) Replicate(int)
+
+```{r}
+design.dt <- anno.dt[, .(Sample_name=sample,
+                         Condition=condition_id,
+                         Replicate=as.integer(replicate_id)
+                         )] %>% 
+  unique()
+```
+
+Prepare MW calibration table and add this info to the protein anno DT
+```{r}
+mw.dt <- fread("./data/HIV_Infection_CD4T_cells/SEC_Profiles/D1-D3-cal_SRT.txt")
+setnames(mw.dt, new=c('std_elu_fractions', 'std_weights_kDa'))
+mw.dt <- mw.dt[, .(std_weights_kDa, std_elu_fractions)]
+
+
+calibration = calibrateMW(mw.dt,
+                          PDF=T,
+                          plot=TRUE)
+
+saveRDS(calibration,"calibration.rds")
+```
+import a traces list of objects
+```{r}
+pep.dt
+anno.dt
+pep.dt
+#' # Import traces list
+samples <- unique(anno.dt$sample)
+
+# Import data as traces object for each sample
+traces_list <- lapply(samples,function(x){
+  message(x) #just need these two cols I think
+  ann <- anno.dt[grepl(x, filename), .(filename, fraction_number)]
+  setkey(ann,fraction_number)
+  
+  data <- pep.dt[(grepl(x, filename) & !is.na(intensity)),]
+  data <- merge(data, ann, by=c("filename"))
+  setkey(data,fraction_number)
+  data[, fraction_number:= NULL]
+
+  traces <- importPCPdata(input_data=data,fraction_annotation=ann)
+  return(traces)
+})
+names(traces_list) = samples
+class(traces_list) <- "tracesList"
+
+
+saveRDS(traces_list, ScriptAndDatedFileName('hiv.d123.peptide.traces.rds'))
+# save the obj to file
+```
+annotate the trace object in the data using anno info from uniprot (or maybe what Monita has shared)...
+
+Mismatches between ids in traces and annotation.. could it be bc the samples have different protein IDs/different searches, so the traces IDs will be a subset of the annotation file, or are IDs in traces missing in the annotation?
+
+I think we just need to proceed as is with the original traces and see if we can annotate these downstream...
+
+```{r}
+id.anno <- unique(idMapper[,.(protein_id, gene, org, mw_da=mw)])
+id.anno <- id.anno[!grepl(';',protein_id)]
+
+overlap <- intersect(id.anno$protein_id, pep.dt$protein_id)
+id.anno <- id.anno[protein_id %in% overlap]
+
+id.anno <- id.anno[gene != 'NaN'] # all of the isoforms? What can I do with these? drop fro now..
+#id.anno <- id.anno[!grepl(';', protein)]
+
+
+id.anno[protein_id %in% viral.ids$protein]
+# you know what, for now just annotate with the test 
+# keep getting error.. Error in .tracesTest(traces) :  IDs in traces and trace_annotation are not identical... this could be due to different protein ids in the different samples...
+pepTraces_raw <- annotateTraces(traces=traces_list,
+                            trace_annotation=id.anno,
+                            traces_id_column = "protein_id",
+                            trace_annotation_id_column = "protein_id",
+                            trace_annotation_mass_column = "mw_da",
+                            uniprot_mass_format = FALSE,
+                            replace_whitespace = TRUE)
+
+```
+Try with a default version
+
+```{r}
+pepTraces_raw <- annotateTraces(traces=traces_list,
+                            trace_annotation=exampleTraceAnnotation,
+                            traces_id_column = "protein_id",
+                            trace_annotation_id_column = "Entry",
+                            trace_annotation_mass_column = "Mass",
+                            uniprot_mass_format = TRUE,
+                            replace_whitespace = TRUE)
+
+# I think it might have dropped the viral proteins
+pepTraces_raw$Challenged_1$trace_annotation[Organism == 'Homo sapiens (Human)']
+```
+```{r}
+#' # Annotate traces with molecular weight calibration
+pepTraces_raw <- annotateMolecularWeight(pepTraces_raw,
+                                     calibration)
+
+summary(pepTraces_raw)
+saveRDS(pepTraces_raw, ScriptAndDatedFileName('hiv.d123.huAnnotated.peptide.traces.rds'))
+```
+
+```{r}
+testForTracelist <- function (tracesList, type = NULL, additionalItems = NULL) 
+{
+    if (!class(tracesList) == "tracesList") {
+        stop("Object is not of class tracesList")
+    }
+    if (is.null(names(tracesList))) 
+        stop("TracesList must consist of named traces objects. No names detected.")
+    res <- lapply(tracesList, function(traces) {
+        if (!all(c("traces", "trace_type", "trace_annotation", 
+            "fraction_annotation") %in% names(traces))) {
+            stop("At least one traces object doesn't contain all necessary items: traces, trace_type, trace_annotation, and fraction_annotation.")
+        }
+        if (!is.null(type)) {
+            if (type != traces$trace_type) {
+                stop("At least one traces object is of wrong type. Please check your input traces.")
+            }
+        }
+        if (!identical(traces$traces$id, traces$trace_annotation$id)) {
+            stop("In at least one traces object: IDs in traces and trace_annotation are not identical.")
+        }
+        if (!identical(names(traces$traces), c(traces$fraction_annotation$id, 
+            "id"))) {
+            stop("In at least one traces object: Fractions in traces and fraction_annotation are not identical.")
+        }
+        if (!is.null(additionalItems)) {
+            contained <- (additionalItems %in% names(traces))
+            if (!all(contained)) {
+                stop(paste0("Required entries not found: ", additionalItems[!contained]))
+            }
+        }
+    })
+}
+```
+
+**Todo**
+Need to figure out why the annotation is not working.... otherwise ignore the annotation and just proceed with the protein level info and annotate mysefl downstream
+
+
+viral proteins; these are in the unannotated set. Just move on until we find a better way to annotate the genes
+```{r}
+viral.ids <- idMapper[org == 'Human immunodeficiency virus type 1', .(protein, gene)] %>% 
+    unique()
+
+traces_list$Challenged_2$trace_annotation[protein_id %in% viral.ids$protein]
+```
+## QC & preprocessing 
+alignment fails with sample3... not sure why?
+
+```{r}
+#' # QC
+#' # Assess how well SEC traces align across all samples
+alignTraces(pepTraces_raw, min_lag = -5, max_lag = 5, plot = T, PDF=T)
+
+# is it an issue with early/late fractions?
+pepTraces_subset <- subset(pepTraces_raw, fraction_ids=seq(20,60,1))
+
+# reason this isnt working is duplicated IDs in one of the samples.... I guess in Rep3 as all of these keep failing...
+getLag(pepTraces_subset$Uninfected_2, pepTraces_subset$Challenged_2)
+
+undebug(getLag)
+#' # Assess total intensity as a proxi for extraction efficiency across samples
+plotGlobalIntensities(pepTraces_raw, plot = T, PDF=T)
+
+#' Find missing values
+#' (defined as having identifications in left and right neigbouring fractions):
+pepTracesMV <- findMissingValues(pepTraces_raw,
+                                 bound_left = 1,
+                                 bound_right = 1,
+                                 consider_borders = TRUE)
+
+#' Impute NA values by fitting a spline:
+pepTracesImp <- imputeMissingVals(pepTracesMV, method = "spline")
+
+#' Plot imputation summary:
+plotImputationSummary(pepTracesMV, pepTracesImp, PDF = T,
+                      plot_traces = T, max_n_traces = 2)
+```
+```{r}
+print('hell')
+```
+
+```{r}
+missingInViral <- c('CD4','CD44')
+```
+

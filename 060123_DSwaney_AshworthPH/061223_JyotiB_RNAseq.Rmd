@@ -1,0 +1,217 @@
+---
+title: "061223_JyotiB_RNAseq"
+author: "Martin Gordon"
+date: "2023-06-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Project: Melborne Victroia subtype RNAseq comparison
+##: Date: 06/20/23
+## Contact: Jyoti Batra
+
+```{r load-packages, message=FALSE, warning=FALSE, echo=TRUE}
+library(data.table)
+library(ggplot2)
+library(tximport)
+library(DESeq2)
+library(ashr) #adaptive shrinkage estimator to improve lFC estimates in DESEq2
+library(IHW) # Independent Hypothesis Weighting 
+# visualisation
+library(RColorBrewer)
+library(viridis)
+library(ComplexHeatmap)
+# annotation & filtering 
+library(AnnotationDbi) 
+library(org.Hs.eg.db) # Human Genome Annotation
+library(genefilter) # not available 
+# tables 
+library(pander)
+library(DT)
+# enrichment analysis
+library(clusterProfiler)
+library(fgsea)
+
+library(AnnotationHub)
+```
+
+```{r functions, warning=FALSE, echo=FALSE }
+
+#function to save plots generated
+save_plot <- function(plot_func, plot_args, filename, directory) {
+  # Call the plot function with the provided arguments
+  plot <- do.call(plot_func, plot_args)
+  
+   # create the directory if it doesn't exist
+  if (!dir.exists(directory)) {
+    dir.create(directory, recursive=TRUE)
+  }
+  
+  # save the plot to file in the specified directory
+  filepath <- file.path(directory, filename)
+  ggsave(plot, file = filepath)
+  
+  message(paste0("Plot saved to file: ", filepath))
+  
+}
+
+#Plotting, Filtering & Mapping Functions 
+extract_sig_genes <- function(dds_obj, log2FC=1, p_adjust=0.05) {
+  # extract rowswith p.val (0.05) and log2FC (1) thresholds for subsetting results... adjust thresholds as desired
+  sig_key <- intersect(rownames(dds_obj)[which(abs(dds_obj$log2FoldChange) >= log2FC)], rownames(dds_obj)[which(dds_obj$padj <= p_adjust)])
+  sig_df <- as.data.frame((dds_obj)[which(rownames(dds_obj) %in% sig_key), ])
+  return(sig_df[order(sig_df$log2FoldChange, decreasing = TRUE), ]) # ordered by fold change (most upregulated at top)
+}
+
+# match gene names and entrez ids
+map_entrez_fun <- function(dds_obj, ref_genome) {
+  dds_obj$symbol <- mapIds(ref_genome, keys = rownames(dds_obj), column = "SYMBOL", keytype = "GENEID", multiVals = "first")
+  dds_obj$entrez <- mapIds(ref_genome, keys = rownames(dds_obj), column = "ENTREZID", keytype = "GENEID", multiVals = "first")
+  return(dds_obj)
+}
+
+
+PCA_fun <- function(x,grouping) {
+  
+  pcaData <- plotPCA(x, intgroup = c(grouping), returnData = TRUE)
+  percentVar <- round(100 * attr(pcaData, "percentVar"))
+  
+  
+  p <- ggplot(pcaData, aes(PC1, PC2, color = group)) +
+    geom_point(size = 2.5) +
+    geom_text_repel(aes(label = colnames(x)), size = 1.75, alpha=0.6, max.overlaps = 20) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    coord_fixed() +
+    labs(title = "PCA Plot", subtitle = "PC1 vs PC2") +
+    theme_classic() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(),
+      legend.position = "bottom",
+      legend.text = element_text(size=6),
+      legend.key.size = unit(5, 'mm'),
+      legend.title = element_text(size=9)
+    )
+}
+
+
+sampleclust_fun <- function(dds_obj, metadata, grouping) {
+  distmat <- as.matrix(dist(t(assay(dds_obj))))
+  rownames(distmat) <- (colnames(dds_obj))
+  
+  # annotation column; create separate df
+  mat_col <- data.frame(cell_type = grouping)
+  rownames(mat_col) <- rownames(metadata) #should match rownames dist-mat
+  mat_colours <- list(cat_var = brewer.pal(length(unique(grouping)), "Set1"))
+  names(mat_colours$cat_var) <- unique(grouping)
+  
+  
+  pheatmap(distmat,
+    scale='none',
+    cluster_rows = T,
+    cluster_cols = T,
+    #clustering_distance_cols #dont specify as distance matrix is provided
+    #clustering_distance_row 
+    color = viridis(20),
+    border_color = NA,
+    fontsize = 8,
+    annotation_col = mat_col,
+    annotation_colors = mat_colours,
+    main = "Sample Euclidean Distance Heatmap")
+}
+
+
+
+MA_fun <- function(x, y) {
+  DESeq2::plotMA(x, main = y)
+}
+Volcano_fun <- function(x, y) {
+  voc_lab <- y
+
+  EnhancedVolcano(x,
+    lab = x$symbol,
+    x = "log2FoldChange",
+    y = "padj",
+  #  selectLab = c(""),
+    caption = paste0("Total Genes: ", nrow(x)),
+    title = paste(voc_lab, "DESeq2 results"),
+    subtitle = "Differential Expression",
+    FCcutoff = 2,
+    pCutoff = 1e-10,
+    colAlpha = 0.25,
+    legendLabels = c("Not Sig", "+/- 2 Log2 FC", "pval <1e-10", "pval <1e-10 & +/- 2 Log2 FC"),
+    legendLabSize = 8,
+    legendPosition = c(.80, .96),
+    legendIconSize = 3,
+    gridlines.major = FALSE,
+    gridlines.minor = FALSE
+  )
+}
+
+gene_cluster_fun = function(x) {
+  
+  # plot the rld values of the  significantly differentially expressed genes and cluster samples
+  # set thresholds 
+  log2cutoff = 2
+  padjcutoff = 0.05
+  var_genes = 500
+  
+  # get list of deferentially expressed genes above threshold
+  topVarGenes <- head(order(rowVars(assay(x)), decreasing = TRUE), var_genes) # select most variable genes  (option 2)
+  mat  <- assay(x)[ topVarGenes, ] #subset matrix for topVar genes
+  mat  <- mat - rowMeans(mat) #differnece between the value and mean
+  
+  head(topVarGenes)
+  # annotation col
+  mat_col = data.frame(cell_type = B512_meta$group)
+  rownames(mat_col) <- colnames(mat)
+  mat_colours <- list(cell_type = brewer.pal(length(unique(B512_meta$group)), "Set1"))
+  names(mat_colours$cell_type) <- unique(B512_meta$group)
+  
+  
+  #pheatmap(scale(assay(x)[sigGenes,]), # uncomment to plot DGEs nstead
+  pheatmap(mat, 
+           cluster_rows = TRUE,
+           cluster_cols = TRUE,
+           clustering_distance_rows = "correlation",
+           clustering_distance_cols = "correlation",
+           color=viridis(10),
+           border_color = NA,
+           annotation_col = mat_col,
+           annotation_colors = mat_colours,
+           annotation_row = NA,
+           show_rownames = FALSE,
+           main = paste("Heatmap of top", var_genes, "variable genes"))
+}
+p_hist_fun <- function(x, y) {
+  voc_lab <- unlist(strsplit(y, "_"))
+  voc_lab <- paste(voc_lab[1], "vs", voc_lab[2], "p-val histogram")
+  hist(x$pvalue[x$baseMean > 1], breaks = 0:20 / 20, col = "grey50", border = "white", main = voc_lab)
+}
+fract_to_dec <- function(x) {
+  x <- as.numeric(x)
+  x <- x[1] / x[2] 
+  return(round(x,3))
+}
+```
+
+Salmon quant.sf files produced using the nf-core RNAseq pipeline 
+
+Find salmon quant.sf transcript quantification files https://nf-co.re/rnaseq
+
+```{r input-files}
+getwd()
+path <- 'output/quant_files'
+
+input <- dir(path=path, pattern = "*_quant.sf$", recursive = T, full.names = TRUE)
+
+rm(path)
+```
+
+

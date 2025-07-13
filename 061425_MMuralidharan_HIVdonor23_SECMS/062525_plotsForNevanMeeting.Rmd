@@ -1,0 +1,987 @@
+---
+title: "062525_plotsForNevanMeeting"
+author: "Martin Gordon"
+date: "2025-06-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(viridis)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(circlize)
+library(stringr)
+library(viridis)
+library(circlize)
+library(RColorBrewer)
+library(eulerr)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/mg_utils/r_utils/plottingHelperFunctions.R") # map hu to mm 
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+
+# color palettes
+RColorBrewer::display.brewer.all()
+condition.pal <- RColorBrewer::brewer.pal(3, 'Set1')
+names(condition.pal) <- c('Infected', 'Challenged', 'Uninfected')
+
+donor.pal <- rev(RColorBrewer::brewer.pal(12, 'Set3'))[1:3]
+names(donor.pal) <- c(1,2,3)
+
+contrast.pal <- RColorBrewer::brewer.pal(10, 'Accent')
+names(contrast.pal) <- c("Infected_Uninfected","Challenged_Infected","Challenged_Uninfected")
+```
+
+## Overview
+
+TODOs for Nevan ahead of the meeting 
+
+- HIV.d123 QC plots, enrichment plots and DE proteins
+- [ ] HIVd123; look at the peakShape overlap enrichment; for donor 1 & donor2 & donor3 look at enrichment plots and see what comes up; done
+- [ ] Make this list of candidates for D1 & D2, look at D3 (D3 infected is an issue; but )
+- [ ] D1: infected vs mock only D3: Challenged vs mock, D2 compare all groups and can look at overlaps between two
+- [ ] Look at CORUM
+- [ ] Investigate the SEC-MS Shiny App: why are some proteins missing? (look at C4, C44)
+
+
+Generate the peak correlation plots; look at the clusterPeaks function: what is actually being plotted? 
+
+```{r}
+sec.long <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_sec.long.normalized.interpolated.filtered.csv.gz')
+
+sec.long[treatment == 'Challenged_Infected', treatment:= 'Infected']
+sec.long[treatment == 'Challenged_Uninfected', treatment := 'Challenged']
+sec.long[, sample.old := sample]
+sec.long[, sample := paste0(treatment, '_', replicate)]
+
+```
+
+plot the clustered peaks for each of the samples
+
+```{r}
+
+# if we normalized, we have to catch the post-normalization matrices
+normInt.mats <- scaledIntensityMatrices(sec.long, useInterpolated = TRUE)
+peakTables <- lapply(normInt.mats, goodPeaksTableFromIntensityMatrix, minCV = -Inf)
+
+allPeaks <- rbindlist(peakTables, idcol = "sample")
+allPeaks[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+```
+```{r}
+peakTables.ls <- lapply(seq(1,3,1), function(x){
+  
+  mats.subset <- normInt.mats[grepl(paste0(x,'$'), names(normInt.mats))]
+  print(names(mats.subset))
+  peakTables <- lapply(mats.subset, goodPeaksTableFromIntensityMatrix, minCV = -Inf)
+  return(peakTables)
+})
+
+# now align peaks within each donor
+sec.long <- lapply(seq(1,3,1), function(x){
+  subdt <- copy(sec.long[replicate == x,])
+  pdf(paste0('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062525_plotsForNevanMeeting_data/pdfs/donor', x, '.peakAlignedToUninfected.pdf'))
+  standardizeAllPeakTablesToStandard(peakTables.ls[[x]], subdt, standardIdx = 3, fitPortion = 0.65, minPeaksPerFraction = 45, startFitAtPeak = 20)
+  dev.off()
+  return(subdt)
+}) %>% rbindlist(.)
+
+View(standardizeOnePeakTableToStandard)
+```
+
+
+```{r}
+full.cor.dt <- qcFractionByFractionCorrelation(sec.long)
+```
+
+First plot of the peak correlations
+Color by donor to show these are the most strongly correlated peaks
+
+```{r, fig.width=7, fig.height=5}
+
+full.cor.dt[, ref.treatment.old := ref.treatment]
+full.cor.dt[, other.treatment.old := other.treatment]
+full.cor.dt[, ref.treatment := ref.replicate]
+full.cor.dt[, other.treatment := other.replicate]
+
+g <- qcFractionCorrelationLinePlot(full.cor.dt,
+                                   splitByReplicate=F, 
+                                   colorFacetStrips = T)
+
+BackupAsPDF(function()grid.draw(g), 'fractionCorrelation.donorColor.lineplot.splitReps.collapsed.pdf')
+```
+CrosCorrelation heatmaps
+Need work... for now plot everythin. Also need the linecharts
+```{r, heatmap, fig.width=8, fig.height=6}
+#' plot these per sample, how does one ref compare to the others
+crossCorrelationHeatmaps <- function(dt, sampleOI, colFun){
+  
+  other.samples <- setdiff(unique(dt$ref.sample), sampleOI)
+  subdt <- copy(dt)
+  subdt <- subdt[(ref.sample == sampleOI & ref.sample != other.sample),]
+  
+  corMats <- lapply(other.samples, function(y){
+    
+    message('plotting ', sampleOI, ' vs ',y, '...')
+    
+    mat <- dcast(subdt[other.sample == y,], ref.fraction~other.fraction, value.var='pearson') %>% 
+    as.matrix(rownames='ref.fraction')
+    mat[is.na(mat)] <- 0
+
+   #grid.grabExpr(plotSampleCorrelationHeatmap(mat, colFun))
+   BackupAsPDF(draw(plotSampleCorrelationHeatmap(mat, 
+                                                 row_order=order(as.numeric(rownames(mat))), 
+                                                 colFun), column_title=paste0(sampleOI, ' vs ', y)), paste0(sampleOI, '.vs.', y,'corheatmap'))
+
+   #grid.grabExpr(draw(plotSampleCorrelationHeatmap(mat, row_order=order(as.numeric(rownames(mat))), colFun), column_title=paste0(sampleOI, ' vs ', y)))
+  })
+  # Arrange the list of grobs in a grid layout (e.g., 2 columns)
+  #gridExtra::grid.arrange(grobs = corMats, ncol = 3)
+}
+
+redpal <- c('white','#FF0000','#8B0000')
+crossCorrelationHeatmaps(full.cor.dt, sampleOI='Challenged_1', colFun = colorRamp2(breaks=c(0,.5,0.7), colors=redpal))
+```
+generate these for each of the different sample types.. maybe useful to look at?
+```{r}
+allSamples <- full.cor.dt$ref.sample %>% 
+  unique()
+
+lapply(allSamples, function(s) crossCorrelationHeatmaps(full.cor.dt, 
+                                sampleOI=s, 
+                                colFun = colorRamp2(breaks=c(0,.5,0.7), 
+                                                    colors=redpal)))
+```
+Try the linechart of best cor score and then some indicator of lag 
+linecharts of sample-sample correlations with lag (ie how many fractions above or below is this best score in the reference taken from)
+
+
+Maybe try it like Bens chart and color by lag
+```{r, pearson-lag-linechart, fig.width=11, fig.height=10}
+full.cor.dt[, lag := other.fraction - ref.fraction]
+
+# get the best correlation per ref fraction
+best.cor.dt <- full.cor.dt[, .SD[which.max(pearson)], by=.(ref.sample, other.sample, ref.fraction)]
+test.cor <- best.cor.dt[ref.sample == 'Infected_1' & other.sample == 'Uninfected_1']
+
+
+g <- ggplot(best.cor.dt[ref.sample != other.sample,], aes(x=ref.fraction, y=pearson, col=lag)) +
+  geom_path(size=1.2) +
+  scale_color_gradient_colorRamp2(colors = c('blue', 'grey50', 'red'),breaks=c(-2,0,2)) +
+  facet_grid(ref.sample~other.sample, scales='free') +
+  labs(title='All-by-all sample fraction correlations', 
+       subtitle = '(Best fraction correlation shown)') +
+  guides(color=guide_legend('fraction lag\n(ref vs other)')) +
+  theme_bw() +
+  theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80"))
+
+g
+BackupAsPDF(g, 'allbyall.lagVsPearsonR.linechart')
+```
+
+Subset this to within groups, then look within donors
+
+```{r, pearson-lag-linechart-withinDonor}
+
+donors <- unique(best.cor.dt$ref.replicate)
+
+lapply(donors, function(x){
+  
+  g <- ggplot(best.cor.dt[ref.sample != other.sample & (ref.replicate == x & other.replicate == x),], aes(x=ref.fraction, y=pearson, col=lag)) +
+    geom_path(size=1.2) +
+    scale_color_gradient_colorRamp2(colors = c('blue', 'grey50', 'red'),breaks=c(-3,0,3)) +
+    facet_grid(ref.sample~other.sample, scales='free') +
+    labs(title=paste0('Donor ', x, ' fraction correlations'), 
+       subtitle = '(Best correlating fractions)') +
+    guides(color=guide_legend('fraction lag\n(other - ref)')) +
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80"))
+
+  g
+  BackupAsPDF(g, paste0('donor.', x,'.lagVsPearsonR.linechart'))
+})
+
+```
+
+Do treatments now 
+
+```{r}
+treatments <- unique(best.cor.dt$ref.treatment.old)
+treatments
+lapply(treatments, function(x){
+  
+  g <- ggplot(best.cor.dt[ref.sample != other.sample & (ref.treatment.old == x & other.treatment.old == x),], aes(x=ref.fraction, y=pearson, col=lag)) +
+    geom_path(size=1.2) +
+    scale_color_gradient_colorRamp2(colors = c('blue', 'grey50', 'red'),breaks=c(-3,0,3)) +
+    facet_grid(ref.sample~other.sample, scales='free') +
+    labs(title=paste0(x, ' fraction correlations'), 
+       subtitle = '(Best correlating fractions)') +
+    guides(color=guide_legend('fraction lag\n(other - ref)')) +
+    theme_bw() +
+    theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80"))
+
+  g
+  BackupAsPDF(g, paste0('treatment.', x,'.lagVsPearsonR.linechart'))
+})
+```
+Redo Bens plot showing the treatment group correlations 
+
+```{r}
+full.cor.dt
+```
+```{r}
+full.cor.dt <- qcFractionByFractionCorrelation(sec.long)
+```
+
+```{r, fig.width=9, fig.height=5}
+g <- qcFractionCorrelationLinePlot(full.cor.dt,
+                                   splitByReplicate=T, 
+                                   colorFacetStrips = T)
+BackupAsPDF(function()grid.draw(g), 'fractionCorrelation.lineplot.splitReps.pdf')
+```
+I find the collapsed version too confusing, use the split version
+```{r, fig.width=6, fig.height=5}
+g <- qcFractionCorrelationLinePlot(full.cor.dt,
+                                   splitByReplicate=F, 
+                                   colorFacetStrips = T)
+BackupAsPDF(function()grid.draw(g), 'fractionCorrelation.lineplot.splitReps.collapsed.pdf')
+```
+Now do the same by donor to show the effect
+
+```{r}
+full.cor.dt[, ref.treatment.old := ref.treatment]
+full.cor.dt[, other.treatment.old := other.treatment]
+full.cor.dt[, ref.treatment := ref.replicate]
+full.cor.dt[, other.treatment := other.replicate]
+
+
+g <- qcFractionCorrelationLinePlot(full.cor.dt,
+                                   splitByReplicate=T, 
+                                   colorFacetStrips = T)
+BackupAsPDF(function()grid.draw(g), 'fractionCorrelation.donorColor.lineplot.splitReps.collapsed.pdf')
+View(qcFractionCorrelationLinePlot)
+```
+# now focus on the differential expression results
+Read in the differential expression table (ANOVA)
+
+```{r}
+anova.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.pwContrasts.csv.gz')
+```
+Number of significant hits from the different contrasts
+
+```{r}
+anova.dt[, c('cond1', 'cond2', 'donor') := tstrsplit(contrast, '_', keep=c(1,2,3))]
+anova.dt[, contrast_grp := paste0(cond1, '_', cond2)]
+```
+
+plot the number of sig hits in each contrast
+```{r}
+g <- ggplot(anova.dt[treatmentDiff.padj < 0.05, .N, by=.(contrast, contrast_grp)], aes(x=contrast, y=N, fill=contrast_grp)) +
+  geom_bar(stat='identity') +
+  labs(title='Differentially eluting protein peaks', y='Number of protein peaks\n(p.adj < 0.05)') +
+  scale_fill_manual(values=contrast.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90)) +
+  guides(fill=guide_legend('contrast'))
+
+g
+BackupAsPDF(g, 'all.sig.differentially.eluting.proteinspeaks.barplot')
+```
+Now look at the number of differentially eluting proteins..
+
+Lets remove those peaks detected in the problematic samples, can then safely summarize to protein level
+
+```{r}
+anova.prot.dt <- anova.dt[,.SD[which.min(treatmentDiff.p)], by=.(protein, contrast)]
+
+g <- ggplot(anova.prot.dt[treatmentDiff.padj < 0.05,.N, by=.(contrast,contrast_grp)], aes(x=contrast, y=N, fill=contrast_grp)) +
+  geom_bar(stat='identity') +
+  labs(title='Differentially eluting proteins', y='Number of protein\n(p.adj < 0.05)') +
+  scale_fill_manual(values=contrast.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90)) +
+  guides(fill=guide_legend('contrast'))
+
+g
+BackupAsPDF(g, 'all.sig.differentially.eluting.proteins.barplot')
+```
+Look at the distribution of N differential peaks per protein
+
+```{r}
+anova.dt[treatmentDiff.padj < 0.05, .N, by=.(protein,contrast,contrast_grp)]
+
+g <- ggplot(anova.dt[treatmentDiff.padj < 0.05, .N, by=.(protein,contrast,contrast_grp)], aes(x=N, fill=contrast)) +
+  geom_histogram()+
+  #scale_y_continuous(trans = 'log2', labels = waiver()) +
+  labs(title='Differentially eluting proteins', y='Number of protein\n(p.adj < 0.05)') +
+  scale_fill_manual(values=contrast.pal) +
+  theme_bw() +
+  facet_wrap(~contrast) +
+  theme(axis.text.x = element_text(angle=90)) +
+  guides(fill=guide_legend('contrast'))
+
+g
+```
+Could do a comparison of the count distributions (K-S test?) to see if they are significantly different.. 
+They are, but cant say why this is right now... leave as is as not very interesting
+
+Do a venn diagram of the proteins that are differentially expressed across the different groups (will help us determine if it even makes sense to look at the DE results)
+Look at the different 
+```{r, eulerr}
+contrasts.oi <- unique(anova.prot.dt$contrast_grp)
+
+lapply(contrasts.oi, function(x){
+  
+  subdt <- anova.prot.dt[contrast_grp == x ][treatmentDiff.padj < 0.05, ]
+  print(subdt)
+  
+  # create the donor sets
+  venn.obj <- list('Donor1' = subdt[donor == 1, unique(protein)],
+                   'Donor2' = subdt[donor==2, unique(protein)],
+                   'Donor3' = subdt[donor==3, unique(protein)]
+                   )
+  
+  gg <- plot(eulerr::euler(venn.obj),
+       main=paste(x),
+       quantities=TRUE, 
+       fills=donor.pal
+       )
+  
+  BackupAsPDF(gg, paste0(x,'.overlaps.sig.ppi.eulerr'))
+})
+```
+Are these sig overlaps mainly related to mitrochondrial ribosomal or more interesting?
+Run enrichment on the complete set of contrasts to see how similiar things are 
+
+Lets just use GO terms for now for simplicity to see if there is significant difference in PPI overlaps
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+
+universe <- sec.long$gene %>% 
+  unique()
+```
+
+Run enrichment on the different groups to see what is found in our significant set
+```{r}
+ # run  enrichment on each group seperately
+enrich.dt <- enricherOnGroups(anova.prot.dt[treatmentDiff.padj < 0.05], 
+                              groupColumns = 'contrast', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+# N terms enriched in each contrast... lets simplify and see what similar terms crop up as significant
+enrich.dt[p.adjust < 0.05,.N, by=contrast]
+
+#fwrite(enrich.dt, ScriptAndDatedFileName('hiv.d123.GOBP.enrich.all.csv.gz'))
+enrich.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062525_plotsForNevanMeeting_data/2025_06_26_hiv.d123.GOBP.enrich.all.csv.gz')
+```
+
+simplify enrichment membership
+```{r}
+simp.dt <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt,
+                                          gmt.go, 
+                                          groupColumn = 'contrast',
+                                           max_pAdjust = 0.1)
+
+#fwrite(simp.dt$simplified, ScriptAndDatedFileName('hiv.d123.GOBP.enrich.simplified.csv.gz'))
+```
+
+plot some heatmaps quickly to see how things look
+```{r, enrich.heatmap, fig.width=9, fig.height=7}
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.dt$simplified,
+                                  groupColumn = 'contrast', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  border=T,
+                                  column_split=c(rep('Challenged_Infected', 3), rep('Challenged_Uninfected', 3), rep('Infected_Uninfected', 3)),
+                                  upperThreshold = 10,
+                                  topN=8,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+ht
+BackupAsPDF(ht, 'go.bp.allSets.heatmap')
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.dt$simplified,
+                                  groupColumn = 'contrast', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  border=T,
+                                  column_split=paste0('Donor',c(1,2,3,1,2,3,1,2,3)),
+                                  upperThreshold = 10,
+                                  topN=8,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+ht
+BackupAsPDF(ht, 'go.bp.allSets.donorSplit.heatmap')
+```
+I think we want to take the simplified enrihcment table and plot the scatterplots; on the x and y we can plot -log10 pvalue, and size can be the ratio of geneRatio or count or something
+Color will specify our LFC cutoff
+```{r}
+simp.dt$simplified$contrast %>% 
+  unique()
+
+# why does this work for some and not others? Investigate
+dcast(simp.dt$simplified[contrast %in% c('Challenged_Uninfected_1', 'Infected_Uninfected_3')],  ID~contrast, value.var = 'p.adjust', fun.aggregate = function(x) -log10(x))
+
+contrasts.oi <- c("Infected_Uninfected_1",  "Challenged_Uninfected_3", "Challenged_Infected_2", "Infected_Uninfected_2", "Challenged_Uninfected_2")
+```
+
+```{r, enrich.scatterplots, fig.width=9, fig.height=6.5}
+
+makeEnrichmentScatter <- function(enrich.res, conditions.oi){
+  
+  enrich.dt <- copy(enrich.res$simplified)
+  enrich.dt <- enrich.dt[contrast %in% conditions.oi,]
+  unique(enrich.dt$contrast) %>% print()
+
+  
+  #enrich.dt <- dcast(enrich.dt, ID~contrast, value.var = 'p.adjust', fun.aggregate = function(x) -log10(x))
+  enrich.dt <- dcast(enrich.dt, ID~contrast, value.var = 'p.adjust')
+
+  
+  cond1 <- colnames(enrich.dt)[2]; cond2 <- colnames(enrich.dt)[3]
+  enrich.dt[, sig := 'not']
+  enrich.dt[get(cond1) < 0.05, sig := 'x-axis contrast sig']
+  enrich.dt[get(cond2) < 0.05, sig := 'y-axis contrast sig']
+  enrich.dt[(get(cond1) < 0.05 & get(cond2) < 0.05), sig := 'both contrast sig']
+  
+
+  ggplot(enrich.dt, aes(x=-log10(.data[[cond1]]), y=-log10(.data[[cond2]]), label=ID, color=sig)) + # rlang access variable within tidyverse (ie aes())
+    geom_point() +
+    geom_vline(xintercept=-log10(0.05), linetype=2, col='red', alpha=0.5) +
+    geom_hline(yintercept=-log10(0.05), linetype=2, col='red', alpha=0.5) +
+    ggrepel::geom_text_repel(data=enrich.dt[sig != 'not'], max.overlaps = 6, color='black', size=2.5) +
+    scale_color_manual(values=c('not'='grey50', 
+                                'both contrast sig'='gold1',
+                                'x-axis contrast sig'="skyblue2",
+                                'y-axis contrast sig'="#FB9A99"
+                                )) +
+    theme_bw()
+}
+
+
+#D1: infected vs mock only D3: Challenged vs mock, D2 compare all groups and can look at overlaps between tw
+g <- makeEnrichmentScatter(simp.dt, c('Infected_Uninfected_1', 'Infected_Uninfected_2'))
+BackupAsPDF(g, 'go.bp.enrich.InfectedVsUninfected.scatterplot')
+
+# not working... work on fixing the issues above, then plot it at the protein level with the best scoring peaks (be wary of FP hits here)
+# also, return this table of results to Robyn so she can inspect
+g <- makeEnrichmentScatter(simp.dt, c('Challenged_Uninfected_3', 'Challenged_Uninfected_2'))
+BackupAsPDF(g, 'go.bp.enrich.ChallengedVsUninfected.scatterplot')
+
+# now compare within group 2
+g <- makeEnrichmentScatter(simp.dt, c('Infected_Uninfected_', 'Infected_Uninfected_2'))
+BackupAsPDF(g, 'go.bp.enrich.InfectedVsUninfected.scatterplot')
+
+# not working... work on fixing the issues above, then plot it at the protein level with the best scoring peaks (be wary of FP hits here)
+# also, return this table of results to Robyn so she can inspect
+g <- makeEnrichmentScatter(simp.dt, c('Infected_Uninfected_2', 'Challenged_Uninfected_2'))
+BackupAsPDF(g, 'go.bp.enrich.InfectedVsChallenged.d2.scatterplot')
+
+g <- makeEnrichmentScatter(simp.dt, c('Infected_Uninfected_2', 'Challenged_Infected_2'))
+BackupAsPDF(g, 'go.bp.enrich.InfectedUninVsChallengedInf.d2.scatterplot')
+```
+
+GO enrichment HIV Donor Sample Correlations
+(Just look at the all by all, and then limit )
+
+For the samples we are interested in, just plot the all-by-all protein correlations
+
+
+```{r}
+makeProteinScatter <- function(res.table, conditions.oi){
+  
+  enrich.dt <- copy(res.table)
+  enrich.dt <- enrich.dt[contrast %in% conditions.oi,]
+  unique(enrich.dt$contrast) %>% print()
+
+  
+  #enrich.dt <- dcast(enrich.dt, ID~contrast, value.var = 'p.adjust', fun.aggregate = function(x) -log10(x))
+  enrich.dt <- dcast(enrich.dt, gene~contrast, value.var = 'treatmentDiff.padj')
+  
+  cond1 <- colnames(enrich.dt)[2]; cond2 <- colnames(enrich.dt)[3]
+  enrich.dt[, sig := 'not']
+  enrich.dt[get(cond1) < 0.05, sig := 'x-axis contrast sig']
+  enrich.dt[get(cond2) < 0.05, sig := 'y-axis contrast sig']
+  enrich.dt[(get(cond1) < 0.05 & get(cond2) < 0.05), sig := 'both contrast sig']
+
+  ggplot(enrich.dt, aes(x=-log10(.data[[cond1]]), y=-log10(.data[[cond2]]), label=gene, color=sig)) + # rlang access variable within tidyverse (ie aes())
+    geom_point(size=0.5) +
+    labs(title='Differentially eluting proteins') +
+    geom_vline(xintercept=-log10(0.05), linetype=2, col='red', alpha=0.5) +
+    geom_hline(yintercept=-log10(0.05), linetype=2, col='red', alpha=0.5) +
+    ggrepel::geom_text_repel(data=enrich.dt[sig != 'not'], max.overlaps = 6, color='black', size=2.5) +
+    scale_color_manual(values=c('not'='grey50', 
+                                'both contrast sig'='gold1',
+                                'x-axis contrast sig'="skyblue2",
+                                'y-axis contrast sig'="#FB9A99"
+                                )) +
+    theme_bw()
+}
+```
+
+```{r}
+g <- makeProteinScatter(anova.prot.dt, c('Infected_Uninfected_2', 'Challenged_Infected_2'))
+g
+BackupAsPDF(g, 'sigProtein.InfectedUninVsChallengedInf.d2.scatterplot')
+```
+```{r}
+#D1: infected vs mock only D3: Challenged vs mock, D2 compare all groups and can look at overlaps between tw
+g <- makeProteinScatter(anova.prot.dt, c('Infected_Uninfected_1', 'Infected_Uninfected_2'))
+BackupAsPDF(g, 'sigprotein.InfectedVsUninfected.scatterplot')
+
+# not working... work on fixing the issues above, then plot it at the protein level with the best scoring peaks (be wary of FP hits here)
+# also, return this table of results to Robyn so she can inspect
+g <- makeProteinScatter(anova.prot.dt, c('Challenged_Uninfected_3', 'Challenged_Uninfected_2'))
+BackupAsPDF(g, 'sigprotein.ChallengedVsUninfected.scatterplot')
+
+# not working... work on fixing the issues above, then plot it at the protein level with the best scoring peaks (be wary of FP hits here)
+# also, return this table of results to Robyn so she can inspect
+g <- makeProteinScatter(anova.prot.dt, c('Infected_Uninfected_2', 'Challenged_Uninfected_2'))
+BackupAsPDF(g, 'sigprotein.InfectedUnifVsChallengedUninf.d2.scatterplot')
+
+g <- makeProteinScatter(anova.prot.dt, c('Infected_Uninfected_2', 'Challenged_Infected_2'))
+BackupAsPDF(g, 'sigprotein.InfectedUninVsChallengedInf.d2.scatterplot')
+```
+share the wide format table of protein scores 
+```{r}
+anova.prot.wide <- dcast(anova.prot.dt, protein+gene~contrast, value.var=c('treatmentDiff.p', 'treatmentDiff.padj'))
+fwrite(anova.prot.wide, ScriptAndDatedFileName('hiv.d123.differentialElution.bestPeakPerProtein.anova.wideformat.csv.gz'))
+
+fwrite(anova.prot.wide, ScriptAndDatedFileName('hiv.d123.differentialElution.bestPeakPerProtein.anova.wideformat.csv'))
+fwrite(anova.dt, ScriptAndDatedFileName('hiv.d123.differentialElution.anova.csv'))
+```
+Dont do a pie chart do a bar chart of the proteins with N peaks per protein contrast
+```{r}
+anova.prot.dt <- merge(anova.prot.dt, anova.dt[treatmentDiff.padj < 0.05][, .(nSigDifferentialPeaks=.N), by=.(contrast, protein, gene)], by=c('contrast', 'protein', 'gene'), all.x=T)
+anova.prot.dt[is.na(nSigDifferentialPeaks), nSigDifferentialPeaks := 0]
+```
+make a barplot of the breakdown 
+```{r}
+peak.dt <- anova.prot.dt[,.(numProteins=.N), by=.(nSigDifferentialPeaks,contrast)]
+peak.dt[, nProteins := sum(numProteins), by=contrast]
+peak.dt[, moreThanOnePeak := 'no']
+peak.dt[nSigDifferentialPeaks > 1, moreThanOnePeak := 'yes']
+peak.dt[, nSigDifferentialPeaks := factor(nSigDifferentialPeaks, levels=c('8','7','6','5','4','3','2','1'))]
+
+peak.dt[, moreThanOnePeak := factor(moreThanOnePeak, levels=c('yes','no'))]
+
+g <- ggplot(peak.dt[nSigDifferentialPeaks > 0], aes(x=contrast, y=numProteins, fill=moreThanOnePeak)) +
+  geom_bar(stat='identity') +
+  labs(title='Differentially eluting protein peaks') +
+  theme_bw() +
+  scale_fill_brewer(type='qual', palette = 2) +
+  theme(axis.text.x= element_text(angle=90))
+g
+BackupAsPDF(g, 'nPeaksPerSigProtein.barplot')
+
+
+g <- ggplot(peak.dt[nSigDifferentialPeaks != 0,], aes(x=contrast, y=numProteins, fill=as.character(nSigDifferentialPeaks))) +
+  geom_bar(stat='identity') +
+  labs(title='Differentially eluting protein peaks') +
+  theme_bw() +
+  scale_fill_brewer(type='qual', palette = 1) +
+  theme(axis.text.x= element_text(angle=90))
+g
+BackupAsPDF(g, 'nPeaksBreakdownPerSigProtein.barplot')
+```
+
+```{r}
+fwrite(anova.prot.dt, ScriptAndDatedFileName('hiv.d123.bestPeakperProtein.anova.wNsigpeaksLabel.csv.gz'))
+fwrite(anova.prot.dt, ScriptAndDatedFileName('hiv.d123.bestPeakperProtein.anova.wNsigpeaksLabel.csv'))
+
+anova.prot.dt
+```
+
+Other plots; do the GO enrichment dotplots for all the contrasts we are interested in
+
+```{r}
+# just an example of what this data looks like
+test.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_enrichmentPlot_D2_data/2025_06_17_GO.enrichment.hiv_d12.csv.gz')
+```
+
+Heatmap of simplified enrichment correlations between all donors
+
+```{r}
+# all GO terms
+cor.mat <- dcast(enrich.dt, ID~contrast, value.var='pvalue') %>% 
+  as.matrix(rownames='ID') %>% 
+  cor(., use='pairwise.complete.obs', method='pearson')
+
+od =  hclust(dist(cor.mat))$order
+cm = cor.mat[od, od]
+
+
+hm <- Heatmap(cm, 
+        name='Sample Pearson Corr.',
+        rect_gp = gpar(type = "none"),  # turn off 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=8),
+        col=colorRamp2(breaks=c(0, 0.5, 0.8), colors=c('white', 'salmon', 'firebrick')),
+	cell_fun = function(j, i, x, y, w, h, fill) {
+		if(i >= j) {
+			grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='black'))
+		}
+	})
+hm
+BackupAsPDF(draw(hm, column_title='GO enrichment term sample correlations'), 'all.go.sampleCor.heatmap')
+
+
+# simplified GO term correlations
+cor.mat <- dcast(simp.dt$simplified, ID~contrast, value.var='pvalue') %>% 
+  as.matrix(rownames='ID') %>% 
+  cor(., use='pairwise.complete.obs', method='pearson')
+
+od =  hclust(dist(cor.mat))$order
+cm = cor.mat[od, od]
+
+
+hm <- Heatmap(cm, 
+        name='Sample Pearson Corr.',
+        rect_gp = gpar(type = "none"),  # turn off 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=8),
+        col=colorRamp2(breaks=c(0, 0.5, 0.8), colors=c('white', 'salmon', 'firebrick')),
+	cell_fun = function(j, i, x, y, w, h, fill) {
+		if(i >= j) {
+			grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='black'))
+		}
+	})
+hm
+BackupAsPDF(draw(hm, column_title='GO enrichment term sample correlations'), 'clustered.goterm.sampleCor.heatmap')
+```
+Make the gsea enrichment plots for CORUM and see how things look for all the donors
+
+```{r}
+corum.db <- fread('/Users/martingordon/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/docs/corum.hs.5.1.txt') %>% 
+  .[, .(protein=unlist(strsplit(subunits_uniprot_id, ';'))), by=complex_name]
+
+allContrasts <- anova.dt
+setorder(allContrasts, treatmentDiff.p, na.last = TRUE)
+contrast.singleProt <- allContrasts[, .SD[1], by= .(protein, contrast)] # taking hte top scoring peak per protein
+contrast.singleProt[, diffScore := -log10(treatmentDiff.p)]
+
+contrasts <- contrast.singleProt$contrast %>% 
+  unique()
+names(contrasts) <- contrasts
+
+corum.allsea <- lapply(contrasts, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(corum.db$protein, corum.db$complex_name),
+                                           contrast.singleProt[contrast == contOI][diffScore > 0, setNames(diffScore, protein)],
+                                           scoreType = "pos")
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) |> rbindlist(idcol = "contrast")
+
+fwrite(corum.allsea, ScriptAndDatedFileName('CORUM.enrichment.hiv_d12.csv.gz'))
+```
+Now lets look at the CORUM enrichment terms and see what comes up
+
+```{r}
+# merge the contrast scores with a subset of enriched corum
+sigPathways  <- corum.allsea[size > 1 & padj < 0.1, unique(pathway)]
+shortComplexLength = 80
+
+# subset enrichment table ~ 600 terms enriched
+sigEnrichedPathways <-  corum.allsea[pathway %in% sigPathways]
+
+corum.mapper <- corum.db[sigEnrichedPathways,, on=c(complex_name="pathway")]
+
+# now merge this with our anova test 
+genesWDiffScores <- contrast.singleProt[corum.mapper,,on = c("contrast", protein = "protein")]
+genesWDiffScores[, diffScore := -log10(treatmentDiff.p)]
+
+
+# add total as a 'total' complex
+genesWDiffScores <- rbind(genesWDiffScores, contrast.singleProt, fill = TRUE)
+genesWDiffScores[, description := complex_name]
+genesWDiffScores[is.na(description), description := "total"]
+setorder(genesWDiffScores, pval, na.last = TRUE) # order by SEA score
+genesWDiffScores[, description := factor(description, levels = rev(unique(genesWDiffScores$description))  )]
+
+fwrite(genesWDiffScores, ScriptAndDatedFileName('corum.enrich.rbindGeneDiffScores.csv.gz'))
+```
+
+
+```{r, fig.width = 10, fig.height = 8}
+
+genesWDiffScores
+lapply(unique(genesWDiffScores$contrast), function(x){
+  
+  p  <- ggplot(genesWDiffScores[!is.na(diffScore) & contrast == x,], 
+             aes(y = description, x = diffScore, color = padj < 0.05, label=gene, shape = description == "total")) +
+  ggforce::geom_sina(scale = "width",   show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #ggforce::geom_sina(data = genesWDiffScores[complex == "total"], shape = ".", scale = "count", show.legend = FALSE) +
+  #facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched (p.adj < 0.05):") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+  ggrepel::geom_text_repel(data  = genesWDiffScores[!is.na(diffScore) & size > 1 & padj < 0.05 & contrast == x, .SD[order (-diffScore)][1:4], by = .(description, contrast)], show.legend = FALSE, size = 2, max.overlaps = 10, box.padding = 0) +
+  theme_bw() +
+  # uncomment to get shortened names in y axis
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle=x) +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+  
+  p
+  BackupAsPDF(p, paste0(x,'.corum.hiv.d123.corum.enrihcment'))
+})
+```
+
+## GSEA enrichment for GO and CORUM
+
+```{r}
+geneSets.dt <- fread('~/Documents/utils/mg_utils/data/stringDB/9606.protein.enrichment.terms.v12.0.txt.gz')
+# merge this with our data
+idmapper <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_StringGeneProtein.idMapper.csv.gz')
+idmapper[, simplifiedGene := gsub('[.].+','', gene)]
+
+geneSets.dt[idmapper, protein := i.protein, on = c(`#string_protein_id` = "stringID")]
+
+go <- geneSets.dt[grep ("Gene Ontology", category)][, .(description,  stringID = `#string_protein_id`, protein)]
+# subset to minimal size
+smallish <- go[, .N, by= description][ N< 100, description]
+go <- go[description %in% smallish]
+
+```
+
+Run GSEA per contrast
+```{r}
+allContrasts <- anova.dt
+
+allContrasts
+setorder(allContrasts, treatmentDiff.p, na.last = TRUE)
+contrast.singleProt <- allContrasts[, .SD[1], by= .(protein, contrast)] # taking hte top scoring peak per protein
+contrast.singleProt[, diffScore := -log10(treatmentDiff.p)]
+
+contrasts <- contrast.singleProt$contrast %>% 
+  unique()
+names(contrasts) <- contrasts
+
+go.allsea <- lapply(contrasts, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(go$protein, go$description),
+                                           contrast.singleProt[contrast == contOI][diffScore > 0, setNames(diffScore, protein)],
+                                           scoreType = "pos")
+         setorder(sea.out, pval)
+         sea.out
+       }) |> rbindlist(idcol = "contrast")
+
+fwrite(go.allsea, ScriptAndDatedFileName('GO.smallishTerms.enrichment.hiv_d123.csv.gz'))
+go.allsea <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062525_plotsForNevanMeeting_data/2025_06_26_GO.smallishTerms.enrichment.hiv_d123.csv.gz')
+```
+assign genes to their sig pathways
+More issues wiht this... try fix and return results
+```{r}
+# merge the contrast scores with a subset of enriched corum
+sigPathways  <- go.allsea[size > 1 & padj < 0.1, unique(pathway)]
+
+go.allsea[padj < 0.1, .N, by=contrast]
+# subset enrichment table
+sigEnrichedPathways <-  go.allsea[pathway %in% sigPathways]
+
+# join with corum to get full genes
+genesInEnrichedPathways <- go[sigEnrichedPathways,, on = c(description = "pathway")]
+
+# join with contrast protein scores
+genesWDiffScores <- anova.prot.dt[genesInEnrichedPathways,on = c("contrast", "protein")]
+genesWDiffScores[, diffScore := -log10(treatmentDiff.p)]
+
+# add total as a 'total' complex
+genesWDiffScores <- rbind(genesWDiffScores, anova.prot.dt, fill = TRUE)
+genesWDiffScores[is.na(description), description := "total"]
+setorder(genesWDiffScores, pval, na.last = TRUE) # order by SEA score
+genesWDiffScores[, description := factor(description, levels = rev(unique(genesWDiffScores$description))  )]
+
+fwrite(genesWDiffScores, ScriptAndDatedFileName('go.bp.enrich.rbindGeneDiffScores.csv.gz'))
+```
+
+Compare the all contrasts results to the set from contrasts d1-d2. These should be basically the same/not very different set of proteins? Why is the enrichment output so significantly different?
+```{r}
+#Heres the N different from the this run; check the old D1 and D2 run
+go.allsea[padj < 0.1, .N, by=contrast]
+
+
+getwd()
+```
+
+
+```{r}
+
+lapply(unique(genesWDiffScores$contrast), function(x){
+  
+  p  <- ggplot(genesWDiffScores[!is.na(diffScore) & contrast == x,], 
+             aes(y = description, x = diffScore, color = padj < 0.05, label=gene, shape = description == "total")) +
+  ggforce::geom_sina(scale = "width",   show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #ggforce::geom_sina(data = genesWDiffScores[complex == "total"], shape = ".", scale = "count", show.legend = FALSE) +
+  #facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched (p.adj < 0.05):") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+  ggrepel::geom_text_repel(data  = genesWDiffScores[!is.na(diffScore) & contrast == 'infected_uninfected_2' & size > 1 & padj < 0.05, .SD[order (-diffScore)][1:4], by = .(description, contrast)], show.legend = FALSE, size = 1.5, max.overlaps = 5, box.padding = 0) +
+  theme_bw() +
+  # uncomment to get shortened names in y axis
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle=x) +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+  
+  p
+})
+
+```
+
+
+get the list of sig pathways from simplified enrich, and plot the genes that belong to them and where they fall
+
+```{r}
+# sig GO pathways
+sigPathways <- simp.dt$simplified[p.adjust < 0.05, unique(ID)]
+sigPathways
+```
+Messy... need to resolve later, just use GSEA for the enrichment...
+
+Prepare gene sets from the GO ontology dataset
+```{r}
+geneSets.dt <- fread('~/Documents/utils/mg_utils/data/stringDB/9606.protein.enrichment.terms.v12.0.txt.gz')
+# merge this with our data
+idmapper <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_StringGeneProtein.idMapper.csv.gz')
+idmapper[, simplifiedGene := gsub('[.].+','', gene)]
+
+geneSets.dt[idmapper, protein := i.protein, on = c(`#string_protein_id` = "stringID")]
+
+go <- geneSets.dt[grep ("Gene Ontology", category)][, .(description,  stringID = `#string_protein_id`)]
+# subset to minimal size
+smallish <- go[, .N, by= description][ N< 100, description]
+go <- go[description %in% smallish]
+```
+
+
+```{r}
+anova.prot.dt[, diffScore := -log10(treatmentDiff.p)]
+
+anova.prot.dt
+
+go
+
+
+# merge the gene GO annotation with the sig enrich results
+genesInEnrichedPathways <- go[,.(description, protein)][simp.dt$simplified,, on = c(description = "ID")]
+genesInEnrichedPathways[Description == 'cytoplasmic translation' & contrast == 'Challenged_Uninfected_2', length(unique(protein))]
+
+
+genesInEnrichedPathways[is.na(protein)]
+
+
+go
+
+
+simp.dt$simplified[Description == 'cytoplasmic translation' & contrast == 'Challenged_Uninfected_2']
+simp.dt$simplified
+```
+join  the sig enrich results with the genes 
+```{r}
+genesInEnrichedPathways
+anova.prot.dt
+genesWDiffScores <- anova.prot.dt[genesInEnrichedPathways,,on = .(contrast, protein,gene)]
+
+genesWDiffScores
+```
+
+
+```{r, fig.width = 10, fig.height = 5}
+# merge the contrast scores with a subset of enriched corum
+sigPathways  <- allsea[size > 1 & padj < 0.05, unique(pathway)]
+shortComplexLength = 80
+
+
+
+# subset enrichment table
+sigEnrichedPathways <- allsea[pathway %in% sigPathways]
+sigEnrichedPathways # over 1k significant scores
+# join with corum to get full genes
+genesInEnrichedPathways <- go[sigEnrichedPathways,, on = c(description = "pathway")]
+ 
+# join with contrast protein scores
+genesWDiffScores <- contrast.singleProt[genesInEnrichedPathways,,on = c("contrast", stringID = "stringID")]
+
+genesWDiffScores[, diffScore := -log10(treatmentDiff.p)]
+
+# add total as a 'total' complex
+genesWDiffScores <- rbind(genesWDiffScores, contrast.singleProt, fill = TRUE)
+genesWDiffScores[is.na(description), description := "total"]
+setorder(genesWDiffScores, pval, na.last = TRUE) # order by SEA score
+genesWDiffScores[, description := factor(description, levels = rev(unique(genesWDiffScores$description))  )]
+
+
+p <- ggplot(genesWDiffScores[!is.na(diffScore)] , aes(y = description, x = diffScore, color = padj < 0.05, shape = description == "total")) +
+  ggforce::geom_sina(scale = "width",   show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #ggforce::geom_sina(data = genesWDiffScores[complex == "total"], shape = ".", scale = "count", show.legend = FALSE) +
+  facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched:") +
+  #scale_color_viridis_d(option = "H") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+ # ggrepel::geom_text_repel(data  = genesWDiffScores[, .SD[order (-diffScore)][1:4], by = .(description, contrast)], show.legend = FALSE, size = 2, direction = "y", box.padding = 0) +
+  theme_bw() +
+  # uncomment to get shortened names in y axis
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle = "") +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+p
+BackupAsPDF(p, format = "png")
+```
+```
+
+
+Repeatthe above plots for CORUM
+
+Complex detection
+
+elution plots of complexes with peaks highlighted
+```{r}
+
+```
+
+
+**TODO** 
+Remove peaks
+
+
+
+Enrichment of the different groups
+
+
+

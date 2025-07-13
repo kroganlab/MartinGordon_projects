@@ -1,0 +1,123 @@
+---
+title: "032525_filterRiboSeqEdits"
+author: "Martin Gordon"
+date: "2025-03-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 03-25-25
+Read in the riboseq edit results, subset to reads from reasonable edits
+
+
+
+packages
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+```
+
+
+```{r}
+in.tables <- dir(path='./output/reditools',full.names=T)
+edits <- lapply(in.tables, fread)
+names(edits)  <- gsub('./output/reditools/|_outTable_[0-9]+', '', in.tables)
+
+edits.dt <- rbindlist(edits, idcol = 'sample')
+```
+
+
+From the riboseq data it all seems T-C edits are detected?
+```{r}
+edits.dt[, tissue := ifelse(grepl('optic', sample), 'optic', 'gill')]
+edits.dt <- edits.dt[sample != 'altRIBO_optic_13',]
+
+# drop the DNA cols as all empty
+cols.oi <- !grepl('^g', colnames(edits.dt))
+edits.dt <- edits.dt[, ..cols.oi]
+
+
+edits.dt
+
+edits.dt[AllSubs == 'TC']
+
+ggplot(edits.dt[Frequency >= 0.01,.N, by=.(sample, AllSubs)], aes(x=AllSubs, y=N)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~sample, scales='free_y')
+
+
+edits.dt[Frequency >= 0.01,.N, by=.(sample, AllSubs)][order(-N)]
+```
+
+Read in one of the RNAseq set; is it just an artifact from the strandedness of the protocol
+
+```{r}
+edits.dt
+edits.dt[Frequency >= 0.05,.N, by=.(sample, AllSubs)][order(-N)]
+
+
+rna.edit <- fread('./output/reditools/RNA_OPTIC_4_outTable_85117309')
+
+ggplot(rna.edit[,.N, by=.(AllSubs)], aes(x=AllSubs, y=N)) +
+  geom_bar(stat='identity')
+```
+
+Read in the salmon quant files and see if this makes sense
+
+```{r}
+tx2g <- fread('./output/salmonQuant/riboSeq/tx2gene.tsv')
+
+transcript.counts <- fread('./output/salmonQuant/riboSeq/salmon/salmon.merged.transcript_counts.tsv')
+
+# get the output with the edits
+counts.mat <- as.matrix(transcript.counts[, -c('gene_id')], rownames='tx') 
+
+apply(counts.mat, 2, function(x){ sum(x >= 10) })
+apply(transcript.counts, 2, function(x){(x > 0)})
+```
+
+get N edited sequences 
+
+```{r}
+anno.dt <- dir('./output/reditools/annotate/', full.names = T)
+anno <- lapply(anno.dt, fread)
+
+names(anno) <- gsub( "./output/reditools/annotate//|_anno.csv", "", anno.dt)
+names(anno)
+anno.dt <- rbindlist(anno, idcol='sample')
+fwrite(anno.dt, ScriptAndDatedFileName('allEdits.annotated.csv.gz'))
+
+anno.dt[order(Frequency)]
+
+edit.geneIds <- anno.dt[anno_tid != '-',.(anno_gid, anno_tid, sample)]
+# expand all fields on $
+r.edit.geneIds <- edit.geneIds[, lapply(.SD, function(x){unlist(tstrsplit(x, "[$]"))}), .SDcols = c("anno_gid", "anno_tid", "sample")]
+
+# now collapse rows to combine the sample Ids
+r.edit.geneIds <- unique(r.edit.geneIds)
+r.edit.geneIds <- r.edit.geneIds[, lapply(.SD, function(x) paste(x, collapse=';')), .SDcols=c('sample'), by=.(anno_gid, anno_tid)]
+r.edit.geneIds[, anno_tid := gsub('-transcript', '', anno_tid)]
+
+transcripts.oi <- unique(r.edit.geneIds[grepl('RIBO_OPTIC', sample), anno_tid])
+
+
+r.edit.geneIds[,.N,by=sample][order(-N)]
+r.edit.geneIds[sample == 'RNA_OPTIC_10;RNA_OPTIC_11;RNA_OPTIC_4',]
+unique(r.edit.geneIds[grepl('RIBO_OPTIC', sample), anno_tid]) %>% length()
+
+r.edit.geneIds
+fwrite(r.edit.geneIds, ScriptAndDatedFileName('transcriptIDs.withEdits.csv'))
+```
+
+```{r}
+apply(counts.mat, 2, function(x){ sum(x >= 10) })
+apply(counts.mat[rownames(counts.mat) %in% transcripts.oi,], 2, function(x){ sum(x >= 10) })
+```
+

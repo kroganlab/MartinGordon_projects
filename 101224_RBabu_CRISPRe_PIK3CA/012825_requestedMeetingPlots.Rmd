@@ -1,0 +1,423 @@
+---
+title: "012225_requestedPlots"
+author: "Martin Gordon"
+date: "2025-01-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Goal of this analysis is to produce some meeting ready plots for Ronald to share with Nevan ahead of the meeting on Friday
+To do: plot showings summary of data (boxplots, scatterplots of replicates, correlation matrix)
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(seqinr)
+library(readxl)
+library(tidymodels)
+library(ggridges)
+library(RColorBrewer)
+
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_ipsum_rc() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+```
+
+Before any of this, lets plot the distributions of the raw counts and ensure we are not 'normalizing out` true differences between the conditions
+
+Take a look at the data
+
+```{r}
+# deseq2 contrasts for the original data
+deseq.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/111824_plotsForKroganWeekly_data/2025_01_22_deseq.pwcomparisons.allAnno.csv') 
+
+
+raw.counts <- fread('./output/141024_noNormalization.count.txt')
+raw.dt <- melt(raw.counts, id.vars = c('sgRNA', 'Gene'))
+#setnames(raw.dt, old=c('variable', 'value'), new=c('sample', 'counts'))
+
+raw.meta <- fread('./output/141024_noNormalization.countsummary.txt')
+raw.meta[, sample := gsub('/wd/data/fastq/bclconvert_defaults/|_S[0-9]{1,2}_R1.+', '', File)]
+raw.meta[, sample := ifelse(grepl("ABE8ENG_", sample), gsub("ABE8ENG_", "abe8e_", sample),  gsub("BE4MaxNG_", "bemax_", sample))]
+raw.meta[, sample := ifelse(grepl("ABE8eNG_", sample), gsub("ABE8eNG_", "abe8e_", sample),  gsub("BE4MaxBG_", "bemax_", sample))]
+raw.meta[, sample := ifelse(grepl("_CTRL", sample), gsub("_CTRL", "_Ctrl", sample),  gsub("BE4MaxBG_", "bemax_", sample))]
+
+raw.meta[, c('editor', 'treatment', 'timepoint') := tstrsplit(sample, '_', keep=c(1,2,3))]
+raw.meta[is.na(timepoint), timepoint := 'day0']
+raw.meta[, timepoint := gsub('day', '', timepoint)]
+
+raw.meta[, replicate := str_extract(treatment, '[1,2]$')]
+raw.meta[is.na(replicate), replicate := '1']
+
+raw.meta[, treatment := gsub('[0-9]$', '', treatment)]
+raw.meta[grepl('[Ll]ib[-]{0,1}', treatment), treatment := 'LibraryRepresentation']
+
+# check the sample IDs in the nromalized set also match up
+raw.meta[, .(Label, sample, editor, treatment, timepoint, replicate)]
+
+raw.dt <- merge(x=raw.dt, y=raw.meta[,.(Label, sample, editor, treatment, timepoint, replicate)], by.x=c('variable'), by.y=c('Label'), all.x=T)
+setnames(raw.dt, old=c('variable', 'value'), new=c('Label', 'counts'))
+```
+
+Boxplot of the raw counts
+```{r}
+ggplot(raw.dt, aes(x=sample, fill=sample, y=log2(counts+1))) +
+  geom_boxplot() +
+  customTheme
+```
+much lower but trends follow the same as the above sample
+the fill is the sgSet which clearly follows trends of the other samples
+```{r}
+ggplot(raw.dt[grepl('sgINTERGENIC', Gene),], aes(x=sample, fill=sample, y=log2(counts+1))) +
+  geom_boxplot() +
+  geom_boxplot(data=raw.dt, aes(x=sample, y=log2(counts+1)), color='red', outliers =F) +
+  customTheme
+```
+Try the log2 normalization method
+
+```{r}
+raw.mat <- dcast(raw.dt, paste(Gene,sgRNA, sep='.')~paste(editor,treatment, timepoint, replicate, sep  = '_'), value.var='counts') %>% 
+  as.matrix(rownames=1)
+
+cpm.mat <- apply(raw.mat, 2, function(x){(x/sum(x, na.rm=T)) * 1000000 + 1})
+cpm.mat <- log2(cpm.mat)
+
+cpm.long <- setDT(melt(cpm.mat))
+
+cpm.long[, c('gene', 'sgRNA') := tstrsplit(Var1,'[.]')]
+cpm.long[, c('editor', 'treatment', 'timepoint', 'replicate') := tstrsplit(Var2, '_')]
+setnames(cpm.long, old=c('value'), new=c('log2_CPM'))
+
+setnames(raw.dt, old='Gene', new='gene')
+
+raw.dt <- merge(raw.dt[treatment != 'Undetermined',], cpm.long[treatment != 'Undetermined',-c('Var1', 'Var2')], by=c('gene', 'sgRNA', 'editor', 'treatment', 'timepoint', 'replicate'))
+raw.dt %>%  colnames()
+```
+
+Look at the distributions of cpm vs raw counts for each of the samples
+
+```{r}
+raw.dt[grepl('sgINTERGENIC', gene), gene :='Intergenic']
+
+raw.dt[treatment == 'Ctrl', treatment := 'DMSO']
+raw.dt[gene == 'non-targeting', gene := 'Non-targeting']
+
+# log2FC look much. better, but still not great
+ggplot(raw.dt, aes(x=sample, y=log2(counts+1)), color='black') +
+  geom_boxplot() +
+  geom_boxplot(data=raw.dt, aes(x=sample, y=log2_CPM), color='red', outliers =F) +
+  customTheme
+```
+Read in the other count data for these files 
+These may still be in matrix format... reformat like this and add to the col
+```{r}
+norm.dt <- fread('101524_MAGECKContrasts_firstPass_data/2024_10_15_sgRNAcounts.normalized.txt')
+setnames(norm.dt, old=c('Gene', 'normCounts'), new=c('gene', 'deseq.norm.counts'))
+
+norm.dt
+raw.dt[sgRNA == 'BE_1',] %>% 
+  .[order(sample)]
+norm.dt[sgRNA == 'BE_1',] %>% 
+  .[order(sample)]
+
+raw.dt[, unique(sample)]
+
+raw.dt[editor == 'Plasmid', editor := 'plasmid']
+raw.dt[, sample := paste(editor, treatment, timepoint, replicate, sep='.')]
+
+norm.dt[, sample := paste(editor, treatment, timepoint, rep, sep='.')]
+norm.dt[treatment == 'control', treatment := 'DMSO']
+norm.dt[treatment == 'librep', treatment := 'LibraryRepresentation']
+norm.dt[, timepoint := as.character(timepoint)]
+norm.dt[, replicate := as.character(rep)]
+norm.dt[grepl('sgINTERGENIC', gene), gene := 'Intergenic']
+norm.dt[grepl('non-targeting', gene), gene := 'Non-targeting']
+
+# ok this has all the normalized counts we need, just write the output to file and generate the plots tomorrow
+raw.dt <- merge(x=raw.dt, y=norm.dt[,.(gene, sgRNA, editor, treatment, timepoint, replicate, deseq.norm.counts, sgRNAnormCounts)], by=c("gene","sgRNA","editor","treatment","timepoint","replicate"))
+
+#fwrite(test, ScriptAndDatedFileName('sampleCounts.rawAndNormalized.dt'))
+#fwrite(raw.dt, ScriptAndDatedFileName('sampleCounts.rawAndNormalized.dt'))
+```
+Will consider editors seperately as have poor QC of the 
+col.pal for treatments/timepoint/editor. keep these the same for all plots
+
+```{r}
+brewer.pal(n=9, name = 'Blues')[4:8]
+brewer.pal(n=9, name = 'PuRd')[4:8]
+brewer.pal(n=9, name = 'Reds')[4:8]
+brewer.pal(n=9, name = 'YlOrRd')[4:8]
+brewer.pal(n=9, name = 'YlGn')[4:8]
+brewer.pal(n=9, name = 'Greys')[4:8]
+# blues
+
+group.pal <- c("#BDBDBD", "#DF65B0", "#C994C7", "#6BAED6", "#9ECAE1","#FB6A4A", "#FC9272" )
+names(group.pal) <- unique(counts.dt$group)
+
+"#FC9272" "#FB6A4A" "#EF3B2C" "#CB181D" "#A50F15"
+"#9ECAE1" "#6BAED6" "#4292C6" "#2171B5" "#08519C"
+"#C994C7" "#DF65B0" "#E7298A" "#CE1256" "#980043"
+"#ADDD8E" "#78C679" "#41AB5D" "#238443" "#006837"
+"#BDBDBD" "#969696" "#737373" "#525252" "#252525"
+"#FEB24C" "#FD8D3C" "#FC4E2A" "#E31A1C" "#BD0026"
+
+
+# timepoint and editor col pal
+counts.dt$timepoint %>% unique()
+
+group.pal <- c("#BDBDBD", "#DF65B0", "#C994C7", "#6BAED6", "#9ECAE1","#FB6A4A", "#FC9272" )
+names(group.pal) <- unique(counts.dt$group)
+
+timepoint.pal <- c("#ADDD8E" ,"#78C679", "#41AB5D")
+names(timepoint.pal) <-c('0','7', '22')
+
+editor.pal <- brewer.pal(n=9, name = 'Set3')[4:6]
+names(editor.pal) <- c('abe8e', 'bemax', 'plasmid')
+```
+
+
+
+read in the counts
+```{r}
+counts.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/012825_requestedMeetingPlots_data/2025_01_29_sampleCounts.rawAndNormalized.dt')
+counts.dt[, group := paste(treatment, timepoint, sep='_')]
+```
+
+Find a nice color palette for the different conditions and stick with that throughout plots
+
+scatterplots of day0 replicates to show sample consistency
+Lets also color the labels according 
+```{r}
+counts.wide <- dcast(counts.dt, paste(gene, sgRNA, sep='.')~paste(editor, treatment, timepoint, replicate, sep='_'), value.var = 'sgRNAnormCounts') %>% 
+  as.matrix(rownames=1)
+
+counts.wide <- log2(counts.wide +1)
+
+cor.mat <- cor(counts.wide[, grepl('abe8e', colnames(counts.wide))], use='pairwise.complete.obs', method='pearson')
+colnames(cor.mat) <- gsub('abe8e_|bemax_','', colnames(cor.mat))
+rownames(cor.mat) <- gsub('abe8e_|bemax_','', rownames(cor.mat))
+#set ordering for diagonal mat
+od =  hclust(dist(cor.mat))$order
+cm = cor.mat[od, od]
+
+
+sample.pal <- sort(rep(group.pal,2))
+names(sample.pal) <- paste(names(sample.pal), rep(c('1','2'),time=length(sample.pal)/2), sep='_')
+hm <- Heatmap(cm, 
+
+        name='R log2(counts+1)',
+        rect_gp = gpar(type = "none"), 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=6),
+        col=viridis(n=5, option='A'),
+      	cell_fun = function(j, i, x, y, w, h, fill) {
+	      	if(i >= j) {
+			                grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		                  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='white'))
+		}
+	})
+hm
+
+hm <- draw(hm, column_title='Abe8e sample correlations', column_title_gp=gpar(fontface='bold'))
+BackupAsPDF(hm, 'abe8e.sampleCor.normCounts.heatmap')
+```
+```{r}
+counts.wide <- dcast(counts.dt, paste(gene, sgRNA, sep='.')~paste(editor, treatment, timepoint, replicate, sep='_'), value.var = 'sgRNAnormCounts') %>% 
+  as.matrix(rownames=1)
+
+counts.wide <- log2(counts.wide +1)
+
+cor.mat <- cor(counts.wide[, grepl('bemax', colnames(counts.wide))], use='pairwise.complete.obs', method='pearson')
+colnames(cor.mat) <- gsub('abe8e_|bemax_','', colnames(cor.mat))
+rownames(cor.mat) <- gsub('abe8e_|bemax_','', rownames(cor.mat))
+#set ordering for diagonal mat
+od =  hclust(dist(cor.mat))$order
+cm = cor.mat[od, od]
+
+
+sample.pal <- sort(rep(group.pal,2))
+names(sample.pal) <- paste(names(sample.pal), rep(c('1','2'),time=length(sample.pal)/2), sep='_')
+
+hm <- Heatmap(cm, 
+        name='R log2(counts+1)',
+        rect_gp = gpar(type = "none"), 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=6),
+        col=viridis(n=5, option='A'),
+      	cell_fun = function(j, i, x, y, w, h, fill) {
+	      	if(i >= j) {
+			                grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		                  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='white'))
+		}
+	})
+hm
+
+hm <- draw(hm, column_title='Bemax sample correlations', column_title_gp=gpar(fontface='bold'))
+BackupAsPDF(hm, 'bemax.sampleCor.normCounts.heatmap')
+```
+
+After sample correlations, we want pairwise correlations of the sample replicates
+Can then just show a select few to highlight sample agreement
+Maybe also plot count distributions 
+
+```{r}
+library(tidymodels)
+scatterplot.set <- UniqueFactorCombos(counts.dt$sample)
+scatterplot.set < scatterplot.set[gsub('[.][12]$' ,'', Var1) == gsub('[.][12]$' ,'', Var2)]
+
+
+apply(scatterplot.set, 1,  function(x){
+  
+  #get the editor
+  editor <- str_extract(x[1], 'abe8e|bemax')
+  
+  dt <- dcast(counts.dt[sample %in% x,], paste(gene, sgRNA, sep='.')~sample, value.var = c('sgRNAnormCounts'))
+  
+  colnames(dt) <- gsub('bemax[.]|abe8e[.]', '', colnames(dt))
+  oldNames <- copy(colnames(dt)) # create copy so DT not changed in place
+
+  # print
+  setnames(dt, new=c('guide', 'counts.x', 'counts.y'))
+  
+  r.score <- cor(dt$counts.x, dt$counts.y)
+  
+  g <- ggplot(dt, aes(x=log2(counts.x+1), y=log2(counts.y+1))) +
+    annotate(geom='text', x=1, y=10, label = paste("r = ", round(r.score,2)), fontface = 'bold') +
+    geom_hex(bins=50) +
+    scale_fill_viridis(option='A', name='N') +
+    ggtitle(paste(editor, 'sample correlations'), subtitle = "log2(normCounts+1)") +
+    xlab(oldNames[2]) +
+    ylab(oldNames[3]) +
+    customTheme +
+    coord_obs_pred()
+  
+  g
+  BackupAsPDF(g, paste0('scatterplots/',editor,'.',oldNames[2], 'vs', oldNames[3],'.sgNormCounts.scatterplots'), dimensions = c(8,8))
+})
+```
+look at a plot of the distributions 
+
+```{r}
+g <- ggplot(counts.dt[editor == 'bemax'], aes(x=sample, y=log2(sgRNAnormCounts+1), fill=group)) +
+  geom_boxplot() +
+  ggtitle(label=expression('Bemax sample distributions')) +
+  labs(x='sample', y=expression(log[2]~'(normCounts+1)')) +
+  scale_fill_manual(values=group.pal) +
+  customTheme
+
+BackupAsPDF(g, 'bemax.distributions.boxplot', dimensions=c(10,7))
+
+
+g <- ggplot(counts.dt[editor == 'abe8e'], aes(x=sample, y=log2(sgRNAnormCounts+1), fill=group)) +
+  geom_boxplot() +
+  ggtitle(label=expression('Abe8e sample distributions')) +
+  labs(x='sample', y=expression(log[2]~'(normCounts+1)')) +
+  scale_fill_manual(values=group.pal) +
+  customTheme
+
+BackupAsPDF(g, 'abe8e.distributions.boxplot', dimensions=c(10,7))
+```
+Counts distributions in each of the samples?
+Maybe overlay the histograms of the counts,faceted by condition
+Makes no sense as normalized; leave as is
+
+```{r}
+ggplot(counts.dt[editor != 'plasmid'], aes(x=log2(sgRNAnormCounts+1), y=group, fill=group)) +
+  geom_density_ridges2() +
+  facet_grid(replicate~editor) +
+  scale_fill_manual(values=group.pal) +
+  customTheme
+```
+Look at PCA plot of the samples; generate seperately and then together
+
+```{r}
+pcaOut <- prcomp(t(counts.wide))
+
+
+colInfo <- data.table(sample = colnames(counts.wide))
+colInfo[, c('editor', 'treatment', 'timepoint', 'replicate') := tstrsplit(sample, '_', keep=c(1,2,3,4))]
+colInfo[, group := paste(treatment, timepoint, sep='_')]
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "sample", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = timepoint, shape = editor)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  customTheme +
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_manual(values=timepoint.pal) +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_manual(values=timepoint.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "normalizedCounts.editorCol.pca")
+```
+Look at distribution of control guides in this set
+
+```{r}
+sginfo.dt <- read_xlsx('./docs/PIK3CA pathway base editing.xlsx', sheet=1) %>%  
+  as.data.table()
+sginfo.dt <- sginfo.dt[, .(gene = toupper(Gene), sgRNA=`Sl No`, guide=Guide)]
+sginfo.dt[grepl('SGINTERGENIC', gene), gene := 'Intergenic']
+
+sginfo.dt[gene == 'Intergenic', sgRNA]
+```
+

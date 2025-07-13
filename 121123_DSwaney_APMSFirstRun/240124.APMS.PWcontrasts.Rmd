@@ -1,0 +1,335 @@
+---
+title: "230124.APMS.pwContrasts"
+author: "Martin Gordon"
+date: "2024-01-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Rerun the pw comparisons for the APMS data using exclusively any genes that passed the SAINT scoring threshold
+
+- Read in the SAINT output and filter to this list of genes
+- Redo the PW comparisons 
+- Also color the bait protein in each of the comparisons so we can see this is not moving
+
+Reran with bait normalisation; unfortunately doesnt do a good job of normalising the prey proteins
+
+25-01-24
+----
+Other normalisation techiques show its not too comparable 
+
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library(readxl)
+library(MSstats)
+library(circlize)
+library(ggvenn)
+library (emmeans)
+library(stringr)
+
+source ("../../utils/bp_utils/spectronautFile2ArtMS.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/LinearModels.R")
+
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+clusterwNA <- function(x, na.val=0){
+  
+  x[is.na(x)] <- na.val
+  dist(x) %>%  hclust(method='complete')
+}
+```
+
+Read in SAINT scoring output, we will take all prots passing APMS thresholds and plot
+
+```{r}
+nsp6.spc.saint <-  fread('./output/SAINT.scoring/nsp6.spc.saint.list.txt')
+nsp6.int.saint <-  fread('./output/SAINT.scoring/nsp6.ints.saint.list.txt')
+orf3a.spc.saint <-fread('./output/SAINT.scoring/orf3a.spc.saint.list.txt')
+orf3a.int.saint <-fread('./output/SAINT.scoring/orf3a.ints.saint.list.txt')
+
+saint.list <- list(nsp6.spc = nsp6.spc.saint,
+                   nsp6.int = nsp6.int.saint,
+                   orf3a.spc = orf3a.spc.saint,
+                   orf3a.int = orf3a.int.saint)
+
+
+lapply(saint.list, str)
+
+f.saint.list <- lapply(saint.list, function(x){
+  
+  x.dt <- x[BFDR < 0.1, unique(Prey)]
+  return(x.dt)
+})
+```
+
+Just combine the ints and spec count edges and lets look at comparisons of the entire set
+```{r}
+nsp6.saint.fdr.01 <- unique(c(f.saint.list[[1]],f.saint.list[[2]]))
+orf3a.saint.fdr.01 <- unique(c(f.saint.list[[3]],f.saint.list[[4]]))
+
+saint.fdr1prc.list <- list(orf3a = orf3a.saint.fdr.01,
+                           nsp6 = nsp6.saint.fdr.01)
+```
+
+Read in the R object and perform the pw contrasts in msstats
+
+```{r}
+orf3a.mss <- readRDS("/Users/martingordon/Documents/projects/121123_DSwaney_APMSFirstRun/090124.APMS.contrastofcontrast_data/orf3a_mss.rds")
+nsp6.mss <- readRDS("/Users/martingordon/Documents/projects/121123_DSwaney_APMSFirstRun/090124.APMS.contrastofcontrast_data/nsp6_mss.rds")
+
+dp.out.list <-  list(orf3a=orf3a.mss,
+                      nsp6=nsp6.mss)
+
+lapply(dp.out.list, function(x){
+  
+  setDT(x$ProteinLevelData)
+  setDT(x$FeatureLevelData)
+  x$ProteinLevelData[,SUBJECT := interaction(GROUP,SUBJECT)] #for PW comparisonsgive each subject a unique label
+  x$FeatureLevelData[,SUBJECT := interaction(GROUP,SUBJECT)]
+  return(x)
+})
+
+lapply(dp.out.list,str)
+
+
+
+lapply(seq_along(dp.out.list),  function(x,y,n,i){
+  
+  bait <- n[[i]]
+  
+  dt <- setDT(x[[bait]]$ProteinLevelData)
+  
+  #make new tables
+  bait.dt <- dt[Protein == y[[bait]], .(GROUP,SUBJECT,LogIntensities)] %>% 
+    .[,NAME := 'bait']
+  gl.mean.dt <- dt[Protein != y[[bait]], mean(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'mean']
+  gl.med.dt <-dt[Protein != y[[bait]], median(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'median']
+  
+  setnames(gl.mean.dt, old='V1', new='LogIntensities')
+  setnames(gl.med.dt, old='V1', new='LogIntensities')
+  
+  p.dt <- rbind(bait.dt, gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(bait) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(bait,'equilizeMedian.norm.linechart' ))
+},x=dp.out.list, y=mssGS.list, n=names(dp.out.list))
+```
+
+subset both DTs to the list of sites significant in the SAINT scoring
+Dont need! just subset afterwards...
+```{r}
+dp.out.list[['orf3a']]$ProteinLevelData
+dp.out.list[['orf3a']]$FeatureLevelData
+
+
+dp.out.list[['orf3a']]$ProteinLevelData <-  dp.out.list[['orf3a']]$ProteinLevelData[Protein %in% orf3a.saint.fdr.01,]
+#dp.out.list[['orf3a']]$FeatureLevelData <-  dp.out.list[['orf3a']]$FeatureLevelData[PROTEIN %in% orf3a.saint.fdr.01,]
+dp.out.list[['nsp6']]$ProteinLevelData <-  dp.out.list[['nsp6']]$ProteinLevelData[Protein %in% nsp6.saint.fdr.01,]
+#dp.out.list[['nsp6']]$FeatureLevelData <-  dp.out.list[['nsp6']]$FeatureLevelData[PROTEIN %in% nsp6.saint.fdr.01,]
+```
+
+create the contrast matrices for both groups
+
+```{r}
+orf3a.contrasts <- makeContrast.AllByAll(dp.out.list$orf3a)
+nsp6.contrasts  <- makeContrast.AllByAll(dp.out.list$nsp6)
+```
+
+'fix' the contrast lists by converting controls to denominators for relevant contrasts
+
+```{r}
+# orf3a
+submat <- orf3a.contrasts[grep('^Lempty|^Empty', rownames(orf3a.contrasts)), ]
+submat <-  submat*-1
+
+old.names <- rownames(submat)
+rev.names <- tstrsplit(rownames(submat), '-')
+
+new.names <- sapply(seq_along(rev.names[[1]]), function(i){
+  paste0(rev.names[[2]][i], '-', rev.names[[1]][i])
+})
+rownames(submat) <- new.names
+
+orf3a.contrasts <- rbind(submat, orf3a.contrasts[!rownames(orf3a.contrasts) %in% old.names,])
+orf3a.contrasts
+
+#sanity check - should all = 0
+apply(orf3a.contrasts, 1, sum)
+```
+
+## TODO convert this to a function to get contrast matrix inverse so can run easily
+
+```{r}
+# nsp6
+submat <- nsp6.contrasts[grep('^DemptyVector|^Empty', rownames(nsp6.contrasts)), ]
+submat <-  submat*-1
+
+old.names <- rownames(submat)
+rev.names <- tstrsplit(rownames(submat), '-')
+
+new.names <- sapply(seq_along(rev.names[[1]]), function(i){
+  paste0(rev.names[[2]][i], '-', rev.names[[1]][i])
+})
+rownames(submat) <- new.names
+
+nsp6.contrasts <- rbind(submat, nsp6.contrasts[!rownames(nsp6.contrasts) %in% old.names,])
+apply(nsp6.contrasts, 1, sum)
+
+# sanity check 
+nsp6.contrasts
+```
+
+
+```{r}
+contrast.list <-  list(orf3a = orf3a.contrasts,
+                       nsp6 = nsp6.contrasts)
+```
+
+run the PW comparisons on the reduced dataset
+
+
+edit
+---- 
+For APMS, we are interested in perhaps sites with oneConditionMissing, but we want to ensure these are
+
+```{r}
+
+mss.out.list <- lapply(seq_along(dp.out.list), function(x,n,i){
+
+  bait <- n[[i]]
+  print(paste0('running comparison on ', bait))
+  
+  # run msstats correcting for batch 
+  mss <- groupComparison(contrast.matrix=contrast.list[[bait]], data=x[[bait]])
+  mss.dt <- setDT(mss$ComparisonResult)
+  
+  return(mss.dt)
+  
+},x=dp.out.list, n=names(dp.out.list))
+
+names(mss.out.list) <- names(dp.out.list)
+
+```
+filter out the non-sig sites and count the number of DEGs within the SAINT sig hits
+
+```{r}
+# 
+lapply(seq_along(mss.out.list), function(x,n,i){
+  dt <- x[[i]]
+  
+   dt[,gene := multiUniprots2multiGenes(as.character(Protein))] %>% #needed as in factor format
+  .[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)] %>% 
+  .[, sig := 'not'] %>% 
+  .[!issue %in% c('completeMissing', 'oneConditionMissing') & abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')] 
+   fwrite(dt, paste0('./output/24.01.24.', n[[i]], '.mss.pwcomparisons.proc.csv'))
+  }, x=mss.out.list, n=names(mss.out.list))
+
+mss.out.list
+
+lapply(mss.out.list, print)
+
+# create another table to filter out to only sig hits in the 
+f.mss.out.list <- lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  bait <-  n[[i]]
+  dt <- x[[bait]] %>% 
+    .[Protein %in% y[[bait]], ] %>% 
+    .[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)] %>%
+    .[, sig := 'not'] %>% 
+    .[!issue %in% c('completeMissing', 'oneConditionMissing') & abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')] 
+   # fwrite(dt, paste0('./output/24.01.24.SAINTsigprots.',bait, '.mss.pwcomparisons.proc.csv'))
+  
+  return(dt)
+  }, x=mss.out.list, y=saint.fdr1prc.list, n=names(mss.out.list))
+
+```
+Heatmap of one condition missing proteins
+```{r}
+lapply(seq_along(f.mss.out.list), function(x,n,i){
+  
+  bait <- n[[i]]  
+  missing.prots <- (x[[bait]][issue == 'oneConditionMissing', unique(Protein)])
+  
+  print(head(dp.out.list[[bait]]$ProteinLevelData))
+  
+  p.mat <-  dcast(dp.out.list[[bait]]$ProteinLevelData, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+
+
+  submat <-  p.mat[rownames(p.mat) %in% missing.prots,]
+  
+  rownames(submat) <- multiUniprots2multiGenes(rownames(submat))
+  
+  # just convert to 0 now
+  submat[is.na(submat)] <- 0
+  
+  
+  print(submat)
+  
+  Heatmap(submat, cluster_rows = T, na_col='grey' )
+  
+},x=f.mss.out.list, n=names(f.mss.out.list))
+
+names(f.mss.out.list) <-names(mss.out.list)
+```
+generateVolcano plots of all the comparisons
+Over 100 in total so dont rerun....
+also highlight the bait 
+
+```{r}
+dp.out.list
+
+prots.oi <- c("P0DTC1","P0DTC3")
+
+lapply(seq_along(f.mss.out.list), function(x,n,i){
+  dt <- x[[i]]
+  
+  # vecotr to iterate through
+  contrasts.oi <- dt$Label %>%  unique()
+  
+  # nested loop w 
+  lapply(contrasts.oi, function(cont){
+    
+      #print(dt[Label == cont & issue %in% c('oneConditionMissing')])
+      g <- ggplot(dt[Label == cont & !issue %in% c('completeMissing'),], aes(x=log2FC, y=-log10(p.adj), color=sig, label=gene)) + 
+      geom_point() +
+      geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+      # add bait to plot
+      geom_point(data=dt[Label == cont & Protein %in% prots.oi,], aes(x=log2FC, y=-log10(p.adj), color='bait')) +
+      ggrepel::geom_text_repel(data=dt[Label == cont & Protein %in% prots.oi,],  size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "green") +
+      geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+      ggrepel::geom_text_repel(data=dt[Label == cont & sig != 'not' & !Protein %in% prots.oi,],  size = 2, max.overlaps = 20) +
+      scale_color_manual(values=c('up'='red', 'down'='blue', 'not'='grey', 'bait'='green')) +
+      ggtitle(paste0(n[[i]], ' ', cont, ' (FC +/ 50% & p.adj < 0.05)')) +
+      # facet_wrap(~Label, scales = 'free') +
+      theme_bw() +
+      theme(strip.text.x = element_text(size = 5))
+      
+      BackupAsPDF(g, paste0(n[[i]],'.',cont,'.SAINT.bfdr0.1.volcanoplot.'))
+    
+  })
+  
+  }, x=f.mss.out.list, n=names(f.mss.out.list))
+
+names(f.mss.out.list)
+```
+

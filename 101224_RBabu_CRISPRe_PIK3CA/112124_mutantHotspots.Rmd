@@ -1,0 +1,820 @@
+---
+title: "112124_mutantHotspotsWork"
+author: "Martin Gordon"
+date: "2024-11-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Identify mutational hotspots in the data; take all our hits that overlap
+
+
+*todo*
+Adjust the splice site positons (move to cloest or furthest site to visualize their impact)
+Summarise the hits per site; using avg of pval+lfc, (maybe check mageck method)
+Smooth across these sites, select peaks and calcualte an average within that peak. Then do a permutation test
+Download PDBs for these 4 proteins read into R and concatenate an avg LFC per residue? Visualize in chimeraX - DONE
+
+```{r}
+library(data.table)
+library(parallel)
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(viridis)
+library(dendextend) # for dendogram modifications
+library(DESeq2)
+library(patchwork)
+library(ggrepel)
+library(tidymodels)
+library(readxl)
+library(ggridges)
+library(RColorBrewer)
+library(gggenes)
+
+#RRA method for summarising scores across multiple guides per residue
+library(RobustRankAggreg)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+# clinvical variant color palette
+col.pal <- c(brewer.pal(8, "Blues"), 'grey')
+# prot domian palette
+domain.pal <- randomcoloR::distinctColorPalette(k=15)
+```
+
+Read in the de analysis data;
+We will look for mutational hotspots in the 22hr vs T0 and 22hr treatment vs control
+```{r}
+de.dt <- fread('111824_plotsForKroganWeekly_data/2024_11_18_PWcomparisons.csv')
+setnames(de.dt, old=c('rn', 'Guide', 'Gene'), new=c('id', 'guide', 'gene'))
+
+guides.anno <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/110724_annotateCRISPRguides_Functions_data/2024_11_20_guides.mutant.anno.collapsed.txt')
+clinvar.anno <- fread('./110724_annotateCRISPRguides_Functions_data/2024_11_14_guides.clinvar.anno.collapsed.txt')
+
+
+# merge with our mutation annotationinformation
+de.dt <- merge(de.dt, guides.anno[, .(guide, editor, genome_index, ref_codon, alt_codon, nucelotide_position, ref_peptide, alt_peptide, peptide_position, 
+                                      nuc_mutant_id, pep_mutant_id,
+                                      splice.site, mutant_type, most_severe_mutant, most_common_mutant)], by.x=c('guide', 'editor'), by.y=c('guide', 'editor'), all.x=T)
+
+#add clinvar annotations
+de.dt <- merge(de.dt, clinvar.anno[,.(guide,  editor, hgvs, clinicalSignificance, clinvar_nuc_site=nuc_site,  clinvar_ref_nuc = coding_ref, clinvar_alt_nuc = coding_alt, 
+                                      clinvar_peptide_site=prot_site, clinvar_ref_peptide=ref_prot, clinvar_alt_peptide=alt_prot)], by.x=c('guide', 'editor'), by.y=c('guide', 'editor'), all.x=T)
+
+
+```
+Looking at splice sites
+```{r}
+de.dt[!is.na(hgvs) & grepl('c[.][0-9]+[+-][12]{1}[ACGT]', hgvs)]
+de.dt[grepl('splice', splice.site) & !is.na(hgvs)]
+#why was NM_004958.4(MTOR):c.4331A>G (p.Glu1444Gly)	 called as a splice site by my algorithm? Need to doublecheck this...
+
+# good news is I am recovering all of their splice sites, but also why the extra set?! So actually, our mutant identification picked up the correct annotation, but also annotated as splice... double check this
+# this is picked up bc the two preceeding nuc positions are in the intron! so actually my set is working well, its just the variant isnt reported in clinvar
+de.dt[hgvs == 'NM_004958.4(MTOR):c.4331A>G (p.Glu1444Gly)',]
+
+
+```
+So we want to identify mutational hotspots along the gene 
+First, lets try identify residues with elevated levels
+
+First, lets just identify overlapping residues hit by different guides
+```{r}
+# left aligns guides by taking the first position in their edit set
+
+leftAlignPosition <- function(loc_idx, sep=';'){
+  
+  if (grepl(sep, loc_idx)){
+    loc.vec <-  strsplit(loc_idx, sep)[[1]] %>% 
+      grep('[0-9]', ., value=T)
+  } else {
+    loc.vec <- loc_idx
+  }
+  firstPos <- sort(as.numeric(unique(loc.vec)))[1]
+  return(firstPos)
+}
+
+de.dt[, first_peptide_idx := leftAlignPosition(peptide_position), by=.I]
+```
+
+Write out the annotated sites for later use
+
+```{r}
+#fwrite(de.dt, ScriptAndDatedFileName('deseq2.pwcomparisons.wAnnotations.csv'))
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/112124_mutantHotspots_data/2024_11_22_deseq2.pwcomparisons.wAnnotations.csv')
+```
+
+Subset to one contrast & gene to test our hotspot detection algorithm
+Left align the residues (maybe a bad idea as we are artifically distinguishing guides.. maybe look for overlaps in their sites?)
+
+```{r}
+# right now, Im just goingt to mvoe forward with one editor
+test.dt <- de.dt[first_peptide_idx != 'NA' & gene == 'PTEN' & contrast == 'Alpelisib_22_vs_LibraryRep_0' & editor == 'abe8e',]
+test.dt[,.N, by=first_peptide_idx][N > 5]
+```
+
+```{r}
+de.dt[!is.na(peptide_position) & !grepl('NA', peptide_position), unique(first_peptide_idx)] %>% sort()
+```
+
+Going to do a cluster-based permutation test;
+i) identify clusters
+ii) quantify strenght (this will be average FC maybe)
+iii) permute (prob we find clusters as big effect or bigger by change if we shuffle the labels)
+iv) first for clusters, lets do one residues either side, reason for this is a crispr editing window is 4-8bp (what we are using anyway) so we want to consider these flanking regions we may hit..
+v)
+
+Using the geometric mean of -log10(pval) and log2FC to 
+```{r}
+leftAlignPosition('12;1;NA;1;11;NA;10')
+```
+
+
+For testing, just take one of the contrasts (try both editors)
+```{r}
+de.dt$contrast %>%  unique()
+test.dt<- de.dt[contrast== 'Alpelisib_22_vs_LibraryRep_0' & gene == 'PTEN' & !is.na(first_peptide_idx), ]
+```
+quick plot of all these log2FC values
+
+```{r}
+test.dt[,.N, first_peptide_idx][order(N)]
+
+
+# ksmooth with box kernel looks step-wise smoothing 
+with(cars, {
+    plot(speed, dist)
+    lines(ksmooth(speed, dist, "normal", bandwidth = 2), col = 2)
+    lines(ksmooth(speed, dist, "normal", bandwidth = 5), col = 3)
+    lines(ksmooth(speed, dist, "box", bandwidth = 5), col = 4)
+})
+
+
+plot(test.dt$first_peptide_idx, (test.dt$log2FoldChange))
+lines(ksmooth(test.dt$first_peptide_idx, (test.dt$log2FoldChange), "normal", bandwidth = 3), col=2)
+lines(ksmooth(test.dt$first_peptide_idx, (test.dt$log2FoldChange), "normal", bandwidth = 5), col=1)
+
+ksmooth(test.dt$first_peptide_idx, test.dt$log2FoldChange, bandwidth=2)
+
+
+test.dt[,.N, by=first_peptide_idx]
+```
+Looks to me the addition of bemax might just be adding noise....
+
+How do we define clusters? 
+First take abs LFC; we are interested in movement at this stage... not direction
+
+As this is log scale just take the mean... I think
+```{r}
+test.dt[, gm_lfc.pval := (-log10(pvalue)  + abs(log2FoldChange))/2, by=.I]
+```
+
+
+```{r}
+plot(test.dt$first_peptide_idx, (test.dt$gm_lfc.pval))
+lines(ksmooth(test.dt$first_peptide_idx, (test.dt$gm_lfc.pval), "normal", bandwidth = 3), col=2)
+lines(ksmooth(test.dt$first_peptide_idx, (test.dt$gm_lfc.pval), "normal", bandwidth = 7), col=1)
+```
+**RRA algorithm**
+Summarize a value per site; essentially ranking sites by importance/significance using RRA
+- Try the alpha RRA method; want a single score per site (could we use t-statistic for this?)
+
+- M is number of objects (all guides)
+- R ranked vector of n sgRNA targeting a gene. We could rank based on pvalues, or use the t-statistic
+- n number of sgRNA targeting a gene (or a site, say...)
+
+
+The sgRNA rank is then converted to a percentile rank. Then, the probability (p(rk})) of obtaining k significant sgRNAs among N total sgRNAs in the pool in a null model threshold (5% significant level) is expressed as the binomial probability of picking such percentile rank in the null model
+To pool the multiple sgRNAs ranks targeting the same gene, MAGeCK only take the minimal p(rk) among the filtered sgRNAs (i.e. NB p-values $\le$ 0.05) as the representative $\rho$-value for the gene
+
+Read in the mageck output and lets view how it handles the RRA approach
+```{r}
+# use the mean of FC + -log10 pval as we want to upweight the signficant hits and does this better than the t-statistic
+ggplot(test.dt[order(pvalue), .((-log10(pvalue) +abs(log2FoldChange))/2, abs(stat), 1-sqrt(pvalue))],  aes(y=V1, x=V2)) +
+  geom_point()
+
+
+test.dt<- de.dt[contrast== 'Alpelisib_22_vs_LibraryRep_0' & !is.na(first_peptide_idx), ]
+
+# geom mean of pval and LFC will be our statistic for ranking
+test.dt[, gm_lfc.pval :=  (-log10(pvalue) + abs(log2FoldChange))/2]
+test.dt[, rank.stat := rank(-gm_lfc.pval), by=.(contrast)] # guides ranked by lfc+pval
+test.dt[, norm.rank :=  rank.stat/.N, by=.(contrast)] 
+
+
+# function to calculate beta scores; taken from the RobustRankAgg package
+betaScores <- function(r){
+	n <- sum(!is.na(r))
+	p <- rep(1, n)
+	r <- sort(r, na.last = TRUE)
+	p <- pbeta(r, 1:n, n - 1:n + 1)
+	return(p)
+} 
+
+#Robust rank aggregation; RRA scores
+site.ranks <- test.dt[, betaScores(norm.rank), by=.(contrast, gene, first_peptide_idx)] %>% # get the 
+  # sig score of site is the minimum pval of the vector
+  .[, .SD[which.min(V1)], by=.(contrast, gene, first_peptide_idx)] %>% 
+  .[order(gene, first_peptide_idx),]
+
+```
+Show tiling plot to see if this analysis makes any sense...
+As a first pass it looks ok, but could do with some more stringent filtering... try rerunning with input guides filtered based on pval (similar to alpah-RRA)
+```{r}
+test.dt <- merge(test.dt, site.ranks[, .(contrast, gene, first_peptide_idx, RRA_sitePval = V1)], by=c('contrast', 'gene', 'first_peptide_idx'))
+
+g <- ggplot(test.dt, aes(x=first_peptide_idx, y=abs(log2FoldChange))) +
+    geom_segment(aes(x=first_peptide_idx, xend=first_peptide_idx, y=0, yend=abs(log2FoldChange)), color="grey", alpha=0.6) +
+    geom_point(aes(shape=editor, fill=sig, alpha=0.6),size=2) +
+    geom_point(data=test.dt[RRA_sitePval < 0.05,], aes(x=first_peptide_idx, y=-1)) +
+    geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    xlab('amino acid residue') +
+    ylab('LFC') +
+    facet_wrap(~gene, scales='free', ncol=1) +
+    scale_shape_manual(values = 21:22) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21), title='key'),
+           alpha = "none",
+           color = guide_legend(override.aes = list(shape =21) ))
+
+g
+#BackupAsPDF(g, paste0('tileplots/PIK3CA_proteinAnno_withSmoothCurve/', x,'.LFC.PIK3CA.lollipop.nolabel.tileplot' ), dimensions=c(16,12)) 
+```
+```{r}
+# Ithink the only difference is we filter the input to the beta
+#Robust rank aggregation; RRA scores
+filtered.site.ranks <- test.dt[sig != 'not', betaScores(norm.rank), by=.(contrast, gene, first_peptide_idx)] %>% # get the 
+  # sig score of site is the minimum pval of the vector
+  .[, .SD[which.min(V1)], by=.(contrast, gene, first_peptide_idx)] %>% 
+  .[order(gene, first_peptide_idx),]
+
+test.dt <- merge(test.dt, filtered.site.ranks[, .(contrast, gene, first_peptide_idx, RRA_filtered_sitePval = V1)], by=c('contrast', 'gene', 'first_peptide_idx'), all.x=T)
+# I thin
+
+g <- ggplot(test.dt, aes(x=first_peptide_idx, y=abs(log2FoldChange))) +
+    geom_segment(aes(x=first_peptide_idx, xend=first_peptide_idx, y=0, yend=abs(log2FoldChange)), color="grey", alpha=0.6) +
+    geom_point(aes(shape=editor, fill=sig, alpha=0.6),size=2) +
+    geom_point(data=test.dt[RRA_filtered_sitePval < 0.05,], aes(x=first_peptide_idx, y=-1, color=-log10(RRA_filtered_sitePval)), shape=17, size=2.5) +
+    geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    scale_color_viridis_c() +
+    xlab('amino acid residue') +
+    ylab('LFC') +
+    facet_wrap(~gene, scales='free', ncol=1) +
+    scale_shape_manual(values = 21:22) +
+    scale_fill_manual(values=c('not'='grey', 'up'='red', 'down'='blue')) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21), title='key'),
+           alpha = "none",
+           color = guide_legend(override.aes = list(shape =21) ))
+
+g
+```
+The filtered input certainly looks better, but lets start with the sites that show significant enrichment
+I think all. we need to do is i) sample p-values randomly from along the length of the gene, randomly assign same amount of 
+```{r}
+
+
+# assign sgRNAs randomly to each site (but the number of sgRNA does not change)
+permuteBetaPvalues <- function(dt, pvalCol='pvalue', ntimes=100, splitCol=c('gene','first_peptide_idx')){
+  
+  pval.universe <- dt[[pvalCol]]
+  
+  truthSet <- dt[, .(RRA_sitePval), by=splitCol] %>% 
+    unique()
+  nGuides <- dt[, .(RRA_sitePval), by=splitCol] %>% 
+    .[,.N, by=splitCol]
+
+  message('Permuting p-values for beta scores')
+  
+  permMat <- sapply(1:ntimes, function(x){
+    # get the permuted set of pvalues per site 
+    permutSet <- sapply(nGuides$N, function(s){
+     # random set of pvalues/ 
+    #using normalized rank in this case as wont change (pval will still jave same ranking and scaling)
+     randomSet <- sample(pval.universe, s, replace=F)
+      
+     bScores.perm <- betaScores(randomSet)
+     rho.score <- which.min(bScores.perm)
+     return(bScores.perm[rho.score])
+    })
+  })
+  
+  logiMat <- permMat < truthSet$RRA_sitePval
+  # get the number of permutations that fell below the value detected in the Ori set 
+  permutedPvals <- apply(logiMat, 1, function(x){ sum(x)/length(x)})
+  return(as.data.table(cbind.data.frame(truthSet, permutedPvals)))
+}
+```
+
+Ok this looks ok, now we need to run this analysis on each. contrast seperately and visualize the output
+```{r}
+permutPvals <- permuteBetaPvalues(test.dt, pvalCol = 'norm.rank', splitCol = c('gene','first_peptide_idx'), ntimes = 1000)
+```
+
+```{r}
+# combine the pvalue significant hotsplots and visualize
+test.dt <- merge(test.dt, permutPvals, by=c('gene', 'first_peptide_idx'), all.x=T)
+test.dt <- merge(test.dt, filtered.site.ranks[, .(contrast, gene, first_peptide_idx, RRA_filtered_sitePval = V1)], by=c('contrast', 'gene', 'first_peptide_idx'), all.x=T)
+
+g <- ggplot(test.dt, aes(x=first_peptide_idx, y=abs(log2FoldChange))) +
+    geom_segment(aes(x=first_peptide_idx, xend=first_peptide_idx, y=0, yend=abs(log2FoldChange)), color="grey", alpha=0.6) +
+    geom_point(aes(shape=editor, fill=sig, alpha=0.6),size=2) +
+    geom_point(data=test.dt[FDR < 0.05,], aes(x=first_peptide_idx, y=-1, color=-log10(permutedPvals)), shape=17, size=3) +
+    geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    scale_color_viridis_c() +
+    xlab('amino acid residue') +
+    ylab('LFC') +
+    facet_wrap(~gene, scales='free', ncol=1) +
+    scale_shape_manual(values = 21:22) +
+    scale_fill_manual(values=c('not'='grey', 'up'='red', 'down'='blue')) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21), title='key'),
+           alpha = "none",
+           color = guide_legend(override.aes = list(shape =21) ))
+
+g
+```
+Now to put these functions togehter:
+want 
+i) given a datatable and a set of pvalues, produce the rankign
+
+```{r}
+# function to calculate beta scores; taken from the RobustRankAgg package
+#' Input is 
+betaScores <- function(r){
+	n <- sum(!is.na(r))
+	p <- rep(1, n)
+	r <- sort(r, na.last = TRUE)
+	p <- pbeta(r, 1:n, n - 1:n + 1)
+	return(p)
+} 
+
+#' Folded into the general RRA function to compute pvals of the rankings
+permuteBetaPvalues <- function(dt, pvalCol='pvalue', ntimes=100, splitCol=c('gene','first_peptide_idx')){
+  
+  pval.universe <- dt[[pvalCol]]
+  
+  truthSet <- dt[, .(RRA_sitePval), by=splitCol] %>% 
+    unique()
+  nGuides <- dt[, .(RRA_sitePval), by=splitCol] %>% 
+    .[,.N, by=splitCol]
+
+  message('Permuting p-values for beta scores')
+  
+  permMat <- sapply(1:ntimes, function(x){
+    # get the permuted set of pvalues per site 
+    permutSet <- sapply(nGuides$N, function(s){
+     # random set of pvalues/ 
+    #using normalized rank in this case as wont change (pval will still jave same ranking and scaling)
+     randomSet <- sample(pval.universe, s, replace=F)
+      
+     bScores.perm <- betaScores(randomSet)
+     rho.score <- which.min(bScores.perm)
+     return(bScores.perm[rho.score])
+    })
+  })
+  
+  logiMat <- permMat < truthSet$RRA_sitePval
+  # get the number of permutations that fall below the value detected in the Ori set 
+  permutedPvals <- apply(logiMat, 1, function(x){ sum(x)/length(x)})
+  return(as.data.table(cbind.data.frame(truthSet, permutedPvals)))
+}
+
+
+#' calculate robust rank aggregation to identify enriched genes/sites in an input data.frame of guides
+#' requires a pval column and column(s) to split the datatable on 
+calculateRRA <- function(dt, pvalCol=NULL, contrastCol=NULL, splitCol=NULL, pvalFilter=NA, ntimes=2){
+  
+  if( any(is.null(pvalCol) | is.null(splitCol) | is.null(contrastCol)) )
+    stop('You must specify pvalue,  grouping (splitCol) and contrast columns to perform the gene/site ranking')
+  
+  if (is.na(pvalFilter))
+    message('Using all pvalues in ranking calculation.\nAdjust pvalFilter if you wish to set a threshold')
+
+  allGroupings <- c(contrastCol, splitCol) %>% 
+    paste(., collapse=',')
+  
+  # loop through the contrasts and run individually
+  contrasts.oi <- unique(dt[[contrastCol]])
+  
+  allPerms.dt <- lapply(contrasts.oi, function(cont){
+    
+    message('Subsetting databtbable to ', cont, '...\n')
+    subdt <- dt[dt[[contrastCol]] == cont,]
+
+    message('Normalizing guide rankings per contrast..\n')
+    subdt[, rank.stat := rank(subdt[[pvalCol]]), by=contrastCol]
+    subdt[, norm.rank := rank.stat/.N, by=contrastCol]
+
+ 
+    #Robust rank aggregation; RRA scores
+    message('Computing beta scores and extracting minimum pval per group: ', paste(allGroupings, collapse=','),'..\n')
+    if (is.na(pvalFilter)){
+    
+      message('Using all pvalues in ranking calculation.\nAdjust pvalFilter if you wish to set a threshold\n')
+      site.ranks <- subdt[, betaScores(norm.rank), by=allGroupings] %>%
+        .[, .SD[which.min(V1)], by=allGroupings]
+  
+    } else {
+    
+      message('Filtering input pvalues at specified threshold ', pvalFilter, '\n')
+      # from my understanding of the manuscript the filtering is performed after rank is calculated, but the non-sig set are not used to compute beta scores 
+      site.ranks <- subdt[subdt[[pvalCol]] <= pvalFilter, betaScores(norm.rank), by=allGroupings] %>%
+        .[, .SD[which.min(V1)], by=allGroupings]
+    }
+    setnames(site.ranks, old='V1', new='Rho')   
+    
+    message('Running n=', ntimes, ' permutations to compute Rho p-values...')
+    
+    # taking all the normalized rankings as background for randomly sampling from
+    sampling.bg <- subdt$norm.rank
+  
+    truthSet <- site.ranks[, .(Rho), by=allGroupings] %>% 
+    unique()
+    # just extract the number of guides that hit each site
+    nGuides <- subdt[,.N, by=allGroupings]
+  
+    if ( all(truthSet[, -c('Rho')] != nGuides[, -c('N')]) )
+      stop('Stopping execution as mismatch in row orders of guide and Rho pvalue data tables.\nRevist and use setorder to match the groups' )
+    # ensure the orders of these objects match...
+  
+    # nested sapply functions to get a matrix of pvalues for each set
+    permMat <- sapply(1:ntimes, function(x){
+      #message('Running ',x, ' permutation..\n')
+      # take a random set of pvalues fromt the bg same size of the grouping 
+      permutSet <- sapply(nGuides$N, function(s){
+     
+      randomSet <- sample(sampling.bg, s, replace=F)
+      bScores.perm <- betaScores(randomSet)
+      rho.score <- which.min(bScores.perm)
+      return(bScores.perm[rho.score])
+      })
+    })
+    message('Computing pvalues values...')
+    # logical matrix
+    logiMat <- permMat < truthSet$Rho
+    
+    # get the proportion of permutations that fall below the original valuea
+    pvalue.permuted <- apply(logiMat, 1, function(x){ sum(x)/length(x)})
+    truthSet <- as.data.table(cbind.data.frame(truthSet, pvalue.permuted))
+    return(truthSet)
+  
+  # combine sets from each contrast  
+  }) %>% rbindlist()
+  
+  message('Returning permutation results for ', length(contrasts.oi), ' contrasts')
+  return(allPerms.dt)
+}
+
+  
+  
+  # taking all the normalized rankings as background for randomly sampling from
+  sampling.bg <- subdt$norm.rank
+  
+  truthSet <- site.ranks[, .(Rho), by=allGroupings] %>% 
+    unique()
+  # just extract the number of guides that hit each site
+  nGuides <- subdt[,.N, by=allGroupings]
+  
+  if ( all(truthSet[, -c('Rho')] != nGuides[, -c('N')]) )
+    stop('Stopping execution as mismatch in row orders of guide and Rho pvalue data tables.\nRevist and use setorder to match the groups' )
+  # ensure the orders of these objects match...
+  
+  # nested sapply functions to get a matrix of pvalues for each set
+  permMat <- sapply(1:ntimes, function(x){
+    #message('Running ',x, ' permutation..\n')
+    # take a random set of pvalues fromt the bg same size of the grouping 
+    permutSet <- sapply(nGuides$N, function(s){
+     
+     randomSet <- sample(sampling.bg, s, replace=F)
+     bScores.perm <- betaScores(randomSet)
+     rho.score <- which.min(bScores.perm)
+     return(bScores.perm[rho.score])
+     
+    })
+  })
+  logiMat <- permMat < truthSet$Rho
+  
+  # get the number of permutations that fell below the value detected in the Ori set 
+  pvalue.permuted <- apply(logiMat, 1, function(x){ sum(x)/length(x)})
+  truthSet <- as.data.table(cbind.data.frame(truthSet, pvalue.permuted))
+  return(truthSet)
+}
+
+rra.t <- calculateRRA(test.dt, pvalCol = 'pvalue', splitCol = c('gene', 'first_peptide_idx'), contrastCol = 'contrast', ntimes=10)
+```
+Test with a second contrast to see if our results are equivalent
+Also expand the sites so we map to each position; this will help us identify flanking sites
+so that guides hitting multiple sites are included...
+
+```{r}
+# expand all the sites
+de.expanded.dt <- de.dt[!is.na(nucelotide_position), lapply(.SD, function(x) unlist(tstrsplit(x, ";"))), .SDcols =c("peptide_position"), by=.(guide, editor, id, gene, baseMean, log2FoldChange, lfcSE, stat,pvalue, padj, sig, contrast, pep_mutant_id, mutant_type)] %>% 
+  unique()
+```
+Running the algorithm seperately, look for enrichment of lfc > 0 and lfc < 0 seperately
+```{r}
+# run the tests in seperately,
+up.mutHotspots.dt <- calculateRRA(dt=de.expanded.dt[log2FoldChange > 0,], pvalCol = 'pvalue', splitCol = c('gene', 'peptide_position'), contrastCol = 'contrast', ntimes=1000)
+up.mutHotspots.dt[, direction := 'up']
+
+down.mutHotspots.dt <- calculateRRA(dt=de.expanded.dt[log2FoldChange < 0,], pvalCol = 'pvalue', splitCol = c('gene', 'peptide_position'), contrastCol = 'contrast', ntimes=1000)
+down.mutHotspots.dt[, direction := 'down']
+
+all.mutHotspots.dt <- rbind(up.mutHotspots.dt, down.mutHotspots.dt)
+
+all.mutHotspots.dt[, fdr.permuted := p.adjust(pvalue.permuted, method='BH'), by=.(gene, contrast, direction)]
+
+# not many, but seems its the 22 hr vs control  that have the most hits
+all.mutHotspots.dt[fdr.permuted < 0.05,.N, by=.(direction,contrast)]
+```
+plot this 
+
+```{r}
+g <- ggplot(all.mutHotspots.dt[fdr.permuted < 0.1,.N, by=.(direction,contrast)], aes(x=contrast, y=N, fill=direction)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=c('down'='blue', 'up'='red')) +
+  ggtitle('Mutation hotspots per contrast') +
+  ylab('RRA FDR < 0.05)') +
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=90))
+
+g
+BackupAsPDF(g, 'nMutationHotspotsperContrast.barplot')
+
+
+g <- ggplot(all.mutHotspots.dt[fdr.permuted < 0.1,.N, by=.(direction,contrast, gene)], aes(x=gene, y=N, fill=direction)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=c('down'='blue', 'up'='red')) +
+  ggtitle('Mutation hotspots per contrast') +
+  ylab('RRA FDR < 0.05)') +
+  facet_wrap(~contrast) +
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=90))
+
+g
+BackupAsPDF(g, 'nMutationHotspotsperContrast.geneFacet.barplot')
+
+
+g <- ggplot(all.mutHotspots.dt[fdr.permuted < 0.05 & gene =='PTEN',.N, by=.(direction,contrast)], aes(x=reorder(contrast,N), y=N, fill=direction)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=c('down'='blue', 'up'='red')) +
+  ggtitle('PTEN mutation hotspots') +
+  ylab('RRA FDR < 0.05)') +
+  theme_bw() + 
+  theme(axis.text.x=element_text(angle=90))
+
+g
+BackupAsPDF(g, 'PTENnMutationHotspotsperContrast.barplot')
+```
+Write out the RRA results per contrast to file
+```{r}
+#fwrite(all.mutHotspots.dt, ScriptAndDatedFileName('RRA.bothDirections.residues.1000permutations.csv'))
+all.mutHotspots.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/112124_mutantHotspots_data/2024_11_27_RRA.bothDirections.residues.1000permutations.csv')
+
+#fwrite(dcast(all.mutHotspots.dt, contrast+gene+peptide_position~direction, value.var = c('Rho','pvalue.permuted','fdr.permuted')), ScriptAndDatedFileName('RRA.bothDirections.residues.1000permutations.wide.csv'))
+all.mutHotspots.wide.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/112124_mutantHotspots_data/2024_11_27_RRA.bothDirections.residues.1000permutations.wide.csv')
+
+# merge the results with the de.dt, and want to plot the results for each contrast...
+de.expanded.dt[, peptide_position := as.numeric(peptide_position)]
+
+merge.dt <- merge(de.expanded.dt, all.mutHotspots.wide.dt, by=c('contrast', 'gene', 'peptide_position'))
+```
+
+Lets the different contrasts and facet by gene
+If we dont see much interesting beyond PTEN, just plot PTEN seperately
+
+Share these, see if Ronald like this type of plot and then we can see if 
+```{r}
+merge.dt[, reduced.sig := 'not']
+merge.dt[pvalue < 0.005 & abs(log2FoldChange) > 1, reduced.sig := ifelse(log2FoldChange > 0, 'up', 'down')]
+
+lapply(unique(merge.dt$contrast), function(x){
+  
+  # filter to the set we are looking at right now
+  sub.dt <- merge.dt[contrast == x,]
+
+  g <- ggplot(sub.dt, aes(x=peptide_position, y=abs(log2FoldChange))) +
+  geom_point(aes(shape=editor, fill=reduced.sig, alpha=0.6),size=2) +
+  geom_point(data=sub.dt[fdr.permuted_up <= 0.05,], aes(x=peptide_position, y=-0.5), shape=17, color='red', size=3, alpha=0.6) +
+  geom_point(data=sub.dt[fdr.permuted_down <= 0.05,], aes(x=peptide_position, y=-0.5), shape=18, color='blue', size=3, alpha=0.6) +
+  # add the trianges above and below for hotspots 
+  geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  ggtitle(x) +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  facet_wrap(~gene, ncol=1, scales='free_x') +
+  #scale_fill_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  scale_fill_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  scale_shape_manual(values = 21:22) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold")) +
+  guides(fill = guide_legend(override.aes = list(shape =21), title='significance (abs(LFC) > 1 & pval < 0.005)'),
+          alpha = "none",
+          color = guide_legend(override.aes = list(shape =21) ))
+
+  g
+ BackupAsPDF(g, paste0('tileplots/mutantHotspots_anno/', x,'.LFC.hotspotAnno.tileplot'), dimensions=c(16,12)) 
+})
+
+```
+## 120424
+Identify the sites that are significantly disrupted (up and downregulated), take a look at the high scoring AF PPI and identify if any of these disrupted regions overlap with these sites
+Taking the merge.dt set from above combined from the de.expanded and the wide format permute output
+
+
+# taking the max scoring site for PTEN and PIK3CA, use these to color the high scoring chimeraX models
+```{r}
+upreg.set <- merge.dt[fdr.permuted_up <= 0.05 & gene %in% c('PTEN', 'PIK3CA'), .(contrast, gene, peptide_position, log2FoldChange, pvalue, fdr.permuted_up)] %>% 
+  .[,.SD[which.max(log2FoldChange)], by=.(contrast,gene,peptide_position)]
+
+downreg.set <- merge.dt[fdr.permuted_down <= 0.05 & gene %in% c('PTEN', 'PIK3CA'), .(contrast, gene, peptide_position, log2FoldChange, pvalue, fdr.permuted_down)] %>% 
+  .[,.SD[which.min(log2FoldChange)], by=.(contrast,gene,peptide_position)]
+
+fwrite(upreg.set, ScriptAndDatedFileName('pten.pik3ca.upregulatedSites.topScores.csv'))
+fwrite(downreg.set, ScriptAndDatedFileName('pten.pik3ca.downregulatedSites.topScores.csv'))
+```
+
+
+```{r}
+# geom mean of pval and LFC will be our statistic for ranking
+test.dt[, gm_lfc.pval :=  (-log10(pvalue) + abs(log2FoldChange))/2]
+test.dt[, rank.stat := rank(-gm_lfc.pval), by=.(contrast)] # guides ranked by lfc+pval
+test.dt[, norm.rank :=  rank.stat/.N, by=.(contrast)] 
+
+
+
+#Robust rank aggregation; RRA scores
+site.ranks <- test.dt[, betaScores(norm.rank), by=.(contrast, gene, first_peptide_idx)] %>% # get the 
+  # sig score of site is the minimum pval of the vector
+  .[, .SD[which.min(V1)], by=.(contrast, gene, first_peptide_idx)] %>% 
+  .[order(gene, first_peptide_idx),]
+
+# assign sgRNAs randomly to each site (but the number of sgRNA does not change)
+permuteBetaPvalues <- function(dt, pvalCol='pvalue', ntimes=100, splitCol=c('gene','first_peptide_idx')){
+  
+  pval.universe <- dt[[pvalCol]]
+  
+  truthSet <- dt[, .(RRA_sitePval), by=splitCol] %>% 
+    unique()
+  nGuides <- dt[, .(RRA_sitePval), by=splitCol] %>% 
+    .[,.N, by=splitCol]
+
+  message('Permuting p-values for beta scores')
+  
+  permMat <- sapply(1:ntimes, function(x){
+    # get the permuted set of pvalues per site 
+    permutSet <- sapply(nGuides$N, function(s){
+     # random set of pvalues/ 
+    #using normalized rank in this case as wont change (pval will still jave same ranking and scaling)
+     randomSet <- sample(pval.universe, s, replace=F)
+      
+     bScores.perm <- betaScores(randomSet)
+     rho.score <- which.min(bScores.perm)
+     return(bScores.perm[rho.score])
+    })
+  })
+  
+  logiMat <- permMat < truthSet$RRA_sitePval
+  # get the number of permutations that fell below the value detected in the Ori set 
+  permutedPvals <- apply(logiMat, 1, function(x){ sum(x)/length(x)})
+  return(as.data.table(cbind.data.frame(truthSet, permutedPvals)))
+}
+
+
+calculateRRA()
+```
+
+not used...
+```{r}
+gene.summary<- fread('./101524_MAGECKContrasts_firstPass_data/DETesting_res/abe8e_Alpelisib_22-vs-abe8e_librep_0.gene_summary.txt')
+gene.summary[num > 1]
+```
+
+```{r}
+test.dt<- de.dt[contrast== 'Alpelisib_22_vs_LibraryRep_0' & !is.na(first_peptide_idx), ]
+
+# rank pvalues and normalize by the n guides
+test.dt[, rank.pval := rank(pvalue), by=.(editor, contrast)]
+test.dt[, norm.rank :=  rank.pval/.N, by=.(contrast, editor)] 
+
+```
+
+
+```{r}
+library(RobustRankAggreg)
+
+test.dt[, .(mean(log2FoldChange, na.rm=T)), by=.(gene)]
+test.dt<- de.dt[contrast== 'Alpelisib_22_vs_LibraryRep_0' & !is.na(first_peptide_idx), ]
+
+# rank pvalues and normalize by the n guides
+test.dt[, rank.pval := rank(pvalue), by=.(editor, contrast)]
+test.dt[, norm.rank :=  rank.pval/.N, by=.(contrast, editor)] 
+
+
+
+
+ggplot(test.dt, aes(x=norm.rank, fill=gene)) +
+  geom_histogram(alpha=0.3, boundary=c(0))
+
+test.dt[,.N, by=.(editor, contrast)]
+test.dt
+
+getRRA <-  function(dt, split){
+  
+  M <- dt[,.N ]
+  
+}
+
+
+
+rankMatrix(cellCycleKO$gl, N = cellCycleKO$N) %>% colnames()
+data(cellCycleKO)
+
+rankMatrix(split(test.dt$norm.rank, test.dt$first_peptide_idx))
+# ok ranks follow a normal distirbution 
+hist(test.dt$norm.rank)
+
+# now we want to use robust rank aggregation to rank the positions in the protein
+test.dt[order(rank.pval), .(pvalue, first_peptide_idx)]
+
+
+)]
+pbeta(test.dt[order(pvalue), norm.rank], 1:631, 631 - 1:631 + 1)
+betaScores(test.dt[order(rank.pval), norm.rank])
+
+
+test.dt[order(rank.pval), norm.rank]
+
+help(beta)
+
+
+
+rankMatrix(split(test.dt$first_peptide_idx, test.dt$guide), N=lapply(split(test.dt$first_peptide_idx, test.dt$guide), function(x) length(x)))
+
+
+# rank our gene lists; is this a set of positions with the pvalues in eachs set?
+split(test.dt$pvalue, test.dt$first_peptide_idx)
+
+split(test.dt[editor == 'abe8e', pvalue], test.dt[editor == 'abe8e', first_peptide_idx])
+
+
+split(test.dt$first_peptide_idx, test.dt$pvalue))test.dt[order(rank.pval), pvalue]
+
+betaScores(test.dt[order(rank.pval), norm.rank])
+test.dt[order(rank.pval), pvalue]
+
+test.dt[first_peptide_idx == 1,]
+ split(test.dt$sig, test.dt$first_peptide_idx)
+
+test.dt[pvalue < 0.05 & abs(log2FoldChange) > 1, unique(first_peptide_idx)]
+aggregateRanks(glist = test.dt[pvalue < 0.05 & abs(log2FoldChange) > 1, split(test.dt$pvalue, test.dt$first_peptide_idx), N = length(unique(test.dt$guide)))
+
+# so we need a named list, with each list and element and pvalurs the index
+rankMatrix(test.dt$first_peptide_idx, N =  length(unique(test.dt$guide)))
+```
+
+```{r}
+
+
+cellCycleKO$gl
+data(cellCycleKO)
+r = rankMatrix(cellCycleKO$gl, N = cellCycleKO$N)
+ar = aggregateRanks(rmat = r)
+head(ar)
+
+plot(test.dt$first_peptide_idx, (test.dt$gm_lfc.pval))
+lines(ksmooth(test.dt$first_peptide_idx, (test.dt$gm_lfc.pval), "normal", bandwidth = 5), col=2)
+```
+
+
+**Notes**
+Ranking the sgRNA pvalues per position
+
+First, per postion(equivalent of gene) rank the pvalures
+Normalize ranks into percentiles
+Use the RRA algorithm to rank the sites individually, then we can check if adjacent sites havea. good rank/score

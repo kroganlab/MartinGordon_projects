@@ -1,0 +1,405 @@
+---
+title: "5min_talk_plots"
+author: "Martin Gordon"
+date: "2024-07-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Generate some plots for the 5 minute AViDD talk
+Just read in the original data and rename the groups
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(hrbrthemes)
+library(viridis)
+library(ggbeeswarm)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj
+library(scales)
+library(seqinr) # reading fasta files
+library(RColorBrewer)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+Read in the abundance data
+
+```{r}
+spec <- fread('/Users/martingordon/Documents/projects/052924_ARichards_AViDD_Murine/data/MPro_Lung_052324/061224/v2/20240615_143854_AVD3_APdb_061524_Report.tsv')
+
+spec[,.N, by=.(Condition,BioReplicate,Run)] # Nirm 4d 5  seems to be missing
+
+spec <- spec[!Condition %in% c("x4673_2d", "x4673_4d" ,"x4673_7d"),]
+```
+
+Need to tidy names in the two files 
+
+Drop junk measurements on the left shoulder
+```{r}
+# no multiple feature peptide ions detected
+spec[,.N, by=.(PeptideSequence,PrecursorCharge,Run)][N >1]
+
+hist(log2(spec$Intensity))
+spec.dt <- spec[Intensity > 2^4,]
+hist(log2(spec.dt$Intensity))
+```
+
+Lets rename the conditions
+
+```{r}
+spec.dt[Condition == 'mock', Condition := 'Mock']
+spec.dt[Condition %like% 'V_', Condition := gsub('V_', 'Vehicle_', Condition)]
+spec.dt[Condition %like% 'Nirm_', Condition := gsub('Nirm_', 'Treatment1_', Condition)]
+spec.dt[Condition %like% 'x4516', Condition := gsub('x4516', 'Treatment2_', Condition)]
+spec.dt$Condition %>%  unique()
+```
+
+Normalize to the protein level and plot
+
+```{r}
+mssInput <- spec.dt[,  IsotopeLabelType := 'L']
+
+ggplot(spec.dt, aes(x=paste0(Condition, BioReplicate), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  theme(axis.text.x=element_text(angle=90))
+```
+
+
+```{r}
+dp.out <- MSstats::dataProcess(mssInput, 
+                              MBimpute =  FALSE, 
+                              normalization = 'EQUALIZEMEDIANS',
+                              featureSubset = "highQuality", 
+                              remove_uninformative_feature_outlier = TRUE)
+```
+
+plot protein level data
+
+```{r}
+p.quant <-  setDT(dp.out$ProteinLevelData)
+
+p.quant[GROUP %like% 'Treatment2', GROUP := gsub('Treatment2_', 'Treatment2', GROUP)]
+p.quant[, GROUP := as.factor(GROUP)]
+
+ggplot(p.quant, aes(x=paste0(GROUP, SUBJECT), y=LogIntensities, fill=GROUP)) +
+  geom_boxplot() +
+  theme(axis.text.x=element_text(angle=90))
+
+```
+Lets add a second round of normalization
+Try TMP or median subtraction
+
+```{r}
+p.mat <- dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+tmp <- medpolish(p.mat, na.rm = T)
+
+tmp.dt <- data.table(sample = names(tmp$col),
+                     offSet = tmp$col)
+
+p.quant[,sample := interaction(GROUP,SUBJECT)]
+
+p.quant <- merge(p.quant, tmp.dt, by='sample', all.x=T)
+
+p.quant[, newLogInts := LogIntensities - offSet]
+```
+
+```{r}
+ggplot(p.quant, aes(x=paste0(GROUP, SUBJECT), y=newLogInts, fill=GROUP)) +
+  geom_boxplot() +
+  theme(axis.text.x=element_text(angle=90))
+```
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(p.quant$GROUP)))
+
+p.mat <- dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+p.mat <-  p.mat[complete.cases(p.mat),]
+
+submat <- sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T))
+
+# create annotation
+ann <- data.table(treatment=sub("[_.].+", "", colnames(p.mat)),
+                  timepoint=ifelse(grepl("[0247]d", colnames(p.mat)), str_extract(colnames(p.mat), "[0247]d"), 'NA'))
+
+colours <- list('timepoint' = c('NA' = '#4477AA', '2d'="#228833", '4d'="#CCBB44", '7d'='#EE6677'),
+                'treatment' =c('Mock' = col.pal[1], 'Vehicle'=col.pal[2], 'Treatment1'=col.pal[3],  'Treatment2'=col.pal[5])
+                )
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+hm <- Heatmap(submat, 
+        border=T,
+        name='Ints./Median',
+        top_annotation = colAnn,
+        cluster_column_slices = F,
+        cluster_columns=F,
+        show_row_names = F,
+        column_title_gp = gpar(font='bold', fontsize=8),
+        column_names_gp = gpar(font='bold', fontsize=5),
+        column_split = gsub('_[247]{1}[0-9]{1}$|[0-9]{1}$', '', colnames(submat)))
+
+
+BackupAsPDF(hm, 'medianScaled.heatmap', dimensions=c(11,9))
+
+#subtract vs mock values
+submat <- sweep(p.mat,1, apply(p.mat[, colnames(p.mat) %like% 'Mock'], 1, median,na.rm=T))
+
+
+hm <- Heatmap(submat, 
+        border=T,
+        name='Ints/Mock',
+        top_annotation = colAnn,
+        cluster_column_slices = F,
+        cluster_columns=F,
+        show_row_names = F,
+        column_title_gp = gpar(font='bold', fontsize=8),
+        column_names_gp = gpar(font='bold', fontsize=5),
+        column_split = gsub('_[247]{1}[0-9]{1}$|[0-9]{1}$', '', colnames(submat)))
+
+hm
+BackupAsPDF(hm, 'vsMock.heatmap', dimensions=c(11,9))
+```
+Create a PCA of this plot
+
+```{r}
+pcaOut <- prcomp(t(p.mat))
+
+ann[, colname := colnames(p.mat)]
+ann[, group := paste0(treatment,'.',timepoint)]
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, ann, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = timepoint)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle(sprintf ("PCA using %d features (log intensity)", nrow(p.mat))) +
+  #scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'proteins.groupandtimepoint.pca', dimension=c(10,8))
+```
+Run PCA batch correction and replot the two heatmaps side-by-side
+
+```{r}
+p.mat <- dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+p.mat <-  p.mat[complete.cases(p.mat),]
+
+# order samples by PC1
+col.order <- pcaDT[order(PC1), rn]
+
+p.mat <- p.mat[, col.order]
+submat <- sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T))
+```
+
+Visualise the data
+
+```{r}
+# create annotation
+ann <- data.table(treatment=sub("[_.].+", "", colnames(p.mat)),
+                  timepoint=ifelse(grepl("[0247]d", colnames(p.mat)), str_extract(colnames(p.mat), "[0247]d"), 'NA'))
+
+colours <- list('timepoint' = c('NA' = '#4477AA', '2d'="#228833", '4d'="#CCBB44", '7d'='#EE6677'),
+                'treatment' =c('Mock' = col.pal[1], 'Vehicle'=col.pal[2], 'Treatment1'=col.pal[3],  'Treatment2'=col.pal[5])
+                )
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+
+hm <- Heatmap(submat, 
+        border=T,
+        name='Ints/Median',
+     #   top_annotation = colAnn,
+        cluster_column_slices = F,
+        cluster_columns=F,
+        show_row_names = F,
+        column_title_gp = gpar(font='bold', fontsize=8),
+        column_names_gp = gpar(font='bold', fontsize=5),
+        column_split = gsub('_[247]{1}[0-9]{1}$|[0-9]{1}$', '', colnames(submat)))
+
+hm
+
+```
+Subtract the PC1 and visualize side-by-side
+
+```{r}
+# recover the first pc matrix by the protein loadings to recover the original matrix
+pc1.mat <- pcaOut$x[,1] %*% t(pcaOut$rotation[,1])
+pc1.mat <- t(pc1.mat) 
+
+
+Heatmap(pc1.mat,row_order = row.order, show_row_names = F)
+
+colnames(pc1.mat) <- colnames(p.mat)
+
+smooth.mat <- p.mat - pc1.mat
+
+smooth.clean.mat <- sweep(smooth.mat, 1, apply(smooth.mat, 1, median, na.rm=T))
+
+Heatmap(smooth.clean.mat, row_order = row.order, cluster_columns = F, show_row_names = F)
+
+
+hm + Heatmap(smooth.clean.mat, 
+        border=T,
+        name='Smoothed Ints/Median',
+        row_order = row.order,
+        cluster_column_slices = F,
+        cluster_columns=F,
+        show_row_names = F,
+        column_title_gp = gpar(font='bold', fontsize=8),
+        column_names_gp = gpar(font='bold', fontsize=5),
+        column_split = gsub('_[247]{1}[0-9]{1}$|[0-9]{1}$', '', colnames(submat)))
+
+
+hm
+
+```
+
+
+
+
+Run PCA batch correction and replot 
+
+vok, now we have imputed the missing values, lets see if we can detect the latent batch variables using sva
+```{r}
+library(sva)
+
+metadata <- p.quant[, .(sample = interaction(GROUP,SUBJECT),
+                        GROUP = factor(GROUP),
+                        status = gsub('[_].+$', '', GROUP), 
+                        day=ifelse(GROUP != 'Mock', str_extract(GROUP, '[247]d'), 'NA') )] %>%  unique()
+
+
+#create full model inc. explanatroy variables and null model with just uninteresting var (unknown so just inlcude intercept model)
+mod <- model.matrix(~GROUP, data=metadata)
+mod0 <- model.matrix(~1, data=metadata)
+```
+Run SVA; estimate batch and other artifacts in the expression matrix
+Estimated only 1 latent variable that explains variance... 
+```{r}
+n.sv <- num.sv(p.mat, mod, method='leek')
+
+svobj <- sva(p.mat, mod, mod0, n.sv)
+
+
+batch.dt <- data.table(sample=colnames(p.mat),
+                       GROUP=gsub('[.][0-9]$','', colnames(p.mat)),
+                       sva=svobj$sv[1:57,])
+
+## subtracting the latent batch variable from the expression method
+## form here: https://www.biostars.org/p/262616/
+## solving a least squares problem to find the coefficients (alpha) that quantify the contribution of surrogate variables to the observed data. 
+# This involves matrix transposition, multiplication, and inversion to achieve the solution efficiently using linear algebra.
+
+svaBatchCor <- function(dat, mmi, mm0,n.sv=NULL){
+    dat <- as.matrix(dat)
+    Y <- t(dat)
+    library(sva)
+    if(is.null(n.sv))   n.sv <- num.sv(dat,mmi,method="leek")
+    o <- sva(dat,mmi,mm0,n.sv=n.sv)
+    W <- o$sv
+    alpha <- solve(t(W) %*% W) %*% t(W) %*% Y
+    o$corrected <- t(Y - W %*% alpha)
+    return(o)
+}
+
+batchCor <- svaBatchCor(p.mat, mmi=mod, mm0=mod0, n.sv=1)
+
+corrected.sub <- sweep(batchCor$corrected, 1, apply(batchCor$corrected, 1, median, na.rm=T))
+
+ht <- Heatmap(corrected.sub, 
+        border=T,
+        name='Smoothed Ints./Mock',
+       # top_annotation = colAnn,
+        cluster_column_slices = F,
+        cluster_columns=F,
+        show_row_names = F,
+        column_title_gp = gpar(font='bold', fontsize=8),
+        column_names_gp = gpar(font='bold', fontsize=5),
+        column_split = gsub('_[247]{1}[0-9]{1}$|[0-9]{1}$', '', colnames(submat)))
+
+ht
+hm + ht
+
+
+BackupAsPDF(hm, 'vsMock.corrected.heatmap', dimensions=c(11,9))
+```
+
+```{r}
+pcaOut <- prcomp(t(corrected.mat))
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+pcaDT
+pcaDT <- merge (pcaDT, ann, by.x = "rn", by.y = "colname", all.x = TRUE)
+pcaDT <- merge(pcaDT, batch.dt, by.x='rn', by.y='sample', all.x=T)
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = timepoint)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  #scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'proteins.svaCol.pca',  dimension=c(10,8))
+
+
+```
+
+PCA of the corrected matrix
+
+```{r}
+
+```
+

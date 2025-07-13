@@ -1,0 +1,323 @@
+---
+title: "070825_CCprofiler_retryPrepInput"
+author: "Martin Gordon"
+date: "2025-07-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Rerun of CCprofiler input preparation for the D2  sample from the MSS summarization.
+Limit this to D2 only, compare to thetest dataset examples 
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(viridis)
+library(pracma)
+library(magick)
+library(eulerr)
+library(CCprofiler)
+library(parallel)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+
+Read in the procesed peptide level data (with mods and precursor charge available)
+Subset to donor2 samples
+```{r}
+feat.dt <- fread('061625_D3_MSstatsSmmarization_data/2025_07_01_hiv.d123.mss.feature.csv.gz')
+
+feat.dt <- feat.dt[grepl('_2$', sample)]
+```
+
+Check for isoforms, weird IDs and drop if necessary
+Ensure peptide sequence does not map to more than one proein
+
+```{r}
+feat.dt <- feat.dt[!grepl(';', protein)]
+feat.dt[, length(unique(protein)), by=sequence][V1 > 1]
+
+# combine the sequence with precursor charge to see fi this removes the duplicates
+feat.dt[, pep.id := paste0(sequence, '.', precursorCharge)]
+multi.mapping.peps <- feat.dt[, length(unique(protein)), by=.(pep.id)][V1 > 1, unique(pep.id)]
+
+feat.dt <-  feat.dt[!pep.id %in% multi.mapping.peps]
+```
+
+tidy the feat.id, and compare to the test data input 
+```{r}
+feat.dt <- feat.dt[, .(protein_id=protein, peptide_id=pep.id, filename=paste0(sample, '_', fraction), intensity)]
+ccp.test.in <- examplePCPdataLong
+
+# look good!
+str(ccp.test.in)
+str(feat.dt)
+```
+Only missing fraction is fraction3 in infected, which is not an informative fraction.
+To simplify, just remove fraction3 and rename fract1-71
+```{r}
+feat.dt[, c('condition', 'replicate', 'fraction') := tstrsplit(filename, '_', keep=c(1,2,3))]
+feat.dt[, sample := paste0(condition, '_', replicate)]
+
+# infected is missing fraction3... instead of imputing all these 0 for different proteins (lets keep data implicit missing like input), we will drop fraction 3 from the other samples
+feat.dt <- feat.dt[fraction != 3,]
+# reset names; important for CCprofiler internally
+feat.dt[, new.fraction := as.numeric(fraction)]
+feat.dt[new.fraction > 2, new.fraction := new.fraction - 1]
+feat.dt[fraction != new.fraction, .(sample, fraction, new.fraction)] %>% 
+  unique()
+
+
+feat.dt <- feat.dt[, .(protein_id, peptide_id, filename=paste0(sample, '_', new.fraction), intensity)]
+```
+mw calibration file
+```{r}
+mw.dt <- fread("./data/HIV_Infection_CD4T_cells/SEC_Profiles/D1-D3-cal_SRT.txt")
+setnames(mw.dt, new=c('std_elu_fractions', 'std_weights_kDa'))
+mw.dt <- mw.dt[, .(std_weights_kDa, std_elu_fractions)]
+
+calibration = calibrateMW(mw.dt,
+                          PDF=T,
+                          plot=TRUE)
+```
+
+Generate the fraction annotation from the peptide dt
+
+```{r}
+ccp.anno.in <- exampleFractionAnnotation
+ccp.anno.in
+
+anno.dt <- feat.dt[, .(filename)] %>% 
+  unique()
+
+anno.dt[, c('condition_id', 'replicate_id', 'fraction_number') := tstrsplit(filename, '_', keep=c(1,2,3))]
+anno.dt[, fraction_number := as.integer(fraction_number)]
+anno.dt <- anno.dt[, .(filename, fraction_number, condition_id, replicate_id)]
+```
+PPrepare the design object.. will need later
+```{r}
+design.dt <- anno.dt[, .(Sample_name=sub('_[0-9]{1,2}$' , '', filename),
+                         Condition=condition_id,
+                         Replicate=as.integer(replicate_id)
+                         )] %>% 
+  unique()
+```
+
+ both look good, write the output to file 
+
+```{r}
+fwrite(design.dt, ScriptAndDatedFileName('hiv.d2.ccprofiler.designMat.csv'))
+fwrite(anno.dt, ScriptAndDatedFileName('hiv.d2.ccprofiler.fractionAnnotation.csv.gz'))
+fwrite(feat.dt, ScriptAndDatedFileName('hiv.d2.ccprofiler.featureIntensities.rmfract3.csv.gz'))
+```
+
+Create the CCprofiler `tracelist` object
+
+```{r}
+cores <- parallel::detectCores() - 2
+
+samples <- sub('_[0-9]{1,2}$' , '', anno.dt$filename) %>% 
+  unique()
+
+traces_list <- pbapply::pblapply(samples, function(x){
+  message(x) #just need these two cols I think
+  ann <- anno.dt[grepl(x, filename), .(filename, fraction_number)]
+  setkey(ann,fraction_number) # order by fract number 
+  
+  pep.in <- feat.dt
+  data <- pep.in[grepl(x, filename),]
+  data <- merge(data, ann, by=c("filename"))
+  setkey(data,fraction_number)
+  data[, fraction_number:= NULL]
+
+  traces <- importPCPdata(input_data=data, fraction_annotation=ann)
+  return(traces)
+}, cl=cores)
+
+names(traces_list) = samples
+class(traces_list) <- "tracesList"
+
+saveRDS(traces_list, ScriptAndDatedFileName('hiv.d2.features.traces.rds'))
+traces_list <- readRDS('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/070825_CCprofiler_retryPrepInput_data/2025_07_08_hiv.d2.features.traces.rds')
+```
+trace annotation file, use the ids that overlap with what e have 
+```{r}
+idMapper <- fread('/Users/martingordon/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/062325_HIV.d123.ccprofiler.diffAnalysis_data/2025_06_23_id.mappers.csv.gz')
+id.anno <- unique(idMapper[,.(protein_id=protein, gene, org, mw_da=mw)])
+
+# avoid trying to annotations toproteins missing from traces obj or will fail 
+overlap <- intersect(id.anno$protein_id, feat.dt$protein)
+id.anno <- id.anno[protein_id %in% overlap]
+
+id.anno <- id.anno[gene != 'NaN'] # all of the isoforms? What can I do with these? drop fro now..
+#id.anno <- id.anno[!grepl(';', protein)]
+
+# only one repcord per uniprot; not perfect, but unfortunately 
+id.anno <- id.anno[,.SD[1], by=protein_id]
+
+id.anno[protein_id == 'P10746']
+
+multi.mappers <- id.anno[,.N, by=protein_id][N>1, unique(protein_id)]
+
+id.anno[protein_id %in% multi.mappers][order(protein_id)]
+
+# tidy the multimappers as there are only afew
+id.anno <- id.anno[!gene %in% c('C7orf50', 'Mgu')]
+id.anno <- id.anno[mw_da != '71369.14']
+```
+
+```{r}
+traces_list <- annotateTraces(traces=traces_list,
+                            trace_annotation=id.anno,
+                            traces_id_column = "protein_id",
+                            trace_annotation_id_column = "protein_id",
+                            trace_annotation_mass_column = "mw_da",
+                            uniprot_mass_format = FALSE,
+                            replace_whitespace = TRUE)
+```
+
+# annotate the MW
+```{r}
+traces_list <- annotateMolecularWeight(traces_list, calibration)
+```
+
+save input for QC & processing 
+```{r}
+saveRDS(traces_list, ScriptAndDatedFileName('hiv.d2.features.traces.annotated.rds'))
+```
+
+*NOT USED*
+Missing fractions in the D2 samples; 'impute' these missing fractions and allow `CCprofiler` to interpolate the values
+```{r}
+feat.dt[, c('condition', 'replicate', 'fraction') := tstrsplit(filename, '_', keep=c(1,2,3))]
+feat.dt[, sample := paste0(condition, '_', replicate)]
+
+
+feat.allfract.dt <- lapply(split(feat.dt, feat.dt$sample), function(x){
+  
+  fractions <- seq(1,72,1) # edit this to the N fractions in your data
+  
+  mat <- dcast(x, paste0(protein_id,'__',peptide_id) ~ fraction, value.var='intensity') %>% 
+    as.matrix(rownames=1)
+  mat <- mat[, match(fractions, colnames(mat)), drop=FALSE]
+
+  colnames(mat) <- fractions # remove NA
+  dt <- setDT(reshape2::melt(mat))
+  setnames(dt, c('sequence', 'fraction', 'intensity'))
+  return(dt)
+}) %>% rbindlist(idcol='sample')
+
+
+feat.allfract.dt[, c('protein', 'peptide_id') := tstrsplit(sequence, '__', keep=c(1,2))]
+feat.allfract.dt[, sequence:= NULL]
+
+# tidy this input and c
+feat.allfract.dt
+feat.dt[, unique(fraction), by=sample][order(V1)][,.N , by=V1][N<3]
+
+# infected is missing fraction3... instead of imputing all these 0 for different proteins (lets keep data implicit missing like input), we will drop fraction 3 from the other samples
+feat.dt <- feat.dt[fraction != 3,]
+# reset names; important for CCprofiler internally
+feat.dt[, new.fraction := as.numeric(fraction)]
+feat.dt[new.fraction > 2, new.fraction := new.fraction - 1]
+feat.dt[fraction != new.fraction, .(sample, fraction, new.fraction)] %>% 
+  unique()
+
+
+feat.dt <- feat.dt[, .(protein_id=protein, peptide_id=pep.id, filename=paste0(sample, '_', fraction), intensity)]
+
+# no missing values... see what NA gives ups in our input 
+ccp.test.in[is.na(intensity),]
+
+
+
+```
+
+
+
+
+
+If we want to convert from spec format to unimod, we can use this but need to create a conversion table first....
+```{r}
+test <- 'ITVVGVGQVGM[Oxidation (M)]AC[Carbamidomethyl (C)]AISILGK.2'
+
+spec.mods.vec <- unique(unlist(base::regmatches(test, gregexpr("\\[.*?\\]", test))))
+# then we want to match these and gsub fromthe conversion table
+ 
+
+# maybe not NB, but may want to convert the spectronaut mod to the unimod format
+# see BP function, otherwise culd use a datatable for conversion
+convertModificationFormat <- function(specModSequence, mods=c("PH", "UB", "CAM", "MOX", "NAC"), convertMassFormats = FALSE){
+  result <- specModSequence
+  specFormats <- list (PH='([STY])[[(]Phospho \\(STY\\)[])]',
+                       UB='(K)[[(]GlyGly \\(K\\)[])]',
+                       CAM = '([C])[[(]Carbamidomethyl \\(C\\)[])]',
+                       MOX = '([M])[[(]Oxidation \\(M\\)[])]',
+                       NAC =  '([A-Z_])[[(]Acetyl \\(Protein N-term\\)[])]')
+  
+  massFormats <- c(MOX = "(.)\\[15.9949\\]",
+                   CAM = "(.)\\[57.0215\\]",
+                   PH = "(.)\\[79.9663\\]",
+                   NAC = "n\\[42.0106\\](.)")
+  
+  
+  artmsFormats <- list (PH='\\1\\(ph\\)',
+                        UB='\\1\\(gl\\)',
+                        CAM = '\\1\\(cam\\)',
+                        MOX = '\\1\\(ox\\)',
+                        NAC = '\\1\\(ac\\)')
+  stopifnot(names(specFormats)==names(artmsFormats))
+  for (mod in mods){
+    if (mod %in% names(specFormats)){
+      result <- gsub(specFormats[[mod]], artmsFormats[[mod]], result)
+    }else (stop("I don't know how to deal with requested mod: ", mod))
+  }
+  
+  if (convertMassFormats){
+    # mass of UB is not yet known...
+    for (mod in mods){
+      if (mod %in% names(massFormats)){
+        result <- gsub(massFormats[[mod]], artmsFormats[[mod]], result)
+      }else (message("I don't yet know how to deal with mod: ", mod))
+    }
+  }
+  
+  return (result)
+}
+```
+
+
+
+
+```{r}
+
+fread('./data/HIV_Infection_CD4T_cells/Fasta/HIV_UP000098604_Plasmid_2025_04_05.fasta')
+help(read.fasta)
+uni.txt <- seqinr::read.fasta('./data/HIV_Infection_CD4T_cells/Fasta/HIV_UP000098604_Plasmid_2025_04_05.fasta', as.string=TRUE, seqtype='AA')
+
+
+names(uni.txt) %>% length()
+
+grep('P68032|P60709', names(uni.txt))
+uni.txt %>% names()
+```
+

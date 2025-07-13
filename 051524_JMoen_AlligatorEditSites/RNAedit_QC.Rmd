@@ -1,0 +1,156 @@
+---
+title: "Alligator RNAEdits"
+author: "Martin Gordon"
+date: "2024-05-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## packages
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+source("../../utils/bp_utils/ManageScriptData.R")
+```
+Combine the individual dts into one large datatable
+
+```{r}
+files <- dir(path='./data/filtered/', pattern='*filtered.tsv', recursive = T, full.names = T)
+files
+files.list <- lapply(files, fread, header=F)
+names(files.list) <- gsub("(?<=[.][0-9]{1}).+", "", gsub('./data/filtered//|.reditools.filtered.tsv|_table','',files), perl = T)
+
+# remove data tables with no values
+files.list <- files.list[sapply(files.list, nrow) > 0]
+
+edits.dt <- rbindlist(files.list, idcol='sample', fill=T)
+```
+
+Read in the output of the redditools command and check the formatting
+
+```{r}
+edits.dt[, condition := tstrsplit(sample, '_', keep=1)]
+edits.dt
+setnames(edits.dt, new=c('sample', 'chr', 'position', 'reference', 'strand', 'coverage_rna', 'meanQuality_rna', 'baseCount_rna[A,C,G,T]', 'allSubs_rna', 'frequency_rna', 
+                         'coverage_dna', 'meanQuality_dna', 'baseCount_dna[A,C,G,T]', 'allSubs_dna', 'frequency_dna', 'condition'))
+
+col.oi <- c('condition', 'chr', 'position', 'reference', 'strand', 'coverage_rna', 'meanQuality_rna', 'baseCount_rna[A,C,G,T]', 'allSubs_rna', 'frequency_rna', 
+                         'coverage_dna', 'meanQuality_dna', 'baseCount_dna[A,C,G,T]', 'allSubs_dna', 'frequency_dna')
+
+
+fwrite(edits.dt[frequency_dna <= 0.05, ..col.oi], ScriptAndDatedFileName('reditool.filtered.csv'))
+
+
+fread('~/Documents/projects/051524_JMoen_AlligatorEditSites/RNAedit_QC_data/2024_05_15_reditool.filtered.csv')
+
+edits.dt[frequency_dna <= 0.05][order(-frequency_rna)][,.N, by=condition]
+edits.dt$strand %>%  unique()
+```
+
+052124
+----
+Read in the rerun data with updated REDItools params
+
+```{r}
+files <- dir(path='./data/anno_0517', pattern='*anno.tsv', recursive = T, full.names = T)
+files.list <- lapply(files, fread, header=F)
+
+names(files.list) <- gsub("(?<=[.][0-9]{1}).+", "", gsub('./data/anno_0517/|.reditools.anno.tsv|_table','',files), perl = T)
+names(files.list)
+# remove data tables with no values
+files.list <- files.list[sapply(files.list, nrow) > 0]
+
+edits.dt <- rbindlist(files.list, idcol='sample', fill=T)
+
+```
+
+Add col names
+```{r}
+edits.dt[, condition := tstrsplit(sample, '_', keep=1)]
+
+setnames(edits.dt, new=c('sample', 'chr', 'position', 'reference', 'strand', 'coverage_rna', 'meanQuality_rna', 'baseCount_rna[A,C,G,T]', 'allSubs_rna', 'frequency_rna', 
+                         'coverage_dna', 'meanQuality_dna', 'baseCount_dna[A,C,G,T]', 'allSubs_dna', 'frequency_dna', 'feature_type', 'gene', 'feature_id','condition'))
+
+edits.f.dt <- edits.dt[frequency_rna >= 0.1 & frequency_dna <= 0.1 & coverage_rna >= 10,]
+#
+fwrite(edits.f.dt, ScriptAndDatedFileName('editSites.minimalfiltering.annotated.csv'))
+```
+Filter out the unedited sites from the data
+
+```{r}
+edits.f.dt[,.(treatment = ifelse(grepl('GFC', condition), 'GFC', 'GFV'), .N), by=condition]
+
+g <- ggplot(edits.f.dt[,.(treatment = ifelse(grepl('GFC', condition), 'GFC', 'GFV'), .N), by=condition], aes(x=condition, y=N, fill=treatment)) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_brewer(type='qual', palette=2) +
+  ggtitle('N edit sites') +
+  theme_bw()
+
+BackupAsPDF(g, 'NeditSites.barplot')
+
+```
+Lets look at the number of 
+
+```{r}
+edits.f.dt[, editType := ifelse(grepl('AG|TC', allSubs_rna), 'A-I', 
+                                ifelse(grepl('CT|GA', allSubs_rna), 'C-U', 'other'))]
+
+
+g <- ggplot(edits.f.dt[,.(treatment = ifelse(grepl('GFC', condition), 'GFC', 'GFV'), .N, editType), by=condition], aes(x=condition, y=N, fill=editType)) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_brewer(type='qual', palette=2) +
+  ggtitle('N edit sites') +
+  theme_bw()
+g
+
+
+edits.f.dt[editType == 'other',]
+```
+
+write out the table
+
+```{r}
+fwrite(edits.f.dt, ScriptAndDatedFileName('editSites.minimalfiltering.csv'))
+edits
+```
+
+
+05-23-24
+---
+Read in the annotated data and check for the conserved modified sites 
+```{r}
+edits.dt <- fread('~/Documents/projects/051524_JMoen_AlligatorEditSites/RNAedit_QC_data/2024_05_21_editSites.minimalfiltering.csv')
+c.sites.dt <- fread('~/Documents/projects/051524_JMoen_AlligatorEditSites/docs/mammilian.conserved.sites.txt', fill=T, rownames=F)
+
+setnames(c.sites.dt, new=c('N',' chr', 'pos', 'strand', 'gene', 'feature','HGVS'))
+```
+
+Looking v quickly, seems two of the genes have multiple conserved sites
+TSHZ2 DACT3
+
+```{r}
+edits.dt[gene %in% c.sites.dt[, unique(gene)], ]
+
+# none of thes three sites have been found 
+edits.dt[gene %in% c('GRIA1','CYFIP','FLNA'),]
+
+edits.dt[grep('CDS', feature_type),]
+
+
+edits.dt[frequency_rna >= 0.1 & frequency_dna < 0.1 & grepl('CDS', feature_type),]$gene %>%  unique()
+
+grep()
+```
+Not used...
+```{r}
+# Step 1: Convert the character column to a list of numeric vectors
+edits.dt[, list_column := lapply(strsplit(gsub("\\[|\\]", "", `baseCount_rna[A,C,G,T]`), ","), function(x) as.numeric(x))]
+# step 2: Sort each list and extract the second highest value
+edits.dt[, variantCount_rna := sapply(list_column, function(x) sort(x, decreasing = TRUE)[2])]
+```

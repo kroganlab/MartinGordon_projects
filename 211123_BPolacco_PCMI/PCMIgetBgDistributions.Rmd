@@ -1,0 +1,411 @@
+---
+title: "PCMIbackgroundDistributions"
+author: "Martin Gordon"
+date: "2023-11-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## PCMI get background distributions
+
+goal here to to detemrine the range of the prey-prey distributions
+We need to subsample the prey-prey set to ~100 iterations
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+
+
+source('~/Documents/utils/bp_utils/ManageScriptData.R')
+```
+read in the datasets and view
+
+```{r}
+af.summary <- fread('./data/2023_11_08_AlphaFoldSummaryScores')
+pcmi.ppi <-  fread('./data/D_Final_v3.txt')
+```
+
+
+summary of the data
+for the af.scores
+
+```{r}
+af.scores %>%  str()
+pcmi.ppi %>%  str()
+
+# so, we have bait-prey (~1.6k)
+# same number of bait-random prey
+# also a prey-prey link (we want to basically subset these)
+af.scores[,.N, by=.(cleanedGroup)]
+
+```
+
+```{r}
+af.scores %>%  head()
+
+# from here we want Bait and PrwyGene, 
+pcmi.baits <- pcmi.ppi$Bait %>%  unique() #100
+pcmi.preys <-  pcmi.ppi$PreyGene %>%  unique() # > 1000
+
+# which baits are also preys?
+pcmi.preyBaits<- pcmi.baits[which(pcmi.baits %in% pcmi.preys)]
+```
+
+prey-prey subset; want to avoid also selecting baits in the prey-prey set?
+For now proceed with just prey..
+
+pairs are named alphabetically 
+
+First thought was to just plot for each gene, but the bait=prey set is a sample of 100 
+
+What about randomly selecting 100 genes from gene 1 per subsampling? repeat this 100 times and then draw these plots for each subsampling
+Start here first...
+
+```{r}
+# have a set of 100 baits, prob with different sizes etc.
+
+prey.oi <- pcmi.preys[!pcmi.preys %in% pcmi.preyBaits]
+pp.dt <- af.summary[gene1 %in% prey.oi & gene2 %in% prey.oi,]
+
+# just a santiy check
+af.summary[cleanedGroup == 'asd_bait_prey', unique(gene1)] %in% pcmi.baits
+af.summary[cleanedGroup == 'asd_bait_prey' & (gene1 %in% pcmi.baits | gene2 %in% pcmi.baits),] # sanity check
+
+# very different distiribtutions
+par(mfrow = c(1,2)) # Create a 2 x 2 plotting matrix
+af.summary[cleanedGroup == 'asd_bait_prey', .N, by=gene1]$N %>% 
+  hist()
+af.summary[cleanedGroup == 'asd_prey_prey', .N, by=gene1]$N %>% 
+  hist()
+
+
+# jsut checking number of unique prey genes.. ~20 less did some of the runs fail?
+af.summary[cleanedGroup == 'asd_prey_prey', unique(c(gene1,gene2)) %>%  length()]
+```
+# for first attempt, subsample 100 random prey to use as (pseudo)Baits  and extract the alphafold scores for all their interactions
+
+```{r}
+samplePreys <- function(input.dt=pp.dt, af.dt=af.summary, subsample.size=100, ntimes=1, input.colOI='gene1', withReplacement=F) {
+  
+  sample.dt <- data.table()
+  
+  for (i in 1:ntimes) {
+    # get keys for filtering
+    Preys <- sample(input.dt[,get(input.colOI)], subsample.size, replace=withReplacement)
+    # sample the preyset 
+    s.dt <-  af.dt[cleanedGroup == 'asd_prey_prey' & gene1 %in% Preys, ] 
+    #extract cols OI
+    s.dt <-  s.dt[, cleanedGroup := paste0(cleanedGroup, '_sample.', i) ] %>% 
+      .[, .(pair, cleanedGroup, gene1, gene2, mean_iptm)]
+    
+    sample.dt <-  rbind(sample.dt, s.dt)
+  }
+  
+  return(sample.dt)
+}
+```
+
+run 1000 times sampling 100 genes and all their AF interactions
+```{r}
+# just a test take 100 psuedobaits 10 times and extract all the af predictions for that set
+subsampled.pcmi <-  samplePreys(pp.dt, af.summary, subsample.size=50, ntimes=100, input.colOI='gene1', withReplacement=F)
+
+
+# interesting, in generale each group of 100 genes has many more interactors that the pcmi baits
+subsampled.pcmi[,.N,by=cleanedGroup] %>%  summary()
+af.summary[,.N,by=cleanedGroup]
+```
+created subsampled DT for plotting
+```{r}
+# get all iptm values in the dataset
+sampMeanIptm <-  subsampled.pcmi$mean_iptm %>%  unique()
+
+sample.expanded <-  subsampled.pcmi[data.table(cleanedGroup = unique(subsampled.pcmi$cleanedGroup) #dt with 3 cols
+                                  )[, .(mean_iptm = sampMeanIptm), by = cleanedGroup], # all cleanedGroups by all mean_confidence
+                       , on = c("cleanedGroup", "mean_iptm")]
+
+sample.binned <- sample.expanded[, .(binnedCount =  sum(!is.na(unique(pair)))), by = .(cleanedGroup, mean_iptm)]
+sample.binned[order(-mean_iptm), cp := cumsum(binnedCount)/sum(binnedCount), by = .(cleanedGroup)]
+sample.binned[cp == 0.0, cp := NA]
+```
+
+std plot of prey-prey, bait-prey and bait-random_prey comparison iptm vals
+
+```{r}
+allMeanIptm <- af.summary$mean_iptm |> unique()  
+
+
+expanded <- af.summary[data.table(cleanedGroup = unique(af.summary$cleanedGroup) #dt with 3 cols
+                                  )[, .(mean_iptm = allMeanIptm), by = cleanedGroup], # all cleanedGroups by all mean_confidence
+                       , on = c("cleanedGroup", "mean_iptm")]
+
+
+binned <- expanded[, .(binnedCount =  sum(!is.na(unique(pair)))), by = .(cleanedGroup, mean_iptm)]
+
+binned[order(-mean_iptm), cp := cumsum(binnedCount)/sum(binnedCount), by = .(cleanedGroup)]
+
+binned[cp == 0.0, cp := NA]
+ggplot (binned, aes(x = mean_iptm, y = cp, color = cleanedGroup)) + geom_line() + scale_y_log10(name = "proportion > threshold")
+
+```
+ggplot with the subsampled plots added
+
+```{r}
+g <-  ggplot (binned, aes(x = mean_iptm, y = cp, color = cleanedGroup)) + 
+  geom_line(data=sample.binned, aes(x = mean_iptm, y = cp, group=cleanedGroup), alpha=0.01, color='black') +
+  geom_line() + 
+  scale_y_log10(name = "proportion > threshold")
+g
+BackupAsPDF(g, 'afscores.mean_iptm.linechart.sample100prots.1000.iters.')
+```
+
+lets try with 30 genes and 1000 iters for testing
+more similiar to the other
+
+```{r}
+subsampled.pcmi <-  samplePreys(pp.dt, af.summary, subsample.size=30, ntimes=1000, input.colOI='gene1', withReplacement=F)
+subsampled.pcmi[, .N, by=cleanedGroup]
+
+subsampled.pcmi[,.N,by=cleanedGroup] %>%  summary()
+af.summary[,.N,by=cleanedGroup]
+```
+```{r}
+# get all iptm values in the dataset
+sampMeanIptm <-  subsampled.pcmi$mean_iptm %>%  unique()
+
+sample.expanded <-  subsampled.pcmi[data.table(cleanedGroup = unique(subsampled.pcmi$cleanedGroup) #dt with 3 cols
+                                  )[, .(mean_iptm = sampMeanIptm), by = cleanedGroup], # all cleanedGroups by all mean_confidence
+                       , on = c("cleanedGroup", "mean_iptm")]
+
+sample.binned <- sample.expanded[, .(binnedCount =  sum(!is.na(unique(pair)))), by = .(cleanedGroup, mean_iptm)]
+sample.binned[order(-mean_iptm), cp := cumsum(binnedCount)/sum(binnedCount), by = .(cleanedGroup)]
+sample.binned[cp == 0.0, cp := NA]
+```
+
+plot the 100 iters sample
+
+```{r}
+g <-  ggplot (binned, aes(x = mean_iptm, y = cp, color = cleanedGroup)) + 
+  geom_line(data=sample.binned, aes(x = mean_iptm, y = cp, group=cleanedGroup), alpha=0.01, color='black') +
+  geom_line() + 
+  scale_y_log10(name = "proportion > threshold")
+g
+BackupAsPDF(g, 'afscores.mean_iptm.linechart.sample30prots.1000.iters.')
+```
+
+another sub-sampling approach
+rather than taking a random prey-prey interaction, look at the preys for each bait, take one from each and then create a list of 100
+
+update: modified to generate random bait-prey interactions, previously taking first element..
+```{r}
+af.summary[cleanedGroup == 'asd_bait_prey',] 
+
+# within each bait, select another prey to act as bait (Pseudobait)
+# want to order sets by size (reducing size) to 
+
+# first identify the individual Baits and sort based on N prey (this will be the loop)
+pcmi.ppi[,.N, by=Bait]
+hist(pcmi.ppi[,.N, by=Bait]$N)
+
+
+# sort Baits based on N prey (this will be our loop iteration)
+bait.iter <- pcmi.ppi[,.N, by=Bait] %>% 
+  .[order(N), Bait]
+
+
+sampleUniquePairsfromSets <-  function(bait.vec, input.dt, colKey='Bait', colVal='PreyGene', n.samples=1, verbose=T){
+  
+  # initialise vec to track Prey values
+  prey.id <- character(0)
+  # initialise results table
+  bp.dt <- data.table()
+
+  # iterate through this list of baits and sample from their sets of preys
+  for (bait in bait.vec){
+  
+    if (verbose %in% c(T, TRUE)){
+      print(paste0('Sampling ', bait,'..'))
+    }
+    # take a random bait
+    preySample <- input.dt[get(colKey) == bait, sample(get(colVal), size=n.samples)] 
+  
+    #check the bait is not already detected
+    if (!preySample %in% prey.id) {
+      
+      if (verbose %in% c(T, TRUE)){
+        print(paste0('Prey ', preySample, ' found...'))
+      }
+      prey.id <- c(prey.id, preySample)
+      bp.dt <- rbind(bp.dt, data.table(Key.id = bait, Val.id = preySample))
+    
+    # if already present resample...
+    } else {
+      if (verbose %in% c(T, TRUE)){
+        print(paste0(preySample, ' already recorded. Resampling ', bait, '...'))
+      }
+      while (preySample %in% prey.id) {
+        # keep sampling until unique prey found
+        preySample <- input.dt[get(colKey) == bait, sample(get(colVal), size=n.samples)]
+      }
+      if (verbose %in% c(T, TRUE)){
+        print(paste0('Prey ', preySample, ' found...'))
+      }
+      prey.id <- c(prey.id, preySample)
+      bp.dt <- rbind(bp.dt, data.table(Key.id = bait, Val.id = preySample))
+    }
+  }
+  
+  return(bp.dt)
+}
+
+# testing
+bp.dt <- sampleUniquePairsfromSets(bait.iter, input.dt=pcmi.ppi, n.samples = 1, colKey = 'Bait', colVal='PreyGene', verbose = F)
+bp.dt$Val.id %>%  unique()
+any(duplicated(bp.dt$Val.id))
+```
+
+Now that you have a unique sample of bait-prey pairs, use these prey as (pseudo)bait and pull out interactions
+(remove duplicate edges from final output)
+
+```{r}
+pseudo.bp.dt <-  data.table()
+
+for (p in bp.dt$Val.id){
+  #extract rows where the 
+  sub.dt <- af.summary[cleanedGroup == 'asd_prey_prey' & (p == gene1 | p == gene2),]
+  pseudo.bp.dt <- rbind(pseudo.bp.dt,sub.dt)
+}
+
+pseudo.bp.dt[, cleanedGroup := 'asd_pseudobait_prey']
+
+# remove duplicate rows
+pseudo.bp.dt <- pseudo.bp.dt[!duplicated(pair)]
+```
+captured all prey-prey interactions involving preys that bait targets (pseudoPrey)
+
+```{r}
+
+# get all iptm values in the dataset
+sampMeanIptm <-  pseudo.bp.dt$mean_iptm %>%  unique()
+
+sample.expanded <-  pseudo.bp.dt[data.table(cleanedGroup = unique(pseudo.bp.dt$cleanedGroup) #dt with 3 cols
+                                  )[, .(mean_iptm = sampMeanIptm), by = cleanedGroup], # all cleanedGroups by all mean_confidence
+                       , on = c("cleanedGroup", "mean_iptm")]
+
+sample.binned <- sample.expanded[, .(binnedCount =  sum(!is.na(unique(pair)))), by = .(cleanedGroup, mean_iptm)]
+sample.binned[order(-mean_iptm), cp := cumsum(binnedCount)/sum(binnedCount), by = .(cleanedGroup)]
+sample.binned[cp == 0.0, cp := NA]
+
+
+new.binned <-  rbind(binned, sample.binned)
+```
+
+plot the new linechart w pseudobait
+
+```{r}
+g <-  ggplot (new.binned, aes(x = mean_iptm, y = cp, color = cleanedGroup)) + 
+  #geom_line(data=sample.binned, aes(x = mean_iptm, y = cp, group=cleanedGroup), color='purple') +
+  geom_line() + 
+  scale_y_log10(name = "proportion > threshold")
+g
+BackupAsPDF(g, 'afscores.mean_iptm.linechart.pseudobait.')
+```
+repeat the sampling event many times (150x) and plot the distribution of this
+Do the repeated resamplings overlap with the other groups, or are they distinct?
+```{r}
+
+# can we improve speed here? V slow to subsample all 
+ntimes <- 200
+
+afSample.dt <-  data.table()
+
+for (i in 1:ntimes){
+  
+  print(paste0('Run ',i,' sampling bait-prey dt for unique combos...'))
+  bpSample.dt <- sampleUniquePairsfromSets(bait.iter, input.dt=pcmi.ppi, n.samples = 1, colKey = 'Bait', colVal='PreyGene', verbose=F)
+  
+  #looping through (pseudoprey)list to extract interactions.. faster way to do this?
+  for (p in bpSample.dt$Val.id){
+    #sampling f
+    sub.dt <- af.summary[cleanedGroup == 'asd_prey_prey' & (p == gene1 | p == gene2),]
+    sub.dt[, cleanedGroup := paste0('asd_pseudobait_prey_', i)]
+    
+    afSample.dt <- rbind(afSample.dt,sub.dt)
+  }
+}
+
+#remove any duplicated rows per sampling
+subsamp.dt <- afSample.dt[, .SD[!duplicated(pair),], by=cleanedGroup] 
+```
+Todo
+----
+as pair-pair, check for duplicates per sampling event 
+
+```{r}
+#backup.dt <- afSample.dt
+subsamp.dt[,.N, by=(cleanedGroup)]
+
+# get all iptm values in the dataset
+sampMeanIptm <-  subsamp.dt$mean_iptm %>%  unique()
+
+sample.expanded <-  subsamp.dt[data.table(cleanedGroup = unique(subsamp.dt$cleanedGroup) #dt with 3 cols
+                                  )[, .(mean_iptm = sampMeanIptm), by = cleanedGroup], # all cleanedGroups by all mean_confidence
+                       , on = c("cleanedGroup", "mean_iptm")]
+
+sample.binned <- sample.expanded[, .(binnedCount =  sum(!is.na(unique(pair)))), by = .(cleanedGroup, mean_iptm)]
+sample.binned[order(-mean_iptm), cp := cumsum(binnedCount)/sum(binnedCount), by = .(cleanedGroup)]
+sample.binned[cp == 0.0, cp := NA]
+```
+
+
+```{r}
+g <-  ggplot (binned, aes(x = mean_iptm, y = cp, color = cleanedGroup)) + 
+  geom_line(data=sample.binned, aes(x = mean_iptm, y = cp, group=cleanedGroup), color='purple', alpha=0.05) +
+  geom_line() + 
+  scale_y_log10(name = "proportion > threshold")
+g
+BackupAsPDF(g, 'afscores.mean_iptm.linechart.pseudobait.200samples.')
+```
+
+not used
+-----
+```{r}
+ntimes <- 50
+
+afSample.dt <-  data.table()
+
+for (i in 1:ntimes){
+  
+  print(paste0('Run ',i,' sampling bait-prey dt for unique combos...'))
+  bpSample.dt <- sampleUniquePairsfromSets(bait.iter, input.dt=pcmi.ppi, n.samples = 1, colKey = 'Bait', colVal='PreyGene', verbose=F)
+
+  keyProts <- unique(bpSample.dt$Val.id)
+  
+  #subset all pseudoBait-prey interactions for this run
+  sub.dt <- af.summary[cleanedGroup == 'asd_prey_prey' & (gene1 == keyProts | gene2 == keyProts),] %>% 
+    .[, cleanedGroup := paste0('asd_pseudobait_prey_', i)]
+  
+  afSample.dt <- rbind(afSample.dt,sub.dt)
+}
+
+afSample.dt
+
+prac.dt <- data.table()
+for (i in bp.dt$Val.id){
+  sub.dt <- (af.summary[cleanedGroup == 'asd_prey_prey' & (i == gene1 | i == gene2),])
+  prac.dt <- rbind(prac.dt,sub.dt)
+}
+prac.dt
+
+
+
+af.summary[cleanedGroup == 'asd_prey_prey',] %>% 
+  .["NUP155" %in% gene1]
+```
+
+
+

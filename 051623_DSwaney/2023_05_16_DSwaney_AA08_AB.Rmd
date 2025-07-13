@@ -1,0 +1,566 @@
+---
+title: "051623_DSwaney"
+author: "Martin Gordon"
+date: "2023-05-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(purrr)
+library(tidyr)
+library(dplyr)
+library(data.table)
+library(MSstats)
+library(ggplot2)
+library(magrittr)
+library(circlize)
+library(ComplexHeatmap)
+library(parallelDist) #needed for some custom enrichment functions
+library(ggvenn)
+
+#source Bens utility scripts
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+```{r helper-functions}
+
+#function to save plots generated
+save_plot <- function(plot_func, plot_args, filename, directory) {
+  # Call the plot function with the provided arguments
+  plot <- do.call(plot_func, plot_args)
+  
+   # create the directory if it doesn't exist
+  if (!dir.exists(directory)) {
+    dir.create(directory, recursive=TRUE)
+  }
+  
+  # save the plot to file in the specified directory
+  filepath <- file.path(directory, filename)
+  ggsave(plot, file = filepath)
+  
+  message(paste0("Plot saved to file: ", filepath))
+  
+}
+
+
+## Bens Functions
+
+today <- function(){
+  format(Sys.time(), "%Y_%m_%d")
+}
+DateFileName <- function(x){
+  name <-   paste0(today(), "_", x)
+  print (name)
+  return (name)
+}
+
+ScriptNamedDir <- function(scriptName = NULL){
+  if(is.null(scriptName))
+    scriptName <- rstudioapi::getActiveDocumentContext()$path
+  if (is.null (scriptName) || scriptName == "")
+    stop("No script name found -- you may need to save this file first")
+  outDir <- gsub(".R(md)?$", "_data", scriptName, ignore.case = TRUE)
+  stopifnot( outDir != scriptName)
+  if (!dir.exists(outDir)){
+    message ("Creating directory associated with ", scriptName,", at ", outDir)
+    dir.create(outDir)
+  }
+  return(outDir)
+}
+
+ScriptAndDatedFileName <- function(x, scriptName = NULL){
+  dir <- ScriptNamedDir(scriptName)
+  fileName <- DateFileName(x)
+  path <- file.path(dir, fileName)
+  print (path)
+  return (path)
+}
+
+GetLatestScriptFile <- function(x, scriptName=NULL){
+  stopifnot (length(x) == 1)
+  dir <- ScriptNamedDir(scriptName)
+  filePattern <- paste0("^\\d{4}_\\d{2}_\\d{2}_", x, "$", collapse = "")
+  filesFound <- list.files(dir, filePattern)
+  stopifnot (length(filesFound) > 0)
+  if (length(filesFound) > 1){
+    message ("Multiple files  with matching names found.  Using the last one")
+    print (filesFound)
+  }
+  return (file.path(dir, tail(filesFound, 1)))
+} 
+
+PDFBackupFileName <- function(prefix = "", subDir = ""){
+  scriptDir <- ScriptNamedDir()
+  imageDir <- file.path(scriptDir, "pdfs", subDir)
+  if (!dir.exists(imageDir)) dir.create(imageDir, recursive = TRUE)
+  now <- format(Sys.time(),  "%Y_%m_%d__%H_%M__%S")
+  counter <- 0
+  path <- file.path (imageDir, sprintf("%s%s.%02d.pdf", prefix, now, counter))
+  while (file.exists(path)){
+    counter <- counter + 1
+    path <- file.path (imageDir, sprintf("%s%s.%02d.pdf", prefix, now, counter))
+  }
+  return (path)
+}
+
+BackupAsPDF <- function(graphics, prefix = "", subDir = "", dimensions = NULL){
+  path <- PDFBackupFileName(prefix, subDir)
+  if (is.null(dimensions))
+  dimensions <- dev.size(units = "in")
+
+  print (sprintf("Writing image to  %s", path))
+  cairo_pdf(path, width = dimensions[1], height = dimensions[2])
+  
+  # handle functions, my enrichment heatmaps that are part of a list
+  if ("function" %in% class(graphics)){
+    graphics()
+    g <- "finished" # something to print to console instead of graphics to device 
+  }else if (! ("ggplot" %in% class(graphics) | "grob" %in% class(graphics) | "Heatmap" %in% class(graphics) | "HeatmapList" %in% class(graphics))){
+    g <- graphics$hmList    
+  }  else{
+    g <- graphics
+  }
+  print (g)
+  
+  dev.off()
+  return (graphics)
+}
+
+
+
+
+
+WriteSessionInfo <- function(path = NULL){
+  if (is.null(path))
+    path <- ScriptAndDatedFileName("SessionInfo.txt")
+  si <- devtools::session_info()
+  fileOut <- file(path, open = "wt")
+  writeLines("─ Session info ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+             con = fileOut)
+  write.table(data.frame( value = unlist(si[[1]])), fileOut)
+  #writeLines(capture.output(data.frame(value = unlist(si[[1]]))), con = fileOut) # for some mysterious reason, this always goes to the notebook output when run in a notebook. type = "message" is no help...[shrug]
+  writeLines(capture.output(data.table(setting = names(si[[1]]), value = unlist(si[[1]]))), con = fileOut) # this too. Maybe an RStudio version issue
+  writeLines("─ Packages ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+             con  = fileOut)
+  #write.table(si[[2]], fileOut)
+  writeLines(capture.output(si[[2]]), con = fileOut)
+  close(fileOut)
+}
+
+WriteInstalledPackages <- function (path = NULL){
+  if (is.null(path))
+    path <- ScriptAndDatedFileName("Installed.Packages.csv")
+  package.mat <- installed.packages()
+  fwrite (as.data.table(package.mat, keep.rownames = TRUE), path)
+}
+
+WriteSessionInfo()
+WriteInstalledPackages()
+
+```
+ 
+
+## 051623 DSwaney Project
+
+Read in spectronaut data & metadata
+
+----
+```{r read-in}
+path <- getwd()
+path
+AB_input <- fread(paste0(path, '/docs/MartinGordon_MSAnalysis_forDanielle/AA08/AB/20230516_094910_AA08_AB_Report.csv'))
+AB_meta <- fread(paste0(path, '/docs/MartinGordon_MSAnalysis_forDanielle/AA08/AB/AA08_AB_ConditionSetup.xls'))
+AB_input$ProteinName <- sub(">", "", AB_input$ProteinName)
+```
+
+
+
+```{r data-inspection}
+summary(AB_input)
+
+AB_input$BioReplicate <- as.factor(AB_input$BioReplicate)
+AB_input$Run <- as.factor(AB_input$Run)
+AB_input$Condition <- as.factor(AB_input$Condition)
+```
+Data inspection
+---------
+
+```{r data structure}
+# order by Condition
+setorder(AB_input, Condition)
+# One run per condition per replicate
+AB_input[, .N, by = .(Run, Condition, BioReplicate)]
+```
+
+Remove '>' preceeding some ProteinNames
+```{r}
+AB_input$ProteinName <- sub(">", "", AB_input$ProteinName)
+```
+
+
+
+Bioreplicate numbers (1-4) are repeated across conditions. Modified as msstats assumes repeated bioreplicate ids indicate a time-series analysis.
+Asigned each cond/biorep combo a unique ID (1-20) for msstats to model as a case-control experiment.
+
+```{r}
+# create new ID col for pairwise comparisons
+AB_input[, ID:=.GRP, by=.(Condition,BioReplicate)]
+
+#reassign to biorep col and drop ID
+AB_input[, BioReplicate:=ID]
+AB_input[, ID:=NULL]
+
+#sanity check
+AB_input[, .N, by = .(Condition,BioReplicate)]
+```
+
+Removed spectronaut peptides with intensities < 2^5 as likely artifacts of the identification/quantification tool.
+
+```{r}
+ggplot(data=AB_input,  mapping=aes(x=log2(Intensity))) +
+  geom_histogram(binwidth = 0.1)
+
+AB_input <- AB_input[log2(Intensity) > 5] #filter out low abundance 
+
+ggplot(data=AB_input,  mapping=aes(x=log2(Intensity))) +
+  geom_histogram(binwidth = 0.1)
+
+```
+
+Identify if there any multiple-feature peptide ions in the runs. We expect one peptide feature per row per run, so identify duplicates.
+No multi-feature peptides detected
+
+```{r}
+any(AB_input[, .N, by = .(Run, PeptideSequence, PrecursorCharge)]$N) > 1
+```
+Plot of number of peptide ion measurements per run. Counts seem pretty consistent across replicates & conditions
+
+```{r}
+### plot of peptide ions per run
+p <- AB_input %>%  
+      ggplot(mapping=aes(x=reorder(interaction(Condition,BioReplicate)), fill=Condition)) +
+      geom_bar() + 
+      theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+BackupAsPDF(p, "BarPlot_NPeptides_")
+```
+Boxplots of distributions of raw intensity values per condition/replicate. Again abundances are pretty consistent and no real concerns with raw data quality. 
+```{r create contrasts}
+p <- ggplot(data = AB_input, mapping=aes(x=reorder(interaction(Condition, BioReplicate)), y=log2(Intensity), fill=Condition)) +
+      geom_boxplot() +
+      theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+BackupAsPDF(p, "BoxPlot_RawIntensities_")
+```
+Data Processing
+----
+Convert spectronaut data to msstats format
+```{r msstats-formatting}
+ab.mss <- specFileToCompleteMSstats(AB_input)
+ab.mss[, IsotopeLabelType := 'L'] #label free
+setDF(ab.mss)  # convert to DF for msstats processing
+
+```
+MSStats DataProcess: Normalise (equilizemedians), filter & summarize peptides to protein intensities
+
+```{r mss-dataproc}
+
+dp.out <- MSstats::dataProcess(ab.mss,
+                               normalization = 'equalizeMedians',
+                               summaryMethod="TMP",
+                               featureSubset = "highQuality",
+                               remove_uninformative_feature_outlier = TRUE,
+                               MBimpute = FALSE )
+```
+Write out protein level data to file (provide feature level data also)
+```{r writeout-data}
+# the main data of interest is this one:
+fwrite(dp.out$ProteinLevelData, ScriptAndDatedFileName("ProteinLevelData.csv.gz"))
+
+#this table is mostly a copy of the input with some additional columns for hte post-normalization intensity (labeled ABUNDANCE), and columns for is_outlier and is_informative
+fwrite(dp.out$FeatureLevelData, ScriptAndDatedFileName("FeatureLevelData.csv.gz"))
+```
+Boxplot of protein intensities post-normalization:
+
+```{r}
+prot.quant <- setDT(dp.out$ProteinLevelData)
+
+p <- prot.quant %>% 
+      ggplot(mapping=aes(x=interaction(GROUP,SUBJECT), y=LogIntensities, fill=GROUP)) +
+      geom_boxplot() +
+      theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+BackupAsPDF(p, "BoxPlot_NormalizedProteinIntensities_")
+```
+
+Convert uniprot ids to gene names
+Some protein names contain illegal characers ('_'); convert to '-'
+```{r}
+prot.quant$Protein <- gsub("_", "-", prot.quant$Protein)
+prot.quant[, gene := multiUniprots2multiGenes(Protein)]
+```
+Clustering
+-----
+
+```{r create-matrix}
+title = ""
+#data reshaping - long to wide format.
+#protein vs interaction group and rep
+intensity.mat <- as.matrix(dcast(prot.quant, Protein ~GROUP+SUBJECT, value.var = "LogIntensities"),
+                           rownames = "Protein")
+
+```
+
+Subsampled 1000 proteins and clustered.
+At high level, two distinct clusters formed:PAR (neg & pos) & WT,EV & N10T20.
+*Note* Clustering dominated by protein intensites, scale the data and replot
+
+```{r subsample-heatmap}
+#sub in 0 for NA val
+rowClusterWithNA <- function(mat, na.value = 0, ...){
+  mat[is.na(mat)] <- na.value
+  hclust(dist(mat), ...) #euclidean
+}
+
+subMat <- intensity.mat[sample.int(nrow(intensity.mat), 1000),]
+
+#create heatmap annotation col
+type <- gsub("_[0-9]{1,2}", "", colnames(subMat))
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right")
+
+hm <- Heatmap(subMat,
+        #clustering_distance_rows = function(m) dist(m, method = 'euclidean'),
+        #clustering_method_rows= "complete",
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(subMat)),
+        name = "Log2 Int.")
+
+hm
+#BackupAsPDF(draw(ha), 'heatmap_subsample_log2intensities')
+rm(hm)
+```
+Above heatmap appears to primarily cluster the low intensity proteins together and then the high intensity proteins, and the run-to-run trends appear secondary. 
+Subtracted median protein expression intensities to observe run-to-run trends.
+Again, we consistently see a seperation between PAR cluster and other groups.
+
+```{r scaled-subsample-heatmap}
+#row median - median prot exp value across experiment
+
+# sweep subtracts a vector of values from either rows (dimension = 1) or columns (dimension = 2)
+# apply applies a function (median here) to each row (dimension = 1 )
+# used together here we are subtracting row medians
+scaled.intensity.mat <- sweep(intensity.mat, 1, apply (intensity.mat, 1, median, na.rm = TRUE))
+
+
+scaled.subMat <- scaled.intensity.mat[sample.int(nrow(scaled.intensity.mat), 1000),]
+
+hm <- Heatmap(scaled.subMat,
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(scaled.subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled proteins", nrow(scaled.subMat)),
+        name = "Log2 Int.")
+
+hm
+#BackupAsPDF(draw(hm), 'heatmap_subsample_scaled')
+
+```
+Heatmap of all clustered proteins (proteins with no missing values)
+
+```{r allprot-heatmap}
+# pca requires no missing values.  Function complete.cases finds rows with no missing values
+complete.mat <- scaled.intensity.mat[complete.cases(scaled.intensity.mat),]
+
+hm <- Heatmap(complete.mat,
+       top_annotation = ha,
+       row_title = sprintf ("%d complete proteins", nrow(complete.mat)),
+       name = "Log2 Int\nvs Median",
+       show_row_names = FALSE,
+       cluster_columns = FALSE)
+
+BackupAsPDF(draw(hm), 'heatmap_prots_scaled')
+```
+PCA plot
+-----
+
+PCA plots seem pretty consistent with clustering output; first principal component clearly distinguishes PAR groups and others. 
+EV, WT and N10T20 groups cluster closely
+```{r pca}
+pcaOut <- prcomp(t(complete.mat))
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaDT[, mainGroup := tstrsplit(rn, "_")[[1]]] #transpose & split
+
+
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color = mainGroup )) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA using %d proteins (log intensity)", nrow(complete.mat))) 
+p
+
+
+BackupAsPDF(p, "PCA_Complete_Proteins")
+```
+Differential Expression Analysis
+------
+
+Perform DEA with provided contrasts
+Generate a contrast matrix for requested pairwise comparisons:
+
+```{r make contrasts}
+#all pairwise; need to customise
+dp.contrasts <- MSstatsContrastMatrix("pairwise", unique(dp.out$ProteinLevelData$GROUP))
+
+#make new contrasts
+dp.contrasts <- dp.contrasts[c(3,8),]
+
+## option 2: customized comparison
+WTpos_N10t20pos <- matrix(c(0,-1,0,0,1),nrow=1)
+WTpos_PARpos <- matrix(c(0,0,0,-1,1),nrow=1)
+WTpos_EVpos <- matrix(c(-1,0,0,0,1),nrow=1)
+
+dp.contrasts <- rbind(dp.contrasts, WTpos_EVpos, WTpos_N10t20pos, WTpos_PARpos)
+row.names(dp.contrasts)<-c("EVpos vs PARpos","PARneg vs PARpos","WTpos vs EVpos","WTpos vs N10t20pos","WTpos vs PARpos")
+rm(WTpos_EVpos,WTpos_N10t20pos,WTpos_PARpos)
+
+dp.contrasts
+```
+Write output to file.
+
+```{r mss-pairwise}
+test.mss <- groupComparison(contrast.matrix=dp.contrasts, data=dp.out)
+test.mss.all <- setDT(test.mss$ComparisonResult)
+
+# adjust p values using the Benjamini Hochberg method, which estimates False Discovery Rate
+test.mss.all[, fdr := p.adjust(pvalue, method = "BH")] 
+#get gene names
+test.mss.all[, gene := multiUniprots2multiGenes(as.character(Protein), simplify = TRUE, allowDups = FALSE)]
+
+
+fwrite(test.mss.all, ScriptAndDatedFileName("msstats_groupcomparisons.csv.gz"))
+```
+```{r rformat test-mms}
+View(test.mss.all)
+
+reform.test.mss <- test.mss.all[, .(Protein,Label,log2FC,pvalue,fdr,gene)] # extract required columns
+reform.test.mss <- dcast(reform.test.mss, Protein+gene+pvalue + fdr ~ Label, value.var="log2FC")
+fwrite(reform.test.mss, ScriptAndDatedFileName("log2fc_groupcomparisons_all.csv"))
+
+# maybe filter this for FDR to see log change
+sig.reform.test.mss <- test.mss.all[fdr <= 0.05,]
+sig.reform.test.mss <- dcast(sig.reform.test.mss, Protein+gene ~ Label, value.var="log2FC")
+rownames(sig.reform.test.mss) <- sig.reform.test.mss$Protein
+sig.reform.test.mss[,Protein:=NULL]
+fwrite(sig.reform.test.mss, ScriptAndDatedFileName("log2fc_groupcomparisons_siggenes.csv"))
+```
+
+```{r}
+#Also, a file that rows as proteins, and then columns are gene, and the log2 intensity value in each condition. Basically like what would go into this heatmap, but also include proteins for which there are NA values for some conditions
+# use prot.quant file
+
+
+log2.fc.out <- prot.quant[, Sample:=paste0(GROUP,"_",SUBJECT)] %>% 
+  dcast(Protein+gene~Sample, value.var = 'LogIntensities') 
+
+fwrite(log2.fc.out, ScriptAndDatedFileName("log2intensities_groupcomparisons.csv"))
+
+```
+
+
+Generate Volcano plots for each of the pairwise comparisons
+
+```{r multi-volcanoplot}
+## volcano plots
+
+# define significant proteins
+test.mss.all[, sig := "Not"]
+test.mss.all[fdr < 0.05 & abs(log2FC) > log2(1.5),sig := ifelse (log2FC  > 0, "Up", "Down")]
+
+p <- ggplot (test.mss.all, aes (x = log2FC, y = -log10(fdr), color = sig, label = gene)) +
+  geom_point() +
+  scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+  ggrepel::geom_text_repel(data = test.mss.all[sig != "Not"]  ,  size = 2, max.overlaps = 20) +
+  theme_bw() +
+  facet_wrap(~ Label)
+
+BackupAsPDF(p, "volcanoplot_multipanel")
+```
+
+Over plotting. Generate each volcano plot separately.
+```{r split-dt}
+#split datatable by comparison
+
+test.mss.list <- split(test.mss.all, test.mss.all$Label)
+```
+
+```{r cal-geommean}
+#calculate geomemtric mean
+test.mss.list <- test.mss.list %>% 
+  map( ~{
+    dt <- .x
+    dt$gm.pval.log2fc <- sqrt(dt[,'fdr']*abs(dt[,'log2FC']))
+    
+    return(dt)
+  })
+
+```
+
+
+```{r volcanoplots}
+# use purr to plot each list element 
+
+
+  imap(test.mss.list, ~ {
+    dt <- .x
+    dt.name <- .y
+    
+    p <- ggplot (dt, aes (x = log2FC, y = -log10(fdr), color = sig, label = gene)) +
+      geom_point() +
+      scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+      ggrepel::geom_text_repel(data = dt[sig != "Not"][order(gm.pval.log2fc)][1:40]  ,  size = 2, max.overlaps = 20) +
+      ggtitle(paste0(dt.name, ' Volcano plot')) +
+      theme_minimal()
+    p
+   #BackupAsPDF(p, paste0(dt.name,"_volcanoplot"))
+  })
+```
+
+Perform enrichment analysis for each of the comparisons
+```{r}
+#creat new factor col of combined label sig info
+test.mss.all[, enrich_grp:= interaction(Label,sig)]
+
+# all go ontology genes (biological process, cellular componetn & metabolic function) for enrichment analysis
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# all identified genes as the background set
+universe <- unique(test.mss.all$gene)
+
+# perform enrichment on significant genes for all groups
+enrich.dt <- enricherOnGroups(test.mss.all[test.mss.all$sig != 'Not'], groupColumns = 'enrich_grp', term2gene.gmt = gmt.go, universe = universe)
+
+#simplify enrich results to remove redundant GO terms
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+
+# failed.. troubleshoot
+enrichmentOnGroupsPL(test.mss.all[test.mss.all$sig != 'Not'], geneColumn = 'gene', groupColumns = 'enrich_grp', gmt = gmt.go, universe = universe)
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 8, negCols =unique(simp.enrich$simplified$enrich_grp[grep('Down', simp.enrich$simplified$enrich_grp)]), row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 5)  # compare enrichment in the top 10 terms per group
+BackupAsPDF(ht, "heatmap_go_enrichment")
+```
+
+

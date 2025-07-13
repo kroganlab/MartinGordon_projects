@@ -1,0 +1,570 @@
+---
+title: "051225_shinySECMS"
+author: "Martin Gordon"
+date: "2025-05-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+First attempt to build a local R shiny app, then port this to GCP for others to use
+```{r packages}
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(InteractiveComplexHeatmap)
+library(data.table)
+library(shiny)
+library(circlize)
+library(ggridges)
+library (DT) # nice tables
+#library(bslib) #themes for shiny
+library(RColorBrewer)
+library(viridis)
+library(shinythemes)
+
+source('~/Documents/utils/bp_utils/manageScriptData.R')
+source('~/Documents/utils/bp_utils/SEC_MS_utils.R')
+source('~/Documents/utils/bp_utils/UniprotIDmapping.R')
+```
+
+```{r, palettes}
+# this will be our baseline for DE
+de.pal <- c("dodgerblue2", "white","#E31A1C")
+
+# for abs abundance use viridis
+treatment.pal <- brewer.pal(n=9,name='Set1')
+treatment.pal <- brewer.pal(n=9,name='Set1')
+```
+
+First working through the examples found here: https://mastering-shiny.org/basic-app.html and https://shiny.posit.co/r/components/outputs/plot-ggplot2/
+Simple example: just create a simple app with a side bar and an ability to upload two files, will use this to create ridge plots
+
+**Todos**
+show two DTs (tab selection; wide format counts and DE results; filter both by gene list)
+why triggered on DE upload?
+
+```{r}
+
+
+#fwrite(sec.long[, .(treatment, replicate, protein, gene, fraction, intensity, intensity_totalScaled)], ScriptAndDatedFileName('shinytest.csv.gz'))
+#fwrite(complexes.dt[,.(protein, gene, info=group, subgroup=group)], ScriptAndDatedFileName('complexesShinytest.csv.gz'))
+
+
+# tidy the input for the app
+dt <- fread('~/Documents/projects/051225_MGordon_SECMS_RShiny/051225_shinySECMS_data/2025_05_13_shinytest.csv.gz')
+dt[, gene := multiUniprots2multiGenes(protein)]
+dt[, sample := paste0(treatment, '_', replicate)]
+#fwrite(dt, ScriptAndDatedFileName('secdata.shinytest.csv.gz'))
+
+
+#fwrite(complexes.dt[, .(gene, protein, info)], ScriptAndDatedFileName('complexdata.shinytest.csv.gz'))
+de.dt <- fread('../040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_14_anova.results.csv.gz')
+fwrite(de.dt, ScriptAndDatedFileName('deanova.shinytest.csv.gz'))
+
+
+de.dt <- fread('~/Documents/projects/051225_MGordon_SECMS_RShiny/051225_shinySECMS_data/2025_05_15_shinytest.de.dt')
+mat <- dcast(dt[sample=='infected_1',], protein~interaction(sample, '.', fraction), value.var='intensity_totalScaled') %>% 
+  as.matrix(rownames='protein')
+
+prot.oi <- sample(rownames(mat), 10)
+
+ori.dt <- fread('~/Documents/projects/051225_MGordon_SECMS_RShiny/051225_shinySECMS_data/2025_05_14_shinytest.csv.gz')
+
+```
+
+```{r}
+dt[, gene := multiUniprots2multiGenes(protein, species='HUMAN')]
+dt[protein %in% prot.oi, unique(gene)]
+
+submat <- mat[rownames(mat) %in% prot.oi,]
+
+mapper <- dt[protein %in% prot.oi, .(gene,protein)] %>% 
+  unique()
+
+submat[match(rownames(submat), mapper$protein),]
+match(mapper$protein, rownames(submat))
+
+
+sample()
+
+
+
+mapper[match(rownames(submat), protein)]
+rownames(submat)
+
+
+mapHeatmapRownamesToGene <- function(mat, secdt, genes.oi){
+  mapper <- secdt[gene %in% genes.oi, .(protein,gene)] %>% 
+    unique()
+  return(mapper[match(rownames(mat), protein)]$gene)
+}
+
+
+dt[match(rownames(submat), protein). .(gene,protein)]
+
+genes.oi <- dt[,sample(gene, 10)]
+submat <- dcast(dt[sample=='infected_1' & gene %in% genes.oi,], protein~interaction(sample, '.', fraction), value.var='intensity_totalScaled') %>% 
+  as.matrix(rownames='protein')
+submat
+
+dt[match(rownames(submat), protein), .(gene,protein)]
+```
+```{r}
+rownames(submat)
+mapHeatmapRownamesToGene(mat=submat, secdt=dt, genes.oi = genes.oi)
+```
+
+
+useful functions 
+```{r}
+makePdf <- function(x, file, dimensions = NULL){
+  if (is.null(dimensions)){
+    dimensions <- 2*dev.size(units = "in")
+  } else{
+    dimensions <- dimensions / 75
+    }
+  pdf(file = file, width = dimensions[1], height = dimensions[2])
+  plot(x)
+  dev.off()
+}
+
+# heatmap plot
+complexIntensityHeatmaps <- function(intMats, colorFun=colorFun, legendtitle){
+  # get the individual sample lists
+  samples <- names(intMats)
+  
+  sample <- samples[1]
+  subMat <- intMats[[sample]]
+  
+  hml <- Heatmap (subMat,
+                  name = legendtitle,
+                  cluster_rows = FALSE,
+                  show_row_dend = F,
+                  cluster_columns = FALSE,
+                  col = colorFun ,
+                  show_row_names = TRUE,
+                  row_names_side = "left",
+                  row_title_rot = 0,
+                  column_title = sample,
+                  column_title_gp = gpar(fontsize=12, fontface='bold'),
+                  show_heatmap_legend = TRUE,
+                  border=TRUE
+  )
+  # first one gets row title, also gets a legend
+  if (length(intMats) > 1){
+    for (sample in samples[2:length(samples)]){
+      hml <- hml + Heatmap (intMats[[sample]],
+                            name = legendtitle,
+                            cluster_rows = FALSE,
+                            row_dend_reorder = FALSE,
+                            cluster_columns = FALSE,
+                            col = colorFun,
+                            show_row_names = FALSE, 
+                            column_title = sample,
+                            column_title_gp = gpar(fontsize=12, fontface='bold'),
+                            # 
+                            show_heatmap_legend = FALSE,
+                            border=TRUE
+                            )      
+    }
+  }
+  return (hml)
+}
+```
+
+working template; ui side seems ok... leave as is for now 
+need to mod this to take multiple inputs, or just plot every gene associated with a complex is simplier?
+
+*todo*
+interactive heatmap looks cool? second window??
+```{r}
+# max file size of 200MB
+options(shiny.maxRequestSize=500*1024^2)
+
+ui <-  fluidPage(
+  theme = shinytheme('flatly'),
+  headerPanel("SEC-MS explorer"),
+  sidebarPanel(
+    # file inputs
+    fileInput(inputId ="seclong", label = "SEC-MS data upload", buttonLabel = "Select file...", accept=c('csv.gz','csv','txt','txt.gz'), multiple = FALSE),
+    fileInput(inputId ="complexfile", label = "complex file data upload", buttonLabel = "Select file...", accept=c('csv.gz','csv','txt','txt.gz'), multiple = FALSE),
+    fileInput(inputId ="deafile", label = "differential analysis results upload", buttonLabel = "Select file...", accept=c('csv.gz','csv','txt','txt.gz'), multiple = FALSE),
+    # 'control panel'
+    selectInput(inputId = "plotType", "Plot Type", c(ridgeline = "ridgeline", heatmap = "heatmap")),
+    selectizeInput(inputId = "samples2plot", 'select samples', choices=NULL, multiple=TRUE),
+    selectizeInput(inputId = "complexes2plot", 'select complexes', choices=NULL, multiple=TRUE, selected='Show all'),
+    selectizeInput(inputId = "genes2plot", 'show genes within complexes', choices=NULL, multiple=TRUE), # take genes from input datatable 
+    # plotting panel only shown if plottype ridgeline
+    conditionalPanel(condition = "input.plotType == 'ridgeline'",
+          sliderInput(inputId='scale', label='height', min=0, max=20, value=5, step=1),
+          #sliderInput(inputId='alpha', label='transparency', min=0, max=1, value=0.6, step=0.1),
+          radioButtons("facetOption", label = "facet order", choices = c("replicateByTreatment", "treatmentByReplicate", "none")),
+          radioButtons("fillBy", label = "color", choices = c( "treatment", "replicate", "intensity")), # "overlayReplicates", "overlayTreatments"
+          h3("Save output")
+          ),
+    conditionalPanel(condition = "input.plotType == 'heatmap'",
+          radioButtons("matScale", label = "scale values", choices = c("none", "total", "max")),
+          sliderInput("colorRange", label = "adjust scale color range", min=0, value=0.3, max=1, step=0.1),
+          h3("Save output")
+    ),
+    downloadButton("savePlot", label = "save plot as pdf"),
+    sliderInput(inputId =  "downloadSize",label = "download size (inches)", min = 0, max = 25, value = 10, step = 0.25)
+    ),
+        # plot of the distributions
+        mainPanel(
+          
+          
+            plotOutput("plot", height = "600px"),
+            div(
+              style = "margin-top: 30px;",
+              h4("Differential Expression Table"),
+              DTOutput("deatable")
+            )
+              #tabsetPanel(
+                # tabbed output.. prefer one panel 
+                #tabPanel("plot", plotOutput("plot")),
+                #tabPanel("differential analysis results", DTOutput("deatable")) )
+                #plotOutput(outputId = "plot"),
+                #DTOutput(outputId = "deatable")
+       )
+)
+```
+
+make the table reactive
+fix the intensity label
+genesToplot should by defualt be everything
+Want genesToplot to also accept a user defined value w/o complex info... idea being if people are exploring counts, can quickly jump to this
+show two DTs (tab selection; wide format counts and DE results; filter both by gene list)
+
+
+
+Want to set the upper limit for the color on heatmap to allow users to adjust
+Why does the DE analysis need to be uploaded to trigger the plotting?
+```{r, devserver}
+
+# Define server logic required to draw a histogram
+server <- function(input, output, session) {
+  
+  # reactive file reads
+  secdata <- reactive({
+      req(input$seclong)
+      dt <- fread(input$seclong$datapath)
+      dt[, sumIntensity := log2(sum(intensity, na.rm=T)), by=.(protein, sample)]
+      dt[, `:=`(replicate = as.factor(replicate),
+                intensity = log2(intensity)
+                )]
+      dt
+  })
+  complexes <- reactive({
+      req(input$complexfile)
+      fread(input$complexfile$datapath)
+  })
+  deadata <- reactive({
+      req(input$deafile)
+      fread(input$deafile$datapath)
+  })
+  # secdata <- reactive({
+  #     dt[, sumIntensity := log2(sum(intensity, na.rm=T)), by=.(protein, sample)]
+  #     dt[, `:=`(replicate = as.factor(replicate),
+  #               intensity = log2(intensity)
+  #               )]
+  # })
+  # complexes <- reactive({
+  #     complexes.dt
+  # })
+  # deadata <- reactive({
+  #     de.dt
+  # })
+
+  observeEvent(complexes(), {
+  updateSelectizeInput(session, 'complexes2plot',
+                       choices = c('Show all', unique(complexes()$info)), server = TRUE)
+  })
+  
+  observeEvent(input$complexes2plot, {
+  if ('Show all' %in% input$complexes2plot){
+    showgenes <-  secdata()[, unique(gene)]
+  } else {
+    showgenes <-  complexes()[info %in% input$complexes2plot, unique(gene)]
+  }
+  updateSelectizeInput(session, 'genes2plot', 
+                       choices = sort(showgenes), server = TRUE)
+  })
+  observeEvent(secdata(), {
+  updateSelectizeInput(session, 'samples2plot',
+                       choices = unique(secdata()$sample), server = TRUE)
+  })
+  
+  # reactive plotting function; take the data dt and the input vals for plotting
+  # modularize the plotting functions; different plot for ridgeline colored by intensity (log2)
+  shinyPlot <- shiny::reactive({
+    req(secdata(), input$genes2plot, input$samples2plot)
+  
+    sec.dt <- secdata()
+    genesOI <- input$genes2plot
+    samplesOI <- input$samples2plot
+
+    
+    if (input$plotType == 'ridgeline') {
+    
+    scale <- input$scale
+    facetOrder <- input$facetOption
+    fillOption <- input$fillBy
+    
+    # reorder genes by similarity
+    sec.mat <- dcast(sec.dt[gene %in% genesOI & sample %in% samplesOI,], gene~paste0(treatment,'_',replicate) + fraction, value.var = "intensity_totalScaled") %>% 
+      as.matrix(rownames = "gene")
+    sec.mat[is.na(sec.mat)] <- 0.0
+    genesOI <- rownames(sec.mat)[dendextend::order.hclust(hclust(dist(sec.mat), method = "ward.D2"))]
+    
+    p <- ggplot (sec.dt[gene %in% genesOI & sample %in% samplesOI,][, gene := factor(gene, levels = genesOI)],
+      aes(x = fraction, y=gene, fill = !!sym(input$fillBy))) + 
+      scale_y_discrete(expand=c(0,0)) + 
+      theme_bw() + 
+      theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80"))
+    
+    if ( !!sym(input$fillBy) == 'replicate' | !!sym(input$fillBy) == 'treatment'){
+      p <- p + ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled), size = 0.1, scale = scale) +
+        scale_fill_manual(values=treatment.pal)
+    #} else if ( !!sym(input$fillBy) == "overlayReplicates"){
+    #  p <- p + ggridges::geom_ridgeline(aes(height = intensity_totalScaled, fill=replicate), alpha=0.5, size = 0.1, scale = scale)
+    } else if ( !!sym(input$fillBy) == 'intensity') {
+      p <- p + ggridges::geom_ridgeline(aes(height = intensity_totalScaled, fill=sumIntensity), size = 0.1, scale = scale) +
+        scale_fill_viridis_c(option='A')
+    #} else if ( !!sym(input$fillBy) == 'overlayTreatments'){
+    #  p <- p + ggridges::geom_ridgeline(aes(height = intensity_totalScaled, fill=treatment), alpha=0.5, size = 0.1, scale = scale)
+    }
+    
+    if (facetOrder == "replicateByTreatment")
+      p <- p + facet_grid(replicate~treatment)
+    else if (facetOrder == "treatmentByReplicate")
+      p <- p + facet_grid(treatment~replicate)
+    p
+    } else if (input$plotType == 'heatmap'){
+      
+    scale <- input$matScale
+    colRange <- input$colorRange
+    denom <-  50 / colRange 
+
+    if (scale == "none"){
+      hmlist <-  scaledIntensityMatrices(sec.dt[gene %in% genesOI & sample %in% samplesOI], scaleDenom = 'none')
+      # get the quantile specified by the user
+      denom <- sec.dt[!is.na(intensity) & gene %in% genesOI & sample %in% samplesOI, 50/(unname(quantile(intensity, colRange)))]
+      colorFun <- circlize::colorRamp2(breaks = (0:50)/denom, colors = viridis(51, direction = 1))
+      scale <- 'log2 Ints.'
+    } else if (scale == 'total'){
+      hmlist <-  scaledIntensityMatrices(secLong.dt=sec.dt[gene %in% genesOI & sample %in% samplesOI,], scaleDenom = 'total')
+      colorFun <- circlize::colorRamp2(breaks = (0:50)/denom, colors = viridis(51, direction = 1))
+    } else if (scale == 'max'){
+      hmlist <-  scaledIntensityMatrices(secLong.dt=sec.dt[gene %in% genesOI & sample %in% samplesOI], scaleDenom = 'max') 
+      colorFun <- circlize::colorRamp2(breaks = (0:50)/denom, colors = viridis(51, direction = 1))
+    }
+    hmlist <- lapply(hmlist, function(x){ rownames(x) <- mapHeatmapRownamesToGene(x, sec.dt, genesOI);return(x) }) 
+    hm <- complexIntensityHeatmaps(hmlist, legendtitle = scale, colorFun = colorFun)
+    draw(hm)
+    }
+    })
+
+  output$plot <- renderPlot({
+    shinyPlot()
+  })
+  
+  output$savePlot <- downloadHandler(
+    filename = function(file) {
+      paste0('shinyPlot.',input$plotType, '.pdf')
+    },
+     content = function(file) {
+        pdf(file=file, width = input$downloadSize, height = input$downloadSize) #res = 300, height = 6, width = 6, units = "in")
+        print(shinyPlot())
+        dev.off()
+      }
+  )
+    
+  output$deatable = DT::renderDT({
+
+    if ('Show all' %in% input$complexes2plot){
+      deadata()[, .(gene, protein, proteinPeakCluster, N, meanPeakHeight, centerOfPeak=center, differentialTreatment.pvalue=treatmentDiff.p, differentialTreatmentIntensity.pvalue=treatmentIntensity.p)]
+    } else {
+      deadata()[gene %in% input$genes2plot, .(gene, protein, proteinPeakCluster, N, meanPeakHeight, centerOfPeak=center, differentialTreatment.pvalue=treatmentDiff.p, differentialTreatmentIntensity.pvalue=treatmentIntensity.p)]
+    }
+  }, options = list(search = list(regex = TRUE, caseInsensitive = FALSE), pageLength = 10)) # options for DT search bar; allow regex searches to look up multiple genes at once
+    
+}
+```
+
+```{r}
+View(multiUniprots2multiGenes)
+
+shinyApp(ui, server)
+
+
+View(scaledIntensityMatrices)
+
+```
+
+
+```{r}
+test.genes <- head(dt)$gene
+dt[, sumIntensity := log2(sum(intensity, na.rm=T)), by=.(protein,sample)]
+
+
+ggplot (dt[gene %in% test.genes,][, gene := factor(gene, levels = test.genes)],
+      aes(x = fraction, y=gene, fill = intensity)) + 
+      scale_y_discrete(expand=c(0,0)) + 
+      theme_bw() + 
+      facet_grid(replicate~treatment) +
+      theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80")) +
+  ggridges::geom_ridgeline(aes(height = intensity_totalScaled, fill=sumIntensity), size = 0.1, scale = 2) +
+  scale_fill_viridis_c(option='A')
+```
+
+tes tto render table 
+```{r}
+testui <- fluidPage(
+  fileInput("upload", NULL, buttonLabel = "Upload...", multiple = TRUE),
+  DTOutput("files")
+)
+testserver <- function(input, output, session) {
+  
+  dataf <-  reactive({
+    req(input$upload)
+    fread(input$upload$datapath)
+  })
+  output$files <- DT::renderDT({
+    DT::datatable(dataf())
+  })
+}
+
+
+help(renderDT)
+
+shinyApp(testui, testserver)
+```
+
+
+
+code for server side: minimal working
+```{r, minimalworkingserver}
+# Define server logic required to draw a histogram
+server <- function(input, output, session) {
+  
+  # code to produce ridgeplot (needs work..)
+  shinyPlot <- shiny::reactive({
+    
+    req(input$seclong) # require input file
+    # values from input
+    sec.dt <- fread(input$seclong$datapath)
+    sec.dt[, replicate := as.factor(replicate)]
+    genesOI <- input$genes2plot
+    complexesOI <-  input$complex2plot
+    
+    if (input$plotType == 'ridgeline') {
+      
+    scale <- input$scale
+    facetOrder <- input$facetOption
+    fillOption <- input$fillBy
+    
+    # reorder genes by similarity
+    sec.mat <- dcast(sec.dt[gene %in% genesOI], gene~paste0(treatment,'_',replicate) + fraction, value.var = "intensity_totalScaled") %>% 
+      as.matrix(rownames = "gene")
+    sec.mat[is.na(sec.mat)] <- 0.0
+    genesOI <- rownames(sec.mat)[dendextend::order.hclust(hclust(dist(sec.mat), method = "ward.D2"))]
+    
+    p <- ggplot (sec.dt[gene %in% genesOI][, gene := factor(gene, levels = genesOI)],
+      aes(x = fraction, y=gene, fill = !!sym(input$fillBy))) + 
+      ggridges::geom_ridgeline_gradient(aes(height = intensity_totalScaled), size = 0.1, scale = scale) +
+      scale_y_discrete(expand=c(0,0)) + 
+      theme_bw() + 
+      theme(strip.text.y=element_text(size=10),
+          strip.text=element_text(color='white'),
+          strip.background = element_rect(colour = "white", fill = "grey80"))
+    
+    if (facetOrder == "replicateByTreatment")
+      p <- p + facet_grid(replicate~treatment)
+    else if (facetOrder == "treatmentByReplicate")
+      p <- p + facet_grid(treatment~replicate)
+    else if (facetOrder == "overlapReplicates")
+      p <- p + facet_wrap(~treatment)
+    
+    p
+    } else if (input$plotType == 'heatmap'){
+      
+    scale <- input$matScale
+    #col range for scaled heatmaps,
+    denom <-  50 / 0.5
+    colorFun <- circlize::colorRamp2(breaks = (0:50)/denom, colors = viridis(51, direction = 1))
+    
+    # create mat and col function   
+    if (scale == "none"){
+      sec.mat <- dcast(sec.dt[gene %in% genesOI], gene~paste0(treatment,'_',replicate, '.', fraction), value.var = "intensity") %>% 
+        as.matrix(rownames = "gene")
+      sec.mat <- log2(sec.mat)
+      colorFun <- viridis(20)
+      scale <- 'log2 Ints.'
+      
+    } else if (scale == 'total'){
+      sec.mat <- dcast(sec.dt[gene %in% genesOI], gene~paste0(treatment,'_',replicate, '.', fraction), value.var = 'intensity_totalScaled') %>% 
+        as.matrix(rownames = "gene")   
+
+    } else if (scale == 'max'){
+       sec.mat <- dcast(sec.dt[gene %in% genesOI], gene~paste0(treatment,'_',replicate, '.', fraction), value.var = 'intensity_maxScaled') %>% 
+         as.matrix(rownames = "gene") 
+    }
+    sec.mat[is.na(sec.mat)] <- 0.0
+    # dont think its a good idea to cluster rows across conditions
+    genesOI <- rownames(sec.mat)[dendextend::order.hclust(hclust(dist(sec.mat), method = "ward.D2"))]
+    
+    colAnno <- HeatmapAnnotation(fraction=stringr::str_extract(colnames(sec.mat), "(?<=[.])[0-9]{1,2}"))
+    
+    hm <- Heatmap(sec.mat,
+                  name=scale,
+                  show_row_dend = F,
+                  cluster_rows = FALSE,
+                  bottom_annotation = colAnno, 
+                  show_column_names = F,
+                  cluster_columns = FALSE,
+                  column_split =  gsub('[.][0-9]+', '', colnames(sec.mat)),
+                  column_title_gp = gpar(fontface='bold'),
+                  cluster_column_slices = F,
+                  row_title_rot = 0,
+                  col=colorFun,
+                  border=T
+                  )
+    hm <- draw(hm)
+    hm
+    #makeInteractiveComplexHeatmap(input, output, session, hm) I think for later veersion yes, but for now leave as is
+    }
+    })
+
+  output$plot <- renderPlot({
+    shinyPlot()
+  })
+  
+  output$savePlot <- downloadHandler(
+    filename = function(file) {
+      paste0('shinyPlot.',input$plotType, '.pdf')
+    },
+     content = function(file) {
+        pdf(file=file, width = input$downloadSize, height = input$downloadSize) #res = 300, height = 6, width = 6, units = "in")
+        print(shinyPlot())
+        dev.off()
+      }
+  )
+}
+```
+Ok have something working, but need a lot of work.. I think the third page can be an interactive heatmap; bottom of first page can be the DE ouput
+```{r}
+shinyApp(ui, server)
+```
+
+
+

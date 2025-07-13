@@ -1,0 +1,349 @@
+---
+title: "location.coefficients"
+author: "Martin Gordon"
+date: "2023-08-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+
+
+source("../../utils/bp_utils/ManageScriptData.R")
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+
+```{r}
+bgVsCyto <- fread ("../../utils/bp_utils/data/2023_08_03_Dar25.28.29_LocationReference_CytoContrasts.csv")
+
+# make long and positive vs Cyto
+bgVsCyto.long <- melt(bgVsCyto, id.vars = "Protein", variable.name = "bg", value.name = "log2FC")
+bgVsCyto.long[, log2FC := -log2FC]
+bgVsCyto.long[, bg := tstrsplit(bg, " - ", keep = 2)]
+```
+
+In this case the gene signatures we have do a nice job of seperating out the spatial signatures
+
+```{r}
+protQuant <- fread("./DARAP.34.11_data/2023_08_21_ProteinLevelData.tmp.2round.wCyto.csv")
+unique(protQuant$GROUP)
+
+
+# limit to location-specific proteins
+pq.subset <- protQuant[ Protein %in% unique(bgVsCyto.long$Protein)  ]
+
+# use the Cyto to predict backgrounds
+predictedBackgrounds <- merge (pq.subset[GROUP == "Cyto"], bgVsCyto.long, by = "Protein", allow.cartesian = TRUE)
+predictedBackgrounds[, LogIntensities := LogIntensities + log2FC ]
+predictedBackgrounds[, GROUP := bg]
+# to be safe, delete the MSstats stuff that is meaningless now
+predictedBackgrounds[, c("RUN", "NumMeasuredFeature", "MissingPercentage", "more50missing", "NumImputedFeature", "originalRUN", "SUBJECT_NESTED", "runInt", "group_subject") :=
+                       NULL ]
+
+
+# view as a matrix, predicted + Cyto
+spatRef.mat <- as.matrix(dcast(rbindlist (list(pq.subset[GROUP == "Cyto"], predictedBackgrounds), fill = TRUE, use.names = TRUE), Protein~GROUP+SUBJECT, value.var = "LogIntensities") ,rownames = "Protein")
+spatRef.mat <- sweep (spatRef.mat, 1, apply(spatRef.mat, 1, median, na.rm = TRUE))
+mnn <- spatRef.mat
+mnn[is.na(spatRef.mat)] <- -0.25
+hc <- hclust(dist(mnn))
+sum(is.na(spatRef.mat))
+dim(spatRef.mat)
+Heatmap (spatRef.mat, cluster_rows = hc, column_split = tstrsplit(colnames(spatRef.mat), "_")[[1]])
+
+```
+
+Samples look v similar to me.. maybe difficult to see differences in location co-efficients
+Explains why results for the location deconvolution looks so poor
+
+```{r, fig.width = 10, fig.height = 6}
+
+spatRef.mat <- as.matrix(dcast(rbindlist (list(pq.subset[GROUP == "Cyto"], predictedBackgrounds), fill = TRUE, use.names = TRUE), Protein~GROUP+SUBJECT, value.var = "LogIntensities") ,rownames = "Protein")
+spatRef.mat <-spatRef.mat[rownames(spatRef.mat) != 'Q8N1F8',]
+colnames(spatRef.mat) #146
+
+pquant.mat <- as.matrix(dcast(pq.subset[GROUP != "Cyto" & Protein %in% rownames(spatRef.mat)], Protein~GROUP+SUBJECT, value.var = "LogIntensities") ,rownames = "Protein")
+colnames(pquant.mat)
+
+which(!rownames(spatRef.mat) %in% rownames(as.matrix(dcast(pq.subset[GROUP != "Cyto" & Protein %in% rownames(spatRef.mat)], Protein~GROUP+SUBJECT, value.var = "LogIntensities") ,rownames = "Protein")) )
+
+prot.mat[rownames(prot.mat) == 'Q8N1F8']
+spatRef.mat[103,]
+
+# adjust clustering 
+mnn <- spatRef.mat
+mnn[is.na(spatRef.mat)] <- 0
+hc <- hclust(dist(mnn))
+
+hm <- Heatmap (spatRef.mat,
+         cluster_rows = hc, column_names_gp = gpar(fontsize=7), column_split = tstrsplit(colnames(spatRef.mat), "_")[[1]]) +
+  Heatmap (as.matrix(dcast(pq.subset[GROUP != "Cyto" & Protein %in% rownames(spatRef.mat)], Protein~GROUP+SUBJECT, value.var = "LogIntensities"), rownames = "Protein"), cluster_columns = FALSE, row_names_gp = gpar(fontsize=6), column_names_gp = gpar(fontsize=7))
+
+
+BackupAsPDF(hm, 'location.coef.heatmap', dimensions=c(10,12))
+```
+
+# deconvolute backgrounds
+
+
+```{r}
+pq <- rbind(pq.subset, predictedBackgrounds, fill = TRUE)
+proteinsToFitOn <- unique(pq$Protein)
+spatialReferences <- unique(c(bgVsCyto.long$bg, "Cyto"))
+
+source ("../../utils/bp_utils/CompositeLocationsAPEX.R")
+
+pq[, scaledIntensity := 2^LogIntensities/max(2^LogIntensities, na.rm=TRUE),by = .(Protein)]
+
+# in case where I have bioreplicate like GROUP.rep
+#pq[, rep := as.integer(tstrsplit(SUBJECT_ORIGINAL, split = "\\.")[[2]])]
+#pq[, rep := gsub ("^.*[._]([1-9])$", "\\1", SUBJECT)]
+pq[, rep := as.integer(as.factor(SUBJECT))]
+
+#pq[, rep := SUBJECT_ORIGINAL]
+
+pq$GROUP %>%  unique()
+
+```
+
+Run the location deconvolution
+
+```{r}
+# mean scaling
+#pq[, scaledIntensity := 2^(logIntWithImputation+10 - bg.mean)]
+
+allIterations <- list()
+for (iteration in 1:100){
+  #calculate per rep by subsetting
+  fitListsByRep <- lapply (unique(pq$rep), 
+                           FUN =function(i)
+                             calculateFitsLong(pq[Protein %in% proteinsToFitOn &
+                                                                            (rep==i 
+                                                                             | GROUP %in% spatialReferences # this OR statement will get all reps for the backgrounds and force summarization  for just the backgrounds 
+                                                                            )],  
+                                               forceNonNegative=TRUE, naIntensityValue = 0, randomizedColumns = 3, withIntercept=FALSE,
+                                               backgroundRuns = spatialReferences))
+  
+  fitsByRep <- lapply (fitListsByRep, FUN = function(l)l$coefficients)
+  
+  #alternatively, we'd summarize and take the mean/median per protein/condition
+  
+  fitsByRep <- rbindlist(fitsByRep, idcol = "rep")
+  repFitsLong <- melt(fitsByRep, id.vars=c("rep", "group"), value.name="coefficient", variable.name="bg")
+  #repFitsLong[,c("mor", "drug", "time") := tstrsplit(group, split="_")]
+  #repFitsLong[, drugName := c(D="DAMGO", M = "Morphine", P = "PZM21")[drug]]
+  allIterations[[iteration]] <- repFitsLong
+}
+
+repFitsLong <- rbindlist(allIterations, idcol = "iteration")
+
+locColors <- RColorBrewer::brewer.pal(8, "Dark2")[1:(length(spatialReferences)+1)]
+names(locColors) <- c(spatialReferences, "z.rand")
+
+```
+
+Tidy the output for visualisation 
+```{r}
+
+repFitsLong
+
+repFitsLong[, receptor := str_extract(group, "MRX2|NK1R")]
+repFitsLong[, drug := 'SP'] %>% .[group %like% 'MRX2_R[0-9]{2}', drug := 'CZ']
+repFitsLong[, bigGroup := paste0(receptor,'.',drug)]
+repFitsLong[, timeStr := str_extract(group, '[0-9]{2}$')]
+repFitsLong[, time :=as.integer(gsub ("min", "", timeStr))]
+
+
+p <- ggplot (repFitsLong[!grepl("Rand", bg)], aes(x=as.integer(time), y=coefficient, col = bg,  lty=as.character(rep), group = interaction(bg,rep, iteration))) + geom_line(alpha=0.1) + facet_wrap (~bigGroup) + scale_x_continuous(name = "minutes") + scale_linetype_discrete (name = "batch") + scale_color_manual(values = locColors)
+
+print (p)
+
+repFitsLong.median <- repFitsLong[,.(coefficient = median(coefficient)),by = .(rep,bg, bigGroup, time )]
+repFitsLong.median[grepl("Rand", bg), bg := "z.rand"]
+
+p <- ggplot (repFitsLong.median[!grepl("rand", bg)], aes(x=as.integer(time), y=coefficient, col = bg,  lty=as.character(rep), group = interaction(bg,rep))) + geom_line(alpha=1.0) + facet_wrap (~bigGroup) + scale_x_continuous(name = "minutes") + scale_linetype_discrete (name = "batch")+ scale_color_manual(values = locColors) + theme_classic()
+
+print(p)
+
+
+standard.error <- function(x, ...){
+  sqrt(var(x, ...))/length(x)
+}
+repFitsLong.median.simple <- repFitsLong.median[, .(coefficient = mean (coefficient), stderr = standard.error(coefficient),
+                                                    stdDev = sd(coefficient),
+                                                    minCoef = min(coefficient),
+                                                    maxCoef = max(coefficient)), by = .(bg, bigGroup, time)]
+
+```
+
+Visualise
+```{r}
+# include random
+p <- ggplot (repFitsLong.median.simple, aes(x=as.integer(time), y=coefficient, col = bg, group = bg)) +
+  geom_line(alpha=1.0) +
+  geom_errorbar( mapping = aes(ymin =  minCoef, ymax = maxCoef)) + 
+  geom_point(data = repFitsLong.median, mapping = aes(y = coefficient)) + 
+  facet_wrap (~bigGroup) +
+  scale_x_continuous(name = "minutes") +
+  #scale_linetype_discrete (name = "batch") +
+  scale_color_manual(values = locColors) + theme_classic()
+p
+BackupAsPDF (p,'location.coefficients.random')
+
+
+repFitsLong.median.simple
+
+# no random
+p <- ggplot (repFitsLong.median.simple[!grepl("rand", bg)], aes(x=as.integer(time), y=coefficient, col = bg, group = bg)) +
+  geom_line(alpha=1.0) +
+  geom_errorbar( mapping = aes(ymin =  minCoef, ymax = maxCoef)) + 
+  geom_point(data = repFitsLong.median[!grepl("rand", bg)], mapping = aes(y = coefficient)) + 
+  facet_wrap (~bigGroup) +
+  scale_x_continuous(name = "minutes") +
+  #scale_linetype_discrete (name = "batch") +
+  scale_color_manual(values = locColors) + theme_classic()
+p
+BackupAsPDF (p, 'location.coefficients.norandom')
+
+
+(repFitsLong.median.simple)
+```
+```{r}
+fwrite (repFitsLong.median, ScriptAndDatedFileName("SpatialCoefficients.csv"))
+```
+
+
+# no cyto
+
+```{r}
+pq <- rbind(pq.subset, predictedBackgrounds, fill = TRUE)
+pq <- pq[GROUP != "Cyto"]
+proteinsToFitOn <- unique(pq$Protein)
+spatialReferences <- unique(c(bgVsCyto.long$bg))
+
+source ("../../utils/bp_utils/CompositeLocationsAPEX.R")
+
+pq[, scaledIntensity := 2^LogIntensities/max(2^LogIntensities, na.rm=TRUE),by = .(Protein)]
+
+# in case where I have bioreplicate like GROUP.rep
+#pq[, rep := as.integer(tstrsplit(SUBJECT_ORIGINAL, split = "\\.")[[2]])]
+#pq[, rep := gsub ("^.*[._]([1-9])$", "\\1", SUBJECT)]
+pq[, rep := as.integer(as.factor(SUBJECT))]
+
+#pq[, rep := SUBJECT_ORIGINAL]
+
+# mean scaling
+#pq[, scaledIntensity := 2^(logIntWithImputation+10 - bg.mean)]
+
+allIterations <- list()
+for (iteration in 1:100){
+  #calculate per rep by subsetting
+  fitListsByRep <- lapply (unique(pq$rep), 
+                           FUN =function(i)
+                             calculateFitsLong(pq[Protein %in% proteinsToFitOn &
+                                                                            (rep==i 
+                                                                             | GROUP %in% spatialReferences # this OR statement will get all reps for the backgrounds and force summarization  for just the backgrounds 
+                                                                            )],  
+                                               forceNonNegative=TRUE, naIntensityValue = 0, randomizedColumns = 3, withIntercept=FALSE,
+                                               backgroundRuns = spatialReferences))
+  
+  fitsByRep <- lapply (fitListsByRep, FUN = function(l)l$coefficients)
+  
+  #alternatively, we'd summarize and take the mean/median per protein/condition
+  
+  fitsByRep <- rbindlist(fitsByRep, idcol = "rep")
+  repFitsLong <- melt(fitsByRep, id.vars=c("rep", "group"), value.name="coefficient", variable.name="bg")
+  #repFitsLong[,c("mor", "drug", "time") := tstrsplit(group, split="_")]
+  #repFitsLong[, drugName := c(D="DAMGO", M = "Morphine", P = "PZM21")[drug]]
+  allIterations[[iteration]] <- repFitsLong
+}
+repFitsLong <- rbindlist(allIterations, idcol = "iteration")
+#ggplot (repFitsLong[!grepl("Rand", bg)], aes(x=time, y=coefficient, col = bg,  lty=as.character(rep), group = interaction(bg,rep))) + geom_line() + facet_wrap (~drug)
+
+locColors <- RColorBrewer::brewer.pal(8, "Dark2")[1:(length(spatialReferences)+1)]
+names(locColors) <- c(spatialReferences, "z.rand")
+```
+
+
+```{r}
+repFitsLong[, receptor := str_extract(group, "MRX2|NK1R")]
+repFitsLong[, drug := 'SP'] %>% .[group %like% 'MRX2_R[0-9]{2}', drug := 'CZ']
+repFitsLong[, bigGroup := paste0(receptor,'.',drug)]
+repFitsLong[, timeStr := str_extract(group, '[0-9]{2}$')]
+repFitsLong[, time :=as.integer(gsub ("min", "", timeStr))]
+
+p <- ggplot (repFitsLong[!grepl("Rand", bg)], aes(x=as.integer(time), y=coefficient, col = bg,  lty=as.character(rep), group = interaction(bg,rep, iteration))) + geom_line(alpha=0.1) + facet_wrap (~bigGroup) + scale_x_continuous(name = "minutes") + scale_linetype_discrete (name = "batch") + scale_color_manual(values = locColors)
+
+print (p)
+
+repFitsLong.median <- repFitsLong[,.(coefficient = median(coefficient)),by = .(rep, bg, bigGroup, time )]
+repFitsLong.median[grepl("Rand", bg), bg := "z.rand"]
+
+p <- ggplot (repFitsLong.median[!grepl("rand", bg)], aes(x=as.integer(time), y=coefficient, col = bg,  lty=as.character(rep), group = interaction(bg,rep))) + geom_line(alpha=1.0) + facet_wrap (~bigGroup) + scale_x_continuous(name = "minutes") + scale_linetype_discrete (name = "batch")+ scale_color_manual(values = locColors) + theme_classic()
+print(p)
+
+
+repFitsLong.median.simple <- repFitsLong.median[, .(coefficient = mean (coefficient), stderr = standard.error(coefficient),
+                                                    stdDev = sd(coefficient),
+                                                    minCoef = min(coefficient),
+                                                    maxCoef = max(coefficient)), by = .(bg, bigGroup, time)]
+
+```
+
+```{r}
+
+# include random
+p <- ggplot (repFitsLong.median.simple, aes(x=as.integer(time), y=coefficient, col = bg, group = bg)) +
+  geom_line(alpha=1.0) +
+  geom_errorbar( mapping = aes(ymin =  minCoef, ymax = maxCoef)) + 
+  geom_point(data = repFitsLong.median, mapping = aes(y = coefficient)) + 
+  facet_wrap (~bigGroup) +
+  scale_x_continuous(name = "minutes") +
+  #scale_linetype_discrete (name = "batch") +
+  scale_color_manual(values = locColors) + theme_classic()
+
+BackupAsPDF (p,'location.coefficients.noCyto.random')
+
+
+
+
+# no random
+p <- ggplot (repFitsLong.median.simple[!grepl("rand", bg)], aes(x=as.integer(time), y=coefficient, col = bg, group = bg)) +
+  geom_line(alpha=1.0) +
+  geom_errorbar( mapping = aes(ymin =  minCoef, ymax = maxCoef)) + 
+  geom_point(data = repFitsLong.median[!grepl("rand", bg)], mapping = aes(y = coefficient)) + 
+  facet_wrap (~bigGroup) +
+  scale_x_continuous(name = "minutes") +
+  #scale_linetype_discrete (name = "batch") +
+  scale_color_manual(values = locColors) + theme_classic()
+
+BackupAsPDF (p,'location.coefficients.noCyto.noRandom')
+
+
+```
+
+```{r}
+ggplot(repFitsLong.median[bg != "z.rand"], aes ( x= time, y = coefficient, color = bg, lty = as.factor(rep))) + geom_line() + theme_classic() + 
+  facet_wrap(~bigGroup) + 
+  scale_color_manual(values = locColors)
+```
+
+
+```{r}
+fwrite (repFitsLong.median, ScriptAndDatedFileName("SpatialCoefficients_NoCyto.csv"))
+```
+
+
+
+
+

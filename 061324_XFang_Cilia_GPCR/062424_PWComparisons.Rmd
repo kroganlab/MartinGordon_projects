@@ -1,0 +1,1442 @@
+p.quant---
+title: "062424_PWComparisons"
+author: "Martin Gordon"
+date: "2024-06-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Overview
+APEX_MS GPCR study in Cilia cells
+
+## quick QC of files
+# looks like 4 bioreplicates per group
+Q. what do the groups look like?
+Conditions:
+
+How many variables do we have here?
+1 +/- cilia (2 lvls)
+2 labels 
+3 +/- agonist 
+
+Options:
+Look at the rerun samples, pick the 'best' from each group and normalize at the protein level
+
+
+Points to make:
+i) Sample QC: going with 134 as most reproducible (most similar features detected)... not so sure about this... maybe we want to take avg of 2,4,5? Try tomorrow, first look at PCA of all samples
+iii) Maybe discuss dropping samples: cilia_GPR135.3 +cilia_Crhr2_ag.3 and +cilia_ARL13b.1
+iv)  Need to also consider proteins absent in one condition... didnt include these in the sample overlaps 
+v) enrichment results v strange... ER localized it seems? some kind of misfolding/clearance due to mislocalization? I guess the fact
+
+Question about the endo carboxylase expression level.. include as a covariate, or nmf to idenftiy this background signal and include in our model
+
+
+**Controls in APEX experiments**
+Nachury et al 2015: control: mislocalized control APEX (mutated cilia probe (myristoylation site that mediates ciliary localization of NPHP3[1–203] was mutated)) and unlabelled probe to capture APEX non-specific biotinylation and endogenous biotinylation
+Nachury et al 2021: non-labelling, water instead of H202. Seems to be where the -cilia idea comes from
+Marshall et al 2012: protein correlation profiling to id cilia proteins (looked at correlation vs known cilia markers)
+
+Todo
+----
+In the literature associated heatmap, annotate with proteins from the GO cillium annotations
+Do the PW comparisons of probe w/wo cilia (background signalling, maybe want to subtract this from sig res?)
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+```{r}
+spec <-  fread('./data/CR1/Re-run/20240618_164945_CR1_rep5_Report.tsv')
+
+# create some new ID columns 
+spec[, agonist := ifelse(grepl('_ag$', Condition), 'Yes','No')]
+spec %>%  str()
+# read in the contrast matrix
+```
+```{r}
+# no multiple feature peptide ions detected.. proceed as is
+spec[,.N, by=.(PeptideSequence,PrecursorCharge,Run)][N >1]
+```
+
+Look at the intensity distributions
+
+```{r}
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram()
+
+spec <- spec[Intensity > 2^4,]
+
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram()
+```
+Define a base directory for the plots and color palette
+
+```{r}
+# get color palettes
+cond.col.pal <- getQualitativePalette(n=12)
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(spec$Condition)))
+
+baseDir <- "~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/pdfs/"
+```
+
+
+A couple of the samples are poor quality.. lets look at feature counts
+Intensities across groups are very variable..
+```{r}
+png(filename=paste0(baseDir, 'ptide.Ints.boxplots.bioRepCol.png'), width=14, height=8, units = 'in', res=200)
+g <- ggplot(spec, aes(x=paste0(Condition,'.',BioReplicate), y=log2(Intensity), fill=as.factor(BioReplicate))) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('Peptide Intensity Distribution') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=6))
+g
+dev.off()
+#BackupAsPDF(g, 'peptide.Ints.boxplots', dimensions=c(12,7))
+```
+
+plots of N features detected
+```{r}
+png(filename=paste0(baseDir, 'features.rawCounts.bioRepCol.png'), width=14, height=8, units = 'in', res=200)
+g <- ggplot(spec[,.N, by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=as.factor(BioReplicate))) +
+  geom_bar(stat='Identity') +
+  ggtitle('N features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=5))
+
+g
+dev.off()
+```
+Replot and order by run order
+This plot clearly demonstrates why we drop these samples
+```{r}
+png(filename=paste0(baseDir, 'features.rawCounts.runOrder.png'), width=14, height=8, units = 'in', res=200)
+
+g <- ggplot(unique(spec[,.(.N, Run = as.numeric(gsub('exD|exLewis|[.]raw','', Run))), by=.(Condition,BioReplicate)]), 
+            aes(x=reorder(paste0(Condition,'.',BioReplicate,'.run',Run), Run), y=N, fill=as.factor(BioReplicate))) +
+  geom_bar(stat='Identity') +
+  ggtitle('N features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=5))
+
+g
+dev.off()
+```
+
+Before the summarization, lets drop run 2 & 5 and just proceed with the others
+
+```{r}
+# drop bioreps 2 and 5
+spec <- spec[!BioReplicate %in% c(2,5)]
+
+# now lets drop the 
+g <- ggplot(spec, aes(x=paste0(Condition,'.',BioReplicate), y=log2(Intensity), fill=(Condition))) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('Peptide Intensity Distribution') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=6))
+g
+```
+Lets not drop any samples right now..
+
+## Summarisation & Normalisation
+Running MSstats processing
+
+```{r}
+mssInput <- spec[, IsotopeLabelType := 'L']
+```
+
+Run MSStats dataProcess
+
+```{r}
+dp.out <- MSstats::dataProcess(mssInput, 
+                               MBimpute =  FALSE, 
+                               normalization = 'EQUALIZEMEDIANS',
+                               featureSubset = "highQuality", 
+                               remove_uninformative_feature_outlier = TRUE)
+
+
+saveRDS(dp.out, ScriptAndDatedFileName('dp.out.rds'))
+```
+
+
+Lets also do a median normalization at the protein level...
+(v similar to the Limma normalization output.. proceed as is..)
+```{r}
+dp.out <- readRDS('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_24_dp.out.rds')
+p.quant <- setDT(dp.out$ProteinLevelData)
+
+
+p.quant[, medianInts := median(LogIntensities, na.rm=T), by=RUN]
+p.quant[, globalMedianInts := median(LogIntensities, na.rm=T),]
+
+p.quant[, newLogInts := LogIntensities - medianInts + globalMedianInts]
+#fwrite(p.quant, ScriptAndDatedFileName('ProteinLevelQuant.renorm.csv'))
+```
+Plot the normalized data and also generate some heatmaps/PCA plots
+
+```{r}
+png(filename=paste0(baseDir, 'prots.ints.medianNorm.boxplots.png'), width=14, height=8, units = 'in', res=200)
+
+# now lets drop the 
+g <- ggplot(p.quant, aes(x=paste0(GROUP,'.',SUBJECT), y=newLogInts, fill=GROUP)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('Protein Intensity Distribution') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=6))
+g
+dev.off()
+```
+
+Ok, now want to look at sample clustering in heatmap and PCA
+
+```{r}
+p.mat <-dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- sweep(p.mat, 1, STAT=apply(p.mat,1, median, na.rm=T))
+
+submat <- submat[sample(rownames(submat), 3000),]
+
+Heatmap(submat, 
+        show_row_names = F,
+        cluster_rows = clusterWNA(submat),
+        column_split=gsub('[.][1-6]$','', colnames(submat)))
+
+# create annotation
+ann <- data.table(group = colnames(p.mat))
+ann[, cilia_present := ifelse(grepl('-cilia', group), 'No', 'Yes')]
+ann[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', group), 'Yes', 'No')]
+ann[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', group)]
+ann[, rep := str_extract(group, '[0-9]$')]
+
+# unique col palette
+col.subset <- (col.pal[1:12])
+names(col.subset) <- unique(ann$status)   
+
+colours <- list('cilia_present' = c('Yes' = '#4477AA', 'No'="#CCBB44"),
+                'agonist_present' = c('Yes' = '#EE6677', 'No'='#228833'),
+                'rep' = c('1'=muted('green'), '2'=muted('yellow'), '3'=muted('pink'), '4'=muted('orange')),
+                'status' = col.subset)
+   
+      
+colAnn <- HeatmapAnnotation(df = ann[,.(status,cilia_present, agonist_present,rep)], col= colours)
+
+hm <- Heatmap(submat,
+        cluster_rows = clusterWNA(submat),
+        show_row_names = F,
+        name='Ints/Median',
+        column_names_gp = gpar(fontsize=7),
+        top_annotation = colAnn)
+hm
+BackupAsPDF(draw(hm), 'prots.ints.medianScaled.heatmap',dimensions=c(14,8))
+
+
+# ok, seems biorep is a driver of difference, but can control for this in linear modelling
+# plot ints with no missing values
+
+submat <- p.mat[complete.cases(p.mat),]
+submat <-  sweep(submat, 1, apply(submat, 1,median, na.rm=T))
+
+hm <- Heatmap(submat,
+        cluster_rows = clusterWNA(submat),
+        show_row_names = F,
+        row_title = sprintf('%s proteins detected in all samples', nrow(submat)),
+        name='Ints/Median',
+        column_names_gp = gpar(fontsize=7),
+        top_annotation = colAnn)
+
+BackupAsPDF(draw(hm), 'prots.ints.completeMatrix.medianScaled.heatmap',dimensions=c(14,8))
+```
+Looks like the top cluster will be the key driver of variance in our samples..
+Lets try cluster the heatmap, extract these genes and run an enrichment 
+
+```{r}
+# just use the submat, otherwise looking at using some kind of imputation mehtod
+pmat.obj <- pam(submat, 5)
+
+hm <- Heatmap(submat,
+        cluster_rows = T,
+        show_row_names = F,
+        split = pmat.obj$clustering,
+        clustering_distance_rows = 'euclidean',
+        #row_title = sprintf('%s proteins detected in all samples', nrow(submat)),
+        name='Ints/Median',
+        column_names_gp = gpar(fontsize=7),
+        top_annotation = colAnn)
+draw(hm)
+
+BackupAsPDF(draw(hm), 'prots.ints.medianScaled.pamClust.heatmap', dimensions=c(14,10))
+```
+Extract the cluster proteins 
+
+```{r}
+clusters.dt <- extractClustersfromHeatmap(draw(hm), submat)
+
+View(extractClustersfromHeatmap)
+
+clust.list <- row_order(draw(hm))
+clust.list
+
+do.call(rbind.data.frame, row_order(draw(hm)))
+
+
+clusters.dt[,.N, by=cluster]
+
+clusters.dt[, gene := multiUniprots2multiGenes(feature, species='MOUSE')]
+
+
+
+# this. works I think the other function just seqs through the clusters so names might be mixed...
+clusters.dt <- lapply(names(clust.list), function(i){
+   out <- data.table(GeneID = rownames(submat[clust.list[[i]],]),
+                     Cluster = paste0("cluster", i),
+                     stringsAsFactors = FALSE)
+   return(out)
+ }) %>%  #pipe (forward) the output 'out' to the function rbind to create 'clu_df'
+   do.call(rbind, .)
+
+#confirm we are extracting the correct clusters
+# looks good
+hm <- Heatmap(submat[rownames(submat) %in% clu_dt[Cluster == 'cluster3', GeneID],],
+        cluster_rows = T,
+        show_row_names = F,
+        #split = pmat.obj$clustering,
+        clustering_distance_rows = 'euclidean',
+        #row_title = sprintf('%s proteins detected in all samples', nrow(submat)),
+        name='Ints/Median',
+        column_names_gp = gpar(fontsize=7))
+draw(hm)
+```
+
+Run enrichment on the extracted clusters
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+```
+
+```{r}
+# define the universe, the total set of identified genes in our study
+universe <- as.character(unique(p.quant$Protein))
+
+enrich.dt <- enricherOnGroups(clusters.dt, 
+                              groupColumns = 'Cluster', 
+                              geneColumn = "GeneID", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('kmeans.cluster.enrichments.csv'))
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'Cluster')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('kmeans.cluster.simplified.enrichments.csv'))
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, 
+                                groupColumn = 'Cluster', 
+                                topN = 8,
+                                title='GO Cellular Component Enrichment', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'pamClust.GO.CC.enrichments.heatmap', dimensions=c(10,10))
+```
+
+ok, lets look at a PCA of the proteins 
+
+```{r}
+p.mat <- p.mat[complete.cases(p.mat),]
+
+pca <- prcomp(t(p.mat))
+
+pca.dt <- data.table(pca$x, keep.rownames = T)
+pca.dt <- merge(x=pca.dt, y=ann, by.x='rn', by.y='group')
+pca.dt[, group := gsub('.[0-9]$','', rn)]
+
+# calculate variance explained
+pcaPercentVar <- round(100 * (pca$sdev^2)/sum(pca$sdev^2), 1)
+
+g <- ggplot(data.table(VarExplained=pcaPercentVar, PC=factor(1:length(pcaPercentVar[])))[1:10,], aes(x=PC, y=VarExplained)) +
+  geom_bar(stat='Identity', fill=cond.col.pal[1]) +
+  ggtitle('PC proportion variance explained') +
+  theme_bw()
+g
+BackupAsPDF(g, 'PCs.varExplained.screeplot')
+
+
+#plot first two components
+p <- ggplot (pca.dt, aes(x=PC1, y=PC2,  fill = group, shape = cilia_present)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab(sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab(sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle(sprintf ("PCA using %d features (log intensity)", nrow(pca$rotation))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'proteins.groupCol.pac', dimensions=c(12,9))
+```
+
+```{r}
+#plot first two components
+p <- ggplot (pca.dt, aes(x=PC1, y=PC2,  fill = status, shape = agonist_present)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab(sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab(sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle(sprintf ("PCA using %d features (log intensity)", nrow(pca$rotation))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'proteins.statusCol.pac', dimensions=c(12,9))
+```
+As we don't really know what to do with the cilia group yet, lets drop these samples and review the PCA
+
+```{r}
+p.mat <- p.mat[complete.cases(p.mat), grep('[-]cilia', colnames(p.mat), invert=T)]
+
+pca <- prcomp(t(p.mat))
+
+
+pca.dt <- data.table(pca$x, keep.rownames = T)
+pca.dt <- merge(x=pca.dt, y=ann, by.x='rn', by.y='group')
+pca.dt[, group := gsub('.[0-9]$','', rn)]
+
+# calculate variance explained
+pcaPercentVar <- round(100 * (pca$sdev^2)/sum(pca$sdev^2), 1)
+
+g <- ggplot(data.table(VarExplained=pcaPercentVar, PC=factor(1:length(pcaPercentVar[])))[1:10,], aes(x=PC, y=VarExplained)) +
+  geom_bar(stat='Identity', fill=cond.col.pal[1]) +
+  ggtitle('PC proportion variance explained') +
+  theme_bw()
+g
+BackupAsPDF(g, 'PCs.varExplained.ciliaOnly.screeplot')
+
+
+#plot first two components
+p <- ggplot (pca.dt, aes(x=PC1, y=PC2,  fill = rep, shape = agonist_present)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab(sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab(sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle(sprintf ("PCA using %d features (log intensity) cilia expressing cells", nrow(pca$rotation))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'proteins.repCol.ciliaOnly.pca', dimensions=c(12,9))
+```
+
+
+
+Search for expression of endogenously biotinylating proteins
+------
+Expression inversely correlated with labelling efficiency. Lets check these are fairly consistent across groups
+Though initially all high endo carboxylase expressing samples might be the -ve cilia groups, but no
+
+GPCR161 samples might be an issue... high endogenous biotinylation
+Key take-away seems to be that there. is definitely a group dependence on endo biotinylation levels, meaning labelling efficiency eg (GPR161 groups) may be lower in some samples than others
++/- agonist and +/- cilia seem comparable, but comparisons between groups (or even vs PM background) may be difficult..
+
+
+```{r}
+# these are human. Map to MOUSE IDs
+biotin.carboxylases.up <- c("O00763","P05165","P11498","Q13085","Q96RQ3")
+
+# lets map the homologs to the mss output and write the complete and tidied data to file 
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+mouse.biotin.carboxylases <- mh_mappings[SWISS_PROT_IDs.human %in% biotin.carboxylases.up, SWISS_PROT_IDs.mouse]
+
+
+carb.mat <- dcast(p.quant[Protein %in% mouse.biotin.carboxylases,], Protein~interaction(GROUP,SUBJECT)) %>% 
+  as.matrix(rownames='Protein')
+
+carb.mat <-  sweep(carb.mat, 1, apply(carb.mat, 1, median, na.rm=T))
+
+carb.quant <- setDT(reshape2::melt(carb.mat))
+setnames(carb.quant, new=c('Protein', 'sample', 'LogInts'))
+
+carb.quant[, `:=`(GROUP  = gsub('[.][0-9]$', '', sample),
+                  SUBJECT = str_extract(sample, '[0-9]$'),
+                  gene = multiUniprots2multiGenes(as.character(Protein), species='MOUSE'))]
+
+# plot the median subtracted biotin carboxylases
+p <- ggplot(carb.quant, aes(x = interaction ( SUBJECT, GROUP ), y = LogInts, color = gene)) + 
+  geom_line(aes(group = Protein)) + 
+  geom_point(aes(shape = as.factor(SUBJECT))) +
+  geom_hline(yintercept=0, alpha=0.5, linetype=2) +
+  ggtitle('endogenous biotin carboxylase') +
+  ylab('LogInts/Median') +
+  xlab('Sample') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=5))
+
+p
+BackupAsPDF(p, "biotinCarboxylaseLevels.medianSubtraction.linechart",dimensions=c(12,10))
+
+                  
+p <- ggplot(p.quant[Protein %in% mouse.biotin.carboxylases], aes(x = interaction ( SUBJECT, GROUP ), y = newLogInts, color = Protein)) + 
+  geom_line(aes(group = Protein)) + 
+  geom_point(aes(shape = as.factor(SUBJECT))) +
+  scale_y_continuous(breaks=seq(9,20,1)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=6))
+
+p
+BackupAsPDF(p, "BiotinCarboxylaseLevels",dimensions=c(10,8))
+
+
+# harder to see... lets subtract our median intensities and see how this looks
+p <- ggplot(p.quant[Protein %in% mouse.biotin.carboxylases], aes(x = interaction ( SUBJECT, GROUP ), y = newLogInts, color = Protein)) + 
+  geom_line(aes(group = Protein)) + 
+  geom_point(aes(shape = as.factor(SUBJECT))) +
+  scale_y_continuous(breaks=seq(9,20,1)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=6))
+p
+
+p <- ggplot(p.quant[Protein %in% mouse.biotin.carboxylases & !GROUP %in% grep('-cilia', GROUP,value=T), ], aes(x = interaction ( SUBJECT, GROUP ), y = newLogInts, color = Protein)) + 
+  geom_line(aes(group = Protein)) + 
+  geom_point(aes(shape = as.factor(SUBJECT))) +
+  scale_y_continuous(breaks=seq(9,20,1)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=6))
+
+p
+BackupAsPDF(p, "endo.biotin.carboxylase.ciliaPos",dimensions=c(10,8))
+
+# plot by runID to see fi something weird going on..
+# no. evidence of run dependence
+p.quant[, RunID := as.numeric(gsub('exD|.raw','', originalRUN))]
+
+p <- ggplot(p.quant[Protein %in% mouse.biotin.carboxylases & !GROUP %in% grep('-cilia', GROUP,value=T), ], aes(x = reorder(paste0(interaction(SUBJECT,GROUP), '.', RunID), RunID), y = newLogInts, color = Protein)) + 
+  geom_line(aes(group = Protein)) + 
+  geom_point(aes(shape = as.factor(SUBJECT))) +
+  scale_y_continuous(breaks=seq(9,20,1)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=6))
+p
+
+## try plot similar conditions each to each other
+p.quant %>% str()
+p.quant[, GROUP := factor(GROUP, levels=c('+cilia_ARL13b','-cilia_ARL13b', 
+                                          '+cilia_PM','-cilia_PM',
+                                          '+cilia_SMO','-cilia_SMO','+cilia_SMO_ag','-cilia_SMO_ag',
+                                          '+cilia_Crhr2', '-cilia_Crhr2', '+cilia_Crhr2_ag', '-cilia_Crhr2_ag',
+                                          '+cilia_GPR161','-cilia_GPR161','+cilia_GPR161_ag','-cilia_GPR161_ag',
+                                          '+cilia_Pth2r', '-cilia_Pth2r', '+cilia_Pth2r_ag', '-cilia_Pth2r_ag',
+                                          '+cilia_GPR124', '-cilia_GPR124',
+                                          '+cilia_GPR135', '-cilia_GPR135',
+                                          '+cilia_Pde8A', '-cilia_Pde8A',  '+cilia_Pde8A_In','-cilia_Pde8A_In',
+                                          '+cilia_Pde8B', '-cilia_Pde8B',  '+cilia_Pde8B_In','-cilia_Pde8B_In'
+                                          ))]
+
+
+p <- ggplot(p.quant[Protein %in% mouse.biotin.carboxylases], aes(x = interaction ( SUBJECT, GROUP ), y = newLogInts, color = Protein)) + 
+  geom_line(aes(group = Protein)) + 
+  geom_point(aes(shape = as.factor(SUBJECT))) +
+  #scale_y_continuous(breaks=seq(9,20,1)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=6))
+
+p
+BackupAsPDF(p, "BiotinCarboxylaseLevels.grpOrder.linechart",dimensions=c(10,8))
+```
+
+Maybe confirm a couple of the genes we expect to move are doing so in some of the samples
+Behavior not really as expected... could be confounded by endo carboxlase levels for example (cilia+ SMO  both w and w/o agonist tends to have higher endoCarboxylase levesl than the -cilia groups...
+
+```{r}
+p.quant[, gene := multiUniprots2multiGenes(as.character(Protein), species='MOUSE')]
+
+p <- ggplot(p.quant[GROUP %in% grep('SMO|PM', GROUP, value=T) & gene %in% c('Prkaca', 'Gli2','Gli3','Smo','Ptch1','Ampk', 'Lkb1')], aes(x = GROUP, y = newLogInts, fill = gene)) + 
+  geom_boxplot() + 
+  geom_point() +
+  facet_wrap(~gene) +
+  scale_fill_brewer(type='qual', palette=2) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=6))
+
+p
+BackupAsPDF(p, 'prots.oi.SMO.boxplots', dimensions=c(9,6))
+```
+Differential Analysis
+----
+Review groups and types of contrasts we wish to perform
+From PMID article 'To control for the respective contributions of endogenous biotinylated proteins and of non-ciliary proteins biotinylated by APEX, we also subjected unlabeled cilia-APEX (would be +cilia_PM) and labeled control-APEX samples (-cilia_PM?) to LC/MS-MS analyses (Figure 2A)"
+This group was identified by being >= 5x enriched compared to I) both controls (1st tier) and II)one control (2nd tier) cilia proteins
+
+Goal 1
+---
+Identify the  proximity proteome of the cilia vs plasma membrane proteins
+So I guess -cilia are the parental cell lines w/o transduced cilia expression?? What to do with these samples? use for bg estimation? Leave out for now
+Agonist is another name for a ligand in GPCR biology, inhibitor similar process? essentially, we want to see how things change when we add this 
+
+What contrasts do we want to start?
+For beginning, lets look at controls vs bg
+
+- +cilia_PM vs -cilia_PM (proteome w/wo cilia presence)
+- +cilia_ARL13b (general cilia marker) vs +cilia_PM (will answer difference in proteome with cilia localization)
+- +cilia_SMO vs +cilia_PM (identify key effectorsin cilia and new signalling components)
+- +cilia_GPR161 vs +cilia_PM (confirm GPR161 role and localization as a scaffold protein)
+- +cilia_ARL13b (general cilia marker) vs -cilia_ARL13b (will answer what is different, w/wo presence of cilia (what are we finding here? background labelling?))
+
+Generate contrast matrix for the comparisons we have listed above
+```{r}
+contrasts.list <- list('+cilia_PM vs -cilia_PM' = data.table(V1="+cilia_PM", V2="-cilia_PM"),
+                       '+cilia_ARL13b vs +cilia_PM' = data.table(V1="+cilia_ARL13b", V2="+cilia_PM"), # 
+                       '+cilia_ARL13b vs -cilia_ARL13b' = data.table(V1="+cilia_ARL13b", V2="-cilia_ARL13b"), # estimate impact of +/- cilia on cellline
+                       '+cilia_SMO vs +cilia_PM' = data.table(V1='+cilia_SMO', V2='+cilia_PM'),
+                       '+cilia_GPR161 vs +cilia_PM' = data.table(V1='+cilia_GPR161', V2='+cilia_PM'))
+
+
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(p.quant$GROUP), 
+                               labels = names(contrasts.list))
+```
+
+```{r}
+dp.out <- readRDS('./062424_PWComparisons_data/2024_06_24_dp.out.rds')
+
+f.quant <- setDT(dp.out$FeatureLevelData)
+
+p.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+
+dp.out$FeatureLevelData <- f.quant
+dp.out$ProteinLevelData <- p.quant
+
+dp.out$ProteinLevelData[,LogIntensities := newLogInts]
+```
+
+Run the differential testing
+
+Run MSStats
+```{r}
+# run msstats correcting for batch 
+mss <- groupComparison(contrast.matrix=contrasts.mat, 
+                       verbose=T,
+                       data=dp.out)
+
+mss.dt <- setDT(mss$ComparisonResult)
+```
+
+process the msstats output
+```{r}
+# write out raw results
+mss.dt[, gene := multiUniprots2multiGenes(as.character(Protein), species = 'MOUSE')]
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+mss.dt[, sig := 'not']
+mss.dt[abs(log2FC) > 1 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+mh_mappings[,.(SWISS_PROT_IDs.mouse,Symbol.human)] %>%  
+  .[,.N, by=SWISS_PROT_IDs.mouse] %>% 
+  .[order(-N)]
+
+mh_mappings[SWISS_PROT_IDs.mouse == 'P84228',]
+
+# merge with human ID table
+anno.dt <- merge(mss.dt, unique(mh_mappings[,.(SWISS_PROT_IDs.mouse, SWISS_PROT_IDs.human,Symbol.human)], by='SWISS_PROT_IDs.mouse'), by.x='Protein', by.y='SWISS_PROT_IDs.mouse', all.x=T, all.y=F)
+```
+
+Write out the comparison results
+
+```{r}
+fwrite(anno.dt, ScriptAndDatedFileName('mss.pwComparisons.controls.csv'))
+fwrite(dcast(anno.dt, gene+Protein~Label, value.var = c('log2FC','pvalue', 'p.adj')), ScriptAndDatedFileName('mss.pwComparisons.controls.wide.csv'))
+```
+read in the MSS results and generate plots for each of the comparisons and also some enrichment
+also increase our log2FC threshold to try reduce our FDR 
+```{r}
+mss.dt <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_25_mss.pwComparisons.controls.csv')
+
+mss.dt[, sig := 'not']
+mss.dt[abs(log2FC) > 2 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+```
+
+Lets plot the number of sig hits per comparison
+Interesting... very small number of proteins DE with and without cilia? 
+Look at this set; are they markers for proteins from the earlier studies?
+```{r}
+g <- ggplot(mss.dt[sig != 'not', .N, by=.(sig,Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Significant hits per contrast (log2FC > 1 & p.adjust < 0.05)') +
+  scale_fill_manual(values=c('down'=muted('blue'), 'up'=muted('red'))) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=7))
+g
+
+BackupAsPDF(g, 'N.sigHits.controls.barplots',dimensions = c(8,9))
+```
+What does these hits mean?
+We are interested in the upregulated hits vs background (PM)
+What does +cilia_PM vs -cilia_PM label? cilia-assoc protein background?
+
+One reason we may find so many 
+
+```{r}
+??eulerr::euler
+
+p.quant <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_26_ProteinLevelQuant.renorm.csv')
+
+# our input vector
+mss.dt[sig != 'not', .(Label, Protein)]
+mss.dt
+
+
+p.quant[Protein == 'A0A0G2JDV3',] %>%  nrow()
+```
+Generate a volcano plot of these 
+Huge number of DE as our variance is empowered by number of N not used in the contrasts and we have a huge number of samples
+The SE is also calculated globally, so need to correct for this
+Recalculate SE/SD locally (per group) for removing outliers.. run after the analysis
+
+```{r}
+g <- ggplot(mss.dt, aes(x=log2FC, y=-log10(adj.pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[sig != 'not'], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-2,2), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  facet_wrap(~Label, scales='free_x') +
+  theme_bw()
+g
+BackupAsPDF(g, 'contrasts.controls.volcano', dimensions=c(14,14))
+```
+Enrichment;
+Add a filter and run GO enrichment 
+Could also run GSEA and filter
+
+Color points in the volcano plot that are highlighted in previous experiments
+Assumption is all these are mouse proteins
+Just take the upregulated things
+```{r}
+# add our sig hits to a list
+sig.list <- mss.dt[sig == 'up',.(Label,gene,Protein)] %>% 
+  split(., by='Label')
+
+sig.prots <- lapply(sig.list, function(x){
+  return(unique(x[, Protein]))
+})
+
+#read in literature sig hits
+cilia.Nachury.2021 <- read_xlsx(path='./docs/ciliaProteins.Nachury.etal.2021.xlsx', sheet=1, skip = 1)$`Gene Symbol`
+cilia.Nachury.2021 <- cilia.Nachury.2021[!is.na(cilia.Nachury.2021)]
+cilia.Nachury.2021 <- translateGeneName2Uniprot(cilia.Nachury.2021, species='MOUSE')
+cilia.Nachury.2021 <- cilia.Nachury.2021[!is.na(cilia.Nachury.2021)]
+
+cilia.Nachury.2015.highConf <- read_xlsx(path='./docs/Nachury.etal.2015cilliaProteins.xlsx', sheet=1)$`Uniprot accession number`
+#cilia.Nachury.2015.highConf <- multiUniprots2multiGenes(cilia.Nachury.2015.highConf, species='MOUSE')
+
+cilia.Nachury.2015.lowConf <- read_xlsx(path='./docs/Nachury.etal.2015cilliaProteins.xlsx', sheet=2)$`Uniprot accession number`
+#cilia.Nachury.2015.lowConf <- multiUniprots2multiGenes(cilia.Nachury.2015.lowConf, species='MOUSE') 
+
+cilia.Marshall <- fread('./docs/Marshall.ciliaProteins.txt',header=F) %>% 
+  .[,V1]
+cilia.Marshall <- translateGeneName2Uniprot(cilia.Marshall, species='MOUSE')
+# ok, lets combine all the hits 
+
+cilia.literature <- list('Nachury et al 2021' = cilia.Nachury.2021,
+                         'Nachury et al 2015 (High Conf)' = cilia.Nachury.2015.highConf,
+                         #'Nachury et al 2015 (Low Conf)' = cilia.Nachury.2015.lowConf,
+                         'Marshall et al 2012' = cilia.Marshall)
+
+
+# rewmove duplciates
+cilia.literature <- lapply(cilia.literature, unique)
+cilia.literature <- lapply(cilia.literature, function(x){x[!is.na(x)]})
+
+p <- plot(euler(cilia.literature),
+     quantities=list(type='counts', fontsize=9),
+     main=list(label='Cilia localized proteins', fontsize=10, font=4),
+     lty = 1,
+     adjust_labels = T,
+     labels = list(font = 4, fontsize=10))
+p
+BackupAsPDF(p, 'identifiedCilaProteins.venn', dimensions=c(9,9))
+```
+
+Lets plot overlap of the sig hits with previously identified cilia associated proteins
+
+```{r}
+lapply(names(sig.list), function(x){
+  
+  p <- plot(euler(c(sig.prots[x],cilia.literature)),
+              stroke_linetype = 1, 
+              stroke_size = 0.5,
+              set_name_color = "black", 
+              set_name_size = 2,
+              fill_color = c("pink", "gold", "palegreen2", "#CAB2D6"))
+  p
+  #BackupAsPDF(p, paste0(x,'.ciliaOverlaps.vennDiagram'), dimensions=c(10,9))
+})
+
+# plot venn diagram instead to show overlaps
+lapply(names(sig.list), function(x){
+  
+  p <- ggvenn(c(sig.prots[x],cilia.literature),
+              stroke_linetype = 1, 
+              stroke_size = 0.5,
+              set_name_color = "black", 
+              set_name_size = 2,
+              fill_color = c("pink", "gold", "palegreen2", "#CAB2D6"))
+  p
+  BackupAsPDF(p, paste0(x,'.ciliaOverlaps.vennDiagram'), dimensions=c(10,9))
+})
+```
+Heatmap of the literature cilia associated genes 
+Strange we don't see much overlap in the groups
+
+```{r}
+lit.prots <- unique(unlist(cilia.literature))
+
+p.mat <- dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- p.mat[rownames(p.mat) %in% lit.prots,]
+
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species = 'MOUSE')
+
+submat <-  sweep(submat, 1, apply(submat, 1, median,na.rm=T))
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        name='Ints./Median',
+        column_split=grepl('[+]cilia', colnames(submat)),
+        column_title  = c('- Cilia', '+ Cilia'),
+        row_names_gp = gpar(fontsize=3),
+        column_names_gp = gpar(fontsize=6))
+
+hm
+BackupAsPDF(hm, 'litCiliaProteins.heatmap', dimensions=c(9,11))
+
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        name='Ints./Median',
+        column_split=gsub('.[0-9]{1}$','', colnames(submat)),
+        row_names_gp = gpar(fontsize=3),
+        column_names_gp = gpar(label=F))
+hm
+BackupAsPDF(hm, 'litCiliaProteins.colSplitheatmap', dimensions=c(17,11))
+
+# drop rows with lots of NA values for 'cleaner' picture'
+```
+produce split keeping groups close to each
+```{r}
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        name='Ints./Median',
+        column_split=gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(submat)),
+        row_names_gp = gpar(fontsize=3),
+        column_names_gp = gpar(label=F))
+hm
+BackupAsPDF(hm, 'litCiliaProteins.colSplitheatmap', dimensions=c(17,11))
+
+```
+PW comparisons of the different groups... setting our FC threshold at log2FC > 1 
+
+```{r}
+prots.oi <- mss.dt[log2FC >= 1 & adj.pvalue < 0.05, Protein]
+
+#groups used in the comparisons
+mss.dt$Label %>%  unique()
+
+cond.oi <- c('+cilia_PM', '-cilia_PM', '+cilia_ARL13b', '-cilia_ARL13b', '+cilia_SMO', '+cilia_GPR161')
+
+p.mat <- dcast(p.quant[GROUP %in% cond.oi,], Protein~interaction(GROUP,SUBJECT), value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- p.mat[rownames(p.mat) %in% prots.oi,]
+
+submat <- sweep(submat, 1, apply(submat,1,median,na.rm=T))
+
+rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+hm <- Heatmap(submat, 
+              cluster_rows = clusterWNA(submat),
+              cluster_columns=F,
+              name='Ints./Median',
+              border = T,
+             # column_split=gsub('[.][0-9]{1}$','', colnames(submat)),
+              column_split=list(gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(submat)),
+                                grep('[+-]{1}cilia', gsub('[_].+$','', colnames(submat)), value = T ) ),
+              row_names_gp = gpar(fontsize=2),
+              row_title = sprintf('%s DE proteins (log2FC >= 1 & adj.pval < 0.05', nrow(submat)),
+              column_names_gp = gpar(label=F))
+hm
+BackupAsPDF(hm, 'sigProts.controlComparisons.medianScaled.heatmap', dimensions = c(12,18))
+```
+## Enrichment Analysis
+-----
+Reload the mss output from the control comparisons
+
+```{r}
+#mss.dt <- fread('./062424_PWComparisons_data/2024_06_25_mss.pwComparisons.controls.csv')
+#mss.dt[sig != 'not']
+#mss.dt[abs(log2FC) >= 1 & p.adj < 0.05, sig := ifelse(log2FC >= 1, 'up', 'down')]
+
+fwrite(mss.dt, ScriptAndDatedFileName('mss.pwComparisons.controlContrasts.csv'))
+
+mss.dt <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_27_mss.pwComparisons.controlContrasts.csv') 
+fwrite(dcast(mss.dt, gene+Protein~Label, value.var = c('log2FC','pvalue', 'p.adj')), ScriptAndDatedFileName('mss.pwComparisons.controlContrasts.wide.csv'))
+```
+
+First run GO CC enrichment
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+```
+
+
+```{r}
+# stay with 1 log2FC
+mss.dt <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_27_mss.pwComparisons.controlContrasts.csv')
+mss.dt[, enrich.grp := paste0(Label, '.', sig)]
+```
+
+GO BP and GO cellular component
+
+Issue with the enrichment results... seems many of these proteins are localized to the Golgi... have they been 
+```{r}
+# define the universe, the total set of identified genes in our study
+universe <- as.character(unique(p.quant$Protein))
+
+
+
+mss.dt[, enrich.grp := interaction(Label,sig)]
+
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('controlContrasts.GO.CC.enrichments.csv'))
+
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('controlContrasts.GO.CC.simplified.enrichments.csv'))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, 
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO Cellular Component', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+#BackupAsPDF(ht, 'pamClust.GOenrichments.heatmap', dimensions=c(9,7))
+```
+
+Some cilliary terms weakly significant, but no smoking gun.... 
+lets enrich on the literature cilia associated proteins and see overlap in enrichment profiles
+
+Very different GO CC enrichment profiles is pretty concerning I guess, but this could be circular (previously identified as cilia from these studies so annotated to it..)
+```{r}
+lit.prots.enrich <- setDT(as.data.frame(clusterProfiler::enricher(mss.dt[Protein %in% lit.prots, Protein],
+                                              pAdjustMethod="fdr",
+                                              universe=universe,
+                                              TERM2GENE =  gmt.go,
+                                              qvalueCutoff = 1.1,
+                                              pvalueCutoff = 1.1)))
+
+lit.prots.enrich[,enrich.grp := 'Cilia-localized (Marhshal/Nachury et al']
+lit.prots.enrich.simplified <-  simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = lit.prots.enrich, gmt=gmt.go, groupColumn = 'enrich.grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = rbind(simp.enrich$simplified, lit.prots.enrich.simplified$simplified, fill=T),
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO Cellular Component', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'controlContrast.GOenrichments.heatmap', dimensions=c(10,10))
+```
+
+# try with a 'new' sig subset; include proteins missing in one condition
+doesnt really improve recovery... lets look at GO BP maybe better overlap
+```{r}
+mss.dt[, sig.inc.missing := 'not']
+mss.dt[adj.pvalue < 0.05 & log2FC > 1, sig.inc.missing := ifelse(log2FC >= 1, 'up','down')]
+
+
+mss.dt[, enrich.grp := interaction(Label,sig.inc.missing)]
+
+
+enrich.dt <- enricherOnGroups(mss.dt[sig.inc.missing != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = rbind(simp.enrich$simplified, lit.prots.enrich, fill=T),
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO Cellular Component', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+```
+
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='BP', keyType='UNIPROT')
+```
+Issue with the enrichment results... seems many of these proteins are localized to the Golgi... has there been an issue wiht the localization?
+Or is this the contrasts we are performing?
+```{r}
+# define the universe, the total set of identified genes in our study
+universe <- as.character(unique(p.quant$Protein))
+
+mss.dt[, enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('controlContrasts.GO.BP.enrichments.csv'))
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('controlContrasts.GO.BP.simplified.enrichments.csv'))
+
+
+lit.prots.enrich <- setDT(as.data.frame(clusterProfiler::enricher(mss.dt[Protein %in% lit.prots, Protein],
+                                              pAdjustMethod="fdr",
+                                              universe=universe,
+                                              TERM2GENE =  gmt.go,
+                                              qvalueCutoff = 1.1,
+                                              pvalueCutoff = 1.1)))
+
+lit.prots.enrich[,enrich.grp := 'Cilia-localized (Marhshal/Nachury et al']
+lit.prots.enrich.simplified <-  simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = lit.prots.enrich, gmt=gmt.go, groupColumn = 'enrich.grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = rbind(simp.enrich$simplified, lit.prots.enrich.simplified$simplified),
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO Biological Processes', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'controlContrast.GO.BP.enrichments.heatmap', dimensions=c(10,10))
+```
+Lets annotate the cilia proteins heatmap with the GO cilia annotation to see how this cluster of genes look
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+cilia.go <- gmt.go[ont == 'cilium', unique(gene)] 
+
+
+p.mat <- dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+# median sweep the submat
+submat <-  sweep(p.mat, 1, apply(p.mat, 1, median,na.rm=T))
+submat <- submat[rownames(submat) %in% lit.prots,]
+
+# add a barplot annotation to show overlap in literature and GO
+names_bar <-  rownames(submat) %in% cilia.go
+
+# creating our annotation heatmaps
+receptor_bar <- rownames(subMat) %in% receptorGenes
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        name='Ints./Median',
+        border = T,
+        column_split=gsub('[+-]cilia_|[.][0-9]{1}$','', colnames(submat)),
+        row_title = sprintf('%s cilia proteins', nrow(submat)),
+        row_names_gp = gpar(fontsize=3),
+        column_names_gp = gpar(fontsize=7),
+        column_title_gp = gpar(fontsize=6)) +
+    Heatmap(names_bar + 0, name = "Cilium GO CC", col = c("0" = "white", "1" = '#5ec962'), border=T,
+        show_heatmap_legend = FALSE, width = unit(4, "mm"), column_names_gp = gpar(fontsize=7), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm"))  +
+   rowAnnotation(link = anno_mark(at = which(names_bar), # gives row index of the items in names_bar
+        labels = multiUniprots2multiGenes(rownames(submat)[names_bar], species='MOUSE'),
+        labels_gp = gpar(fontsize = 5), padding = unit(0.1, "mm"))) 
+  
+hm
+
+BackupAsPDF(draw(hm, column_title='Literature Annotated Cilia Proteins'), 'litCiliaProts.GOciliaAnno.medianSubtract.heatmap', dimensions=c(14,12))
+```
+
+Proteins localized to cilia.... where are these in our volcano plots?
+Redo this plot and color these cilia proteins in our data.
+
+```{r}
+mss.dt <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_25_mss.pwComparisons.controls.csv')
+mss.dt[, sig := 'not' ]
+mss.dt[abs(log2FC) >= 1 & p.adj < 0.05, sig := ifelse(log2FC >= 1, 'up','down')]
+
+mss.dt[, lab := ifelse(Protein %in% cilia.go, 'cilia.GO', sig)]
+
+g <- ggplot(mss.dt, aes(x=log2FC, y=-log10(adj.pvalue), col=lab, label=gene)) +
+  geom_point() + 
+  geom_point(data=mss.dt[Protein %in% cilia.go,]) + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[sig != 'not' & lab == 'cilia.GO'], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey', 'cilia.GO'='#5ec962')) +
+  facet_wrap(~Label, scales='free', ncol=2) +
+  theme_bw()
+g
+BackupAsPDF(g, 'contrasts.controls.ciliaHighlighed.volcano', dimensions=c(14,18))
+```
+Run the comparisons w/wo cilia (no agonist)
+```{r}
+grep('_ag', p.quant$GROUP, invert=T, value=T) %>%  unique()
+
+contrasts.list <- list('+cilia_ARL13b vs -cilia_ARL13b' = data.table(V1="+cilia_ARL13b", V2="-cilia_ARL13b"),
+                       '+cilia_PM vs -cilia_PM' = data.table(V1="+cilia_PM", V2="-cilia_PM"), # 
+                       '+cilia_SMO vs -cilia_SMO' = data.table(V1='+cilia_SMO', V2='-cilia_SMO'),
+                       '+cilia_GPR161 vs -cilia_GPR161' = data.table(V1='+cilia_GPR161', V2='-cilia_GPR161'),
+                       '+cilia_GPR124 vs -cilia_GPR124' = data.table(V1='+cilia_GPR124', V2='-cilia_GPR124'),
+                       '+cilia_GPR135 vs -cilia_GPR135' = data.table(V1='+cilia_GPR135', V2='-cilia_GPR135'),
+                       '+cilia_Pde8A vs -cilia_Pde8A' = data.table(V1='+cilia_Pde8A', V2='-cilia_Pde8A'),
+                       '+cilia_Pde8B vs -cilia_Pde8B' = data.table(V1='+cilia_Pde8B', V2='-cilia_Pde8B'),
+                       '+cilia_Crhr2 vs -cilia_Crhr2' = data.table(V1='+cilia_Crhr2', V2='-cilia_Crhr2'),
+                       '+cilia_Pth2r vs -cilia_Pth2r' = data.table(V1='+cilia_Pth2r', V2='-cilia_Pth2r'))
+
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(p.quant$GROUP), 
+                               labels = names(contrasts.list))
+```
+
+Run the pw comparisons
+```{r}
+p.quant <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_26_ProteinLevelQuant.renorm.csv')
+dp.out <- readRDS('./062424_PWComparisons_data/2024_06_24_dp.out.rds')
+
+f.quant <- setDT(dp.out$FeatureLevelData)
+
+p.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+p.quant[, LogIntensities := newLogInts]
+f.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+
+dp.out$FeatureLevelData <- f.quant
+dp.out$ProteinLevelData <- p.quant
+```
+
+Run the comparisons w/wo cilia
+
+```{r}
+# run msstats correcting for batch 
+mss <- groupComparison(contrast.matrix=contrasts.mat, 
+                       verbose=T,
+                       data=dp.out)
+
+mss.dt <- setDT(mss$ComparisonResult)
+```
+
+process the msstats output
+```{r}
+# write out raw results
+mss.dt[, gene := multiUniprots2multiGenes(as.character(Protein), species = 'MOUSE')]
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+mss.dt[, sig := 'not']
+mss.dt[abs(log2FC) > 1 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+# merge with human ID table
+anno.dt <- merge(mss.dt, unique(mh_mappings[,.(SWISS_PROT_IDs.mouse, SWISS_PROT_IDs.human,Symbol.human)], by='SWISS_PROT_IDs.mouse'), by.x='Protein', by.y='SWISS_PROT_IDs.mouse', all.x=T, all.y=F)
+```
+
+Write out the cilia comparisons to file, plot quickly and generate heatmaps
+
+```{r}
+fwrite(anno.dt, ScriptAndDatedFileName('mss.pwComparisons.ciliaComparisons.csv'))
+fwrite(dcast(anno.dt, gene+Protein~Label, value.var = c('log2FC','pvalue', 'p.adj')), ScriptAndDatedFileName('mss.pwComparisons.ciliaComparisons.wide.csv'))
+```
+plot N sig hits 
+```{r}
+mss.dt <-  fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_27_mss.pwComparisons.ciliaComparisons.csv')
+
+g <- ggplot(mss.dt[sig != 'not', .N, by=.(sig,Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Significant hits per contrast (log2FC > 1 & p.adjust < 0.05)') +
+  scale_fill_manual(values=c('down'=muted('blue'), 'up'=muted('red'))) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=7))
+g
+
+BackupAsPDF(g, 'N.sigHits.ciliaComparisons.barplots',dimensions = c(8,9))
+```
+Volcanoplots of the results with cilia proteins annotated 
+
+```{r}
+mss.dt[, lab := ifelse(Protein %in% cilia.go, 'cilia.GO', sig)]
+
+g <- ggplot(mss.dt, aes(x=log2FC, y=-log10(adj.pvalue), col=lab, label=gene)) +
+  geom_point() + 
+  geom_point(data=mss.dt[Protein %in% cilia.go,]) + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[sig != 'not' & lab == 'cilia.GO'], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey', 'cilia.GO'='#5ec962')) +
+  facet_wrap(~Label, scales='free', ncol=2) +
+  theme_bw()
+g
+BackupAsPDF(g, 'contrasts.ciliaComparisons.ciliaHighlighed.volcano', dimensions=c(14,24))
+```
+Lets run enrichment on the cilia components and then a heatmap of these sig hits
+Not much enrichment... maybe need to drop thresholds
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+
+mss.dt[, enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('ciliaContrasts.GO.CC.enrichments.csv'))
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('ciliaContrasts.GO.CC.simplified.enrichments.csv'))
+
+lit.prots.enrich <- setDT(as.data.frame(clusterProfiler::enricher(mss.dt[Protein %in% lit.prots, Protein],
+                                              pAdjustMethod="fdr",
+                                              universe=universe,
+                                              TERM2GENE =  gmt.go,
+                                              qvalueCutoff = 1.1,
+                                              pvalueCutoff = 1.1)))
+
+lit.prots.enrich[,enrich.grp := 'Cilia-localized (Marhshal/Nachury et al']
+lit.prots.enrich.simplified <-  simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = lit.prots.enrich, gmt=gmt.go, groupColumn = 'enrich.grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = rbind(simp.enrich$simplified, lit.prots.enrich.simplified$simplified),
+                                groupColumn = 'enrich.grp', 
+                                topN = 6,
+                                title='GO Cellular Component', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'ciliaContrast.GO.CC.enrichments.heatmap', dimensions=c(10,10))
+```
+Rerun the enrichment to correct for the background
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+```
+
+
+```{r}
+# stay with 1 log2FC
+mss.dt <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_27_mss.pwComparisons.controlContrasts.csv')
+mss.dt[, enrich.grp := paste0(Label, '.', sig)]
+```
+
+GO CC enrichments for controls
+```{r}
+
+lit.prots.enrich <- setDT(as.data.frame(clusterProfiler::enricher(mss.dt[Protein %in% lit.prots, Protein],
+                                              pAdjustMethod="fdr",
+                                              universe=universe,
+                                              TERM2GENE =  gmt.go,
+                                              qvalueCutoff = 1.1,
+                                              pvalueCutoff = 1.1)))
+
+lit.prots.enrich[,enrich.grp := 'Cilia-localized (Marhshal/Nachury et al)']
+
+enrich.dt <- fread('/Users/martingordon/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_26_controlContrasts.GO.CC.enrichments.csv')
+
+enrich.dt$enrich.grp %>%  unique()
+
+comb.dt <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = rbind(lit.prots.enrich, enrich.dt), gmt=gmt.go, groupColumn = 'enrich.grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = comb.dt$simplified,
+                                groupColumn = 'enrich.grp', 
+                                topN = 6,
+                                title='GO Cellular Component', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', comb.dt$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'controlContrast.GO.CC.enrichments.heatmap', dimensions=c(10,10))
+```
+
+GO BP enrichment for controls
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='BP', keyType='UNIPROT')
+```
+
+```{r}
+lit.prots.enrich <- setDT(as.data.frame(clusterProfiler::enricher(mss.dt[Protein %in% lit.prots, Protein],
+                                              pAdjustMethod="fdr",
+                                              universe=universe,
+                                              TERM2GENE =  gmt.go,
+                                              qvalueCutoff = 1.1,
+                                              pvalueCutoff = 1.1)))
+
+lit.prots.enrich[,enrich.grp := 'Cilia-localized (Marhshal/Nachury et al)']
+
+enrich.dt <- fread('/Users/martingordon/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_26_controlContrasts.GO.BP.enrichments.csv')
+
+comb.dt <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = rbind(lit.prots.enrich, enrich.dt), gmt=gmt.go, groupColumn = 'enrich.grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = comb.dt$simplified,
+                                groupColumn = 'enrich.grp', 
+                                topN = 6,
+                                title='GO Biological Processes', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', comb.dt$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'controlContrast.GO.BP.enrichments.heatmap', dimensions=c(10,10))
+```
+GO CC enrichment for cilia background
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='CC', keyType='UNIPROT')
+```
+
+```{r}
+# stay with 1 log2FC
+mss.dt <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_27_mss.pwComparisons.ciliaComparisons.csv')
+mss.dt[, enrich.grp := paste0(Label, '.', sig)]
+```
+
+GO CC enrichments for controls
+```{r}
+lit.prots.enrich <- setDT(as.data.frame(clusterProfiler::enricher(mss.dt[Protein %in% lit.prots, Protein],
+                                              pAdjustMethod="fdr",
+                                              universe=universe,
+                                              TERM2GENE =  gmt.go,
+                                              qvalueCutoff = 1.1,
+                                              pvalueCutoff = 1.1)))
+
+lit.prots.enrich[,enrich.grp := 'Cilia-localized (Marhshal/Nachury et al)']
+
+enrich.dt <- fread('/Users/martingordon/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_27_ciliaContrasts.GO.CC.enrichments.csv')
+
+comb.dt <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = rbind(lit.prots.enrich, enrich.dt), gmt=gmt.go, groupColumn = 'enrich.grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = comb.dt$simplified,
+                                groupColumn = 'enrich.grp', 
+                                topN = 6,
+                                title='GO Cellular Component', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', comb.dt$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'ciliaContrast.GO.CC.enrichments.heatmap', dimensions=c(10,10))
+```
+GO BP cilia contrasts 
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology='BP', keyType='UNIPROT')
+```
+
+GO BP enrichments for controls
+```{r}
+lit.prots.enrich <- setDT(as.data.frame(clusterProfiler::enricher(mss.dt[Protein %in% lit.prots, Protein],
+                                              pAdjustMethod="fdr",
+                                              universe=universe,
+                                              TERM2GENE =  gmt.go,
+                                              qvalueCutoff = 1.1,
+                                              pvalueCutoff = 1.1)))
+
+lit.prots.enrich[,enrich.grp := 'Cilia-localized (Marhshal/Nachury et al)']
+
+#run GO BP enrichment on ciliaContrasts
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+#fwrite(enrich.dt, ScriptAndDatedFileName('ciliaContrasts.GO.BP.enrichments.csv'))
+enrich.dt <- fread('~/Documents/projects/061324_XFang_Cilia_GPCR/062424_PWComparisons_data/2024_06_27_ciliaContrasts.GO.BP.enrichments.csv')
+
+comb.dt <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = rbind(lit.prots.enrich, enrich.dt), gmt=gmt.go, groupColumn = 'enrich.grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = comb.dt$simplified,
+                                groupColumn = 'enrich.grp', 
+                                topN = 6,
+                                title='GO Biological Process', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', comb.dt$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+
+BackupAsPDF(ht, 'ciliaContrast.GO.BP.enrichments.heatmap', dimensions=c(10,10))
+```

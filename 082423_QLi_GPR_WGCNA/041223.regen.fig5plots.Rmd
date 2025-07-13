@@ -1,0 +1,1066 @@
+---
+title: "041223.newFig5plots"
+author: "Martin Gordon"
+date: "2023-12-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+TODO
+---
+Double check our top hits with IUPAR classifications
+check our summary data.table tn ensure group averages are correctly calculated
+
+## DARPA regenerate the fig 5 plots requested by the group
+Outline of work:
+Figure 5.
+S-curve rank plot with the modified labels of genes (prelim done)
+
+the correlation scores of top proteins for each G protein type heatmap, with clusters of proteins specific to each G protein type
+
+intensity of proteins from clusters specific to each G protein type from heatmap b, across all the receptors.
+
+plots for positive controls: plot the highest log2FC for each receptor and cluster to bars in group of G proteins. (Gq: PRKCA, PACS1, UNC13B; Gi: EYA4, maybe KCTD12).
+
+Venn diagram of candidates significant for YM 5 min vs. 5 min, overlapped with the correlation analysis Gq top correlation candidates. Before we decide to use 5 min or 10 min, we could check the heatmap from a pair-wise comparison for 5min +/- YM and 10min +/- YM.
+For figure 2: the WGCNA heatmap, cluster the heatmap for receptors based on the largest log2FC.
+For the GO enrichment in the current figure 3: resize it to enable a larger font size of GO terms.
+
+
+## Todo
+Maybe generate the 5th percentile heatmap
+For now focus on other requests; complete the Venn Diagram
+
+packages
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(WGCNA)
+library(magrittr)
+library(stringr)
+library(ggbeeswarm)
+library(ggrepel)
+library(patchwork)
+library(readxl)
+library(circlize)
+
+#Ben utils
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+
+# helper scripts for module/network export etc
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+```
+
+first thing to do is tidy the S-rank plots produced previously
+We need to seperate out the ggrepel hits so they are visible 
+
+Read in the results from the correlation produced previously
+
+Correlations with the IUPHAR classification
+
+plot output dir 
+```{r}
+plot.outdir <- '/Users/martingordon/Documents/projects/082423_QLi_GPR_WGCNA/041223.regen.fig5plots_data/pdfs/'
+```
+
+
+lets first check the raw data 
+
+```{r}
+pred <- fread("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/predictionScores.txt")
+exp <- fread ("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/experimentalScores.txt")
+iupar <- data.table(read_xlsx("/Users/martingordon/Documents/projects/310723_QLi_GPCR.correlations/data/IUPHAR_11GPCRs_Gprotein_class_primary.xlsx"))
+
+#exp.long <- melt(exp, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+pred.long <- melt(pred, id.vars = "GPCR", measure.vars = grep ("GNA", colnames(pred)), variable.name = "GProtein", value.name = "score")[, score := as.numeric(score)][]
+
+# convert to long format
+iupar.long <- melt(iupar, id.vars = 'GPCR', measure.vars = grep('GPCR', colnames(iupar), invert=T),  variable.name = "GProtein", value.name = "score") %>% 
+  .[, score := as.numeric(score)] 
+```
+
+
+```{r scores.list}
+
+scores.list <- list(exp = exp.long,
+                    pred = pred.long,
+                    iupar = iupar.long)
+```
+Convert the scores to a matrix
+
+```{r}
+scores.mat <- lapply(scores.list, function(x){
+  dcast(x, GProtein~GPCR, value.var = 'score') %>% 
+    as.matrix(rownames = 'GProtein')
+})
+
+lapply(scores.mat, colnames)
+```
+apply the scores mat to the data
+```{r}
+scores.mat <- lapply(scores.mat, function(x){
+  colnames(x) <- c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+  return(x)
+})
+```
+
+reorder the mss columns to follow the order above 
+
+Restrict the analysis to the sig genes from the APEX experiment (pval < 0.005 & abs log2FC(1.5))
+
+```{r}
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+
+mss.out <- fread('./data/2022_08_31_NiceFitsPower3.csv')
+
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+
+# filter to sig genes and reorder
+sig.genes <- mss.out[pvalue < 0.005 & abs(log2FC) > log2(1.5) & receptor != 'MOR.LG94', unique(gene) ]
+exp.mat <- exp.mat[rownames(exp.mat) %in% sig.genes,]
+
+'DIAPH2' %in% sig.genes
+# renanme MOR DAMGO to MOR
+colnames(exp.mat) <- c('DOR', 'KOR', 'MOR', 'MRX2', 'MRX4', 'NK1R', 'NPFFR1', 'NPY1R','PTGER1', 'PTGER4','QRFPR')
+
+# reorder the cols to match the matrices
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+
+exp.mat[1:10,1:10]
+exp.mat <- exp.mat[, col.order]
+exp.mat[1:10,1:10]
+
+
+# sanit check; looks fine
+lapply(scores.mat, colnames)
+colnames(exp.mat)
+
+exp
+```
+
+run the correlations for each of the datasets
+
+```{r}
+# cors run colwise with the two vectors
+cor.list <- lapply(scores.mat, function(x){
+  cor(t(exp.mat), t(x), use= "pairwise.complete.obs")
+})
+
+cor.long <- lapply(cor.list, function(x){
+  x <- melt(as.data.table(x, keep.rownames = TRUE), id.vars = "rn", variable.name  = "GProtein", value.name = "R")
+  setnames(x, old = "rn", new = "gene")
+  return(x)
+})
+```
+
+count number of observations, only want to take results with vals observed for all receptors to reduce FPs
+
+```{r}
+cor.long$iupar[, .SD[which.max(R)], by=GProtein]
+
+# most of these have values for all the 11 receptors
+obs.counts <- mss.out[!is.na(log2FC) & receptor != 'MOR.LG94' & gene %in% sig.genes, .N, by = gene]
+hist(obs.counts$N, breaks=seq(1,11))
+
+```
+
+add this info to the correlation res
+
+```{r}
+lapply(cor.long, function(x){
+  
+  x[obs.counts, numObservations := N, on = 'gene']
+  setorder(x, -numObservations, -R, na.last = TRUE) #strongest associations at top
+})
+```
+write these files out to folder for reuse
+
+```{r}
+#lapply(seq_along(cor.long), function(x,n, i){
+#  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'gprotein.corscores.csv')) ) 
+#}, x=cor.long, n=names(cor.long))
+```
+
+
+
+
+read in the iupar result
+```{r}
+#iupar.cor.dt <- fread(ScriptAndDatedFileName('iupargprotein.corscores.csv'))
+iupar.cor.dt <- fread("/Users/martingordon/Documents/projects/082423_QLi_GPR_WGCNA/041223.regen.fig5plots_data/2023_12_04_iupargprotein.corscores.csv")
+iupar.cor.dt <- iupar.cor.dt[numObservations == 11,] # only keep those with 11 observations
+
+gprots <-  unique(iupar.cor.dt$GProtein)
+```
+
+Aside: create the 5 and 2 percentile data in w format and share
+
+```{r}
+snd.pc <- iupar.cor.dt[, lab := ifelse( (R >= quantile(R,0.98) | R <= quantile(R,0.02)), unique(gene), ''), by=GProtein] %>% 
+  .[lab != '',unique(gene)]
+fifth.pc <- iupar.cor.dt[, lab := ifelse( (R >= quantile(R,0.95) | R <= quantile(R,0.05)), unique(gene), ''), by=GProtein] %>% 
+  .[lab != '', unique(gene)]
+  
+snd.pc %>%  length()
+fifth.pc %>%  length() # still few overlaps..
+
+# write out these and also the entire list of genes
+snd.dt.wide <- iupar.cor.dt[gene %in% snd.pc,] %>% 
+  dcast(., gene~GProtein, value.var='R')
+
+fifth.dt.wide <- iupar.cor.dt[gene %in% fifth.pc,] %>% 
+  dcast(., gene~GProtein, value.var='R')
+
+
+# write out data in wide format
+fwrite(snd.dt.wide,  ScriptAndDatedFileName('2perc.gprot.corscores.wide.csv'))
+fwrite(fifth.dt.wide, ScriptAndDatedFileName('5perc.gprot.corscores.wide.csv'))
+
+# write out complete dt in wide format 
+fwrite(dcast(iupar.cor.dt, gene~GProtein, value.var='R'), ScriptAndDatedFileName('all.gprot.corscores.wide.csv'))
+
+# write out filtered data in long format
+fwrite(snd.dt.wide,  ScriptAndDatedFileName('2perc.gprot.corscores.wide.csv'))
+fwrite(fifth.dt.wide, ScriptAndDatedFileName('5perc.gprot.corscores.wide.csv'))
+
+# write out long format
+snd.dt <- iupar.cor.dt[, lab := ifelse( (R >= quantile(R,0.98) | R <= quantile(R,0.02)), unique(gene), ''), by=GProtein] %>% 
+  .[lab != '', ]
+
+fifth.dt <- iupar.cor.dt[, lab := ifelse( (R >= quantile(R,0.95) | R <= quantile(R,0.05)), unique(gene), ''), by=GProtein] %>% 
+  .[lab != '',]
+
+fwrite(snd.dt,  ScriptAndDatedFileName('2perc.gprot.corscores.csv'))
+fwrite(fifth.dt, ScriptAndDatedFileName('5perc.gprot.corscores.csv'))
+```
+
+
+
+
+
+Request1: s-rank plots
+-----
+
+Lets take and label the top two percent
+```{r}
+iupar.cor.dt
+
+lapply(seq_along(gprots), function(x,i){
+  
+  g <- ggplot(data=iupar.cor.dt[GProtein == x[[i]]], aes(x=reorder(gene,R), y=R, col=GProtein, label=lab)) +
+    geom_point(size=1) +
+    geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+    geom_text_repel(data=cor.long$iupar[GProtein == x[[i]]], aes(label=lab),segment.linetype=3, segement.color='grey', max.overlaps = 30,size=1.5, position = 'dodge') +
+    xlab('genes (Pearson r ordered)') +
+    theme_classic() +
+    scale_x_discrete(expand=expansion(add=50)) +
+    scale_color_manual(values=c(col.pal[[i]])) +
+    ggtitle(paste0(x[[i]], ' Pearson r')) +
+    theme(axis.text.x = element_blank()
+        )
+  g
+ #BackupAsPDF(g, 'rankplot.Gprots.R0.7.')
+},x=gprots)
+
+```
+as a basic first pass; maybe we can extract the top and bottom percentile and plot these as windows to the side?
+color by top hits; blue red grey
+
+modify slightly and inlay the two plots; the postively correlated at top and negative at bottom
+
+```{r}
+# define the labels we wish to use 
+iupar.cor.dt[, sig := '']
+iupar.cor.dt[, lab:= '']
+iupar.cor.dt[, lab := ifelse( (R >= quantile(R,0.98) | R <= quantile(R,0.02)), unique(gene), ''), by=GProtein]
+iupar.cor.dt[lab != '', sig := ifelse(R > 0, 'pos', 'neg')]
+
+iupar.cor.dt[, .N,  by=sig]
+iupar.cor.dt$sig
+
+lapply(seq_along(gprots), function(x,i){
+  
+  
+  outlab <- gsub('/', '.', x[[i]])
+  
+  g <- ggplot(data=iupar.cor.dt[GProtein == x[[i]]], aes(x=reorder(gene,R), y=R,label=lab, color=sig)) +
+    geom_point(size=1) +
+    geom_hline(aes(alpha=0.7), yintercept = 0, linetype='dotdash') +
+    scale_color_manual(values=c('grey'='', 'neg'='blue', 'pos'='red')) +
+    #geom_text_repel(data=cor.long$iupar[GProtein == x[[i]]], aes(label=lab),segment.linetype=3, max.overlaps = 20, size=1.5, position = 'dodge') +
+    xlab('genes (Pearson r ordered)') +
+    theme_classic() +
+    guides(color=FALSE) +
+    scale_x_discrete(expand=expansion(add=50)) + # just to see both ends of the plot
+     theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+  
+  # create up.dt
+  up.dt <-  iupar.cor.dt[GProtein == x[[i]] & R > 0 & lab != '', ]
+  
+  up.g <- ggplot(data=up.dt, aes(x=reorder(gene,R), y=R,label=lab, color=sig)) +
+    geom_point(size=1) +
+    #geom_hline(aes(alpha=0.7), yintercept = 0, linetype='dotdash') +
+    scale_color_manual(values=c('grey'='', 'neg'='blue', 'pos'='red')) +
+    geom_text_repel(data=up.dt, aes(label=lab),segment.linetype=3, max.overlaps = 30, size=1.5, position = 'dodge') +
+    xlab('genes (Pearson r ordered)') +
+    theme_classic() +
+    guides(color=FALSE) +
+    #scale_x_discrete(expand=expansion(add=50)) + # just to see both ends of the plot
+    ggtitle('98th Percentile') +
+      theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+  
+   down.dt <-  iupar.cor.dt[GProtein == x[[i]] & R < 0 & lab != '', ]
+  
+   down.g <- ggplot(data=down.dt, aes(x=reorder(gene,-R), y=R,label=lab, color=sig)) +
+    geom_point(size=1) +
+    #geom_hline(aes(alpha=0.7), yintercept = 0, linetype='dotdash') +
+    scale_color_manual(values=c('grey'='', 'neg'='blue', 'pos'='red')) +
+    geom_text_repel(data=down.dt, aes(label=lab),segment.linetype=3, max.overlaps = 30, size=1.5, position = 'dodge') +
+    xlab('genes (Pearson r ordered)') +
+    theme_classic() +
+    guides(color=FALSE) +
+    #scale_x_discrete(expand=expansion(add=50)) + # just to see both ends of the plot
+    ggtitle('2nd Percentile') +
+      theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+  
+  comb.g <- g + (up.g / down.g) +
+  plot_annotation(title = paste0(x[[i]], ' Pearson R')) +
+  plot_layout(widths = c(1,1))
+
+
+  #ggsave(paste0(plot.outdir, outlab, 'gprot.cor.faceted.pdf'),comb.g, width = 8, height = 6)
+    
+ #BackupAsPDF(ggsave(comb.g), paste0(x[[i]], 'gprot.cor.faceted.'))
+},x=gprots)
+
+```
+I think this actually looks ok and is a better representation of the data.. maybe still abit overcrowded,  but looks ok
+retry but in lay the plots
+
+edit: 'flip' the negatively correlated genes so we can see
+could also go with the 1D option to save space
+```{r}
+
+lapply(seq_along(gprots), function(x,i){
+  
+  outlab <- gsub('/', '.', x[[i]])
+  
+  g <- ggplot(data=iupar.cor.dt[GProtein == x[[i]]], aes(x=reorder(gene,R), y=R,label=lab, color=sig)) +
+    geom_point(size=1) +
+    geom_hline(aes(alpha=0.7), yintercept = 0, linetype='dotdash') +
+    scale_color_manual(values=c('grey'='', 'neg'='blue', 'pos'='red')) +
+    #geom_text_repel(data=cor.long$iupar[GProtein == x[[i]]], aes(label=lab),segment.linetype=3, max.overlaps = 20, size=1.5, position = 'dodge') +
+    xlab('genes (Pearson r ordered)') +
+    theme_classic() +
+    guides(color=FALSE) +
+    scale_x_discrete(expand=expansion(add=50)) + # just to see both ends of the plot
+     theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())
+  
+  # create up.dt
+  up.dt <-  iupar.cor.dt[GProtein == x[[i]] & R > 0 & lab != '', ]
+  
+  up.g <- ggplot(data=up.dt, aes(x=reorder(gene,R), y=R,label=lab, color=sig)) +
+    geom_point(size=1) +
+    #geom_hline(aes(alpha=0.7), yintercept = 0, linetype='dotdash') +
+    scale_color_manual(values=c('grey'='', 'neg'='blue', 'pos'='red')) +
+    geom_text_repel(data=up.dt, aes(label=lab),segment.linetype=3, max.overlaps = 10, size=1.5, position = 'dodge') +
+    #xlab('genes (Pearson r ordered)') +
+    theme_bw() +
+    guides(color=FALSE) +
+    #scale_x_discrete(expand=expansion(add=50)) + # just to see both ends of the plot
+    ggtitle('98th Percentile') +
+      theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        #axis.text.y=element_blank(),
+        #axis.title.y=element_blank(),
+        axis.title.x.top = element_blank(),
+        axis.ticks.x=element_blank())
+  
+   down.dt <-  iupar.cor.dt[GProtein == x[[i]] & R < 0 & lab != '', ]
+  
+   down.g <- ggplot(data=down.dt, aes(x=reorder(gene,R), y=R,label=lab, color=sig)) +
+    geom_point(size=1) +
+    #geom_hline(aes(alpha=0.7), yintercept = 0, linetype='dotdash') +
+    scale_color_manual(values=c('grey'='', 'neg'='blue', 'pos'='red')) +
+    geom_text_repel(data=down.dt, aes(label=lab),segment.linetype=3, max.overlaps = 10, size=1.5, position = 'dodge') +
+    xlab('genes (Pearson r ordered)') +
+    theme_bw() +
+    guides(color=FALSE) +
+    #scale_x_discrete(expand=expansion(add=50)) + # just to see both ends of the plot
+    ggtitle('2nd Percentile') +
+      theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        #axis.text.y=element_blank(),
+       # axis.title.y=element_blank(),
+        axis.title.x.top = element_blank(),
+        axis.ticks.x=element_blank())
+  
+  comb.g <- g + 
+    inset_element(up.g, left = 0, bottom = 0.55, right=0.55,  top = 1) +
+    inset_element(down.g, left = 0.45,  bottom = 0.01, right = 1, top = 0.45) +
+    plot_annotation(title = paste0(x[[i]], ' Pearson R')) 
+    
+
+  ggsave(paste0(plot.outdir, outlab, 'gprot.cor.inlaid.reorderneg.pdf'),comb.g, width = 8, height = 6)
+},x=gprots)
+```
+correlation scores of these top scoring prots; visualised as a heatmap
+we want to find clusters specific to the receptors we are interested in 
+
+150 proteins that we find strongly (anti)correlated with one of the GProtein receptors
+
+What does the 11 receptor clustering look like? when we take the top 4% of hits
+getting 150
+```{r}
+genes.oi <- sapply(gprots, function(x){
+  sub.dt <- iupar.cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.98) | R <= quantile(R,0.02), unique(gene)])
+}) %>% c() %>% unique()
+
+# each GProtein cor has returned many unique values. Perhaps a good sign!
+genes.oi %>%  length()
+
+# dt of gene lists
+genes.list <- sapply(gprots, function(x){
+  sub.dt <- iupar.cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.98) | R <= quantile(R,0.02), unique(gene)])
+}) %>%  data.table()
+```
+v little overlap in sig hits, which is good but no strong signal for Gs
+
+Request 3:
+intensity of proteins from clusters specific to each G protein type from heatmap b, across all the receptors.
+
+```{r}
+subMat <-  exp.mat[rownames(exp.mat) %in% genes.oi,]
+
+# name and reorder cols to match GProt annotation
+
+# create a different scoring metric
+
+GProtein <- c('Gi/Go & Gq/G11', 'Gq/G11', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gq/G11', 'Gs', 'Gi/Go & Gq/G11', 'Gq/G11 & Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue',
+                                            'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')) )
+                        
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'pearson',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='2nd & 98th Percentile R scores')
+#BackupAsPDF(hm, ('2.and.98th.percentiles.log2FC.heatmap'), dimensions=c(8,8))
+```
+lets 'cluster' the log2FC values and see what we get
+```{r}
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'pearson',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+        row_km=3,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title = c("", "Gq/G11", "Gi/Go"),
+        #row_title =sprintf("%d Proteins",
+        #                    nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+     hm   
+hm <- draw(hm, column_title='2nd & 98th Percentile R scores')
+#BackupAsPDF(hm, ('2.and.98th.percentiles.log2FC.km3.heatmap'), dimensions=c(8,8))
+```
+extract these cluster genes and visualise
+
+```{r}
+lfc.clust.genes <- extractClustersfromHeatmap(hm, subMat)
+
+lfc.clust.genes[, ID := fcase(
+  cluster == 1, '',
+  cluster == 2, 'Gq/G11',
+  cluster == 3, 'Gi/Go'
+)]
+
+#fwrite(lfc.clust.genes, ScriptAndDatedFileName('lfc.heatmap.cluster.genes.km3.csv'))
+lfc.clust.genes[, enrich_grp := ID]
+
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# our background? only genes used for WGCNA analysis
+universe <- mss.out$gene %>%  unique()
+
+enrich.dt <- enricherOnGroups(lfc.clust.genes[cluster !=1,], groupColumns = 'enrich_grp', geneColumn = "feature", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+enrich.dt[p.adjust < 0.05, ]
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'enrich_grp', topN = 8,
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 7,  cluster_columns =F)
+
+BackupAsPDF(ht, 'gprotein.log2FC.cor.GOenrichment.kmgroups.', dimensions=c(8,12))
+
+#save the enrichment results too 
+#fwrite(enrich.dt, ScriptAndDatedFileName('gprotein.log2FC.cor.GOenrichment.csv'))
+```
+
+Heatmap looks pretty good all in all, cant really see much Gs specific clustering
+Is this an artifact of the IUPAR scoring? lots more 0's so maybe a lot of this is noise... enrichment might tell us more
+
+request3: the correlation scores of top proteins for each G protein type heatmap, with clusters of proteins specific to each G protein type
+
+Heatmap of pearson distance of R scores
+
+```{r}
+cor.mat <- dcast(iupar.cor.dt, gene~GProtein, value.var = 'R') %>% 
+  as.matrix(rownames='gene')
+
+subMat <-  cor.mat[rownames(cor.mat) %in% genes.oi,]
+
+GProtein <- c('Gi/Go', 'Gq/G11', 'Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go'='#22A884FF', 'Gq/G11'='#440154FF',
+                                            'Gs'='#FDE725FF')) )
+
+hm <- Heatmap(subMat,
+        top_annotation = ha,
+        cluster_columns = T, 
+        row_km = 3,
+        row_gap = unit(1.5, "mm"),
+        clustering_distance_rows = 'euclidean',
+        name='Pearson r',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+
+hm
+
+
+hm.k3 <- draw(hm, column_title='2nd & 98th Percentile R scores')
+
+BackupAsPDF(hm.k3, 'R.2nd.98thpercentile.gprotein.cor.3k.heatmap', dimensions = c(8,8))
+```
+
+try 5-k for more ingrained differences
+
+```{r}
+hm <- Heatmap(subMat,
+        top_annotation = ha,
+        cluster_columns = T, 
+        row_km = 5,
+        row_gap = unit(1.5, "mm"),
+        clustering_distance_rows = 'euclidean',
+        name='Pearson r',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+
+
+hm.k5 <- draw(hm, column_title='2nd & 98th Percentile R scores')
+BackupAsPDF(hm.k5, 'R.2nd.98thpercentile.gprotein.cor.5k.heatmap', dimensions = c(8,8))
+```
+What is going on in these clusters?
+extract the hits in k3 and k5 clusters and enrich
+```{r}
+k3.clust.genes <- extractClustersfromHeatmap(hm.k3, subMat)
+k5.clust.genes <- extractClustersfromHeatmap(hm.k5, subMat)
+
+k3.clust.genes[, cluster := paste0('km3.', cluster)]
+k5.clust.genes[, cluster := paste0('km5.', cluster)]
+
+comb.clust <-  rbind(k3.clust.genes, k5.clust.genes)
+
+comb.clust[, enrich_grp := cluster]
+
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# our background? only genes used for WGCNA analysis
+universe <- mss.out$gene %>%  unique()
+
+enrich.dt <- enricherOnGroups(comb.clust, groupColumns = 'enrich_grp', geneColumn = "feature", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+
+
+col.order <- c("km3.1", "km3.2", "km3.3", "km5.1", "km5.2", "km5.3", "km5.4", "km5.5")
+col.split.vec <- c('k=3', 'k=3', 'k=3', 'k=5', 'k=5', 'k=5', 'k=5')
+
+enrich.dt[, enrich_grp := factor(enrich_grp, levels = col.order)]
+
+simp.enrich$simplified$enrich_grp %>%  unique() %>%  length()
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'enrich_grp', topN = 8,
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 7,  cluster_columns =F, column_split=col.split.vec)
+
+BackupAsPDF(ht, 'gprotein.cor.GOenrichment.kmgroups.', dimensions=c(8,12))
+```
+plots for positive controls: plot the highest log2FC for each receptor and cluster to bars in group of G proteins. (Gq: PRKCA, PACS1, UNC13B; Gi: EYA4, maybe KCTD12).
+For starters, extract the top hits
+For ours, take the top 10 hits (up and down) for each GProtein
+
+```{r}
+qiongyu.controls <-  c('PRKCA', 'PACS1', 'UNC13B', 'EYA4', 'KCTD12') #include the top 10 hits in both directions and the other two genes Qiongyu mentioned
+
+# Gi controls are not super positively cor with GProtein group
+pos.controls <- iupar.cor.dt[(gene %in% c('PRKCA', 'PACS1', 'UNC13B') & GProtein == 'Gq/G11' | gene %in% c('EYA4', 'KCTD12') & GProtein == 'Gi/Go'),]
+
+# this is just taking top hits from the data; look at Qiongyu data first
+pos.cor <- iupar.cor.dt[, .SD[order(-R) %>% head(10), .(gene,R)], by=GProtein]
+neg.cor <- iupar.cor.dt[, .SD[order(-R) %>% tail(10), .(gene,R)], by=GProtein]
+
+# take the hits mentioned, plust the top 10 hits up and down in each
+data.pos.controls <- rbind(pos.cor, neg.cor, iupar.cor.dt[gene %in% c('EYA4', 'KCTD12'), .(gene,R,GProtein)])
+```
+
+subset the de data for proteins included in the correlation analysis
+also, duplicate records for members of more than 1 gprotein group
+
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(k=5)
+
+mss.corprots <- mss.out[receptor != 'MOR.LG94' & gene %in% pos.controls$gene,]
+
+mss.corprots[receptor == "MOR.DAMGO", receptor := 'MOR']
+
+# create another label for gprotein
+mss.corprots[, iupar := fcase(
+  receptor %in% c('PTGER4'), 'Gs',
+  receptor %in% c('MOR', 'DOR', 'KOR', 'NPFFR1', 'NPY1R'), 'Gi/Go', 
+  receptor %in% c('MRX2', 'QRFPR'), 'Gi/Go & Gq/G11',
+  receptor %in% c('PTGER1', 'MRX4'), 'Gq/G11',
+  receptor %in% c('NK1R'), 'Gq/G11 & Gs'
+)]
+
+# need to duplicate records for receptors assigned to more than one group
+dup.rows <- mss.corprots[ grepl("\\&", iupar),] %>% 
+  .[, plot.grp := str_extract(iupar, "(?<=&\\s)(Gs|Gq/G11)" )] #positve lookbehind & for matching
+
+# clean the mss.corplots 
+mss.corprots[, plot.grp := ifelse(grepl("\\&", iupar), str_extract(iupar, "(Gi/Go|Gq/G11)(?=\\s&)" ), iupar )] #positive lookahead for space & 
+
+mss.corprots <-  rbind(mss.corprots, dup.rows)
+
+#sanity check; looks good
+mss.corprots[plot.grp != iupar,] %>% 
+  .[order(gene,receptor)]
+
+g <- ggplot(mss.corprots, aes(x=receptor, y=log2FC, fill=plot.grp, label=gene)) + 
+  geom_boxplot(alpha=0.6) +
+  geom_point(color='black') + 
+  geom_hline(yintercept=0, linetype=2, color='grey', alpha=0.5) +
+  scale_fill_manual(values=(col.pal)) +
+  facet_wrap(~plot.grp, scales="free_x") +
+  geom_text_repel(data=mss.corprots, color='black', size=1.5, vjust=-2) +
+  theme_bw() +
+  guides(
+  colour = guide_legend('GProtein')) +
+  theme(axis.text.x = element_text(angle=90)) 
+
+g
+BackupAsPDF(g, 'positive.control.profiles.boxplot.', dimensions=c(9,5))
+
+g <- ggplot(mss.corprots, aes(x=receptor, y=log2FC, color=plot.grp, label=gene)) + 
+  #geom_boxplot(alpha=0.6) +
+  geom_point() + 
+  geom_hline(yintercept=0, linetype=2, color='grey', alpha=0.5) +
+  scale_fill_manual(values=(col.pal)) +
+  facet_wrap(~plot.grp, scales="free_x") +
+  geom_text_repel(data=mss.corprots, color='black', size=1.5, vjust=-2) +
+  theme_bw() +
+  guides(
+  colour = guide_legend('GProtein')) +
+  theme(axis.text.x = element_text(angle=90)) 
+
+g
+BackupAsPDF(g, 'positive.control.profiles.noboxplot.', dimensions=c(9,5))
+```
+This does not look good.... shows the postive controls are also high in other IUPAR groups
+Take another view; take each gene and plot calculate their average score across groups
+
+calculate mean of (Gq: PRKCA, PACS1, UNC13B; Gi: EYA4, maybe KCTD12)
+
+```{r}
+summary.dt <- mss.corprots[, .(mean.log2FC = mean(log2FC), sd.log2FC=sd(log2FC)), by=.(plot.grp,gene)]
+summary.dt[gene == 'UNC13B']
+
+summary.dt %>%  str()
+# plot the mean expression of each protein, plus the SD per gprotein
+g <- ggplot(summary.dt, aes(x=gene, y=mean.log2FC, fill=gene)) +
+  geom_bar(stat = 'Identity', alpha=0.8) + 
+  geom_errorbar(aes(ymin=mean.log2FC-sd.log2FC, ymax=mean.log2FC+sd.log2FC, group=gene), width=0.2, lwd=.5, color='darkgrey') +
+  facet_wrap(~plot.grp) +
+  theme_bw() +
+  scale_fill_manual(values=(col.pal)) +
+  guides(
+  colour = guide_legend('GProtein')) +
+  theme(axis.text.x = element_text(angle=90)) 
+g
+#BackupAsPDF(g, 'positive.controls.geneMeanperGProtgroup.barplot')
+
+
+mss.corprots[,.N, .(plot.grp, iupar)]
+
+
+```
+
+
+intensity of proteins from clusters specific to each G protein type from heatmap b, across all the receptors.
+I think this is the log2FC plot covers this...
+what do you mean with this? an average log2FC? 
+need to consider up and down cor seperately as otherwise will even out..
+go with km3 as simplier; look at the average intensity overtime
+-----
+
+```{r}
+k3.clust.genes
+```
+
+plots for positive controls: plot the highest log2FC for each receptor and cluster to bars in group of G proteins. (Gq: PRKCA, PACS1, UNC13B; Gi: EYA4, maybe KCTD12).
+----
+
+How does the top 10% of hits look? Think nearly taking top 2 percentiles more specific? less FP results...
+
+```{r}
+genes.oi <- sapply(gprots, function(x){
+  sub.dt <- iupar.cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.95) | R <= quantile(R,0.05), unique(gene)])
+}) %>% c() %>% unique()
+
+
+
+subMat <-  exp.mat[rownames(exp.mat) %in% genes.oi,]
+
+colnames(subMat)
+
+# create a different scoring metric
+GProtein <- c('Gi/Go & Gq/G11', 'Gq/G11', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gq/G11', 'Gs', 'Gi/Go & Gq/G11', 'Gq/G11 & Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue',
+                                            'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')) )
+                        
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'pearson',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+        col = circlize::colorRamp2(breaks=c(-2,0,2), colors=c('blue', 'white', 'red')),
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='5nd & 95th Percentile R scores')
+BackupAsPDF(hm, ('5.and.95th.percentiles.log2FC.heatmap'), dimensions=c(8,8))
+```
+cor heatmap of top 5 percentiles
+
+```{r}
+subMat <-  cor.mat[rownames(cor.mat) %in% genes.oi,]
+
+GProtein <- c('Gi/Go', 'Gq/G11', 'Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go'='#22A884FF', 'Gq/G11'='#440154FF',
+                                            'Gs'='#FDE725FF')) )
+
+hm <- Heatmap(subMat,
+        top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_rows = 'pearson',
+        name='Pearson r',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+
+hm
+hm <- draw(hm, column_title='5nd & 95th Percentile R scores')
+
+BackupAsPDF(hm, 'R.5nd.95thpercentile.gprotein.cor.heatmap', dimensions = c(8,8))
+```
+
+
+
+
+
+Not used...
+----
+
+
+Can we do a better job of highlighting run to run trends?
+Maybe we can scale/standaridse the columns; this might more clearly highlight trends
+z-score scaling will just put all the data on the same scale
+how many SD is the gene from the mean per sample? Better in this case then using abs values due to the differences in range for the sample
+
+```{r}
+genes.oi <- sapply(gprots, function(x){
+  sub.dt <- iupar.cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.98) | R <= quantile(R,0.02), unique(gene)])
+}) %>% c() %>% unique()
+
+
+subMat <-  exp.mat[rownames(exp.mat) %in% genes.oi,]
+
+# create a different scoring metric
+GProtein <- c('Gi/Go & Gq/G11', 'Gq/G11', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gq/G11', 'Gs', 'Gi/Go & Gq/G11', 'Gq/G11 & Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue',
+                                            'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')) )
+                        
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'pearson',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+        col = circlize::colorRamp2(breaks=c(-2,0,2), colors=c('blue', 'white', 'red')),
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='2nd & 98th Percentile R scores')
+BackupAsPDF(hm, ('2.and.98th.percentiles.log2FC.colscaleadjusted.heatmap'), dimensions=c(8,8))
+
+```
+Scale the columns to allow comparisons of trends
+First scale by all 'interesting' things used as input for correlation
+
+```{r}
+scaledMat <- scale(exp.mat, center=T, scale=T)
+
+subMat <-  scaledMat[rownames(scaledMat) %in% genes.oi,]
+
+# create a different scoring metric
+GProtein <- c('Gi/Go & Gq/G11', 'Gq/G11', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gq/G11', 'Gs', 'Gi/Go & Gq/G11', 'Gq/G11 & Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue',
+                                            'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')) )
+                        
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'pearson',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+        col = circlize::colorRamp2(breaks=c(-3,0,3), colors=c('blue', 'white', 'red')),
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='2nd & 98th Percentile R scores')
+```
+Maybe makes more sense to scale by all the data?
+
+```{r}
+# scale by all values
+all.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+# renanme MOR DAMGO to MOR
+colnames(all.mat) <- c('DOR', 'KOR', 'MOR', 'MRX2', 'MRX4', 'NK1R', 'NPFFR1', 'NPY1R','PTGER1', 'PTGER4','QRFPR')
+
+# reorder the cols to match the matrices
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+all.mat <- all.mat[, col.order]
+```
+
+
+```{r}
+# scale by the entire dt
+scaledMat <- scale(all.mat, center=T, scale=T)
+scaledMat %>%  summary()
+subMat <-  scaledMat[rownames(scaledMat) %in% genes.oi,]
+
+# create a different scoring metric
+GProtein <- c('Gi/Go & Gq/G11', 'Gq/G11', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gq/G11', 'Gs', 'Gi/Go & Gq/G11', 'Gq/G11 & Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue',
+                                            'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')) )
+                        
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'pearson',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+       # col = circlize::colorRamp2(breaks=c(-2,0,2), colors=c('blue', 'white', 'red')),
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='2nd & 98th Percentile R scores')
+
+
+```
+
+
+
+```{r}
+subMat <-  exp.mat[rownames(exp.mat) %in% genes.oi,]
+
+
+subMat %>%  colnames()
+
+scaled.subMat <- scale(subMat)
+
+scaled.subMat %>%  summary()
+
+# create a different scoring metric
+GProtein <- c('Gi/Go & Gq/G11', 'Gq/G11', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gq/G11', 'Gs', 'Gi/Go & Gq/G11', 'Gq/G11 & Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue',
+                                            'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')) )
+                        
+hm <- Heatmap(scaled.subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'pearson',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+        name='log2FC (z-score)',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='2nd & 98th Percentile R scores')
+
+```
+
+```{r}
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'pearson',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='2nd & 98th Percentile R scores')
+```
+
+
+Could we look at something like GSEA for enrichment and incorporating the Log2FC and/or R scores in the plot??
+
+```{r}
+colnames(subMat)
+t(iupar)
+
+iupar
+```
+
+
+cor score plot of the quantiles
+```{r}
+subMat <-  cor.mat[rownames(cor.mat) %in% genes.oi,]
+
+hm <- Heatmap(subMat,
+        cluster_columns = F, 
+        show_column_names = F,
+        name='Pearson r',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 3),
+         column_names_gp = gpar (fontsize= 8),
+         column_split = colnames(subMat),
+         column_title_gp = gpar (fontsize= 9))
+
+hm <- draw(hm, column_title='5% and 95% quantiles')
+
+BackupAsPDF(hm, 'R.05.95.quantiles.gprotein.heatmap', dimensions = c(6,11))
+```
+```{r}
+# extract the sig genes and reorder columns to match the scoring mat
+subMat <-  lfc.mat[rownames(lfc.mat) %in% genes.oi, colnames(scores.mat$iupar)]
+
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        show_column_names = T,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 3),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+hm <- draw(hm, column_title='5% and 95% quantiles')
+
+BackupAsPDF(hm, 'R.05.95.quantiles.log2FC.heatmap', dimensions = c(7,12.5))
+```
+
+
+

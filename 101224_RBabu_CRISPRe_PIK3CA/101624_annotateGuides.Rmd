@@ -1,0 +1,1133 @@
+---
+title: "161024_annotateGuides"
+author: "Martin Gordon"
+date: "2024-10-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Goal here is to annotate the guides to locations in the genome/proteome
+
+Looks like the clinvar ID mapping didnt work correctly
+
+We are just working with FCs; forget about Pvals for now as uncertain which plots to use
+- Need to:
+- Generate heatmaps annotated with location/mutant severity
+- Ridge plots of log2FC distributions of the different mutant types
+- Ridge plots of the lFC distributions of clinvar severity
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(viridis)
+library(dendextend) # for dendogram modifications
+library(DESeq2)
+library(patchwork)
+library(ggrepel)
+library(tidymodels)
+library(Biostrings)
+library(readxl)
+library(BSgenome.Hsapiens.NCBI.GRCh38) # NCBI reference; important to match with the clinvar annotations
+library(ggpubr) # could also use geom_annotate..
+library(tidymodels)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+source ("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+```
+
+read in our files with  the annotation information
+
+sgrna.dt is the list of guide RNAs (1:8202), their (genomic) position, the gene it targets
+1 row per guide
+
+```{r}
+clinvar.dt <- fread('/Users/martingordon/Documents/projects/071724_BRabu_CRISPRbe_LibraryDesign/data/GRCh38.snp_clinvar.txt')
+clinvar.dt <- clinvar.dt[Assembly == 'GRCh38' & GeneSymbol %in% c("PTEN" ,"MTOR","AKT1","PIK3CA"),]
+
+sgrna.dt <- read_xlsx('/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/docs/PIK3CA pathway base editing.xlsx', sheet=1) %>% 
+  as.data.table()
+
+sgrna.dt
+clinvar.dt
+# just want the sequence and the guide id for now
+sgrna.dt <- sgrna.dt[, .(sgrna=`Sl No`, Gene, Guide)]
+sgrna.dt[Gene %like% 'sgINTERGENIC', Gene := 'Intergenic']
+```
+First pass; use the baseeditortool to rerun the guide generation, match the guides based on sequence and gene
+Look at this output
+```{r}
+clinvar.anno.dt <-  fread('/Users/martingordon/Documents/projects/071724_BRabu_CRISPRbe_LibraryDesign/script/base-editor-design-tool/allGuide.output.txt_24-10-16-21-08-54/clinvar_annotations_allGuide.output.txt.txt', sep='\t', fill=T)
+colnames(clinvar.anno.dt) <- gsub(' ', '_', colnames(clinvar.anno.dt))
+
+# this is the one we want with the locations collapsed
+be.ouput.dt <- fread('/Users/martingordon/Documents/projects/071724_BRabu_CRISPRbe_LibraryDesign/script/base-editor-design-tool/allGuide.output.txt_24-10-16-21-08-54/sgrna_designs_allGuide.output.txt.txt', sep='\t', fill=T)
+colnames(be.ouput.dt) <- gsub(' ', '_', colnames(be.ouput.dt))
+be.ouput.dt[, editor := ifelse(Edit == 'C-T', 'bemax', 'abe8e')]
+```
+
+Read in the LFC results from MAGECK testing and merge with the guide info table
+
+```{r}
+de.dt <- fread('/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_16_PWcomparisonsVsLibDay0.firstpass.csv')
+
+de.dt <- merge(de.dt[,.(editor, comparison=newLabel,numeratorTimepoint, LFC, Gene, sgrna, control_count, treatment_count, control_mean, treat_mean)], sgrna.dt, by=c('sgrna', 'Gene'))
+de.dt[,Guide := toupper(Guide)]
+de.dt[, Gene := toupper(Gene)]
+de.dt[, grp_comparion := gsub('_[0-9]+', '', comparison)]
+de.dt[, numeratorTimepoint := factor(numeratorTimepoint, levels=c(7,22))]
+```
+
+Extract the most severe clinvar mutant for mapping
+
+```{r}
+# subset to the cols we want
+be.sub.dt <- be.ouput.dt[,.(Guide=toupper(sgRNA_sequence), Gene=Gene_Symbol,sgrna_genomic_position, Nucleotide_edits, Amino_acid_edits, Mutation_category, editor)]
+
+# ranks based on ensembl Sequence Ontology consequence terms info: https://useast.ensembl.org/info/genome/variation/prediction/predicted_data.html#consequences
+# loosely based on the 
+variant.severity <- data.table(Consequence =c('Splice-acceptor',
+                        'Splice-donor',
+                        'Nonsense',
+                        'Missense',
+                        'UTR',
+                        'Intron',
+                        'Silent'))
+# severity ranking
+variant.severity[, rank := .I]
+
+# extract most severe mutant
+be.sub.dt[, mostSevereMutant := getMostSevereVariant(Mutation_category, rankingDT = variant.severity, verbose = F), by=.I]
+
+
+#fwrite(be.sub.dt, ScriptAndDatedFileName('BE.output.csv'))
+be.sub.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101624_annotateGuides_data/2024_10_17_BE.output.csv')
+```
+
+merge this with the editor output information for first pass
+Losing ~30 guides but proceed as is for now; should still have excellent coverage
+
+```{r}
+de.dt <- merge(de.dt, be.sub.dt, by=c('Guide', 'Gene', 'editor'), all.x=T)
+de.dt[,.(Mutation_category, mostSevereMutant)]
+unique(de.dt[Gene %in% c("PIK3CA","AKT1","PTEN","MTOR")]$Guide) %>% length()
+# losing 30 guides that base editor tool failed to generate.. lets look at their FCs
+unique(de.dt[Gene %in% c("PIK3CA","AKT1","PTEN","MTOR")]$Guide) %in% unique(be.sub.dt$Guide) %>% sum()
+
+# these are the guides in our data with no corresponding measure in be.sub
+missing.guides <- de.dt[is.na(sgrna_genomic_position) & Gene %in% c('MTOR', 'AKT1', 'PIK3CA'), unique(Guide)]
+
+# 18 above thresholds, but move forward for now but return to this next week
+de.dt[Guide %in% missing.guides & abs(LFC) > 1, unique(Guide)]
+```
+Write this intermediate output to file for now;
+
+```{r}
+#fwrite(de.dt, ScriptAndDatedFileName('mageck.DEvsT0.mutAnno.csv'))
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101624_annotateGuides_data/2024_10_17_mageck.DEvsT0.mutAnno.csv')
+de.dt[, mostSevereMutant := factor(mostSevereMutant, levels=c('Splice-acceptor','Splice-donor','Nonsense','Missense','UTR','Intron','Silent'))]
+```
+
+Get z-score of the LFCs per contrast; do we want to average over each of the different contrasts? I think so, we can see then if the more severe mutants tend to be 
+```{r}
+# first just average over each group
+de.dt[, zScore.LFC := scale(LFC, center=T, scale=T), by=.(comparison, editor)]
+
+
+
+```
+
+
+Now lets plot the distribution of log2FC values for each of the mutant classification; intergenic or non-targeting will be our controls
+
+for ridgeplots lets use ggridges
+For these drop non-sense plots
+
+```{r}
+
+#ksmmoth r funciton
+
+library(ggridges)
+library(viridis)
+
+lapply(unique(de.dt$comparison), function(x){
+
+    # subset to this data
+    subdt <-  de.dt[!is.na(mostSevereMutant) &  !mostSevereMutant %in% c('Nonsense','UTR') & comparison == x,]
+    
+    g <- ggplot(subdt, aes(x=LFC, y=mostSevereMutant, fill=mostSevereMutant, height=after_stat(density))) + #,  height = after_stat(density))) +
+      geom_density_ridges(scale = 1, stat='density') +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+      scale_x_continuous(breaks=c(-5,5)) +
+      ggtitle(paste0(x)) +
+      scale_fill_viridis_d(option=2) +
+      facet_grid(~editor) +
+      theme_ridges() +
+      guides(fill='none')
+  g
+  #BackupAsPDF(g, paste0('ridgeplots/perContrast_noUTR/',x,'.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions = c(10,8))
+})
+```
+
+Clearly signal here; although its noisy due to these LFC changes from low count genes
+Maybe easiest thing to do would be a quick and dirty filtering of these low count stuff (must be 10 reads in all conditions) and replot; hopefully removes this noise
+
+```{r}
+
+de.dt[, grp_comparion := gsub('_[0-9]+', '', comparison)]
+
+lapply(unique(de.dt$grp_comparion), function(x){
+
+    # subset to this data
+    subdt <-  de.dt[!is.na(mostSevereMutant) &  !mostSevereMutant %in% c('Nonsense','UTR') & grp_comparion == x,]
+    
+    g <- ggplot(subdt, aes(x=LFC, y=mostSevereMutant, fill=mostSevereMutant, height=after_stat(density))) + #,  height = after_stat(density))) +
+      geom_density_ridges(scale = 1, stat='density') +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+      scale_x_continuous(breaks=c(-5,5)) +
+      ggtitle(paste0(x)) +
+      scale_fill_viridis_d(option=2) +
+      facet_grid(editor~numeratorTimepoint) +
+      theme_ridges() +
+      guides(fill='none')
+  g
+  BackupAsPDF(g, paste0('ridgeplots/perTimepoint_Contrast_noUTR/',x,'.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions = c(10,8))
+})
+
+```
+
+Repeat, iterating through the contrasts and then the genes in each contrast
+
+```{r}
+
+lapply(unique(de.dt$comparison), function(x){
+
+      # subset to this data
+      subdt <-  de.dt[!is.na(mostSevereMutant) &  !mostSevereMutant %in% c('Nonsense','UTR') & comparison == x,]
+    
+      for (i in c("MTOR","AKT1","PIK3CA","PTEN")){
+        g <- ggplot(subdt[Gene == i,], aes(x=LFC, y=mostSevereMutant, fill=mostSevereMutant, height=after_stat(density))) + #,  height = after_stat(density))) +
+          geom_density_ridges(scale = 1, stat='density') +
+          xlab('Log2FC') +
+          ylab('Mutation Consequence') +
+          geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+          #scale_x_continuous(breaks=c(-5,5)) +
+          ggtitle(paste(i, x, 'LFC distributions', sep=' ')) +
+          scale_fill_viridis_d(option=2) +
+          facet_grid(~editor) +
+          theme_ridges() +
+          guides(fill='none')
+        g
+        print(g)
+        BackupAsPDF(g, paste0('ridgeplots/perContrast_Gene_noUTR/',x,'.',i,'.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions=c(8,6))      
+      }
+})
+```
+
+
+Quick and dirty; just identify the first site where the mutation occurs 
+Lets just do the simple one first; only consider snps to start 
+```{r}
+# just do this for the SNPs we detect
+de.dt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense'), edit_Position := gsub('[A-Za-z]','', Amino_acid_edits)]
+de.dt[!is.na(edit_Position), firstSite := tstrsplit(edit_Position,';', keep=1)]
+
+fetchGeneFeatures <- function(gene_symbol, tID, species='HUMAN') {
+  require(biomaRt) # warning if package not found
+  message('This function requires biomart. Please see this post for issues related to database loading: https://stackoverflow.com/questions/77370659/error-failed-to-collect-lazy-table-caused-by-error-in-db-collect-using')
+  
+  if (toupper(species) != 'HUMAN'){
+    message('Currently only HUMAN database is supported....')
+    stop()
+  } else {
+    
+    mart <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+  }
+  
+  message('fetching gene information...')
+  
+  geneAnno.dt <-  getBM(attributes = c('chromosome_name', 
+                                       'external_gene_name',
+                                       'start_position',
+                                       'end_position',
+                                       'transcript_start', 
+                                       'transcript_end', 'strand', 
+                                       'ensembl_transcript_id', 
+                                       'ensembl_gene_id', 
+                                       'gene_biotype'),
+                        filters=c('external_gene_name', 'ensembl_transcript_id'),
+                        values=list(external_gene_name=gene_symbol, ensembl_transcript_id=tID),
+                        mart = mart)
+  
+  if (nrow(geneAnno.dt) == 0) {
+    stop("Gene not found.")
+  }
+  return(as.data.table(geneAnno.dt))
+}
+
+# extract the gene info 
+gene.info.dt <- fetchGeneFeatures(gene_symbol=genes.dt$gene, tID=genes.dt$transcriptID)
+
+
+# not good; need to run this function by row or else it scrambles the ID!!!
+gene.info.dt[, peptideSequence := fetchPeptideSequencefromEnsemblTranscriptID(ensembl_transcript_id), by=.I]
+gene.info.dt[, protein_start :=  1]
+gene.info.dt[, protein_end := nchar(peptideSequence) - protein_start]
+
+```
+
+Merge this annotation info to the protein
+
+```{r}
+de.dt <- merge(de.dt, gene.info.dt, by.x='Gene', by.y='external_gene_name', all.x=T)
+```
+Quick first pass; plot all of the mutant sites along the axis for one contrast; overlay both the BEmax and Abe8e edits
+prep the datatable for plotting
+
+```{r}
+
+col.pal <- randomcoloR::distinctColorPalette(k=2)
+#"#BF86C9" "#B8D69F"
+subdt <- de.dt[!is.na(firstSite),]
+subdt[, firstSite := as.numeric(firstSite)]
+
+subdt[, status := 'ns']
+subdt[abs(LFC) > 1, status := ifelse(LFC > 0, 'up', 'down')]
+```
+
+
+```{r}
+g <- ggplot(subdt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense') & comparison == 'Alpelisib_22-vs-librep_0' & Gene %in% c("AKT1","MTOR","PIK3CA","PTEN"),], 
+            aes(x=firstSite, y=LFC, fill=status, shape=editor, label=Amino_acid_edits)) +
+  geom_bar(stat='Identity', position = 'Identity', alpha=0.6) +
+  geom_hline(yintercept=c(-1,1), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  facet_wrap(~Gene, ncol=1, scales='free') +
+  ggtitle('Example contrast') +
+  ggrepel::geom_text_repel(data=subdt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense') & comparison == 'Alpelisib_22-vs-librep_0' & Gene %in% c("AKT1","MTOR","PIK3CA","PTEN") & abs(LFC > 2),], segment.alpha=0.5, segment.linetype=2, max.overlaps = 60, size=1.5) +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  #scale_color_viridis(option='inferno', discrete = T) +
+  scale_fill_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+#  scale_color_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+  #scale_fill_viridis(option='inferno', discrete = T) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold"))
+
+g
+
+BackupAsPDF(g, paste0('tileplots/examples/barplot.example'), dimensions=c(16,12))
+
+g <- ggplot(subdt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense') & comparison == 'Alpelisib_22-vs-librep_0' & Gene %in% c("AKT1","MTOR","PIK3CA","PTEN"),], 
+            aes(x=firstSite, y=LFC, fill=status, shape=editor)) +
+  geom_bar(stat='Identity', position = 'Identity', alpha=0.6) +
+  geom_hline(yintercept=c(-1,1), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  facet_wrap(~Gene, ncol=1, scales='free') +
+  ggtitle('Example contrast') +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  #scale_color_viridis(option='inferno', discrete = T) +
+  scale_fill_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+#  scale_color_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+  #scale_fill_viridis(option='inferno', discrete = T) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold"))
+
+g
+BackupAsPDF(g, paste0('tileplots/examples/barplot.noLabels.example'), dimensions=c(16,12))
+
+
+g <- ggplot(subdt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense') & comparison == 'Alpelisib_22-vs-librep_0' & Gene %in% c("AKT1","MTOR","PIK3CA","PTEN"),], 
+            aes(x=firstSite, y=LFC, fill=status, shape=editor, label=Amino_acid_edits)) +
+  geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=LFC), color="grey") +
+  geom_point(size=2.5) +
+  geom_hline(yintercept=c(-1,1), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  facet_wrap(~Gene, ncol=1, scales='free') +
+  ggtitle('Example contrast') +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  ggrepel::geom_text_repel(data=subdt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense') & comparison == 'Alpelisib_22-vs-librep_0' & Gene %in% c("AKT1","MTOR","PIK3CA","PTEN") & abs(LFC > 2),], 
+                           show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 60, size=2) +
+  #scale_color_viridis(option='inferno', discrete = T) +
+ # scale_color_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+#  scale_fill_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+  scale_color_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  scale_fill_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  scale_shape_manual(values = 21:22) +
+#  scale_color_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+  #scale_fill_viridis(option='inferno', discrete = T) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+g
+BackupAsPDF(g, paste0('tileplots/examples/lollipop.noLabels.example'), dimensions=c(16,12))
+```
+for now, generate all the plots 
+```{r}
+lapply(unique(subdt$comparison), function(x){
+  
+  # filter to the set we are looking at right now
+  sub.dt <- subdt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense') & Gene %in% c("AKT1","MTOR","PIK3CA","PTEN"),]
+  
+  g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=LFC, fill=status, shape=editor, label=Amino_acid_edits)) +
+  geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=LFC), color="grey") +
+  geom_point(size=2.5) +
+  geom_hline(yintercept=c(-1,1), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  facet_wrap(~Gene, ncol=1, scales='free') +
+  ggtitle(x) +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  ggrepel::geom_text_repel(data=sub.dt[comparison == x & abs(LFC > 1.75),], 
+                           show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 100, size=2) +
+ # scale_color_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+#  scale_fill_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+  scale_color_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  scale_fill_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  scale_shape_manual(values = 21:22) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ))
+
+ BackupAsPDF(g, paste0('tileplots/tileplots_lollipop_viridis/', x,'.LFC.viridis.lollipop.tileplot' ), dimensions=c(16,12)) 
+})
+
+
+lapply(unique(subdt$comparison), function(x){
+  
+  # filter to the set we are looking at right now
+  sub.dt <- subdt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense') & Gene %in% c("AKT1","MTOR","PIK3CA","PTEN"),]
+  
+ # g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=LFC, fill=status, shape=editor, label=Amino_acid_edits)) +
+  g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=LFC, fill=status, shape=editor)) +
+  geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=LFC), color="grey") +
+  geom_point(size=2.5) +
+  geom_hline(yintercept=c(-1,1), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  facet_wrap(~Gene, ncol=1, scales='free') +
+  ggtitle(x) +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+ # ggrepel::geom_text_repel(data=sub.dt[comparison == x & abs(LFC > 1.75),], 
+  #                         show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 100, size=2) +
+  scale_color_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+  scale_fill_manual(values=c('down'="dodgerblue2",'up'="#E31A1C", 'not'='grey')) +
+  #scale_color_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  #scale_fill_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  scale_shape_manual(values = 21:22) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ))
+
+ BackupAsPDF(g, paste0('tileplots/tileplots_lollipop_redblue/', x,'.LFC.viridis.lollipop.nolabel.tileplot' ), dimensions=c(16,12)) 
+})
+```
+Regenerate scatterplots
+
+```{r}
+
+# do scatterplots of the different contrast pairs
+contrast.pairs <-  data.table(Var1 = c("abe8e_Alpelisib_22-vs-librep_0", "abe8e_Alpelisib_22-vs-librep_0", "abe8e_Alpelisib_22-vs-librep_0", "abe8e_Paxalisib_22-vs-librep_0",
+                                      "bemax_Alpelisib_22-vs-librep_0", "bemax_Alpelisib_22-vs-librep_0", "bemax_Alpelisib_22-vs-librep_0",  "bemax_Paxalisib_22-vs-librep_0"),
+                             Var2 = c("abe8e_Alpelisib_7-vs-librep_0",  "abe8e_control_22-vs-librep_0", "abe8e_Paxalisib_22-vs-librep_0", "abe8e_control_22-vs-librep_0",
+                                      "bemax_Alpelisib_7-vs-librep_0", "bemax_control_22-vs-librep_0" , "bemax_Paxalisib_22-vs-librep_0", "bemax_control_22-vs-librep_0"))
+
+
+de.dt[, contrast := paste0(editor,'_', comparison)]
+
+
+apply(contrast.pairs, 1,  function(x){
+  
+  
+  
+  dt <- dcast(de.dt[contrast %in% x,], sgrna+firstSite+Amino_acid_edits+Gene~contrast, value.var = c('LFC'))
+  print(dt)
+  setnames(dt, new=c('sgrna', 'firstSite', 'Amino_acid_edits',  'gene', 'log2FC.x', 'log2FC.y'))
+  
+    # create a col factor for 
+  #dt[, label := ifelse(sig.x != 'not' & sig.y != 'not', 'both sig',
+  #                          ifelse(sig.x != 'not' & sig.y == 'not', 'x-axis sig',
+  #                                 ifelse(sig.x == 'not' & sig.y != 'not', 'y-axis sig',
+  #                                        'not sig')))]
+  
+
+  dt[, label := ifelse(abs(log2FC.x) > 1 & abs(log2FC.y) > 1, 'abs(LFC) > 1 both conditions',
+                              ifelse(abs(log2FC.x) > 1 & abs(log2FC.y)  < 1, 'abs(LFC) > 1 x-axis condition',
+                                     ifelse(abs(log2FC.y) > 1 & abs(log2FC.x)  < 1, 'abs(LFC) > 1 y-axis condition', 'abs(LFC) < 1')))]
+
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=firstSite)) +
+    geom_point(size=1) +
+    geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-1,1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('abs(LFC) > 1 x-axis condition'='#35B779FF','abs(LFC) > 1 y-axis condition'="#FDE725FF", 'abs(LFC) < 1'='grey','abs(LFC) > 1 both conditions'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label == 'abs(LFC) > 1 both conditions' & abs(log2FC.x) > 1.5 & abs(log2FC.y) > 1.5,],size = 3, max.overlaps = 20, segment.alpha=0.5, segment.linetype=2, show.legend = F) +
+    xlab(paste(x[1], 'log2 fold change',sep=' ')) +
+    ylab(paste(x[2], 'log2 fold change',sep=' ')) +
+    ggtitle(paste('Fold Change Comparisons')) + 
+    theme_bw() +
+    coord_obs_pred()
+  
+  #add cor score
+  g <- g + stat_cor(data=dt, aes(x=log2FC.x, y=log2FC.y, label=..r.label..), method='pearson', inherit.aes = F)
+  
+  g
+  BackupAsPDF(g, paste0('scatterplots/',x[1], '__', x[2],'.log2FC.scatterplots.'), dimensions=c(10,10))
+})
+
+```
+
+
+
+
+10-21-24
+--
+Some other useful functions; annotate edits
+
+```{r}
+clinvar.anno.dt
+clinvar.dt %>% head()
+```
+So, how do we map clinvar variants?
+
+
+Steps
+read in clinvar
+filter to the reference genome, mutants (SNPs) and genes you are interested in 
+```{r}
+sgrna.dt <- read_xlsx('/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/docs/PIK3CA pathway base editing.xlsx', sheet=1) %>% 
+  as.data.table()
+
+# tidy names 
+sgrna.dt[Gene %like% 'sgINTERGENIC', Gene := 'intergenic']
+sgrna.dt[Gene == 'mTOR', Gene := 'MTOR']
+sgrna.dt[Gene == 'Akt1', Gene := 'AKT1']
+# just want the sequence and the guide id for now
+#sgrna.dt <- sgrna.dt[, .(sgrna=`Sl No`, Gene, Guide)]
+#sgrna.dt[Gene %like% 'sgINTERGENIC', Gene := 'Intergenic']
+
+
+getClinvarDT <- function(path, genesOI, variantOI, ref){
+  
+  if (missing(genesOI) | missing(ref) | missing(variantOI)){
+
+    stop('Missing parameters: please supply genesOI, variantOI and ref')
+  }
+  message(paste('Reading in clinvar database:', path ,sep=' '))
+
+  dt <- fread(path)
+  subdt <- dt[Assembly == ref & GeneSymbol %in% genesOI & Type %in% variantOI,] 
+  
+  
+  return(subdt)
+  
+}
+
+clinvar.dt <- getClinvarDT(path='/Users/martingordon/Documents/projects/071724_BRabu_CRISPRbe_LibraryDesign/data/GRCh38.snp_clinvar.txt',ref='GRCh38',  genesOI = c("PTEN" ,"MTOR","AKT1","PIK3CA"), variantOI = "single nucleotide variant")
+```
+
+Now we need to match sites; I think perhaps best approach is to match by gene, reference, 
+Maybe what we need is the guide sequence only; we want to align this to our reference, perfect match only, identify the sites(s) it aligns, count the number of sites, and then filter the site by the matching gene
+
+We also need to find the strand; i) identify if the gene is on the positive strand (align that, if not reverse transcibe and align that)
+```{r}
+source ("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+library(Biostrings)
+library(BSgenome.Hsapiens.NCBI.GRCh38)
+
+# gene info datatable
+genes.dt <- data.table(transcriptID=c('ENST00000371953', 'ENST00000361445', 'ENST00000649815', 'ENST00000263967'),
+                       gene=c('PTEN', 'MTOR', 'AKT1', 'PIK3CA'))
+
+
+# first load the gene information 
+anno.dt <- fetchGeneFeatures(gene_symbol = genes.dt$gene, tID=genes.dt$transcriptID)
+
+
+#sequence to align
+sgrna.dt[Gene == 'MTOR']
+
+
+sgrna.dt$gene %>%  unique()
+
+
+sgrna.dt
+
+unique(sgrna.dt$Gene)
+unique(sgrna.dt$Gene) %in% unique(anno.dt$external_gene_name)
+
+
+# write a function to align a sequence to reference genome
+# first, function to check 
+anno.dt
+
+align.in.dt <- merge(x=sgrna.dt[,.(`Sl No`,Gene, `Guide Strand`, Position, Guide)], y=anno.dt, by.x='Gene', by.y='external_gene_name')
+
+
+# need our guide seq to be on + strand for alignment; 
+# check if gene on + and guide Strand + = sequence to search = insequence
+
+align.in.dt[, ForwardStrandToAlign := ifelse(`Guide Strand` == 1 & strand == 1, Guide, # if its on + strand and the same, then take this
+                                            ifelse(`Guide Strand` == 1 & strand == -1, getSeqReverseComplement(Guide), # need pos strand seq for search
+                                                  ifelse(`Guide Strand` == -1 & strand == -1, Guide, getSeqReverseComplement(Guide))) ), by=.I] 
+
+
+align.in.dt
+
+getSeqReverseComplement <- function(sequence){
+  require(Biostrings)
+  if (grepl('U', sequence)){
+    
+    seq.obj <- RNAStringSet(sequence)
+    return(as.character(reverseComplement(seq.obj)))
+    
+  } else {
+    
+    seq.obj <- DNAStringSet(sequence)
+    return(as.character(reverseComplement(seq.obj)))
+    
+  }
+}
+
+
+#' @ a datatable with identifiers and a sequence
+alignToReference <- function(seq.dt, ref=genome, mismatches=0){
+  require(Biostrings)
+  
+  genome = ref
+  message(paste('Using', genome, 'as reference for alignment..', sep=' ')) 
+  
+  # format our input as a dna str object; makes pattern search faster
+  seqsIn <- seq.dt$ForwardStrandToAlign
+  names(seqsIn) <- seq.dt$`Sl No`
+  
+  query.obj <- Biostrings::DNAStringSet(seqsIn, use.names = T)
+
+}
+
+
+
+alignToReference <- function(seqIn, ref, chrToSearch, strand, outfile="", append=FALSE){
+  
+  cat("\nTarget: strand", strand, "of", metadata(ref)$genome, "chromosomes", paste(chrToSearch, collapse=", "), "\n") 
+  pdict <- PDict(seqIn)
+
+  for (seqname in chrToSearch) {
+    subject <- ref[[seqname]]
+    cat(">>> Finding all hits in strand", strand, "of chromosome", seqname, "...\n")
+    mindex <- matchPDict(pdict, subject)
+    print(mindex)
+    matches <- extractAllMatches(subject, mindex)
+    print(matches)
+  }
+  
+  # now we want to capture the number of matches in each chromosome
+  
+}
+
+
+alignToReference(DNAstr.test[1:10], ref=genome, chrToSearch=c('1','3','10','11'), strand='+')
+
+
+
+anno.dt
+                   
+                   seqnames(genome)
+DNAstr.test[1:10]
+test <- align.in.dt$ForwardStrandToAlign
+names(test) <-  align.in.dt$`Sl No`
+
+DNAstr.test <- DNAStringSet(test, use.names = T)
+View(DNAstr.test)
+
+
+DNAstr.test
+
+align.in.dt[ForwardStrandToAlign == 'GAATTTTTTTTTATCAAGAG',]
+```
+
+```{r}
+> runAnalysis1 <- function(dict0, outfile="")
++ {
++ library(BSgenome.Celegans.UCSC.ce2)
++ genome <- BSgenome.Celegans.UCSC.ce2
++ seqnames <- seqnames(genome)
++ seqnames_in1string <- paste(seqnames, collapse=", ")
++ cat("Target:", metadata(genome)$genome,
++ "chromosomes", seqnames_in1string, "\n")
++ append <- FALSE
++ for (seqname in seqnames) {
++ subject <- genome[[seqname]]
++ cat(">>> Finding all hits in chromosome", seqname, "...\n")
++ for (i in seq_len(length(dict0))) {
++ patternID <- names(dict0)[i]
++ pattern <- dict0[[i]]
++ plus_matches <- matchPattern(pattern, subject)
++ names(plus_matches) <- rep.int(patternID, length(plus_matches))
++ writeHits(seqname, plus_matches, "+", file=outfile, append=append)
++ append <- TRUE
++ rcpattern <- reverseComplement(pattern)
++ minus_matches <- matchPattern(rcpattern, subject)
++ names(minus_matches) <- rep.int(patternID, length(minus_matches))
++ writeHits(seqname, minus_matches, "-", file=outfile, append=append)
++ }
++ cat(">>> DONE\n")
++ }
++ }
+Some i
+```
+
+# only contain forward strand info
+genome <- BSgenome.Hsapiens.NCBI.GRCh38
+
+
+seqnames(genome)
+
+genome$`1`
+
+
+choose(c(-1,1) 2)
+
+choose(c(1,2),2)
+
+
+getSeqReverseComplement('CGCGGGAGCCTCGGGCACCA')
+```
+
+
+
+
+colors...
+```{r}
+viridis(option='viridis', 6)
+"#000004FF" "#420A68FF" "#932667FF" "#DD513AFF" "#FCA50AFF" "#FCFFA4FF"
+
+"#000004FF" "#231151FF" "#5F187FFF" "#982D80FF" "#D3436EFF" "#F8765CFF" "#FEBA80FF" "#FCFDBFFF"
+"#000004FF" "#3B0F70FF" "#8C2981FF" "#DE4968FF" "#FE9F6DFF" "#FCFDBFFF"
+
+"#440154FF" "#414487FF" "#2A788EFF" "#22A884FF" "#7AD151FF" "#FDE725FF"
+```
+
+
+
+
+First, we need to get the coordinates for the genomic regions in nucleotide format 
+get protein sequences for the genes we are interested in, convert these to the 3 letter aa code, map our edits to these sites
+
+load necessary libraries
+```{r}
+library(BSgenome.Hsapiens.NCBI.GRCh38)  # Genome reference
+library(GenomicFeatures)                # For working with genomic features
+library(biomaRt)                        # For gene annotations
+```
+
+
+```{r}
+genes.dt <- data.table(transcriptID=c('ENST00000371953', 'ENST00000361445', 'ENST00000649815', 'ENST00000263967'),
+                       gene=c('PTEN', 'MTOR', 'AKT1', 'PIK3CA'))
+
+# load the human biomart database (need dbplyr v 2.3.4 DO NOT UPDATE!!)
+# for function just add a message with fix details incase fails
+
+fetchPeptideSequencefromEnsemblTranscriptID <- function(tID, species='HUMAN'){
+  require(biomaRt) # warning if package not found
+  message('This function requires biomart. Please see this post for issues related to database loading: https://stackoverflow.com/questions/77370659/error-failed-to-collect-lazy-table-caused-by-error-in-db-collect-using')
+  
+  if (toupper(species) != 'HUMAN'){
+    message('Currently only HUMAN database is supported....')
+    stop()
+  } else {
+    
+    mart <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+  }
+  
+  message('fetching peptide sequence(s)...')
+  
+  seq.dt <-  getSequence(id=tID, seqType='peptide', type='ensembl_transcript_id', mart=mart)
+  return(seq.dt$peptide)
+}
+
+
+genes.dt[, peptideSequence := fetchPeptideSequencefromEnsemblTranscriptID(tID=transcriptID)]
+```
+
+
+
+
+Create new file from the output; transpose the datatable and get the site index
+
+```{r}
+
+
+de.dt
+
+createSequenceTable <- function(inputDT){
+  
+  for (i in inputDT$gene){
+    
+    
+  }
+  
+  
+}
+
+# Step 2: Extract the peptide sequences and split them into individual residues
+protein1_seq <- unlist(strsplit(input_dt$PeptideSequence[1], split = ""))
+protein2_seq <- unlist(strsplit(input_dt$PeptideSequence[2], split = ""))
+
+# Step 3: Create a new data.table with the index and corresponding residues from both proteins
+n_residues <- max(length(protein1_seq), length(protein2_seq))  # Ensure you cover the full length of both sequences
+
+# Create the new data.table with residue index, Protein1, and Protein2 amino acids
+result_dt <- data.table(
+  ResidueIndex = 1:n_residues,             # 1-based index for residues
+  Protein1_AA = protein1_seq,              # Amino acids from Protein 1
+  Protein2_AA = protein2_seq               # Amino acids from Protein 2
+)
+```
+
+
+```{r}
+#<- fetchPeptideSequencefromEnsemblTranscriptID(tID=genes.dt$transcriptID
+getGeneFeatures <- function(gene_symbol) {
+  
+  # Step 1: Use biomaRt to retrieve the genomic coordinates of the gene
+  ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+  
+  # Query transcript information by Ensembl transcript ID
+  gene_info <- getBM(attributes = c('chromosome_name', 
+                                          'transcript_start', 
+                                          'transcript_end', 'strand', 
+                                          'ensembl_transcript_id', 
+                                          'ensembl_gene_id', 'gene_biotype'),
+                           filters = 'external_gene_name',
+                           values = gene_symbol,
+                           mart = ensembl)
+  
+  if (nrow(gene_info) == 0) {
+    stop("Gene not found.")
+  }
+  
+}
+
+listAttributes(ensembl)[c(25,223, 260,1985,2029,2067),]
+
+mtor.dt <- getGeneFeatures('PTEN')
+mtor.dt
+
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+getBM(mart=ensembl, attributes=c('external_gene_name'))
+grep('exon', listAttributes(ensembl)$name, value=T)
+listAttributes(ensembl)$name
+
+
+getBM(mart = ensembl, attributes = c('chromosome_name', 'start_position', 'end_position', 'transcript_start', 'transcript_end', 
+                                     'strand', 'ensembl_transcript_id','pfam', "pfam_start", "pfam_end", "ensembl_exon_id",
+                                      'gene_biotype'), filters=c('external_gene_name', 'ensembl_transcript_id'),  values=list(external_gene_name=c('MTOR'), ensembl_transcript_id=c('ENST00000361445')))
+
+
+getSequence(id='ENST00000361445', seqType='peptide', type='ensembl_transcript_id', mart=ensembl) %>%  str()
+
+
+
+```
+
+get protein sequences for the genes we are interested in, convert these to the 3 letter aa code, map our edits to these sites
+
+```{r}
+
+```
+
+# get protein sequence for these genes
+
+```{r}
+getSequence(mart=ensembl)
+
+getSequence(id='ENST00000361445', type = "ensembl", seqType='cdna', mart=ensembl) %>% View()
+```
+
+
+
+
+
+Todo: map to Clinvar mutants and repeat the plotting; for now just proceed as is; we need to do a tiling plot
+
+
+```{r}
+be.ouput.dt[]
+clinvar.anno.dt
+```
+
+
+
+
+
+
+Clinvar DT is one record per snp
+clinvar anno is records collapsed to sgRNA guide
+
+```{r}
+clinvar.anno.dt
+
+be.sub.dt[,.(Guide, Amino_acid_edits,editor)][Guide == 'AAAACCCTCCTGATGTACAC',]
+
+clinvar.anno.dt[,.(sgRNA_sequence, SNP_amino_acid_change, editor)][sgRNA_sequence == 'AAAACCCTCCTGATGTACAC',]
+clinvar.anno.dt[SNP_name %in% clinvar.dt$Name,]
+
+clinvar.dt[grepl('Thr1876Ile', Name),]
+
+clinvar.dt %>%  head()
+clinvar.dt %>%  colnames()
+
+clinvar.anno.dt[SNP_amino_acid_change == 'Met1Arg',]
+clinvar.anno.dt %>%  colnames()
+
+clinvar.anno.dt[,.N, sgRNA_context_sequence]
+
+
+clinvar.anno.dt[sgRNA_context_sequence == 'ATGGCTGTCATGTCTGGGAGCCTGTGGCT']
+
+
+de.dt
+
+
+clinvar.dt[GeneSymbol == 'MTOR',]
+
+
+
+de.dt$Mutation_category %>%  unique()
+
+
+
+de.dt$Mutation_category %>%  unique()
+```
+
+Function to rank variants on severity 
+
+```{r}
+# ranks based on ensembl Sequence Ontology consequence terms info: https://useast.ensembl.org/info/genome/variation/prediction/predicted_data.html#consequences
+# loosely based on the 
+variant.severity <- data.table(Consequence =c('Splice-acceptor',
+                        'Splice-donor',
+                        'Nonsense',
+                        'Missense',
+                        'UTR',
+                        'Intron',
+                        'Silent'))
+
+# severity ranking
+variant.severity[, rank := .I]
+
+getMostSevereVariant <- function(variants, rankingDT=''){
+  
+  
+  
+  # first check if more than one variant
+  if(grepl(';', variants)){
+    message('More than one variant detected. Splitting & extracting most severe variant')
+    
+    variants.set <- unlist(strsplit(variants, ';'))
+    message(paste('Found the following variants: ', paste(variants.set, collapse=';')))
+    stopifnot(variants.set %in% rankingDT$Consequence)
+    
+    rankingDT[Consequence %in% variants.set, .SD[which.min(rank)]]$Consequence
+    
+    
+  } else {
+    
+    stopifnot(variants %in% c(rankingDT$Consequence, NA, ''))
+    return(variants)
+  }
+  
+}
+```
+
+
+
+```{r}
+
+de.dt$Clinical_significance %>%  unique()
+merge(de.dt, be.sub.dt, by.x=c('Guide', 'Gene'))
+```
+
+
+
+For simple first pass, match to 
+
+```{r}
+# set the editors depending on the introduced edits
+be.ouput.dt[, editor := ifelse(Edit == 'C-T', 'bemax', 'abe8e')]
+clinvar.anno.dt[, editor := ifelse(Edit == 'C-T', 'bemax', 'abe8e')]
+
+be.sub.dt <- be.ouput.dt[, .(sgRNA_sequence, Gene=Gene_Symbol, sgrna_genomic_position, Mutation_category, Clinical_significance, Nucleotide_edits, Amino_acid_edits, editor)]
+
+be.sub.dt[sgRNA_sequence == 'TGTCATGTCTGGGAGCCTGT',]
+
+be.ouput.dt
+```
+```{r}
+clinvar.sub.dt <- clinvar.anno.dt[,.(sgRNA_sequence, Gene, Edit_nucleotide, `Edit_nucleotide_position(s)`, SNP_name, SNP_clinical_significance, SNP_nucleotide_position, editor)]
+clinvar.sub.dt[sgRNA_sequence == 'TGTCATGTCTGGGAGCCTGT',]
+clinvar.anno.dt[sgRNA_sequence == 'TGTCATGTCTGGGAGCCTGT',]
+
+
+clinvar.anno.dt[,.N, by=sgRNA_sequence]
+```
+Clinvar status ridge plots
+Subset clinvar to the edits intorru
+```{r}
+# where our edits map to a recorded snp; subset our edits to this set
+clinvar.edits.dt <- clinvar.anno.dt[sgRNA_amino_acid_change == SNP_amino_acid_change,]
+clinvar.edits.dt[,.N, by=sgRNA_sequence][sgRNA_sequence == 'CCATCATCAAAGAGATCGTT',]
+
+clinvar.edits.dt[sgRNA_sequence == 'CCATCATCAAAGAGATCGTT',]
+
+clinvar.edits.dt[sgRNA_sequence == 'CAGCCACAGGCTCCCAGACA',]
+de.dt <- merge(de.dt[,.(editor, comparison=newLabel,numeratorTimepoint, LFC, Gene, sgrna, control_count, treatment_count, control_mean, treat_mean)], sgrna.dt, by=c('sgrna', 'Gene'))
+```
+# now becomes more difficult.. we want to map our guides to the guides generated by the software (may be different..) and pull out things 
+
+```{r}
+be.ouput.dt[]
+```
+
+
+
+
+Look-up table to conver to 3-letter aa code
+
+```{r}
+# Create a lookup table for codons to 3-letter amino acid codes
+codon_table <- c(
+  "UUU" = "Phe", "UUC" = "Phe",
+  "UUA" = "Leu", "UUG" = "Leu", "CUU" = "Leu", "CUC" = "Leu", "CUA" = "Leu", "CUG" = "Leu",
+  "AUU" = "Ile", "AUC" = "Ile", "AUA" = "Ile", "AUG" = "Met",
+  "GUU" = "Val", "GUC" = "Val", "GUA" = "Val", "GUG" = "Val",
+  "UCU" = "Ser", "UCC" = "Ser", "UCA" = "Ser", "UCG" = "Ser",
+  "CCU" = "Pro", "CCC" = "Pro", "CCA" = "Pro", "CCG" = "Pro",
+  "ACU" = "Thr", "ACC" = "Thr", "ACA" = "Thr", "ACG" = "Thr",
+  "GCU" = "Ala", "GCC" = "Ala", "GCA" = "Ala", "GCG" = "Ala",
+  "UAU" = "Tyr", "UAC" = "Tyr",
+  "UAA" = "Ter", "UAG" = "Ter", "UGA" = "Ter",
+  "CAU" = "His", "CAC" = "His",
+  "CAA" = "Gln", "CAG" = "Gln",
+  "AAU" = "Asn", "AAC" = "Asn",
+  "AAA" = "Lys", "AAG" = "Lys",
+  "GAU" = "Asp", "GAC" = "Asp",
+  "GAA" = "Glu", "GAG" = "Glu",
+  "UGU" = "Cys", "UGC" = "Cys",
+  "UGG" = "Trp",
+  "CGU" = "Arg", "CGC" = "Arg", "CGA" = "Arg", "CGG" = "Arg", "AGA" = "Arg", "AGG" = "Arg",
+  "AGU" = "Ser", "AGC" = "Ser",
+  "GGU" = "Gly", "GGC" = "Gly", "GGA" = "Gly", "GGG" = "Gly"
+)
+
+
+translate_codon <- function(codon) {
+  # Convert codon to uppercase in case it is provided in lowercase
+  codon <- toupper(codon)
+  
+  # if T is provided convert to U
+  codon <- gsub('T', 'U', codon)
+  
+  # Return the corresponding amino acid or a message if not found
+  if (codon %in% names(codon_table)) {
+    return(codon_table[[codon]])
+  } else {
+    return("Invalid codon")
+  }
+}
+
+translate_codon('ATA')
+```
+
+
+
+
+
+Later...
+
+align the sgRNA to the references
+```{r}
+library(BSgenome.Hsapiens.NCBI.GRCh38)
+
+ref_genome <- BSgenome.Hsapiens.NCBI.GRCh38
+
+runPWAlignments <- function(refGenome=BSgenome.Hsapiens.NCBI.GRCh38, querySeq){
+  
+      # Convert the sequence to a DNAString
+    query <- DNAString(querySeq)
+    
+    # Find the best pairwise alignment in the human genome
+    alignments <- pairwiseAlignment(query, refGenome, type = "local")
+    
+    # Return the alignment summary, including the positions of matches
+    summary(alignments)
+  
+}
+
+runPWAlignments(refGenome = BSgenome.Hsapiens.NCBI.GRCh38, querySeq = 'TGTAAAACTTGCAAAGAATC')
+
+
+queryDNA <- DNAString('TGTAAAACTTGCAAAGAATC')
+
+
+pairwiseAlignment(queryDNA, ref_genome, type = "local")
+
+
+BSgenome.Hsapiens.NCBI.GRCh38$
+```
+```{r}
+# Example 20 bp sequences and their respective genes
+sequences <- c("ATGCGTACGTAGCTAGCTAC", "CGTACGTAGCTAGCTACGAT", 
+               "GTAGCTAGCTACGATCGTAC", "CTAGCTACGATCGTACGTAG")
+
+
+# Create a reference genome
+human_genome <- BSgenome.Hsapiens.NCBI.GRCh38
+
+# Loop through each sequence and perform pairwise alignment
+results <- lapply(sequences, function(seq) {
+    # Convert the sequence to a DNAString
+    query <- DNAString(seq)
+    
+    # Find the best pairwise alignment in the human genome
+    alignments <- pairwiseAlignment(query, human_genome, type = "local")
+    
+    # Return the alignment summary, including the positions of matches
+    summary(alignments)
+})
+
+
+getSeq(human_genome, 'MTOR')
+```
+
+

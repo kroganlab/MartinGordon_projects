@@ -1,0 +1,216 @@
+---
+title: "030325_PHSanityCheck"
+author: "Martin Gordon"
+date: "2025-03-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Considering the large number of DE sites, I want to process this w/o artMS, run the comparisons to ensure the n sig hits are comparable before sharing hte results
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(artMS)
+library(readxl)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/spectronautFile2ArtMS.R")
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# kinase enrichment analysis
+source("/Users/martingordon/Documents/utils/bp_utils/KinaseActivityScores.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90,size=6)
+        )
+#set one
+col.pal <- getQualitativePalette(n=13)
+```
+
+Read in the files with the modified sequences and protein sites named
+
+```{r}
+#these just include the modified sites 
+spec.list <- list(MRC5=fread('./022525_PH_pwComparisons_data/MRC5/evidence.PH.txt'),
+                  RFe=fread('./022525_PH_pwComparisons_data/RFe/evidence.PH.txt')
+                  )
+
+keys.list <- list(MRC5=fread('./022525_PH_pwComparisons_data/MRC5/keys.txt'),
+                  RFe=fread('./022525_PH_pwComparisons_data/RFe/keys.txt')
+                  )
+
+# combine the two lists element wise
+comb.list <- mapply(function(spec, key) merge(x=spec, y=key, by='RawFile'), spec.list, keys.list, SIMPLIFY = F)
+```
+Actually, I think the safest method  may be to just merge the sequences on Protein
+```{r}
+
+input.list <- list(MRC5=fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/123024_PH_InitialQC_data/2025_02_25_MRC5.mssInput.csv'),
+                  RFe=fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/123024_PH_InitialQC_data/2025_02_25_Rfe.mssInput.csv'))
+
+
+# create necessary cols and simplify 
+comb.list <- lapply(comb.list, function(x){
+  # reverse engineering to get MSS input
+  x[, `:=`(ProteinName = Proteins,
+           PeptideSequence = sequence,
+           #PeptideSequence =gsub('[(][a-z]+[)]' ,'', `Modified sequence`),
+           PeptideModifiedSequence = `Modified sequence`,
+           PrecursorCharge = Charge,
+           FragmentIon = NA,
+           ProductCharge = NA
+           )]
+  
+  
+  x <- x[, .(Condition, Run=RawFile, BioReplicate=as.numeric(gsub('.+[.]' ,'', BioReplicate)), ProteinName, PeptideSequence=PeptideModifiedSequence, FragmentIon,
+             PrecursorCharge, Intensity, ProductCharge, IsotopeLabelType)]
+  return(x)
+})
+
+
+dp.list <- lapply(comb.list, function(x){
+  
+  dp.out <- MSstats::dataProcess(x, 
+                                 MBimpute =  FALSE, 
+                                 normalization = 'equalizeMedians',
+                                 summaryMethod = "TMP")
+
+  return(dp.out)
+})
+
+```
+
+```{r}
+lapply(names(dp.list), function(x){
+  
+  saveRDS(dp.list[[x]], ScriptAndDatedFileName(paste0(x, 'dataProc.rds')))
+})
+```
+
+```{r}
+dp.list <- list(MRC5=readRDS('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/030325_PHpwComparisonsSanityCheck_data/2025_03_03_MRC5dataProc.rds'),
+                RFe=readRDS('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/030325_PHpwComparisonsSanityCheck_data/2025_03_03_RFedataProc.rds'))
+
+
+# look fine 
+lapply(dp.list, function(x){
+  
+  ggplot(x$ProteinLevelData, aes(x=paste0(GROUP,SUBJECT), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot()
+})
+```
+Quickly want to run PW comparisons to ensure results are not v far off what we have recovered before sharing
+
+```{r}
+contrasts.oi <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/022525_PH_pwComparisons_data/RFe/contrast.txt', header = F)
+
+input <- split(contrasts.oi, contrasts.oi$V1)
+
+input <- lapply(input, function(x){
+  
+  cond <- unlist(strsplit(x$V1, '[-]'))
+  num <- cond[1]; denom <- cond[2]
+  return(c(num,denom))
+})
+
+contrast.mat <- MSstatsContrastMatrix(contrasts=input, conditions = unique(dp.list[[2]]$ProteinLevelData$GROUP))
+```
+
+Run the pw comparisons
+```{r}
+ms.list <- lapply(names(dp.list), function(x){
+  
+  obj <- dp.list[[x]]
+
+  if (x == 'MRC5'){
+    cmat <- contrast.mat[!grepl('06hpi', rownames(contrast.mat)),!grepl('06hpi', colnames(contrast.mat))]
+  } else {
+    cmat <-  contrast.mat
+  }
+
+  print(obj$ProteinLevelData)
+  p.quant <- setDT(obj$ProteinLevelData)
+  #p.quant[, SUBJECT := factor(paste0(GROUP, '.', SUBJECT))]
+  #p.quant[, GROUP := factor(GROUP)]
+
+  obj$ProteinLevelData <-  p.quant
+  message('runnning MS contrasts on ', x)
+  mss <- groupComparison(contrast.matrix=cmat, data=obj)
+  mss.dt <- setDT(mss$ComparisonResult)
+  return(mss.dt)
+})
+names(ms.list) <- c('MRC5', 'RFe')
+```
+save to file, create a sig column and compare the number of hits across conditions 
+```{r}
+#fwrite(rbindlist(ms.list, idcol='cell_line'), ScriptAndDatedFileName('mss.pwcomparisons.customRun.csv.gz'))
+
+mss.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/030325_PHpwComparisonsSanityCheck_data/2025_03_03_mss.pwcomparisons.customRun.csv.gz')
+mss.dt[, gene := multiUniprotSites2multiGeneSites(Protein, species = 'HUMAN')]
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+mss.dt[, sig := 'not']
+mss.dt[abs(log2FC) > 0.58 & p.adj < 0.05 & !issue %in% c("oneConditionMissing","completeMissing"), sig := ifelse(log2FC > 0, 'up', 'down')]
+# remove modifications
+mss.dt[, simplifiedProtein := gsub('[_][STY][0-9]+', '', Protein)]
+mss.dt[, sites := lapply(.SD, function(x) paste0(unlist(str_extract_all(x,  '[_][STY][0-9]+')), collapse=';')), .SDcols = 'Protein', by=.I]
+```
+just get the n hits in eahc 
+Results look identical, which is great! Why so many differences in comparison to the abundance data? Sure we have enriched, but no evidence of this DE in abundance?
+```{r}
+g <- ggplot(mss.dt[sig != 'not',.N, by=.(cell_line, sig, Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Number of significant hits per contrast', "abs LFC > 0.58 & adj.pval < 0.05") +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(cell_line~.) +
+  customTheme
+g
+```
+
+```{r}
+
+```
+

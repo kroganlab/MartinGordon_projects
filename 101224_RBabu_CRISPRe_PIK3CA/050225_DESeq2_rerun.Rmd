@@ -1,0 +1,235 @@
+---
+title: "050225_DESeq2_rerun"
+author: "Martin Gordon"
+date: "2025-05-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+**Overview**
+Assess if adding batch term to the DE model improves results; confirm we still recover our set of DE genes
+Do we find more things? Is there a better aggreement of the annotations and the DE results? Investigate
+
+For filtering, required at least 10 read in 75% of the samples
+
+## packages 
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(DESeq2)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(seqinr)
+library(readxl)
+library(ggridges)
+library(RColorBrewer)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_bw() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# for heatmaps etc use this palette
+redBlue <- RedBlueColPal()
+
+# clinvar palette
+clinvar.pal <- c(brewer.pal(8, "Blues"), 'grey')
+```
+
+Counts etc.
+```{r}
+counts.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/012825_requestedMeetingPlots_data/2025_01_29_sampleCounts.rawAndNormalized.dt')
+counts.dt$group %>% unique()
+grp.levels <- c('LibraryRepresentation_0', 'Alpelisib_22', 'Alpelisib_7', 'DMSO_22', 'DMSO_7', 'Paxalisib_22', 'Paxalisib_7')
+counts.dt[, group := factor(paste(treatment, timepoint, sep='_'), levels=grp.levels)]
+
+# also nned the PW comparisons and anno; this should be the set of everything we have
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/111824_plotsForKroganWeekly_data/2025_01_22_deseq.pwcomparisons.allAnno.csv')
+
+gene.oi <- c('MTOR','PIK3CA', 'PTEN', 'AKT1')
+
+de.dt[, c('numerator', 'denominator') := tstrsplit(contrast, '_vs_', keep=c(1,2))]
+de.dt[, numerator := factor(numerator, levels=c('DMSO_7','DMSO_22', 'Paxalisib_7','Paxalisib_22', 'Alpelisib_7','Alpelisib_22'))]
+de.dt[, numeratorTreatment := gsub('_[0-9]{1,2}', '', numerator)]
+de.dt[, Gene := gene] # just to avoid reediting
+
+
+selected.targets <- setDT(read_xlsx('./data/ronald_targets.xlsx', col_names =F))
+setnames(selected.targets, new=c('guideName', 'sequence','status'))
+
+de.dt <- merge(de.dt, selected.targets[,.(guideName,sequence, status)], by.x=c('guide'), by.y=c('sequence'), all.x=T)
+
+# get the list of IDs to label
+guidesOI <- de.dt[status != 'NA', unique(id)]
+```
+
+color palette stuff 
+```{r}
+
+brewer.pal(n=9, name = 'Blues')[4:8]
+brewer.pal(n=9, name = 'PuRd')[4:8]
+brewer.pal(n=9, name = 'Reds')[4:8]
+brewer.pal(n=9, name = 'YlOrRd')[4:8]
+brewer.pal(n=9, name = 'YlGn')[4:8]
+brewer.pal(n=9, name = 'Greys')[4:8]
+# blues
+
+group.pal <- c("#BDBDBD", "#DF65B0", "#C994C7", "#6BAED6", "#9ECAE1","#FB6A4A", "#FC9272" )
+#names(group.pal) <- unique(counts.dt$group)
+names(group.pal) <- c('LibraryRepresentation_0', 'Alpelisib_22', 'Alpelisib_7', 'DMSO_22 DMSO_7', 'Paxalisib_22', 'Paxalisib_7')
+
+# "#FC9272" "#FB6A4A" "#EF3B2C" "#CB181D" "#A50F15"
+# "#9ECAE1" "#6BAED6" "#4292C6" "#2171B5" "#08519C"
+# "#C994C7" "#DF65B0" "#E7298A" "#CE1256" "#980043"
+# "#ADDD8E" "#78C679" "#41AB5D" "#238443" "#006837"
+# "#BDBDBD" "#969696" "#737373" "#525252" "#252525"
+# "#FEB24C" "#FD8D3C" "#FC4E2A" "#E31A1C" "#BD0026"
+
+
+# timepoint and editor col pal
+counts.dt$timepoint %>% unique()
+
+group.pal <- c("#BDBDBD", "#DF65B0", "#C994C7", "#6BAED6", "#9ECAE1","#FB6A4A", "#FC9272" )
+names(group.pal) <- unique(counts.dt$group)
+
+timepoint.pal <- c("#ADDD8E" ,"#78C679", "#41AB5D")
+names(timepoint.pal) <-c('0','7', '22')
+
+editor.pal <- brewer.pal(n=9, name = 'Set3')[4:6]
+names(editor.pal) <- c('abe8e', 'bemax', 'plasmid')
+
+gene.col <- brewer.pal(n=6, name = 'Set2')
+# set6 if need non targeting
+gene.col <- c("#66C2A5" ,"#FC8D62","#FFD92F", "#8DA0CB") # "#A6D854" "#FFD92F" "#E78AC3""#8DA0CB"
+
+```
+Read in the DESeq2 ojects 
+Size factors set to 0 as already normalized
+
+```{r}
+des.obj.list <- list(abe8e=readRDS('161024_PWComparisons_DESeq2_data/abe8e.dds.obj'),
+                     bemax=readRDS('161024_PWComparisons_DESeq2_data/bemax.dds.obj'))
+```
+
+Quickly plot the PCA; does it make sense to do this? Are all the samples consistent naming?
+Make big image so we can see the seperation
+
+```{r}
+summary.dt <- fread('./output/141024_noNormalization.countsummary.txt')
+
+# drop the undetermined file.. may need to dig into this set later; see if we can recover some barcodes from here
+# remove this undetermined file
+summary.dt <- summary.dt[!grepl('Undetermined', File)]
+
+
+summary.dt[, newLabel := gsub('/wd/data/fastq/bclconvert_defaults/|_R1_001.fastq.gz', '', File)]
+
+summary.dt[, editor := ifelse(grepl('^ABE8[Ee]', newLabel), 'abe8e', 
+                              ifelse(grepl('^BE4Max', newLabel), 'bemax', 'plasmid'))]
+
+
+summary.dt[, treatment := stringr::str_extract(newLabel, 'Alpelisib|CTRL|Paxalisib|Librep|Lib-rep|librep')]
+
+# lets tidy the treatment names
+summary.dt[, treatment ] %>%  unique()
+summary.dt[treatment == 'CTRL', treatment := 'control']
+summary.dt[treatment %in% c("Librep","Lib-rep","librep"), treatment := 'librep']
+
+# add a timepoint marke r
+summary.dt[, timepoint := gsub('day', '', stringr::str_extract(newLabel, 'day[0-9]{1,2}'))]
+summary.dt[is.na(timepoint), timepoint := '0']
+summary.dt[, timepoint := factor(timepoint, levels=c('0', '7', '22'))]
+
+summary.dt
+summary.dt[, .(timepoint, newLabel)]
+```
+
+```{r}
+
+```
+```{r}
+counts.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/012825_requestedMeetingPlots_data/2025_01_29_sampleCounts.rawAndNormalized.dt')
+counts.dt[, group := paste(treatment, timepoint, sep='_')]
+```
+
+
+```{r}
+counts.wide <- dcast(counts.dt, paste(gene, sgRNA, sep='.')~paste(editor, treatment, timepoint, replicate, sep='_'), value.var = 'sgRNAnormCounts') %>% 
+  as.matrix(rownames=1)
+
+counts.wide <- log2(counts.wide +1)
+```
+
+```{r}
+pcaOut <- prcomp(t(counts.wide))
+
+colInfo <- data.table(sample = colnames(counts.wide))
+colInfo[, c('editor', 'treatment', 'timepoint', 'replicate') := tstrsplit(sample, '_', keep=c(1,2,3,4))]
+colInfo
+colInfo[, group := paste(treatment, timepoint, sep='_')]
+colInfo[, group := factor(paste(treatment, timepoint, sep='_'), levels=grp.levels)]
+
+group.pal <- c("#BDBDBD", "#DF65B0", "#C994C7", "#6BAED6", "#9ECAE1","#FB6A4A", "#FC9272" )
+#names(group.pal) <- unique(counts.dt$group)
+names(group.pal) <- c('LibraryRepresentation_0', 'Alpelisib_22', 'Alpelisib_7', 'DMSO_22', 'DMSO_7', 'Paxalisib_22', 'Paxalisib_7')
+
+
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "sample", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = editor)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3, max.overlaps = 30) +
+  customTheme +
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_manual(values=timepoint.pal) +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_manual(values=group.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "normalizedCounts.editorCol.pca", dimensions = c(12,12))
+```
+
+

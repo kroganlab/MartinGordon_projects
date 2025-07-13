@@ -1,0 +1,466 @@
+---
+title: "260923_QLi_DAR34.11.locations"
+author: "Martin Gordon"
+date: "2023-09-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+packages
+
+```{r}
+
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library (emmeans)
+library(stringr)
+library(circlize)
+
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+
+#source Bens utility scripts
+source ("/Users/martingordon/Documents/utils/bp_utils/MS_ModelFitting_TimeSeries.R")
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+
+source("../../utils/mg_utils/helperFunctions.R") #functions to xtract enriched clusters from the Heatmaps
+
+source("../../utils/bp_utils/Localization_CellMap.R") # functions to enrich for cell pos localisation
+
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+
+## SAR34.11 location analysis
+
+look at our clusters recovered from the 34.11 clustering of the DEG genes and check for enrichment in each of the different cellular localisations using CellMAP 
+
+read in the interaction analysis data
+```{r}
+mrx2.drug <- fread('~/Documents/projects/070923_DAR34.11_contrasts/mrx2.drug.anova.csv.gz')
+receptor.cz <- fread('~/Documents/projects/070923_DAR34.11_contrasts/receptor.CP.anova.csv.gz')
+
+#inital ts data. Filter hits for the sig proteins
+ts.res <- fread('~/Documents/projects/082423_QLi_DARPA.34.11/DARAP.34.11_data/2023_08_23_allFits.csv')
+
+```
+protein expression data
+
+```{r}
+# including the dropped sample for now
+protQuant <- fread ("/Users/martingordon/Documents/projects/082423_QLi_DARPA.34.11/DARAP.34.11_data/2023_08_21_ProteinLevelData.tmp.2round.csv")
+
+# parse GROUP names to define the actual columns that the linear models will work on
+# this work depends on how your columsn are defined
+protQuant[, receptor   := str_extract(GROUP,"MRX2|NK1R")]
+protQuant[, drug := 'SP'] %>% .[GROUP %like% 'MRX2_R[0-9]{2}', drug := 'CZ']
+protQuant[, receptor.drug := interaction(receptor,drug)]
+
+#protQuant <- protQuant[receptor != 'NK1R']
+
+# fix subject info to account for batch
+protQuant[ drug != 'SP', SUBJECT := SUBJECT + 4 ]
+protQuant[, SUBJECT := as.factor(SUBJECT)]
+#protQuant[, SUBJECT     := paste0(drug, '.', SUBJECT)] # remember superbatch with the treatment lvl so control for this
+
+
+protQuant[, timeStr := str_extract(GROUP, "[0-9]{2}$")]
+protQuant[, rankTime := as.integer(as.factor(timeStr))] #timeranked to 0-5
+protQuant[, .(timeStr, rankTime)] %>% unique() #timepoint to time rank 
+
+protQuant[, .N, by=.(receptor,drug, timeStr,SUBJECT)] %>% 
+  .[order(timeStr,drug)]
+
+
+#vs T0 
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, receptor.drug)]
+
+# num of identified proteins per condition
+protQuant[, prots.per.condition := .N, by=.(Protein,receptor.drug)] 
+```
+
+remove proteins with only one feature as likely miss-identification
+
+```{r}
+# remove prots with many na vals per group
+na.prots <- protQuant[prots.per.condition <= 6, unique(Protein)] 
+#protQuant <- protQuant[NumMeasuredFeature != 1,] # remove proteins with only 1 measured feature
+```
+
+
+```{r}
+sigProts <- mrx2.drug[term %in% c('drug:rankTime.2','drug:rankTime.3') & fdr < 0.05, unique(Protein)] 
+
+#just take proteins that as significantly differentially expressed in 
+dea.sigProts <- ts.res[ sig != 'not' & receptor.drug %in% c('MRX2.CZ', 'MRX2.SP'), unique(Protein)]
+```
+
+only plot these hits for the genes
+```{r}
+prot.mat <- dcast (protQuant[Protein %in% sigProts & receptor != 'NK1R' & !Protein %in% na.prots, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+prot.mat
+
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 4),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("SP", colnames(prot.mat)), "SP", "CZ")))
+hm
+BackupAsPDF(hm, 'mrx2.treatment.rmNAsInteractions.heatmap', dimensions=c(8,14))
+```
+drops to 99 features when removing NAs
+Clustering these values w pearson distance into 4 and 5 clusters  and enrich
+
+```{r}
+prot.mat <- dcast (protQuant[Protein %in% sigProts & receptor != 'NK1R' & !Protein %in% na.prots, ], Protein~GROUP+SUBJECT, value.var = "vsTimeZero") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <-multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+
+set.seed(123)
+hm.5clust <- Heatmap(prot.mat, 
+              cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              clustering_distance_rows = 'pearson',
+              row_split = 5,
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+             # row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 4),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("SP", colnames(prot.mat)), "SP", "CZ")))
+
+BackupAsPDF(draw(hm.5clust, column_title='Different response to treatment (Interactions fdr < 0.05)'), "pearsonDist.5clusters.heatmap", dimensions = c(8,12))
+```
+```{r}
+set.seed(123)
+hm.4clust <- Heatmap(prot.mat, 
+              cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              clustering_distance_rows = 'pearson',
+              row_split = 4,
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+             # row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 4),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("SP", colnames(prot.mat)), "SP", "CZ")))
+
+BackupAsPDF(draw(hm.4clust, column_title='Different response to treatment (Interactions fdr < 0.05)'), "pearsonDist.4clusters.heatmap", dimensions = c(8,12))
+```
+Extract the genes belonging to both clusters and enrich
+
+```{r}
+cluster.grps.4 <- extractClustersfromHeatmap(draw(hm.4clust), prot.mat)
+cluster.grps.5 <- extractClustersfromHeatmap(draw(hm.5clust), prot.mat)
+```
+
+enrich for 4 & 5 clusters
+```{r}
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+universe <- ts.res$gene %>%  unique()
+
+enrich.dt <- enricherOnGroups(cluster.grps.4, groupColumns = 'cluster', geneColumn = "feature", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'cluster')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'cluster.x', topN = 20, title='GO enrichment clusters', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold =6)
+
+BackupAsPDF(ht, 'go.enrichment.4clusters.')
+
+enrich.dt <- enricherOnGroups(cluster.grps.5, groupColumns = 'cluster', geneColumn = "feature", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'cluster')
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'cluster.x', topN = 20, title='GO enrichment clusters', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold =6)
+
+BackupAsPDF(ht, 'go.enrichment.5clusters.')
+
+View(loadCellMap)
+```
+
+
+Look at all our genes and look for cell localization: based on CellMap HEK cells
+This plot will just tell us if the DEGs for each contrast are enriched for different cell locations
+
+```{r}
+
+# create a label col from receptor.drug to work with BP functions 
+ts.res[, Label := receptor.drug]
+
+# drop the other receptor as not interested atm
+#dea.res <- ts.res[receptor.drug !=  "NK1R.SP",]
+dea.res <- ts.res
+
+results.list <- cellMapLocalizationScores(dea.res) # instead of calling loadCellMap function, just read from file 
+
+p <- violinsAndScatterLocations(dea.res, xlimits=c(-4,4))
+p
+#BackupAsPDF(p, 'allrecptor.drug.allsig.localizationEnrichment')
+
+
+# generate our own plot of the sig enrichment results (maybe also think of adding NES score for plotting)
+
+# get a list of sig locations in either condition
+sig.locations <- dea.res[!is.na(location) & abs(sea.sigScore) > 1.3, unique(location)]
+
+
+p <- ggplot (dea.res[!is.na(location) & location %in% sig.locations,],
+               aes(y = location, x = log2FC, fill = sea.sigScore )) +
+    geom_vline(xintercept = 0) +
+    geom_jitter(alpha = 0.1, width = 0.0, height = 0.1) +
+    geom_violin(lwd = 0.2) + 
+    facet_grid(~receptor.drug) +
+    #scale_x_continuous(limits = c(-2,2)) +
+    coord_cartesian(xlim = c(-4,4)) + 
+    scale_fill_gradient2(low = "blue", high = "red") +
+
+    theme_bw()
+p
+BackupAsPDF(p, 'mrx2.drug.siglocations.localizationEnrichment')
+```
+Visualise these results as a heatmap
+
+```{r}
+# drop the other receptor as not interested atm
+#dea.res <- ts.res[receptor.drug !=  "NK1R.SP",]
+dea.res <- ts.res
+
+sig.locations <- dea.res[!is.na(location) & abs(sea.sigScore) > 1.3, unique(location)]
+
+
+sea.mat <- summarizesSEAMatrixFromScoresDT(dea.res)
+
+sea.mat[rownames(sea.mat) %in% sig.locations,]
+  
+hm <- Heatmap(sea.mat,
+        name = 'SEA enrichment score',
+        cluster_columns = F,
+        na_col = 'grey',
+        row_names_gp  = gpar(fontsize= 8),
+         col = colorRamp2(c(-10,0,10), c('blue', 'white', 'red')),
+         #column_split = ifelse(grepl('SP',colnames(sea.mat)), "SP", "CZ")
+        column_split = colnames(sea.mat)
+        )
+hm
+BackupAsPDF(hm, 'allreceptors.location.enrichment.scores.heatmap')
+
+
+# only plot any locations with sig results in one of the datasets
+
+```
+
+now generate heatmaps of only sig locations
+
+```{r}
+# drop the other receptor as not interested atm
+dea.res <- ts.res[receptor.drug !=  "NK1R.SP",]
+#dea.res <- ts.res
+
+
+sig.locations <- dea.res[!is.na(location) & abs(sea.sigScore) > 1.3, unique(location)]
+
+sea.mat <- summarizesSEAMatrixFromScoresDT(dea.res)
+
+sea.mat <- sea.mat[rownames(sea.mat) %in% sig.locations,]
+  
+hm <- Heatmap(sea.mat,
+        name = 'SEA enrichment score',
+        cluster_columns = F,
+        na_col = 'grey',
+        row_names_gp  = gpar(fontsize= 8),
+         col = colorRamp2(c(-10,0,10), c('blue', 'white', 'red')),
+         #column_split = ifelse(grepl('SP',colnames(sea.mat)), "SP", "CZ")
+        column_split = colnames(sea.mat)
+        )
+hm
+BackupAsPDF(hm, 'mrx2.siglocations.enrichment.scores.heatmap')
+
+
+# only plot any locations with sig results in one of the datasets
+
+```
+replot violin plots; color by NES and adjust the x-axis by subtracting NES from log2FC
+color by NES or median log2FC per group/cell location
+then for each value plotted subtract NES from log2FC  (why?)
+
+```{r}
+# change col names in sea output to allow merging
+setnames(results.list$sea.dt, old=colnames(results.list$sea.dt), new=c("receptor.drug", "location", "pval", "padj", "log2err","ES","NES","size","leadingEdge","sigScore"  ))
+
+# merge the cols in the dt
+results.list$scores.dt[results.list$sea.dt, NES := i.NES, on=.(receptor.drug, location)]
+
+
+#calculate log2FC shift vs location NES value per prot/label/location
+sea.dt <- results.list$scores.dt[!is.na(location), sum.log2FC.NES := NES+log2FC, by=.(location,Label,Protein)] %>% 
+  .[!is.na(location), .(Label, Protein, gene, log2FC, pvalue, adj.pvalue, location, sea.sigScore, NES, sum.log2FC.NES)]
+
+# c
+sea.dt[, median.log2FC := median(log2FC, na.rm=T), by=.(location,Label)]
+
+```
+plot the results 
+
+```{r}
+p <- ggplot(sea.dt, aes(x=log2FC,y=location, fill=sea.sigScore)) + 
+         geom_jitter(alpha = 0.1, width = 0.0, height = 0.1) +
+         geom_violin(lwd= 0.2) +
+         geom_vline(xintercept = 0) +
+         coord_cartesian(xlim = c(-5,5)) + 
+         scale_fill_gradient2(low = "blue", high = "red") +
+         facet_wrap(~Label) +
+         theme_bw() +
+         theme(axis.text.y = element_text(size=6))
+
+BackupAsPDF(p, 'cellMap.location.enrichment.allGroups.allLocaitons', dimensions=c(8,10))
+
+
+p <- ggplot(sea.dt[Label != 'NK1R.SP',], aes(x=log2FC,y=location, fill=sea.sigScore)) + 
+         geom_jitter(alpha = 0.1, width = 0.0, height = 0.1) +
+         geom_violin(lwd= 0.2) +
+         geom_vline(xintercept = 0) +
+         coord_cartesian(xlim = c(-5,5)) + 
+         scale_fill_gradient2(low = "blue", high = "red") +
+         facet_wrap(~Label) +
+         theme_bw() +
+         theme(axis.text.y = element_text(size=6))
+
+
+BackupAsPDF(p, 'cellMap.location.enrichment.MRX2.allLocations', dimensions=c(8,10))
+```
+plot the log2fc x axis and sea.sig scores for the significant results for both
+
+```{r}
+sig.locations <- ts.res[!is.na(location) & abs(sea.sigScore) > 1.3, unique(location)]
+
+
+p <- ggplot(sea.dt[location %in% sig.locations], aes(x=log2FC,y=location, fill=sea.sigScore)) + 
+         geom_jitter(alpha = 0.1, width = 0.0, height = 0.1) +
+         geom_violin(lwd= 0.2) +
+         geom_vline(xintercept = 0) +
+         coord_cartesian(xlim = c(-5,5)) + 
+         scale_fill_gradient2(low = "blue", high = "red") +
+         facet_wrap(~Label) +
+         theme_bw() +
+         theme(axis.text.y = element_text(size=6))
+
+BackupAsPDF(p, 'cellMap.location.enrichment.allGroups.sigLocations', dimensions=c(9,6))
+
+sig.locations <- ts.res[!is.na(location) &  Label != 'NK1R.SP' & abs(sea.sigScore) > 1.3, unique(location)]
+
+p <- ggplot(sea.dt[location %in% sig.locations & Label != 'NK1R.SP',], aes(x=log2FC,y=location, fill=sea.sigScore)) + 
+         geom_jitter(alpha = 0.1, width = 0.0, height = 0.1) +
+         geom_violin(lwd= 0.2) +
+         geom_vline(xintercept = 0) +
+         coord_cartesian(xlim = c(-5,5)) + 
+         scale_fill_gradient2(low = "blue", high = "red") +
+         facet_wrap(~Label) +
+         theme_bw() +
+         theme(axis.text.y = element_text(size=6))
+
+BackupAsPDF(p, 'cellMap.location.enrichment.MRX2.sigLocations', dimensions=c(9,6))
+
+
+```
+
+
+now only plot the significant results 
+what is this value telling us?  NES (per grp) - log2FC
+
+```{r}
+sig.locations <- ts.res[!is.na(location) & abs(sea.sigScore) > 1.3, unique(location)]
+
+
+p <- ggplot(sea.dt[location %in% sig.locations], aes(x=sum.log2FC.NES,y=location, fill=sea.sigScore)) +
+         geom_jitter(alpha = 0.1, width = 0.0, height = 0.1) +
+         geom_violin(lwd= 0.2) +
+         geom_vline(xintercept = 0, alpha=0.5) +
+         #coord_cartesian(xlim = c(-5,5)) + 
+         scale_fill_gradient2(low = "blue", high = "red") +
+         xlab('Log2FC + NES') +
+         facet_wrap(~Label) +
+         theme_bw() +
+         theme(axis.text.y = element_text(size=6))
+p
+BackupAsPDF(p, 'cellMap.location.enrichment.allGroups.FC.NES.sigLocations', dimensions=c(10,5))
+
+sig.locations <- ts.res[!is.na(location) &  Label != 'NK1R.SP' & abs(sea.sigScore) > 1.3, unique(location)]
+
+
+p <- ggplot(sea.dt[Label != 'NK1R.SP' & location %in% sig.locations,], aes(x=sum.log2FC.NES,y=location, fill=sea.sigScore)) + 
+         geom_jitter(alpha = 0.1, width = 0.0, height = 0.1) +
+         geom_violin(lwd= 0.2) +
+         geom_vline(xintercept = 0, alpha=0.5) +
+        # coord_cartesian(xlim = c(-5,5)) + 
+         scale_fill_gradient2(low = "blue", high = "red") +
+         facet_wrap(~Label) +
+         xlab('Log2FC + NES') +
+         theme_bw() +
+         theme(axis.text.y = element_text(size=6))
+p
+
+BackupAsPDF(p, 'cellMap.location.enrichment.MRX2.FC.NES.sigLocations', dimensions=c(10,5))
+
+```
+write out table of the sig hits in each 
+
+```{r}
+#fwrite(results.list$sea.dt, './output/cellMaplocationenrichment.csv')
+sea.dt <- fread('./output/cellMaplocationenrichment.csv')
+```
+
+03-03-23
+----
+Redo the gsea enrichment analysis plot faceting by location instead of treatment
+
+```{r}
+# create a new colored value of threshold
+sea.dt[, SEA.sig := sea.sigScore]
+sea.dt[SEA.sig > 10 | SEA.sig < -10, SEA.sig := ifelse(SEA.sig > 0, 10, -10)]
+
+p <- ggplot(sea.dt[location %in% sig.locations], aes(x=Label,y=sum.log2FC.NES, fill=SEA.sig)) +
+         geom_jitter(alpha = 0.1, width = 0.0, height = 0.1) +
+         geom_violin(lwd= 0.2) +
+         geom_hline(yintercept = 0, alpha=0.5, linetype=2) +
+        # coord_cartesian(ylim = c(-5,5)) + 
+         scale_fill_gradient2(low = "blue", mid='white', high = "red") +
+         xlab('Group') +
+         ylab('Log2FC + NES') +
+         facet_wrap(~location, scales = 'free') +
+         theme_bw() +
+         theme(axis.text.y = element_text(size=6)) 
+p
+BackupAsPDF(p, 'cellMap.location.enrichment.allGroups.sigLocationsFacet.FC.NES.colthreshold', dimensions=c(10,5))
+
+p <- ggplot(sea.dt[location %in% sig.locations & Label != 'NK1R.SP'], aes(x=Label,y=sum.log2FC.NES, fill=SEA.sig)) +
+         geom_jitter(alpha = 0.1, width = 0.0, height = 0.1) +
+         geom_violin(lwd= 0.2) +
+         geom_hline(yintercept = 0, alpha=0.5, linetype=2) +
+         scale_fill_gradient2(low = "blue", mid='white', high = "red") +
+         xlab('Group') +
+         ylab('Log2FC + NES') +
+         facet_wrap(~location, scales = 'free') +
+         theme_bw() +
+         theme(axis.text.y = element_text(size=6)) 
+p
+BackupAsPDF(p, 'cellMap.location.enrichment.MRX2Groups.sigLocationsFacet.FC.NES.coltrheshold', dimensions=c(10,5))
+```
+
+
+
+

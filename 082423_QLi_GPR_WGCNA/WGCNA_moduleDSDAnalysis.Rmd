@@ -1,0 +1,378 @@
+---
+title: "WGCNA.moduleDSDAnalysis"
+author: "Martin Gordon"
+date: "2023-10-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## GPCR WGCNA 
+
+Issue with importing the complete modules is their size; how do we tease apart the different complexes/groups and identify interesting subprocesses
+Calculate the diffusion state distance for the all-by-all matrix and then extract the different modules
+
+Look at the workflow for T_SNE previously
+
+```{r}
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(RcppCNPy) #R/W support to import numpy objects into R
+library(VennDiagram)
+library(pbapply) #apply functions with progress bar
+library(eulerr)
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+source ("../../utils/bp_utils/NetworkPropagation.R")
+source("../../utils/bp_utils/PPINetworkModularized.R")
+
+
+
+# Attach the `umap` library
+library(umap)
+
+library(cluster) #k-mediod clustering
+library(factoextra) #estimate optimal k
+```
+First port of call; identify the DSD between the proteins in our dataset
+For our matrix, we will use all genes fed into the WGCNA module generation
+
+
+```{r}
+# exp mat
+receptor.exp.mat <- readRDS('./output/gpcr.11.receptors.exp.mat.Rdata')
+
+#exp mat
+adj.mat <- readRDS('./output/gpcr.11.receptors.adj.mat.Rdata')
+selected.prots <- rownames(adj.mat)
+```
+
+Read in string data 
+1361 prots in STRING only 9 not located
+
+```{r}
+string <- fread('./data/9606.protein.links.detailed.v12.0.txt.gz')
+aliases <- fread('./data/9606.protein.aliases.v12.0.txt.gz')
+
+
+sum (sigProteins %in% string.alias$alias)
+sum (!sigProteins %in% string.alias$alias)
+
+```
+
+```{r}
+findConnectorNodeEdges <- function (edgeTable, stringsOI, minScore = 800){
+  
+   # subset to get all edges from one of the stringsOI nodes
+   allEdges <- edgeTable[combined_score > minScore & 
+                              (protein1 %in% stringsOI |  # include single edges to outside group
+                              protein2 %in% stringsOI )]
+   
+   # any node in the above edges that is not in stringsOI is a candidate singleHop node
+   candidateSteppingNodes <- setdiff(unique(c(allEdges$protein1, allEdges$protein2)), stringsOI)
+   
+   
+   # just the edges out from (or in to) 
+   outEdges <- rbind(
+     allEdges[candidateSteppingNodes,,on = "protein1"][, cand := protein1][protein1 > protein2, c("protein1", "protein2") := .(protein2, protein1)][, .(protein1, protein2, cand, weight = combined_score/1000)],
+     allEdges[candidateSteppingNodes,, on = "protein2"][, cand := protein2][protein1 > protein2, c("protein1", "protein2") := .(protein2, protein1)][, .(protein1, protein2, cand, weight = combined_score/1000)]
+   )
+   
+   # collapse over protein1, protein2, cand, taking best weight if there are multiple different
+   outEdges <- outEdges[, .(weight = max(weight)), by = .(protein1, protein2, cand)]
+   goodCandidates <- outEdges[, .N, by = cand][N > 1,cand]
+   outEdges[cand %in% goodCandidates, .(protein1, protein2, weight)]
+}
+
+
+# edges between stringsOI
+sigNetworkSet <- string[combined_score > 600 & 
+                              (protein1 %in% stringsOI &  
+                              protein2 %in% stringsOI ),
+                            .(protein1, protein2, weight  = combined_score/1000)]
+
+# edges to 1-hop connectors
+singleHopEdges <- findConnectorNodeEdges(string, stringsOI)
+
+
+fwrite(rbind(sigNetworkSet, singleHopEdges), "./output/STRING.gt600.allRec.tsv", sep = "\t", col.names=FALSE)  
+
+```
+
+
+# get string subnetwork for all the proteins
+
+First identifiy the STRING aliases and then extract the connections between STRING nodes
+High confidence STRING network
+STRING network to propagate over? for now using all high confidence physical interactions
+Physical may be better as it is APEX data, so assuming correlated genes involved in similar functions and share interactions. However only ~7-800 nodes retained using this threshold
+
+```{r}
+# get string subnetwork for each contrast
+stringMapping <- GetStringIDMapping(selected.prots, stringAliasFile='./data/9606.protein.aliases.v12.0.txt.gz')
+
+#just use the alias of genes with no stringIDs
+stringsOI <- c(setdiff(selected.prots, stringMapping$alias), stringMapping$string) 
+
+# using a STRING confidence score of 600 to threshold physical interactions
+# also extracting one hop connections here
+stringEdges <- GetStringSubNetwork(stringsOI,  oneHopConnections = TRUE, stringFile = './data/9606.protein.links.detailed.v12.0.txt.gz' ) #includes 1 hop connectors
+
+View(GetStringSubNetwork)
+```
+write out the STRING connections for the data
+```{r}
+#fwrite(stringEdges, './output/11receptor.STRINGPhysConnections.600.txt',sep = "\t", col.names=FALSE)
+fwrite(stringEdges, './output/11receptor.STRINGConnections.600.txt',sep = "\t", col.names=FALSE)
+
+stringEdges <- fread('./output/11receptor.STRINGConnections.600.txt')
+
+stringEdges %>%  str()
+```
+### DSD in external python script
+(newest version turned off weighting and left steps at default)
+
+```{r, eval=FALSE}
+# run this in CL
+#conda activate python2.7
+# -c confidence values in ppi as edge weights
+# -s 20 steps in random walk
+
+#python ./scripts/capDSD-src/DSD.py ./output/11receptor.STRINGConnections.600.csv.gz ./output/11receptor.STRINGConnections.600 
+
+#reran to calculate unweighted network
+```
+
+Looks like there is one very large module, but can also see tight clustering of the different modules
+based on DSD there is an outlier group with a very distinct pattern to everything else
+
+```{r}
+#receptor.dsd <- fread("./output/11receptor.STRINGConnections.600.dsd")
+receptor.dsd.nw <- fread("./output/STRING.gt600.allRec.dsd")
+
+dsd.mat <- as.matrix(receptor.dsd.nw, rownames='V1')
+#dsd.mat.nw <- as.matrix(receptor.dsd.nw, rownames='V1')
+
+# remove the 1 hop connectors
+stringsInMat <- intersect(rownames(dsd.mat), c(stringsOI))
+
+# sbset to just strings in the datatable
+dsd.mat <- dsd.mat[stringsInMat, stringsInMat]
+
+# compute distance matrix
+dsd.dist <- as.dist(dsd.mat)
+
+ddr <- hclust (dsd.dist, method= "average") %>%  as.dendrogram()
+hm <- Heatmap(dsd.mat, show_row_names = FALSE, show_column_names = FALSE, cluster_rows = ddr, cluster_columns = ddr)
+hm
+#BackupAsPDF(hm, 'STRINGphysint.600conf.DSDdist')
+
+```
+
+Network modularisation
+------
+Issue with using physical connections is we are filtering out many proteins that may be of interest..
+Question is what network should we calculate distance over? For now using high confidence STRING (600 conf score), maybe physical interaction better and we could drop threshold?
+
+```{r}
+# file with cluster assignment for each gene/protein
+cluster.assignment <- fread('./output/wgcna.clustergenes.adjmat.csv')
+
+string.gene.map <- fread('./data/9606.protein.aliases.v12.0.txt.gz')
+string.gene.map[,GeneID := alias]
+colnames(string.gene.map) <- c('string', 'alias', 'source', 'GeneID')
+
+cluster.assignment[string.gene.map, stringID := i.string, on=c('GeneID', 'GeneID') ]
+
+# now subset the matrix into 11 clusters
+modules.mat <- lapply(cluster.vector, function(x){
+  
+  print(x)
+  prots.oi <- cluster.assignment[!is.na(stringID) & Cluster == x, stringID]
+
+  # subset the dsd matrix to each module
+  clust.mat <- dsd.mat[rownames(dsd.mat) %in% prots.oi, colnames(dsd.mat) %in% prots.oi]
+  return(clust.mat)
+  
+})
+
+lapply(modules.mat, dim)
+cluster.assignment[, .N, by=Cluster]
+names(modules.mat) <- sub('cluster','',cluster.vector)
+```
+
+What nodes are being lost? 86 in total
+Some definitely adding good signal.. Issue with choice of network for construction?
+
+```{r}
+lost.nodes <- cluster.assignment[!stringID %in% rownames(dsd.mat), .(GeneID, Cluster)]
+
+Heatmap(prot.mat[rownames(prot.mat) %in% lost.nodes$GeneID,], cluster_columns = FALSE, na_col = 'grey',
+        row_title =sprintf("%d Proteins", nrow(prot.mat[rownames(prot.mat) %in% lost.nodes$GeneID,])),
+        row_names_gp = gpar (fontsize= 5),
+        column_names_gp = gpar(fontsize=5),
+        column_split = tstrsplit(colnames(prot.mat), "[_.]")[[1]]
+        )
+```
+Visualize the distance matrices of each of the modules
+Can we see a breakdown of further functional clusters?
+Removing the weighting and the number of steps has reduced 
+```{r}
+lapply(seq_along(modules.mat), function(x,n,i){
+  
+  #get distance matrix for clustering
+  dist.mat <- as.dist(x[[i]])
+  ddr <- hclust(dist.mat, method= "average") %>% 
+    as.dendrogram()
+
+  hm <- Heatmap(x[[i]], show_row_names = FALSE, show_column_names = FALSE, cluster_rows = ddr, cluster_columns = ddr, column_title=paste0('Module ',  n[[i]], ' DSD STRING All Interactions'))
+  BackupAsPDF(draw(hm),paste0('Module', n[[i]],'DSD.allInteractions.STRING.600score.pdf'))
+
+}, x=modules.mat, n=names(modules.mat))
+
+names(modules.mat)
+```
+Some noisy clusters but also some modularisation here. Lets generate a T-SNE plot based on DSD
+T-SNE plots not useful for this.. try PAM clustering, but not v hopeful based on the heatmaps
+
+
+```{r, fig.width = 6, fig.height =  6}
+#exact tsne when theta = 0.0 # manually set perplexity limit based on nrows as def vlaue (30) too large for the smaller modules. See: https://stackoverflow.com/questions/51089556/rtsne-perplexity-is-too-large
+ # perplexity can be thought of as the balance between preserving the global and the local structure of the data:  https://opentsne.readthedocs.io/en/latest/parameters.html#:~:text=Perplexity%20is%20perhaps%20the%20most,local%20structure%20of%20the%20data.
+
+tsne.list <- lapply(seq_along(modules.mat), function(x,n,i){
+
+ dist.mat <- as.dist(x[[i]])
+
+ t <- Rtsne::Rtsne(dist.mat, is.distance = TRUE, theta = 0.0, perplexity=ifelse(floor((nrow(x[[i]]) - 1) / 3) >= 30, 30, floor((nrow(x[[i]]) - 1) / 3)) )  #exact tsne whn theta=0
+ 
+ tsne.dt <- as.data.table(t$Y)
+ tsne.dt$string <- attr(dist.mat, "Labels")
+ return(tsne.dt)
+
+}, x= modules.mat, n=names(modules.mat))
+
+names(tsne.list) <- names(modules.mat)
+
+lapply(tsne.list, function(x){ 
+  ggplot(x, aes(x=V1, y=V2)) + geom_point()})
+
+```
+
+k-medoid (PAM) clustering (more robust than k-means)
+
+First use the `factoextra` package to estimate otpimal number of clusters
+Weighted sum of squares to assess N clusters per modules
+
+Based on this the optimal number of clusters looks about 3-5 per module
+
+```{r}
+
+lapply(modules.mat, function(x){
+  fviz_nbclust(x, kmeans,method='wss', k.max = 10) #5-7
+})
+
+n.clusters <- c(5,3,3,5,4,3,3,6,4,4,4)
+```
+PAM clustering based on DSD 
+Not looking great.. try to rerun w/o
+```{r}
+
+lapply(seq_along(modules.mat), function(x,y,i){
+  
+  pam.out <- cluster::pam(x[[i]],diss = TRUE, k = 4)
+  y[[i]][names(pam.out$clustering), clusterID := pam.out$clustering, on = "string"]
+
+  y[[i]][, cluster := sprintf("clust.%02d", clusterID)]
+  y[[i]][, c("x", "y") := .(V1, V2)]
+
+  y[[i]][, .N, by=cluster]
+  
+ p <- ggplot(y[[i]], aes (x = x, y = y,)) +
+ geom_point(aes( color = cluster)) +
+ coord_fixed() + theme_void()
+
+
+}, x=modules.mat, y=tsne.list)
+
+```
+
+mod1 k=5
+mod2 k=2/3
+mod3 k=3/4
+mod4 k=3
+mod5 k=3
+mod5 k=2
+mod6 k=3
+mod7 k=2/3
+mod8 k=3
+mod9 k=2/3
+mod10 k=2
+mod11 k=3
+
+
+Enrich for the modules.
+```{r}
+
+gmt <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+  
+lapply(seq_along(tsne.list), function(x,n,i){
+    x[[i]][, gene := translateString2Gene(string, species = "HUMAN")]
+    geneToCluster <- x[[i]][,.(gene = gene, cluster = cluster)]
+  
+    #label each of the modules by enrichment results
+    enrichNames.out <- labelModulesByEnrichment(cluster.dt = geneToCluster, gmt = gmt, numProcessors = 8)
+  
+    # choose a naming scheme
+    clusterNames.dt <- enrichNames.out$clusterNames.dt[, .(cluster, name = termScore.name, go = termScore.go)]
+    enrich.dt <- enrichNames.out$enrich.dt
+ 
+    x[[i]][clusterNames.dt, c("name", "go" ) := .( i.name, i.go), on = "cluster"]
+    x[[i]][gmt, nameMatch := TRUE, on = c(gene = "gene", go = "ont") ]
+    x[[i]][nameMatch == TRUE, nameMatchCluster := cluster]
+  
+ 
+    p <- ggplot(x[[i]], aes (x = x, y = y,)) +
+      geom_point(aes( color = name  )) +
+      ggtitle(paste0('Module ',n[[i]], ' GO enrichment' )) +
+      coord_fixed() + theme_void()
+
+    BackupAsPDF(p, paste0(n[[i]],'.k3.tsne.enrichment.pdf'))
+
+}, x=tsne.list, n=names(tsne.list))
+```
+enrichment tables
+```{r}
+lapply(seq_along(tsne.list), function(x,n,i){
+  x[[i]][, gene := translateString2Gene(string, species = "HUMAN")]
+  geneToCluster <- x[[i]][,.(gene = gene, cluster = cluster)]
+  
+  #label each of the modules by enrichment results
+  enrichNames.out <- labelModulesByEnrichment(cluster.dt = geneToCluster, gmt = gmt, numProcessors = 8)
+  # choose a naming scheme
+  clusterNames.dt <- enrichNames.out$clusterNames.dt[, .(cluster, name = termScore.name, go = termScore.go)]
+ # print(clusterNames.dt)
+ fwrite(clusterNames.dt, paste0('./output/module',n[[i]], '.k4-PAM.cluster.go.enrichment.csv.gz'))
+
+}, x=tsne.list, n=names(tsne.list))
+```
+
+
+
+
+```{r}
+
+```
+

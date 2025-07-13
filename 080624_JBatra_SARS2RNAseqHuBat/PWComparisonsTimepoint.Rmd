@@ -1,0 +1,1052 @@
+---
+title: "PWComparisonsTimepoints"
+author: "Martin Gordon"
+date: "2024-08-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Perform the PW comparisons within each timepoint for both bat and virus
+
+## Todo
+PW comparisons within each timepoint
+Inspect the mapping statistics for each of the files from the Kraken output and plot
+Plot viral counts in each of the datasets
+Inspect STRING mapping to try integrate the two datasets; could we 
+
+
+Am I being overly stringent thresholding things with logFC .+/- 1
+Scatterplot FC of the different timepoints?
+
+```{r}
+
+
+library(DESeq2)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(circlize)
+library(ComplexHeatmap)
+library(ggrepel)
+library(readxl)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj; eg facet_grid allow x/y axis to vary
+library(scales)
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(ggvenn)
+library(viridis)
+library(readxl)
+library(viridis)
+
+library(biomaRt)
+
+# RNAseq DE functions
+library(tximport)
+library(DESeq2)
+library(IHW)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+source("../../utils/mg_utils/r_utils/IDmapping.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+```
+
+Load relevant datasets
+```{r}
+id.mapping.dt <- read_xlsx('./docs/human_to_RFE_gene_conversion_table_FINAL.xlsx')
+
+isGenes <- fread('/Users/martingordon/Documents/projects/022624_AViDD_AB_PH_data/docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+
+viralGenes <- c('orf1ab', 'S', 'orf3a', 'E', 'M',  'orf6', 'orf7a', 'orf8', 'N', 'orf10')
+```
+
+metadata
+
+```{r}
+meta.data <- data.table(sample=dir('./output/salmonOut', full.names = F, pattern='quant.sf'))
+meta.data[, `:=`(host=ifelse(grepl('MRC5', sample), 'human', 'bat'),
+                 timepoint=ifelse(grepl('Mock', sample), '', str_extract(sample, '[0-9]{1,2}h')),
+                 virus=ifelse(grepl('Mock', sample), 'Mock', gsub('MRC5_|RFe_|_[0-9]{1,2}h.+', '', sample))
+                 )]
+
+# now want to set T0 and Mock as baseline for factor levels
+meta.data[, `:=`(virus=factor(virus, levels=c('Mock','WA', 'N_P80T', '9bI_N_P80T')),
+                 timepoint=factor(timepoint, levels=c('','6h', '12h', '24h', '48h'))
+                 )]
+
+
+# another fix; tp and virus are confounded for Mock, so we need to create a 'group' variable 
+meta.data[, condition := factor(ifelse(virus=='Mock', 'Mock', paste(virus, timepoint, sep='.')))]
+meta.data[, condition := relevel(condition, ref='Mock')]
+
+bat.meta <- data.frame(meta.data[host=='bat',], row.names = 'sample')
+hu.meta <- data.frame(meta.data[host=='human',], row.names = 'sample')
+
+# reset the tp levels for human as missing 6hr
+hu.meta$timepoint <-  factor(hu.meta$timepoint, levels=c('12h', '24h', '48h'))
+bat.meta$timepoint <-  factor(bat.meta$timepoint, levels=c('6h', '12h', '24h', '48h'))
+```
+
+
+Read in the dds objects from the `PWcomparions` work and extract the contrasts within each timepoint
+Considering the reduced dynamic range of virus vs mock, we may need to drop lFC thresholds to find differences between the groups
+
+Pull out the individual contrasts within each timepoint
+see links below for info: https://rpubs.com/ge600/deseq2 
+
+```{r}
+dds.bat <- readRDS('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/080824_PWcomparisons_data/2024_08_13_dds.bat.vsMock.rds')
+dds.hu <- readRDS('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/080824_PWcomparisons_data/2024_08_13_dds.human.vsMock.rds')
+ 
+# loop through the conditions 
+conds.oi <- list("N_P80T-WA"=c('N_P80T','WA'),
+                 "9bI_N_P80T-WA"=c('9bI_N_P80T','WA'),
+                 "9bI_N_P80T-N_P80T"=c('9bI_N_P80T','N_P80T'))
+
+
+hu.viralContrasts.dt <- lapply(names(conds.oi), function(x){
+  
+  # cycle through timepoints
+  res <- list()
+   for (i in c('12h', '24h', '48h')){
+    
+    denom = paste(conds.oi[[x]][2], i, sep='.' )
+    num =  paste(conds.oi[[x]][1], i, sep='.')
+    message('Using contrast ', c("condition", num, denom))
+    
+    resLFC <- results(dds.hu, contrast=c("condition", num, denom), filterFun=ihw)
+    LFCshr <- lfcShrink(dds.hu, contrast=c("condition", num, denom), type='ashr', res=resLFC)
+    dt <-  data.table(as.data.frame(LFCshr), keep.rownames = T)
+    dt[, contrast := paste(x,i, sep='_')]
+    
+    res[[paste(x,i, sep='_')]] <- dt
+   }
+   # bind the nested output
+   res <- rbindlist(res)
+   # bind all
+}) %>% rbindlist()
+
+bat.viralContrasts.dt <- lapply(names(conds.oi), function(x){
+  
+  # cycle through timepoints
+  res <- list()
+   for (i in c('6h','12h', '24h', '48h')){
+    
+    denom = paste(conds.oi[[x]][2], i, sep='.' )
+    num =  paste(conds.oi[[x]][1], i, sep='.')
+    message('Using contrast ', c("condition", num, denom))
+    
+    resLFC <- results(dds.bat, contrast=c("condition", num, denom), filterFun=ihw)
+    LFCshr <- lfcShrink(dds.bat, contrast=c("condition", num, denom), type='ashr', res=resLFC)
+    dt <-  data.table(as.data.frame(LFCshr), keep.rownames = T)
+    dt[, contrast := paste(x,i, sep='_')]
+    
+    res[[paste(x,i, sep='_')]] <- dt
+   }
+   # bind the nested output
+   res <- rbindlist(res)
+   # bind all
+}) %>% rbindlist()
+```
+save results for now and lets plot differneces
+
+```{r}
+bat.viralContrasts.dt[, species:='bat']
+hu.viralContrasts.dt[,  species:='human']
+
+comb.dt <- rbind(hu.viralContrasts.dt, bat.viralContrasts.dt)
+setnames(comb.dt, old='rn', new='gene')
+
+comb.dt[, sig := 'not']
+comb.dt[abs(log2FoldChange) > 1 & padj < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')]
+comb.dt[,contrast := factor(contrast, levels=c("N_P80T-WA_6h", "9bI_N_P80T-WA_6h","9bI_N_P80T-N_P80T_6h",
+                                                              "N_P80T-WA_12h", "9bI_N_P80T-WA_12h", "9bI_N_P80T-N_P80T_12h",
+                                                              "N_P80T-WA_24h", "9bI_N_P80T-WA_24h",  "9bI_N_P80T-N_P80T_24h",
+                                                               "N_P80T-WA_48h", "9bI_N_P80T-WA_48h", "9bI_N_P80T-N_P80T_48h"))]
+
+comb.dt[, c('numerator', 'denominator') := tstrsplit(gsub('[_][0-9]{1,2}h','',contrast), '[-]', keep=c(1,2))]
+
+comb.dt[, virus := factor(str_extract(numerator,'WA|9bI_N_P80T|N_P80T'), levels=c('WA','N_P80T','9bI_N_P80T'))]
+comb.dt[, timepoint := factor(str_extract(contrast, '[0-9]{1,2}h'), levels=c('6h','12h','24h', '48h')) ]
+comb.dt[, comparison := paste(numerator, denominator, sep='-')]
+#fwrite(comb.viralContrasts.dt, ScriptAndDatedFileName('PWcomparisons.viralTimepoint.csv'))
+comb.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/PWComparisonsTimepoint_data/2024_08_13_PWcomparisons.viralTimepoint.csv')
+
+```
+Run through the plots from the earlier comparisons
+```{r}
+g <- ggplot(comb.dt[sig != 'not', .N, by=.(sig,species,virus, comparison, timepoint)], aes(x=timepoint, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_grid2(species~comparison, scales='free', independent = 'x') +
+  scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  ggtitle(expression("Viral comparisons")) +
+  ylab(expression("abs" ~ log[2] ~ "FC > 1 & p.adj < 0.05")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        axis.title.x= element_blank())
+g
+BackupAsPDF(g, 'NsigHits.contrastFacet.barplot', dimensions=c(8,8))
+
+g <- ggplot(comb.dt[sig != 'not', .N, by=.(sig,species,virus, comparison, timepoint)], aes(x=comparison, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_grid2(species~timepoint, scales='free', independent = 'x') +
+  scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  ggtitle(expression("Viral comparisons")) +
+  ylab(expression("abs" ~ log[2] ~ "FC > 1 & p.adj < 0.05")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        axis.title.x= element_blank())
+g
+BackupAsPDF(g, 'NsigHits.timepointFacet.barplot', dimensions=c(8,8))
+
+```
+Basically looks like at 12h there is the biggest difference between the different viruses
+
+```{r}
+g <- ggplot(comb.dt, aes(x=pvalue)) +
+  geom_histogram(alpha=0.8, boundary=0.0,bins=50) +
+  facet_grid2(species~contrast, scales='free_x', independent = 'x') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        strip.text.x.top = element_text(size=5),
+        axis.title.x= element_blank())
+g
+BackupAsPDF(g, 'vsViralTimepoints.histogram', dimensions = c(12,6))
+
+g <- ggplot(comb.dt, aes(x=pvalue, fill=comparison)) +
+  geom_histogram(alpha=0.8, boundary=0.0,bins=100) +
+  facet_grid2(species~timepoint, scales='free_x', independent = 'x') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        strip.text.x.top = element_text(size=5),
+        axis.title.x= element_blank())
+g
+BackupAsPDF(g, 'vsViralTimepoints.histogram', dimensions = c(12,6))
+```
+Interesting that there are many sig hits at 6h but none pass our log2FC threshold... lets look at the abs LFC distributions of things passing sig
+
+```{r}
+g <- ggplot(comb.dt[padj < 0.05,], aes(x=contrast, y=abs(log2FoldChange), fill=timepoint)) +
+  geom_violin(outliers = T) +
+  geom_hline(yintercept=1, linetype=2, alpha=0.4) +
+  ylim(0,1.5) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+```
+Plot the volcanoplots of the sig hits at each of the contrasts
+
+```{r, fig.width=8, fig.height=8}
+plot.dir <- c('/Users/martingordon/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/PWComparisonsTimepoint_data/pdfs')
+
+lapply(unique(comb.dt$species), function(x){
+  
+ unloc.genes <- grep('LOC[0-9]+$',comb.dt[,unique(gene)], value=T) 
+ 
+ subdt <- comb.dt[species== x & !gene %in% unloc.genes ]
+ subdt[, timepoint := factor(timepoint, levels=c('6h','12h', '24h', '48h'))]
+ subdt[, virus := factor(virus, levels=c('WA',"N_P80T", "9bI_N_P80T"))]
+ 
+ # lets create a threshold for our data; 
+ # start with 3 FC and 40 adj p
+ subdt[, FCthreshold := log2FoldChange]
+ subdt[abs(log2FoldChange) > 3, FCthreshold := ifelse(FCthreshold > 0, 3, -3)]
+ 
+ subdt[,pvalthreshold := -log10(padj)]
+ subdt[pvalthreshold > 40, pvalthreshold := 40]
+ 
+ subdt[,abvthreshold := ifelse(((log2FoldChange > FCthreshold) | (-log10(padj) > pvalthreshold)), 'yes', 'no')]
+ 
+ 
+# g <-  ggplot(subdt, aes(y=pvalthreshold, x=FCthreshold, fill = sig, color=sig, label=gene, shape=abvthreshold)) +
+ g <-  ggplot(subdt, aes(y=-log10(padj), x=log2FoldChange, fill = sig, color=sig, label=gene, shape=abvthreshold)) +  
+    geom_point(size=2.5) +
+    geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept=-log10(0.05), linetype=2, alpha=0.4) +
+    ggtitle(paste0(x, ' cell-line viral comparisons')) +
+   # coord_cartesian(xlim=c(-3,3), ylim=c(0,40)) +
+    ylab(expression(-log[10] ~' adj.pvalue')) +
+    geom_text_repel(data=subdt[sig != 'not',], max.iter = 1000, max.overlaps = 20, size=3) +
+    scale_shape_manual(values=c(21, 2)) +
+    scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    facet_grid2(comparison~timepoint, scales='free', independent = 'all') +
+    theme_bw() +
+    guides(shape = "none")
+
+ print(g)
+ #BackupAsPDF(g, paste0('/volcanoplots/', x, 'FC1.padj05.volcanoplots.rmUnlocated'), dimensions = c(20,18))
+ #ggsave(paste0(plot.dir,'/volcanoplots/', x, 'FC1.padj05.volcanoplots.png'), device='png', width=20,height=18)
+ #print(g)
+ #dev.off()
+})
+```
+
+plot each volcanoplot individually 
+
+```{r}
+lapply(unique(comb.dt$species), function(x){
+  
+ unloc.genes <- grep('LOC[0-9]+$',comb.dt[,unique(gene)], value=T) 
+ 
+ subdt <- comb.dt[species== x,]
+ subdt[, timepoint := factor(timepoint, levels=c('6h','12h', '24h', '48h'))]
+ subdt[, virus := factor(virus, levels=c('WA',"N_P80T", "9bI_N_P80T"))]
+ 
+ 
+ # lets create a threshold for our data; 
+ # start with 3 FC and 40 adj p
+ subdt[, FCthreshold := log2FoldChange]
+ subdt[abs(log2FoldChange) > 1.5, FCthreshold := ifelse(FCthreshold > 0, 1.5, -1.5)]
+ 
+ subdt[,pvalthreshold := -log10(padj)]
+ subdt[pvalthreshold > 10, pvalthreshold := 10]
+ 
+ subdt[,abvthreshold := ifelse(((log2FoldChange > FCthreshold) | (-log10(padj) > pvalthreshold)), 'yes', 'no')]
+ 
+ #for (grp in unique(subdt$contrast)){
+for (grp in c('N_P80T-WA_48h')){
+     
+  g <-  ggplot(subdt[contrast == grp & !gene %in% unloc.genes,], aes(y=pvalthreshold, x=FCthreshold, fill = sig, color=sig, label=gene, alpha=abvthreshold)) +  
+    geom_point(size=2) +
+    geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept=-log10(0.05), linetype=2, alpha=0.4) +
+    ggtitle(paste0(x, ' ', grp)) +
+   # coord_cartesian(xlim=c(-3,3), ylim=c(0,40)) +
+    ylab(expression(-log[10] ~' adj.pvalue')) +
+    geom_text_repel(data=subdt[contrast == grp & padj < 0.05 & !gene %in% unloc.genes & gene != 'FMC1-LUC7L2',], max.iter = 1000, max.overlaps = 20, size=3) +
+    scale_shape_manual(values=c(21, 2)) +
+    scale_alpha_manual(values=c('no'=0.99, 'yes'=0.5)) +
+    scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    theme_bw() +
+    guides(shape = "none", alpha='none')
+
+  print(g)
+ BackupAsPDF(g, paste0('/volcanoplots_individual/', x,'.',grp,'FC1.padj05.volcanoplots.adjLabels'), dimensions = c(8,6))
+ }
+ #BackupAsPDF(g, paste0('/volcanoplots_individual/', x, 'FC1.padj05.volcanoplots.rmUnlocated'), dimensions = c(8,6))
+ #ggsave(paste0(plot.dir,'/volcanoplots/', x, 'FC1.padj05.volcanoplots.png'), device='png', width=20,height=18)
+ #print(g)
+ #dev.off()
+})
+
+comb.dt[contrast %in% c('N_P80T-WA_48h') & sig != 'not',.N, contrast]
+```
+
+
+```{r}
+comb.dt[contrast %in% c('N_P80T-WA_24h','N_P80T-WA_48h') & sig != 'not' & abs(log2FoldChange) > 1 & padj < 0.05,.N, by=contrast]
+
+subDT <- comb.dt[contrast == "N_P80T-WA_48h" & timepoint =='48h' & species == 'human',]
+
+
+subDT[gene == 'OAS2']
+
+# lets create a threshold for our data; 
+# start with 3 FC and 40 adj p
+subDT[, FCthreshold := log2FoldChange]
+subDT[abs(log2FoldChange) > 3, FCthreshold := ifelse(FCthreshold > 0, 3, -3)]
+ 
+subDT[,pvalthreshold := -log10(padj)]
+subDT[pvalthreshold > 20, pvalthreshold := 20]
+ 
+subDT[,abvthreshold := ifelse(((log2FoldChange > FCthreshold) | (-log10(padj) > pvalthreshold)), 'yes', 'no')]
+
+
+
+
+g <-  ggplot(subDT, aes(y=-log10(padj), x=log2FoldChange, fill = sig, color=sig, label=gene)) +
+    geom_point(size=2.5) +
+    geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept=-log10(0.05), linetype=2, alpha=0.4) +
+  #  ggtitle(paste0(x, ' cell-line viral comparisons')) +
+   # coord_cartesian(xlim=c(-3,3), ylim=c(0,40)) +
+    ylab(expression(-log[10] ~' adj.pvalue')) +
+    geom_text_repel(data=subDT[sig != 'not',], max.iter = 1000, max.overlaps = 20, size=3) +
+    scale_shape_manual(values=c(21, 2)) +
+    scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    theme_bw() +
+    guides(shape = "none")
+
+g
+```
+
+
+```{r}
+g <-  ggplot(comb.dt[contrast == "N_P80T-WA_48h" & timepoint =='48h',], aes(y=-log10(padj), x=log2FoldChange, fill = sig, color=sig, label=gene)) +
+    geom_point(size=2.5) +
+    geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept=-log10(0.05), linetype=2, alpha=0.4) +
+    #ggtitle(paste0(x, ' cell-line viral comparisons')) +
+   # coord_cartesian(xlim=c(-3,3), ylim=c(0,40)) +
+    ylab(expression(-log[10] ~' adj.pvalue')) +
+    geom_text_repel(data=comb.dt[contrast == "N_P80T-WA_48h" & timepoint =='48h' & sig != 'not',], max.iter = 1000, max.overlaps = 20, size=3) +
+    scale_shape_manual(values=c(21, 2)) +
+    scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    theme_bw() +
+    guides(shape = "none")
+
+g
+```
+
+
+```{r}
+```
+Just loop through the different groups and plot
+
+```{r}
+
+```
+
+
+
+
+Regenerate the viral 
+
+
+Lets perform enrichment analysis on each of the sets
+
+First prepare the genesets;
+Get the orgDB from `AnnotaitonHUb`
+```{r}
+library(AnnotationHub) #provides access to large collections of publicly available whole genome resources, e.g,. ENSEMBL genome fasta or gtf files, UCSC chain resources, ENCODE data tracks at UCSC, etc.
+
+# create anno hu object
+ah <- AnnotationHub() # see general info available; like a centralised resource for genomic
+# if all you know is species name etc, you can recover this record, get metadata and search
+# Find an orgDB for this exotic species and retrieve specific info
+dm <- query(ah, c("Rhinolophus ferrumequinum"))
+
+org.rt.db <- dm[['AH108239']] # orgDB for bat species
+```
+
+prepare the gmt files for the enrichment
+```{r}
+# get human DBs ready
+gmt.hs.go.bp <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+gmt.hs.go.cc <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='CC', keyType='SYMBOL')
+gmt.hs.kegg <-  loadKegg(organism='hsa', keyType = 'kegg') # map to entrez ID
+
+# human kegg to symbol and can merge these tables and
+hsKeggMap.dt <- clusterProfiler:::bitr(gmt.hs.kegg$gene, fromType='ENTREZID', toType='SYMBOL', OrgDb='org.Hs.eg.db')
+gmt.hs.kegg <- merge(x=gmt.hs.kegg, y=hsKeggMap.dt, by.x="gene", by.y="ENTREZID", all.x=T)
+gmt.hs.kegg <- gmt.hs.kegg[, .(ont, gene = ifelse(SYMBOL == '', gene, SYMBOL), ont.id)]
+
+# get bat DBs ready
+# two approaches; load the terms directly from GO for that species (using bioMart)
+# or map bat/hu gene Ids and filter the human Go annotations
+# i think the first approach safer; not assuming homolgy and function are equivalent?
+gmt.bat.kegg <-  loadKegg(organism='rfq', keyType = 'kegg') 
+
+# convert kegg/entrez ID to gene
+# issue iwth this anno DB; seems mapping to SYMBOL is broken, so use alias, collapse and simplify
+batMap.dt <- data.table(clusterProfiler:::bitr(gmt.bat.kegg$gene, fromType='ENTREZID', toType='ALIAS', OrgDb=org.rt.db)) %>% 
+  .[, .(SYMBOL =  paste(ALIAS,collapse=';')), by=ENTREZID] %>%   # simplify names
+  .[, SYMBOL := ifelse(grepl(';', SYMBOL), gsub('[;].+','', SYMBOL), SYMBOL)]
+
+gmt.bat.kegg <- merge(x=gmt.bat.kegg, y=batMap.dt, by.x="gene", by.y="ENTREZID", all.x=T)
+gmt.bat.kegg <- gmt.bat.kegg[, .(ont = gsub('\\s[-].+', '', ont), gene = ifelse(SYMBOL == '', gene, SYMBOL), ont.id)]
+```
+tidy the bat GO gmt
+```{r}
+# read in GO terms previously extracted
+bat.GO.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/080824_PWcomparisons_data/2024_08_09_rferrumequinumGOpathways.csv')
+
+gmt.bat.go.cc <- bat.GO.dt[ontology == 'cellular_component', .(ont=description, gene, ont.id=go.id)]
+gmt.bat.go.bp <-bat.GO.dt[ontology == 'biological_process', .(ont=description, gene, ont.id=go.id)]
+```
+
+Run enrichment comparisons for the sets
+```{r}
+
+runEnrichment <- function(dt, ont, keepSp='human', title, isKEGG=F){
+  
+  sub.dt <-dt[species==keepSp, ]
+  print(sub.dt)
+  
+  # pull out bg
+  universe <-  unique(sub.dt$gene)
+  
+  # create enrichment groups
+  sub.dt[, enrich.grp := interaction(contrast, sig)]
+  
+  # run GO enrichment on each group seperately
+  enrich.dt <- enricherOnGroups(sub.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = ont, 
+                              universe = universe)
+  
+  if (isKEGG) {
+    
+    return(list(
+              enrich=enrich.dt))
+    
+  } else {
+    simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                           gmt=ont, 
+                                                           groupColumn = 'enrich.grp',
+                                                           max_pAdjust = 0.1)
+    
+    return(list(
+              enrich=enrich.dt,
+              simpenrich=simp.enrich))
+  }
+}
+```
+
+I think for now, stay suspecious of the bat enrichments, focus on the human set and see if these behave differently in bat also; highlight these in the volcano plot
+```{r}
+# 
+hm.bp <- runEnrichment(comb.dt, ont=gmt.hs.go.bp, keepSp='human', title='GO Biological Process', isKEGG=F)
+hm.cc <- runEnrichment(comb.dt, ont=gmt.hs.go.cc, keepSp='human', title='GO Biological Process', isKEGG=F)
+hm.kegg <- runEnrichment(comb.dt, ont=gmt.hs.kegg, keepSp='human', title='GO KEGG Pathways', isKEGG = T) 
+
+
+fwrite(hm.bp$enrich, ScriptAndDatedFileName('human.GO.BP.enrichment.csv'))
+fwrite(hm.bp$simpenrich$simplified, ScriptAndDatedFileName('human.GO.BP.enrichment.simplified.csv'))
+fwrite(hm.cc$enrich, ScriptAndDatedFileName('human.GO.CC.enrichment.csv'))
+fwrite(hm.cc$simpenrich$simplified, ScriptAndDatedFileName('human.GO.CC.enrichment.simplified.csv'))
+fwrite(hm.kegg$enrich, ScriptAndDatedFileName('human.KEGG.enrichment.csv'))
+# find out what is happening with the kegg enrichment
+
+bat.bp <- runEnrichment(comb.dt, ont=gmt.bat.go.bp, keepSp='bat', title='GO Biological Process', isKEGG=F)
+bat.cc <- runEnrichment(comb.dt, ont=gmt.bat.go.cc, keepSp='bat', title='GO Biological Process', isKEGG=F)
+bat.kegg <- runEnrichment(comb.dt, ont=gmt.bat.kegg, keepSp='bat', title='GO KEGG Pathways', isKEGG = T) 
+
+fwrite(bat.bp$enrich, ScriptAndDatedFileName('bat.GO.BP.enrichment.csv'))
+fwrite(bat.bp$simpenrich$simplified, ScriptAndDatedFileName('bat.GO.BP.enrichment.simplified.csv'))
+fwrite(bat.cc$enrich, ScriptAndDatedFileName('bat.GO.CC.enrichment.csv'))
+fwrite(bat.cc$simpenrich$simplified, ScriptAndDatedFileName('bat.GO.CC.enrichment.simplified.csv'))
+fwrite(bat.kegg$enrich, ScriptAndDatedFileName('bat.KEGG.enrichment.csv'))
+```
+plot the enrichment results for each group
+
+```{r}
+comb.dt[, sig:= 'not']
+comb.dt[padj < 0.05 & abs(log2FoldChange) > 1, sig := ifelse(log2FoldChange > 0, 'up', 'down')]
+
+plotHeatmap <- function(dt, keepSp='human', pThresh=8, nTerms=8){
+  
+  subDT <- copy(dt) # create cp for modifying
+  
+  if (keepSp == 'bat'){
+    
+      subDT[, enrich.grp := factor(enrich.grp, levels=c("N_P80T-WA_6h.up", "9bI_N_P80T-WA_6h.up", "9bI_N_P80T-N_P80T_6h.up",
+                                                        "N_P80T-WA_12h.up","9bI_N_P80T-WA_12h.up","9bI_N_P80T-N_P80T_12h.up",
+                                                        "N_P80T-WA_24h.up",  "9bI_N_P80T-WA_24h.up","9bI_N_P80T-N_P80T_24h.up",
+                                                        "N_P80T-WA_48h.up", "9bI_N_P80T-WA_48h.up","9bI_N_P80T-N_P80T_48h.up",
+                                                        "N_P80T-WA_6h.down", "9bI_N_P80T-WA_6h.down", "9bI_N_P80T-N_P80T_6h.down",
+                                                        "N_P80T-WA_12h.down","9bI_N_P80T-WA_12h.down","9bI_N_P80T-N_P80T_12h.down",
+                                                        "N_P80T-WA_24h.down",  "9bI_N_P80T-WA_24h.down","9bI_N_P80T-N_P80T_24h.down",
+                                                        "N_P80T-WA_48h.down", "9bI_N_P80T-WA_48h.down","9bI_N_P80T-N_P80T_48h.down")
+                                                  )]
+  } else {
+    
+      subDT[, enrich.grp := factor(enrich.grp, levels=c("N_P80T-WA_12h.up","9bI_N_P80T-WA_12h.up","9bI_N_P80T-N_P80T_12h.up",
+                                                        "N_P80T-WA_24h.up",  "9bI_N_P80T-WA_24h.up","9bI_N_P80T-N_P80T_24h.up",
+                                                        "N_P80T-WA_48h.up", "9bI_N_P80T-WA_48h.up","9bI_N_P80T-N_P80T_48h.up",
+                                                        "N_P80T-WA_12h.down","9bI_N_P80T-WA_12h.down","9bI_N_P80T-N_P80T_12h.down",
+                                                        "N_P80T-WA_24h.down",  "9bI_N_P80T-WA_24h.down","9bI_N_P80T-N_P80T_24h.down",
+                                                        "N_P80T-WA_48h.down", "9bI_N_P80T-WA_48h.down","9bI_N_P80T-N_P80T_48h.down"))]
+  }
+
+  # define col split... must be better way to do this; identify colnames of the matrix and
+  
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = subDT,
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  negCols=grep('down',unique(subDT$enrich.grp), value=T),
+                               #   column_split=list(str_extract(levels(subDT$enrich.grp), '[0-9]{1,2}h'),
+                               #                     str_extract(levels(subDT$enrich.grp),'down|up')),
+                                  topN=nTerms,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6), 
+                                  upperThreshold = pThresh)
+  
+  return(ht)
+}
+```
+
+
+plot the heatmaps for each of the sets in human
+```{r}
+plotHeatmap(hm.bp$simpenrich$simplified, keepSp = 'human')
+
+BackupAsPDF(plotHeatmap(hm.bp$simpenrich$simplified, keepSp = 'human'),'human.GO.BP.heatmap', dimensions = c(10,8))
+BackupAsPDF(plotHeatmap(hm.cc$simpenrich$simplified, keepSp = 'human'),'human.GO.CC.heatmap', dimensions = c(10,8))
+BackupAsPDF(plotHeatmap(hm.kegg$enrich, keepSp = 'human'),'human.kegg.heatmap', dimensions = c(10,8))
+```
+
+plot the same set in bat
+
+```{r}
+BackupAsPDF(plotHeatmap(bat.bp$simpenrich$simplified, keepSp = 'bat', pThresh=4),'bat.GO.BP.heatmap', dimensions = c(10,8))
+BackupAsPDF(plotHeatmap(bat.cc$simpenrich$simplified, keepSp = 'bat',  pThresh=4),'bat.GO.CC.heatmap', dimensions = c(10,8))
+BackupAsPDF(plotHeatmap(bat.kegg$enrich, keepSp = 'bat',  pThresh=4), 'bat.kegg.heatmap', dimensions = c(10,8))
+```
+Adjust the sig threshold on the tests; lets drop lFC to 0.58 and see how things look
+
+```{r}
+comb.dt[, sig:= 'not']
+comb.dt[padj < 0.05 & abs(log2FoldChange) > 0.58, sig := ifelse(log2FoldChange > 0, 'up', 'down')]
+
+hm.bp <- runEnrichment(comb.dt, ont=gmt.hs.go.bp, keepSp='human', title='GO Biological Process', isKEGG=F)
+hm.cc <- runEnrichment(comb.dt, ont=gmt.hs.go.cc, keepSp='human', title='GO Biological Process', isKEGG=F)
+hm.kegg <- runEnrichment(comb.dt, ont=gmt.hs.kegg, keepSp='human', title='GO KEGG Pathways', isKEGG = T) 
+bat.bp <- runEnrichment(comb.dt, ont=gmt.bat.go.bp, keepSp='bat', title='GO Biological Process', isKEGG=F)
+bat.cc <- runEnrichment(comb.dt, ont=gmt.bat.go.cc, keepSp='bat', title='GO Biological Process', isKEGG=F)
+bat.kegg <- runEnrichment(comb.dt, ont=gmt.bat.kegg, keepSp='bat', title='GO KEGG Pathways', isKEGG = T) 
+
+
+#pval only
+fwrite(hm.bp$enrich, ScriptAndDatedFileName('human.GO.BP.enrichment.pvalOnly.csv'))
+fwrite(hm.bp$simpenrich$simplified, ScriptAndDatedFileName('human.GO.BP.enrichment.simplified.pvalOnly.csv'))
+fwrite(hm.cc$enrich, ScriptAndDatedFileName('human.GO.CC.enrichment.pvalOnly.csv'))
+fwrite(hm.cc$simpenrich$simplified, ScriptAndDatedFileName('human.GO.CC.enrichment.simplified.pvalOnly.csv'))
+fwrite(hm.kegg$enrich, ScriptAndDatedFileName('human.KEGG.enrichment.pvalOnly.csv'))
+fwrite(bat.bp$enrich, ScriptAndDatedFileName('bat.GO.BP.enrichment.pvalOnly.csv'))
+fwrite(bat.bp$simpenrich$simplified, ScriptAndDatedFileName('bat.GO.BP.enrichment.simplified.pvalOnly.csv'))
+fwrite(bat.cc$enrich, ScriptAndDatedFileName('bat.GO.CC.enrichment.pvalOnly.csv'))
+fwrite(bat.cc$simpenrich$simplified, ScriptAndDatedFileName('bat.GO.CC.enrichment.simplified.pvalOnly.csv'))
+fwrite(bat.kegg$enrich, ScriptAndDatedFileName('bat.KEGG.enrichment.pvalOnly.csv'))
+```
+plot all the enrichment results
+```{r}
+plotHeatmap <- function(dt, keepSp='human', pThresh=8, nTerms=8){
+  
+  subDT <- copy(dt) # create cp for modifying
+  
+  if (keepSp == 'bat'){
+    
+      subDT[, enrich.grp := factor(enrich.grp, levels=c("N_P80T-WA_6h.up", "9bI_N_P80T-WA_6h.up", "9bI_N_P80T-N_P80T_6h.up",
+                                                        "N_P80T-WA_12h.up","9bI_N_P80T-WA_12h.up","9bI_N_P80T-N_P80T_12h.up",
+                                                        "N_P80T-WA_24h.up",  "9bI_N_P80T-WA_24h.up","9bI_N_P80T-N_P80T_24h.up",
+                                                        "N_P80T-WA_48h.up", "9bI_N_P80T-WA_48h.up","9bI_N_P80T-N_P80T_48h.up",
+                                                        "N_P80T-WA_6h.down", "9bI_N_P80T-WA_6h.down", "9bI_N_P80T-N_P80T_6h.down",
+                                                        "N_P80T-WA_12h.down","9bI_N_P80T-WA_12h.down","9bI_N_P80T-N_P80T_12h.down",
+                                                        "N_P80T-WA_24h.down",  "9bI_N_P80T-WA_24h.down","9bI_N_P80T-N_P80T_24h.down",
+                                                        "N_P80T-WA_48h.down", "9bI_N_P80T-WA_48h.down","9bI_N_P80T-N_P80T_48h.down")
+                                                  )]
+  } else {
+    
+      subDT[, enrich.grp := factor(enrich.grp, levels=c("N_P80T-WA_12h.up","9bI_N_P80T-WA_12h.up","9bI_N_P80T-N_P80T_12h.up",
+                                                        "N_P80T-WA_24h.up",  "9bI_N_P80T-WA_24h.up","9bI_N_P80T-N_P80T_24h.up",
+                                                        "N_P80T-WA_48h.up", "9bI_N_P80T-WA_48h.up","9bI_N_P80T-N_P80T_48h.up",
+                                                        "N_P80T-WA_12h.down","9bI_N_P80T-WA_12h.down","9bI_N_P80T-N_P80T_12h.down",
+                                                        "N_P80T-WA_24h.down",  "9bI_N_P80T-WA_24h.down","9bI_N_P80T-N_P80T_24h.down",
+                                                        "N_P80T-WA_48h.down", "9bI_N_P80T-WA_48h.down","9bI_N_P80T-N_P80T_48h.down"))]
+  }
+
+  # define col split... must be better way to do this; identify colnames of the matrix and
+  
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = subDT,
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  negCols=grep('down',unique(subDT$enrich.grp), value=T),
+                               #   column_split=list(str_extract(levels(subDT$enrich.grp), '[0-9]{1,2}h'),
+                               #                     str_extract(levels(subDT$enrich.grp),'down|up')),
+                                  topN=nTerms,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6), 
+                                  upperThreshold = pThresh)
+  
+  return(ht)
+}
+
+BackupAsPDF(plotHeatmap(hm.bp$simpenrich$simplified, keepSp = 'human'), 'hm.GO.BP.pvalOnly.heatmap', dimensions = c(10,8))
+BackupAsPDF(plotHeatmap(hm.cc$simpenrich$simplified, keepSp = 'human'), 'hm.GO.CC.pvalOnly.heatmap', dimensions = c(10,8))
+BackupAsPDF(plotHeatmap(hm.kegg$enrich, keepSp = 'human'), 'hm.kegg.pvalOnly.heatmap', dimensions = c(10,8))
+
+BackupAsPDF(plotHeatmap(bat.bp$simpenrich$simplified, keepSp = 'bat'), 'bat.GO.BP.pvalOnly.heatmap', dimensions = c(10,8))
+BackupAsPDF(plotHeatmap(bat.cc$simpenrich$simplified, keepSp = 'bat'), 'bat.GO.CC.pvalOnly.heatmap', dimensions = c(10,8))
+BackupAsPDF(plotHeatmap(bat.kegg$enrich, keepSp = 'bat'), 'bat.kegg.pvalOnly.heatmap', dimensions = c(10,8))
+```
+
+Regenerate the volcano plots with interesting GO annotations attached 
+
+```{r}
+hm.bp <- fread('/Users/martingordon/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/PWComparisonsTimepoint_data/2024_08_14_human.GO.BP.enrichment.pvalOnly.csv')
+```
+
+
+
+```{r}
+# SARS resposne genes
+viralResponse <- unlist(strsplit(hm.bp[Description == 'response to virus', geneID], "/"))
+isgResponse <-  isGenes
+inflamResponse <- unlist(strsplit(hm.bp[Description == 'inflammatory response', geneID], "/"))
+
+c(viralResponse, isgResponse) %>%  unique() %>% length()
+```
+
+Looks like the IM kicks in earlier with the SARS variants, but seems to be similar at 48hrs
+```{r}
+comb.dt[, label := ifelse(gene %in% viralResponse, 'response to virus', 
+                         ifelse(gene %in% isgResponse, 'interferon stimulated genes (ISGs)', sig))] 
+
+
+
+lapply(unique(comb.dt$species), function(x){
+  
+ subdt <- comb.dt[species== x, ]
+ subdt[, timepoint := factor(timepoint, levels=c('6h','12h', '24h', '48h'))]
+ subdt[, virus := factor(virus, levels=c('WA',"N_P80T", "9bI_N_P80T"))]
+ 
+ # lets create a threshold for our data; 
+ # start with 3 FC and 40 adj p
+ subdt[, FCthreshold := log2FoldChange]
+ subdt[abs(log2FoldChange) > 3, FCthreshold := ifelse(FCthreshold > 0, 3, -3)]
+ 
+ subdt[,pvalthreshold := -log10(padj)]
+ subdt[pvalthreshold > 20, pvalthreshold := 20]
+ 
+ subdt[,abvthreshold := ifelse(((log2FoldChange > FCthreshold) | (-log10(padj) > pvalthreshold)), 'yes', 'no')]
+ 
+ 
+ g <-  ggplot(subdt, aes(y=pvalthreshold, x=FCthreshold, fill = label, color=label, label=gene, shape=abvthreshold)) +
+    geom_point(alpha=0.6) +
+    geom_point(data=subdt[gene %in% c(viralResponse,isgResponse)]) +
+    geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept=-log10(0.05), linetype=2, alpha=0.4) +
+    ggtitle(paste0(x, ' cell-line viral comparisons')) +
+    ylab(expression(-log[10] ~' adj.pvalue')) +
+    xlab(expression(log[2] ~ ' Fold change')) +
+    geom_text_repel(data=subdt[sig != 'not' & gene %in% c(viralResponse, isgResponse),], max.iter = 1000, max.overlaps = 20, size=3) +
+    scale_shape_manual(values=c(21, 2)) +
+    scale_color_manual(values=c('up'='#D01B1B', 'down'='#47abd8', 'not'='grey', 
+                              'response to virus'='#5ec962', 
+                              'interferon stimulated genes (ISGs)'='#414487FF')) +
+    scale_fill_manual(values=c('up'='#D01B1B', 'down'='#47abd8', 'not'='grey', 
+                              'response to virus'='#5ec962',  
+                              'interferon stimulated genes (ISGs)'='#414487FF')) +
+  facet_grid2(comparison~timepoint, scales='free', independent = 'all') +
+  theme_bw() +
+   theme(strip.text.x = element_text(size=9),
+         strip.text.y = element_text(size=9)) +
+    guides(shape = "none",
+           fill = 'none') +
+   theme(strip.text = element_text(size=20))
+
+ 
+ #ggsave(paste0(plot.dir,'/volcanoplots/', x, 'FC1.padj05.annoLabels.volcanoplots.png'), device='png', width=20,height=18)
+ #print(g)
+ #dev.off()
+ g
+ BackupAsPDF(g, paste0('/volcanoplots/', x, 'FC1.padj05.annoLabelsvolcanoplots'), dimensions = c(20,18))
+})
+
+
+```
+
+Heatmaps of the ISGs
+
+```{r}
+# set blind =T for unsupervised for QC plots; for DE maybe use blind=F
+bat.counts <- assay(vst(dds.bat, blind=F))
+hu.counts <- assay(vst(dds.hu, blind=F))
+```
+plot the viral protein ISGs
+
+```{r}
+
+col.pal <- randomcoloR::distinctColorPalette(k=8)
+
+hu.sig  <- comb.dt[species=='human' & sig != 'not', gene]
+bat.sig <- comb.dt[species=='bat' & sig != 'not', gene]
+
+submat <- sweep(hu.counts, 1, apply(hu.counts,1, mean, na.rm=T), FUN='-')
+submat <- submat[rownames(submat) %in% hu.sig, grep('Mock', colnames(submat), invert=T)] # drop mock from this comparison
+
+colnames(submat) <- gsub("[.]quant[.]sf", "", colnames(submat))
+
+
+# lets make a color vectoe
+colours <- list('timepoint' = c('12h'="#228833", '24h'="#CCBB44", '6h'='#66CCEE', '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'human' & virus != 'Mock',.(timepoint)],
+                            col = colours)
+
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =F,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        show_row_names=T,
+        row_title = sprintf("%s genes (FC +/- 1 & p.adj < 0.05)", nrow(submat)),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=5), #to reordr , treat the extracted vector as factor and set levls
+        column_split = factor(ifelse(grepl('Mock', colnames(submat)), 'Na', str_extract(colnames(submat), '[0-9]{1,2}h')), levels=c('Na', '6h','12h', '24h','48h')),
+        name='Counts/Median',
+        border=T)
+
+BackupAsPDF(hm,'human.sigGenes.medianSweep.tpSplit.heatmap', dimensions=c(9,8))
+
+
+colours <- list('timepoint' = c('12h'="#228833", '24h'="#CCBB44", '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'human' & virus != 'Mock',.(timepoint)],
+                            col = colours)
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =F,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        show_row_names=T,
+        row_title = sprintf("%s genes (log2FC +/- 1 & p.adj < 0.05)", nrow(submat)),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=5), #to reordr , treat the extracted vector as factor and set levls
+        column_split = rep(c('9bI_N_P80T', 'N_P80T', 'WA'), each=9),
+        name='Counts/Median',
+        border=T)
+hm
+
+BackupAsPDF(hm,'human.sigGenes.medianSweep.virusSplit.heatmap', dimensions=c(9,8))
+```
+
+timepoint split is more helpful, so stick with that 
+plot heatmaps with go annotations
+```{r}
+# reset annotation
+colours <- list('timepoint' = c('12h'="#228833", '24h'="#CCBB44", '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'human' & virus != 'Mock',.(virus)],
+                            col = colours)
+
+# these sets defined above at enrihcment step
+# binary vecotr of matrix genes based on presence/absence in genesets of interest
+viral_bar <- as.numeric(rownames(submat) %in% viralResponse) #logical vec
+isg_bar <- as.numeric(rownames(submat) %in% isgResponse)
+inflam_bar <-  as.numeric(rownames(submat) %in% inflamResponse)
+
+#matrix rownames
+names_bar <-  rownames(submat) %in% c(isgResponse, viralResponse, inflamResponse)
+
+ht_list = Heatmap(submat, 
+              top_annotation = colAnn,
+              show_row_names = T, 
+              show_column_names = T,
+              cluster_columns = F,
+              border = T,
+              clustering_distance_rows = 'pearson',
+              row_title = paste0(nrow(submat), ' genes (log2FC  +/- 1 & p.adj < 0.05)'),
+              row_title_gp = gpar(fontsize=9),
+              column_split = factor(ifelse(grepl('Mock', colnames(submat)), 'Na', str_extract(colnames(submat), '[0-9]{1,2}h')), levels=c('Na', '6h','12h', '24h','48h')),
+              column_title_gp = gpar(fontsize=9),
+              name="Counts vs Mock",
+              heatmap_legend_param = list(direction='horizontal', title="FC vs Mock",
+              heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))  +
+  Heatmap(viral_bar, name = "response to virus", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(isg_bar, name = "interferon stimulated genes (ISGs)", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(inflam_bar, name = "inflammatory response", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(submat)[names_bar], 
+        labels_gp = gpar(fontsize = 4), padding = unit(0.2, "mm"))) 
+
+draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="top")
+
+BackupAsPDF(draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="top"), 'human.siggenes.annoLabels.heatmap', dimensions=c(8,7))
+
+```
+Now repeat for bat
+
+```{r}
+submat <- sweep(bat.counts, 1, apply(bat.counts,1, mean, na.rm=T), FUN='-')
+submat <- submat[rownames(submat) %in% bat.sig, grep('Mock', colnames(submat), invert=T)] # drop mock from this comparison
+
+colnames(submat) <- gsub("[.]quant[.]sf", "", colnames(submat))
+
+
+# lets make a color vectoe
+colours <- list('timepoint' = c('12h'="#228833", '24h'="#CCBB44", '6h'='#66CCEE', '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'bat' & virus != 'Mock',.(virus)],
+                            col = colours)
+
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =F,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        show_row_names=T,
+        row_title = sprintf("%s genes (FC +/- 1 & p.adj < 0.05)", nrow(submat)),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=5), #to reordr , treat the extracted vector as factor and set levls
+        column_split = factor(ifelse(grepl('Mock', colnames(submat)), 'Na', str_extract(colnames(submat), '[0-9]{1,2}h')), levels=c('Na', '6h','12h', '24h','48h')),
+        name='Counts/Median',
+        border=T)
+hm
+BackupAsPDF(hm,'bat.sigGenes.medianSweep.tpSplit.heatmap', dimensions=c(9,8))
+
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'bat' & virus != 'Mock',.(timepoint)],
+                            col = colours)
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =F,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        show_row_names=T,
+        row_title = sprintf("%s genes (log2FC +/- 1 & p.adj < 0.05)", nrow(submat)),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=5), #to reordr , treat the extracted vector as factor and set levls
+        column_split = rep(c('9bI_N_P80T', 'N_P80T', 'WA'), each=12),
+        name='Counts/Median',
+        border=T)
+hm
+
+BackupAsPDF(hm,'bat.sigGenes.medianSweep.virusSplit.heatmap', dimensions=c(9,8))
+```
+```{r}
+# reset annotation
+colours <- list('timepoint' = c('12h'="#228833", '24h'="#CCBB44", '48h'='#EE6677'),
+                'virus' = c('WA'=col.pal[1], 'N_P80T'=col.pal[2], '9bI_N_P80T'=col.pal[3]))
+
+colAnn <- HeatmapAnnotation(df = meta.data[host == 'bat' & virus != 'Mock',.(virus)],
+                            col = colours)
+
+# these sets defined above at enrihcment step
+# binary vecotr of matrix genes based on presence/absence in genesets of interest
+viral_bar <- as.numeric(rownames(submat) %in% viralResponse) #logical vec
+isg_bar <- as.numeric(rownames(submat) %in% isgResponse)
+inflam_bar <-  as.numeric(rownames(submat) %in% inflamResponse)
+
+#matrix rownames
+names_bar <-  rownames(submat) %in% c(isgResponse, viralResponse, inflamResponse)
+
+ht_list = Heatmap(submat, 
+              top_annotation = colAnn,
+              show_row_names = T, 
+              show_column_names = T,
+              cluster_columns = F,
+              border = T,
+              clustering_distance_rows = 'pearson',
+              row_title = paste0(nrow(submat), ' genes (log2FC  +/- 1 & p.adj < 0.05)'),
+              row_title_gp = gpar(fontsize=9),
+              column_split = factor(ifelse(grepl('Mock', colnames(submat)), 'Na', str_extract(colnames(submat), '[0-9]{1,2}h')), levels=c('Na', '6h','12h', '24h','48h')),
+              column_title_gp = gpar(fontsize=9),
+              name="Counts vs Mock",
+              heatmap_legend_param = list(direction='horizontal', title="FC vs Mock",
+              heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=5))  +
+  Heatmap(viral_bar, name = "response to virus", col = c("0" = "white", "1" = '#fde725'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(isg_bar, name = "interferon stimulated genes (ISGs)", col = c("0" = "white", "1" = '#440154FF'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(inflam_bar, name = "inflammatory response", col = c("0" = "white", "1" = '#5ec962'), 
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  rowAnnotation(link = anno_mark(at = which(names_bar), 
+        labels = rownames(submat)[names_bar], 
+        labels_gp = gpar(fontsize = 4), padding = unit(0.2, "mm"))) 
+
+draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="top")
+
+BackupAsPDF(draw(ht_list, ht_gap = unit(0.2, "mm"), heatmap_legend_side="top"), 'bat.siggenes.annoLabels.heatmap', dimensions=c(8,7))
+```
+
+
+
+
+
+
+```{r}
+
+print(contrast=c("condition", num, denom))
+bat.viralContrasts.DT <- rbindlist(bat.viralContrasts, idcol='contrast')
+```
+
+
+
+```{R}
+#look into this LFC shrinkagea little more...
+test <- results(dds.bat, contrast=c("condition","N_P80T.12h","WA.12h"),filterFun=ihw)
+test2 <- lfcShrink(dds.bat, contrast=c("condition","N_P80T.12h","WA.6h"), res=test, type='ashr')
+
+as.data.table(test2, keep.rownames=T)
+plot(test$log2FoldChange, test2$log2FoldChange)
+
+```
+loop through the results and apply LFC shrinkage
+```{r}
+lapply(names(hu.viralContrasts), function(x){
+  
+  #
+  resLFC <- lfcShrink(hu.viralContrasts[[x]], coef=x, type='apeglm', res=res)
+  resLFC <- as.data.table(resLFC, keep.rownames=T)
+  resLFC[, contrast := x ]
+  
+})
+```
+
+look within timepoint contrasts
+```{r}
+# drop intercept
+bat.viralContrasts.dt <- lapply(resultsNames(dds.bat)[-1], function(x){
+  res <- results(dds.bat, name=x, filterFun=ihw)
+  # lfcShrink calls results internally
+  # think its useful here maybe due to potential coverage issues?
+  #We have also adjusted for multiple testing locally
+  resLFC <- lfcShrink(dds.bat, coef=x, type='apeglm', res=res)
+  resLFC <- as.data.table(resLFC, keep.rownames=T)
+  resLFC[, contrast := x ]
+  return(resLFC)
+  
+}) %>%  rbindlist()
+
+
+hu.viralContrasts.dt <- lapply(resultsNames(dds.hu)[-1], function(x){
+  
+  res <- results(dds.hu, name=x, filterFun=ihw)
+  # lfcShrink calls results internally
+  # think its useful here maybe due to potential coverage issues?
+  resLFC <- lfcShrink(dds.hu, coef=x, type='apeglm', res=res)
+  resLFC <- as.data.table(resLFC, keep.rownames=T)
+  resLFC[, contrast := x ]
+  return(resLFC)
+  
+}) %>%  rbindlist()
+```
+
+
+
+Todo 
+Replot FCs with pvalues; border 
+Add CI if possible 
+Proportions; drop the double mutant from both plots
+
+

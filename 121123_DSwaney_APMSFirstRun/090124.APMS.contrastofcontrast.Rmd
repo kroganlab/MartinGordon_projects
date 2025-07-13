@@ -1,0 +1,2209 @@
+---
+title: "090124.APMS.contrastofcontrast"
+author: "Martin Gordon"
+date: "2024-01-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## APMS qc plots and run contrast of contrast
+
+For the previous analysis, we want to generate a plot of the normalised intensity data for the baits across each condition, and also the global intensity (avg/median + some error estimate)
+Goal is to determine if there is a global shift in certain conditions, which is accounted for by normalisation, or if more worryingly if there is a jump in bait concentrations only..
+
+
+Questions
+- I have additional DF when correctly annotating the Bioreps (unique ID for group comparisons), so more statistical power. But why?
+- Why after normalising by bait, did one set of the samples median expression reduce so much
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library(readxl)
+library(MSstats)
+library(circlize)
+library(ggvenn)
+library (emmeans)
+library(stringr)
+
+source ("../../utils/bp_utils/spectronautFile2ArtMS.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/LinearModels.R")
+
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+```
+
+
+
+
+### 16-01-23
+Try a new normalization method to normalzse to bait concentration
+TMP on bait to take column offsets and subtract from the logIntensities
+
+
+## tmp normalisation not working effectively on one of the samples.. for now proceed with standard normalisation
+
+```{r}
+dataDir <- '/Users/martingordon/Documents/projects/121123_DSwaney_APMStest/data/'
+
+```
+run tmp, subtract the column offset for each sample to 'normalise',  then run TMP normalising by global standards
+```{r}
+spec <- fread(paste(dataDir, 'MSstats.csv', sep=''))
+#remove contaminant proteins
+spec <- spec[!ProteinName %like% 'contam_sp',]
+
+spec[, group_subject := paste(Condition, BioReplicate,sep='_')]
+```
+
+seperate the two bait groups
+
+```{r}
+orf3a.grps <- c('Empty', 'Lempty', 'Lorf3aBeta', 'Lorf3aQ57H', 'Lorf3aS171L', 'Lorf3aWT', 
+               'orf3aBeta', 'orf3aQ57H', 'orf3aS171L', 'orf3aWT', 'UT')
+
+nsp6.gprs <- c('DemptyVector', 'Dnsp6BA1', 'Dnsp6BA2', 'Dnsp6WT', 'Dnsp6XBB', 'Empty',
+               'nsp6BA1', 'nsp6BA2', 'nsp6WT', 'nsp6XBB', 'UT')
+
+
+spec.orf3a <- spec[Condition %in% orf3a.grps,]
+spec.nsp6 <- spec[Condition %in% nsp6.gprs,]
+```
+
+```{r}
+spec.list <-  list(orf3a = spec.orf3a,
+                   nsp6 = spec.nsp6)
+```
+
+```{r}
+
+mssInput.list <- lapply(spec.list, function(x){
+  
+  # configure for MSstats input
+  x[, PeptideModifiedSequence := PeptideSequence]
+  mssInput <- specFileToCompleteMSstats(x)
+  mssInput[, IsotopeLabelType := 'L']
+  
+  
+  mssInput[, uniprot := str_extract(ProteinName,'(?<=\\|).+(?=\\|)')]
+  mssInput[, ProteinName := uniprot]
+
+  return(mssInput)
+})
+
+```
+process each dataset; normalise using equilize medians as standard...
+```{r}
+mss.list <-  lapply(seq_along(mssInput.list), function(x,y,i){
+  
+  mss.x <-  dataProcess(x[[i]], 
+                        normalization = 'equalizeMedians', #preran with globalStandards and didnt work well...
+                        summaryMethod="TMP",
+                        remove_uninformative_feature_outlier=TRUE,
+                        featureSubset="highQuality",
+                        MBimpute =  FALSE)
+ return(mss.x)
+  
+}, x=mssInput.list, y=mssGS.list)
+
+
+names(mss.list) <- names(mssInput.list)
+```
+
+write output to file
+
+```{r}
+lapply(seq_along(mss.list), function(x,n,i){
+  
+  fwrite(x[[i]]$ProteinLevelData, ScriptAndDatedFileName(paste0(n[[i]],"_ProteinLevelData.csv")))
+  fwrite(x[[i]]$FeatureLevelData, ScriptAndDatedFileName(paste0(n[[i]],"_FeatureLevelData.csv")))
+  
+},x=mss.list, n=names(mss.list))
+
+
+lapply(seq_along(mss.list), function(x,n,i){
+  
+ saveRDS(x[[i]], paste0('./090124.APMS.contrastofcontrast_data/', n[[i]], '_mss.rds'))
+  
+},x=mss.list, n=names(mss.list))
+```
+
+
+Read in the R object and perform the pw contrasts in msstats
+
+```{r}
+orf3a.mss <- readRDS("/Users/martingordon/Documents/projects/121123_DSwaney_APMSFirstRun/090124.APMS.contrastofcontrast_data/orf3a_mss.rds")
+nsp6.mss <- readRDS("/Users/martingordon/Documents/projects/121123_DSwaney_APMSFirstRun/090124.APMS.contrastofcontrast_data/nsp6_mss.rds")
+
+dp.out.list <-  list(orf3a=orf3a.mss,
+                      nsp6=nsp6.mss)
+
+
+
+# as doing a group comparison we want 16 unique IDs
+# atm we have 19 DF, which is N - model coefficients
+# try rerun with modified ID column
+
+
+lapply(dp.out.list, function(x){
+  
+  setDT(x$ProteinLevelData)
+  setDT(x$FeatureLevelData)
+  x$ProteinLevelData[,SUBJECT := interaction(GROUP,SUBJECT)]
+  x$FeatureLevelData[,SUBJECT := interaction(GROUP,SUBJECT)]
+  return(x)
+})
+
+```
+
+```{r}
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  dt <- data.table(x[[i]]$ProteinLevelData)
+  print(dt)
+  g <- ggplot(dt[, .N, by=.(Protein,GROUP,SUBJECT)], aes(x=reorder(interaction(GROUP,SUBJECT)), y=N, fill=GROUP)) + 
+    geom_bar(stat='Identity') +
+    scale_fill_manual(values=col.pal) +
+    ggtitle(paste0(n[[i]], ' Protein counts')) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+ g
+  #BackupAsPDF(g, paste0(n[[i]], '.protein.counts.'))
+},x=dp.out.list, n=names(dp.out.list))
+```
+
+heatmaps
+----
+
+```{r}
+p.quant.orf3 <- fread('./090124.APMS.contrastofcontrast_data/2024_01_09_orf3a_ProteinLevelData.csv')
+p.quant.nsp6 <- fread('./090124.APMS.contrastofcontrast_data/2024_01_09_nsp6_ProteinLevelData.csv')
+
+
+p.quant.list <-  list(orf3a=p.quant.orf3,
+                      nsp6=p.quant.nsp6)
+```
+
+
+```{r}
+clusterwNA <- function(x, na.val=0){
+  
+  x[is.na(x)] <- na.val
+  dist(x) %>%  hclust(method='complete')
+}
+
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  p.mat <-  data.table(x[[i]]$ProteinLevelData) %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  subMat <- p.mat[sample(rownames(p.mat),2000), ]
+
+  #heatmap annotation 
+  grp <- sub(".[1-6]$", "", colnames(subMat))
+  treat <- ifelse(grepl("^[D|L]{1}", colnames(subMat)), str_extract(colnames(subMat), "^[D|L]{1}"), 'CTRL')
+  batch <- sub(".","",str_extract(colnames(subMat), ".[1-3]$"))
+
+  
+  ha <- HeatmapAnnotation(group = grp, treatment=treat, batch=batch, col=list(treatment=c('L'='red', 'D'='blue', 'CTRL'='green'),
+                                                                              
+                                                                              batch=c('1'='pink','2'='cyan', '3'='palegreen')))
+  
+  hm <-  Heatmap(subMat, 
+          cluster_rows = clusterwNA(subMat),
+          show_row_names = F,
+          name = 'Log2 Intensities',
+          row_title = sprintf('%s sampled proteins', nrow(subMat)),
+          top_annotation = ha)
+  
+  #BackupAsPDF(draw(hm, column_title=n[[i]]), paste0(n[[i]], '.intensity.heatmaps.'),  dimensions=c(8,8))
+  
+}, x=dp.out.list, n=names(dp.out.list))
+```
+heatmaps of median swept plots
+
+```{r}
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  p.mat <-  data.table(x[[i]]$ProteinLevelData) %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  # subtract median vals from rows
+  subMat <- sweep(p.mat, 1, FUN='-', STATS=apply(p.mat, 1, median, na.rm=T))
+  
+  subMat <- subMat[sample(rownames(subMat),2000), ]
+
+  #heatmap annotation 
+  grp <- sub(".[1-6]$", "", colnames(subMat))
+  treat <- ifelse(grepl("^[D|L]{1}", colnames(subMat)), str_extract(colnames(subMat), "^[D|L]{1}"), 'CTRL')
+  batch <- sub(".","",str_extract(colnames(subMat), ".[1-3]$"))
+
+  
+  ha <- HeatmapAnnotation(group = grp, treatment=treat, batch=batch, col=list(treatment=c('L'='red', 'D'='blue', 'CTRL'='green'),
+                                                                              
+                                                                              batch=c('1'='pink','2'='cyan', '3'='palegreen')))
+  
+  hm <-  Heatmap(subMat, 
+          cluster_rows = clusterwNA(subMat),
+          show_row_names = F,
+          name = 'Intensities vs. Median',
+          row_title = sprintf('%s sampled proteins', nrow(subMat)),
+          column_names_gp = gpar(fontsize=6),
+          top_annotation = ha,
+          heatmap_legend_param = list(
+            legend_direction='vertical',
+            legend_width = unit(2, "cm"))
+            
+          )
+  
+  #draw(hm, column_title=n[[i]], heatmap_legend_side="bottom")
+#BackupAsPDF(draw(hm, column_title=n[[i]]), paste0(n[[i]], '.mediansweep.heatmaps.'), dimensions=c(8,8))
+  
+}, x=dp.out.list, n=names(dp.out.list))
+```
+
+create contrasts
+----
+TODO continue on the pw contrasts
+
+First things; create two seperate list of contrasts, one for each dataset and add to list
+Give lists same name as the dp.out objects and process
+
+```{r}
+orf3a.contrasts <- makeContrast.AllByAll(dp.out.list$orf3a)
+nsp6.contrasts  <- makeContrast.AllByAll(dp.out.list$nsp6)
+```
+
+'fix' the contrast lists by converting controls to denominators for relevant contrasts
+
+```{r}
+# orf3a
+submat <- orf3a.contrasts[grep('^Lempty|^Empty', rownames(orf3a.contrasts)), ]
+submat <-  submat*-1
+
+old.names <- rownames(submat)
+rev.names <- tstrsplit(rownames(submat), '-')
+
+new.names <- sapply(seq_along(rev.names[[1]]), function(i){
+  paste0(rev.names[[2]][i], '-', rev.names[[1]][i])
+})
+rownames(submat) <- new.names
+
+orf3a.contrasts <- rbind(submat, orf3a.contrasts[!rownames(orf3a.contrasts) %in% old.names,])
+orf3a.contrasts
+```
+## TODO convert this to a function to get contrast matrix inverse so can run easily
+
+```{r}
+# nsp6
+submat <- nsp6.contrasts[grep('^DemptyVector|^Empty', rownames(nsp6.contrasts)), ]
+submat <-  submat*-1
+
+old.names <- rownames(submat)
+rev.names <- tstrsplit(rownames(submat), '-')
+
+new.names <- sapply(seq_along(rev.names[[1]]), function(i){
+  paste0(rev.names[[2]][i], '-', rev.names[[1]][i])
+})
+rownames(submat) <- new.names
+
+nsp6.contrasts <- rbind(submat, nsp6.contrasts[!rownames(nsp6.contrasts) %in% old.names,])
+
+
+# sanity check 
+nsp6.contrasts
+orf3a.contrasts
+```
+run the pw comparisons between groups
+
+check out the MRX2 data first. Looks fine when adjusting names so run for both datasets
+
+```{r}
+contrast.list <-  list(orf3a = orf3a.contrasts,
+                       nsp6 = nsp6.contrasts)
+
+```
+
+
+```{r}
+mss.out.list <- lapply(seq_along(dp.out.list), function(x,n,i){
+
+  bait <- n[[i]]
+  print(paste0('running comparison on ', bait))
+  
+  # run msstats correcting for batch 
+  mss <- groupComparison(contrast.matrix=contrast.list[[bait]], data=x[[bait]])
+  mss.dt <- setDT(mss$ComparisonResult)
+  
+  return(mss.dt)
+  
+},x=dp.out.list, n=names(dp.out.list))
+
+names(mss.out.list) <- names(dp.out.list)
+
+```
+## generate plots and tables of the comparisons
+
+Identify the number of degs in each condition
+
+```{r eval=FALSE}
+lapply(seq_along(mss.out.list), function(x,n,i){
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.mss.pwcomparisons.raw.csv'))
+  
+},x=mss.out.list,n=names(mss.out.list))
+```
+
+count number of DEGs
+More DEGs seem to be found in the QRFPR samples
+```{r}
+lapply(seq_along(mss.out.list), function(x,n,i){
+  dt <- x[[i]]
+  
+  dt[,gene := multiUniprots2multiGenes(as.character(Protein))] %>% #needed as in factor format
+  .[, sig := 'not'] %>% 
+  .[!issue %in% c('completeMissing','oneConditionMissing') & abs(log2FC) > 0.58 & adj.pvalue < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+  
+   fwrite(dt, paste0('./output/', n[[i]], '.mss.pwcomparisons.proc.csv'))
+  }, x=mss.out.list, n=names(mss.out.list))
+```
+
+Volcano plots of all the comparisons
+Over 100 in total so dont rerun....
+
+```{r}
+lapply(seq_along(mss.out.list), function(x,n,i){
+  dt <- x[[i]]
+  
+  # vecotr to iterate through
+  contrasts.oi <- dt$Label %>%  unique()
+  
+  # nested loop w 
+  lapply(contrasts.oi, function(cont){
+    
+      g <- ggplot(dt[Label == cont & !issue %in% c('completeMissing','oneConditionMissing'),], aes(x=log2FC, y=-log10(adj.pvalue), color=sig, label=gene)) + 
+      geom_point() +
+      geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+      geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+      ggrepel::geom_text_repel(data=dt[Label == cont & sig != 'not',],  size = 2, max.overlaps = 20) +
+      scale_color_manual(values=c('up'='red', 'down'='blue', 'not'='grey')) +
+      ggtitle(paste0(n[[i]], ' ', cont, ' (FC +/ 50% & p.adj < 0.05)')) +
+      # facet_wrap(~Label, scales = 'free') +
+      theme_bw() +
+      theme(strip.text.x = element_text(size = 5))
+      
+      #BackupAsPDF(g, paste0(n[[i]],'.',cont,'.volcanoplot.'))
+    
+  })
+  
+  }, x=mss.out.list, n=names(mss.out.list))
+
+```
+
+Go enrichment for each of the differentially expressed gene groups across comparisons
+Not very strong enrichment across groups; could 
+
+
+At the moment just too many contrasts to plot... supply the table of the simplified GO enrichment 
+```{r}
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "UNIPROT")
+
+#universe: all proteins detected in exp
+universe <- sapply(dp.out.list, function(x){
+   as.character(x$ProteinLevelData$Protein)
+  #x$ProteinLevelData[,unique(Protein)]
+}) %>%  unlist() %>%  unique()
+
+
+# run enrichment on non-missing hits
+simp.enrich.list <- lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  mss <- x[[i]]
+  mss[,enrich_grp := interaction(Label,sig)]
+  
+  enrich.dt <- enricherOnGroups(mss[sig != 'not' & !issue %in% c('completeMissing','oneConditionMissing'),], groupColumns = 'enrich_grp', geneColumn = "Protein", term2gene.gmt = gmt.go, universe = universe)
+  
+  simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+  return(simp.enrich)
+  
+  }, x=mss.out.list, y=dp.out.list, n=names(mss.out.list))
+
+```
+
+
+
+write out results of the pw comparisons and the GO enrichment for the pw comparisons
+
+```{r}
+names(simp.enrich.list) <- names(mss.out.list)
+
+lapply(seq_along(simp.enrich.list), function(x,n,i){
+  
+  fwrite(x[[i]]$simplified, paste0('./output/', n[[i]], '.GOenrichment.simplified.csv'))
+  
+},x=simp.enrich.list, n=names(simp.enrich.list))
+
+```
+
+## TODO 
+write out the tables in correct format and share
+
+write files out in wide format
+```{r}
+mss.wide.list <- lapply(mss.out.list, function(x){
+  dt <-  x[!issue %in% c('completeMissing','oneConditionMissing')]
+  
+  dt.w <- dcast(dt, Protein+gene~Label, value.var = c('log2FC', 'pvalue', 'adj.pvalue'))
+  return(dt.w)
+})
+
+
+lapply(seq_along(mss.wide.list), function(x,n,i){
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.mss.pwcomparisons.wide.csv'))
+},x=mss.wide.list, n=names(mss.wide.list))  
+
+```
+## 17-01-24
+Instead of using another software, we will attempt an interaction analysis between treatment/condition and pretreatment
+In reality, we have two factors (treatment: many levels and pretreatment 2 levels) but as is we have one factor which has levels of each combination, which is set-up for the MSstats model for testing interactions
+
+build new contrast matrix for 
+
+
+# orf3a contrasts oi
+- (Lorf3aBeta-Lempty) - (orf3aBeta-Empty)
+- (Lorf3aBeta-Lorf3aQ57H) - (orf3aBeta-orf3aQ57H)
+- (Lorf3aBeta-Lorf3aS171L) - (orf3aBeta-Lorf3aS171L)
+- (Lorf3aBeta-Lorf3aWT) - (orf3aBeta-Lorf3aWT)
+
+
+- (Lorf3aQ57H-Lempty) - (orf3aQ57H-Empty)
+- (Lorf3aS171L-Lempty) - (orf3aS171L-Empty) 
+- (Lorf3aWT-Lempty) - (orf3aWT-Empty)
+- 
+
+
+# nsp6 contrasts oi
+- (Dnsp6BA1-DemptyVector) - (nsp6BA1 - Empty)
+- (Dnsp6BA2-DemptyVector) - (nsp6BA2 - Empty)
+- (Dnsp6WT-DemptyVector) -  (nsp6WT - Empty)
+- (Dnsp6XBB-DemptyVector) - (nsp6XBB-Empty)
+
+```{r}
+orf3a.contrasts
+# contrasts we want
+
+nsp6.contrasts
+
+
+```
+
+
+
+
+
+
+## Contrast of contrasts
+----
+
+read in the processed p.quant data 
+
+```{r}
+dataDir <-'/Users/martingordon/Documents/projects/121123_DSwaney_APMSFirstRun/090124.APMS.contrastofcontrast_data/'
+
+p.quant.nsp6 <- fread(paste0(dataDir, '2024_01_16_nsp6_ProteinLevelData.csv'))
+p.quant.orf3a <- fread(paste0(dataDir, '2024_01_16_orf3a_ProteinLevelData.csv'))
+
+# combine in list
+p.quant.list <-  list(orf3a = p.quant.orf3a,
+                      nsp6 = p.quant.nsp6)
+```
+
+Tidy the formatting 
+
+```{r}
+p.quant.list[[1]]$GROUP %>%  unique()
+p.quant.list[[2]]$GROUP %>%  unique()
+
+
+# create a pretreatment col 
+lapply(p.quant.list, function(x){
+  x[, condition   :=  sub("^[LD]{1}", '', GROUP)]
+  # tidy
+  x[ condition == 'Empty' | condition == "emptyVector", condition := 'empty']
+  x[, pretreat := ifelse(grepl("^[LD]{1}.*", GROUP), str_extract(GROUP, "^[LD]{1}"), 'Ctrl')] 
+})
+
+
+# sanity check; looks good
+lapply(p.quant.list, function(x){
+  x[, .N, by=.(GROUP,SUBJECT,condition,pretreat)]
+})
+
+lapply(p.quant.list, function(x){
+  x[, unique(condition)]
+})
+
+
+p.quant.list$orf3a$condition  %>%  unique()
+p.quant.list$nsp6$condition  %>%  unique()
+```
+So we have two factors; condition(6 levels), pretreatment(2 levels) for two baits; 11 conditions in total (no UT pretreat)
+Want an interaction contrast: ie 'contrast of contrasts'
+Take a single protein and look at this
+
+Testing looks good; contrast of contrast performed correctly
+```{r}
+# interaction contrasts functions
+em.interactionContrast <-  function (l, factorFormula = ~condition*pretreat){  # interaction of condition and pretreatment?
+  emm <- emmeans::emmeans(l, factorFormula) # obtain the estimated marginal means for each condition per pretreatment status (control vs pretreament) from the model
+  contrast1 <- contrast(emm, interaction = c("pairwise"), by = NULL) #interaction contrast, or contrasts of contrasts
+  return (as.data.table(contrast1))
+}
+
+
+# 1 prot example
+test <-  p.quant.list[[1]][Protein == 'A0A075B6R9',]
+test %>%  head()
+
+dim(p.quant.list[[1]])
+dim(test)
+
+
+
+## testing 
+test.lm <- linearModelsAllProteins(p.quant.list[[1]], 
+                                  formulaList = list(full   = LogIntensities~condition + pretreat + condition:pretreat), # full model; 4 way ANOV
+                                  splitColumn = "Protein", postProcessFunction = em.interactionContrast, cl = 6) |> suppressWarnings()
+
+
+test.lm$postProcess
+
+mod1<- lm(LogIntensities ~ condition + pretreat + condition:pretreat, data=test)
+emm <- emmeans(mod1,  ~condition*pretreat) #interaction term in formula
+emm
+#test.contrast <- pairs(emm, simple = list("pretreat", "condition")) # simple contrasts; compare within each factor level
+#contrast(emm, "consec", simple="each", combine=TRUE) # another way to do a simple contrast within each factor level
+
+# interaction contrast
+contrast(emm, interaction = c("pairwise"), by = NULL) # this is what we want; an interaction contrast, or, contrast of contrasts; eg (pretreat treat vs control) - (no pretreat treat vs control)
+
+# looking at  empty - orf3aQ57H
+#empty      Ctrl       23.8
+#orf3aQ57H  Ctrl       23.4
+
+#empty      L          23.8
+#orf3aQ57H  L          24.0
+
+# estimate is  0.605
+# (pretreat treat vs control) - (no pretreat treat vs control).. looks good! although sign of magnitude not helpful..
+#(23.8 - 23.4) - (23.8 -  24)
+```
+
+run the lm model with the new function for all the samples
+
+```{r}
+# interaction contrasts functions ('contrast of contrast')
+em.interactionContrast <-  function (l, factorFormula = ~condition*pretreat){  # interaction of condition and pretreatment?
+  emm <- emmeans::emmeans(l, factorFormula) # obtain the estimated marginal means for each condition per pretreatment status (control vs pretreament) from the model
+  contrast1 <- contrast(emm, interaction = c("pairwise"), by = NULL) #interaction contrast, or contrasts of contrasts
+  return (as.data.table(contrast1))
+}
+
+
+lm.out <- lapply(p.quant.list, function(x){
+  
+  # Numbers near the number of processors available in your machine is probably counterproductive.
+  x.lm <- linearModelsAllProteins(x, 
+                                  formulaList = list(full   = LogIntensities~condition + pretreat + condition:pretreat), # full model; 4 way ANOV
+                                  splitColumn = "Protein", postProcessFunction = em.interactionContrast, cl = 6) |> suppressWarnings()
+  return(x.lm)
+})
+```
+
+
+looks like lack of interaction for orf3a, but stronger evidence of interaction between factors for NSP6.
+Look at normalisation plots again..
+```{r}
+lapply(seq_along(lm.out), function(x,n,i){
+
+  dt <- x[[i]][['anova']]
+  str(dt)
+
+ g <- ggplot(dt, aes(x=dt$p.value)) +
+   geom_histogram(boundary=0.0, binwidth = 0.005) +
+   xlim(c(0,0.05)) +
+   ggtitle(n[[i]]) +
+   facet_wrap(~dt$term)
+ 
+ BackupAsPDF(g, paste0(n[[i]], '.aov.term.pval.historgrams'))
+ 
+},x=lm.out, n=names(lm.out))
+
+```
+## adjust pvalues 
+
+```{r}
+lapply(lm.out, function(x){
+  x[['anova']][, fdr := p.adjust(p.value, method = "BH"), by= term]
+})
+
+```
+Lets look at the ANOVA results
+
+```{r}
+lapply(lm.out, function(x){
+  #x[['anova']][,gene := multiUniprots2multiGenes(Protein)]
+  x[['anova']][term == 'condition:pretreat',]
+})
+```
+Look at the emmeans Contrast of Contrast table
+adjust pvalues
+create a new label column to more explicity state the interaction contrasts for sharing
+
+
+```{r}
+lapply(lm.out, function(x){
+  x[['postProcess']][,gene := multiUniprots2multiGenes(Protein)]
+  x[['postProcess']][, fdr := p.adjust(p.value, method='BH'), by=.(condition_pairwise)]
+  x[['postProcess']][, c('Ctrl', 'PreTreat') := tstrsplit(pretreat_pairwise, ' - ')]
+  x[['postProcess']][, Label := paste('(', condition_pairwise, Ctrl, ')','-', '(', condition_pairwise, PreTreat, ')', sep=' ')]
+})
+```
+write out the data in wide and long format
+
+```{r}
+lapply(seq_along(lm.out), function(x,n,i){
+  
+  
+  tidy.x <- x[[i]][['postProcess']][pretreat_pairwise != '(nothing)', .(gene,Protein, Label, estimate, p.value, fdr)]
+  fwrite(tidy.x, ScriptAndDatedFileName(paste0(n[[i]], '.emm.interactionContrasts.csv')))
+  
+  # convert to wide and wirte
+  tidy.wide <- dcast(tidy.x, gene+Protein~Label, value.var = c('estimate', 'p.value', 'fdr'))
+  fwrite(tidy.wide, ScriptAndDatedFileName(paste0(n[[i]], '.emm.interactionContrasts.wide.csv')))
+},x=lm.out, n=names(lm.out))
+```
+
+heatmaps of interaction contrasts
+Lets try plot all significant results at once on the same plot, then we can try by label
+```{r}
+
+nsp6.emm  <- fread(paste(dataDir,'2024_01_17_nsp6.emm.interactionContrasts.csv', sep='/'))
+orf3a.emm <- fread(paste(dataDir,'2024_01_17_orf3a.emm.interactionContrasts.csv', sep='/'))
+
+# read in the interaction data and convert to wide format
+emm.interactions <- list(orf3a = orf3a.emm,
+                         nsp6 = nsp6.emm
+                         )
+
+```
+
+heatmaps of all sig hits (fdr < 0.05)
+
+```{r}
+rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+
+#play with thresholds here
+lapply(seq_along(emm.interactions), function(x,n,i){
+
+  sigProtein <- x[[i]][fdr < 0.05 & !is.infinite(p.value),] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+
+  print(sigProtein)
+  # filter just to our data
+   prot.mat <- dcast (p.quant.list[[i]][Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") %>% 
+     as.matrix(rownames = "Protein")
+
+  # convert to gene names
+  rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  # median sweep
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  hm <- Heatmap(prot.mat, 
+                cluster_columns = FALSE, 
+                cluster_rows = rowClusterWithNA(prot.mat),
+                name = 'log2 Ints/Median',
+                show_row_names = T,
+                #column_title = paste0(n[[i]]),
+                row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(prot.mat)),
+                row_names_gp = gpar(fontsize = 4),
+                column_names_gp = gpar(fontsize = 8),#,
+                column_split = ifelse(grepl("^[DL]{1}", colnames(prot.mat)), 'pre-treatment', "no pre-treatment") )
+  
+ #BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' treatment effects')), paste0(n[[i]], '.all.interaction.contrasts.fdr<0.05.heatmap'), dimensions = c(8,7))
+  
+},x=emm.interactions, n=names(emm.interactions))
+
+```
+
+ok, now we want to get the list of the pw comparisons, subset to the PW comparisons we are interested in and correct for multiple-testing
+
+```{r}
+
+#play with thresholds here
+lapply(seq_along(emm.interactions), function(x,n,i){
+  
+  
+  # identify each contrast and iterate 
+  contrasts.oi <-  x[[i]][, unique(Label)]
+  
+  lapply(contrasts.oi, function(lab){
+   
+   sigProtein <- x[[i]][Label == lab & fdr < 0.05 & !is.infinite(p.value),] %>% 
+    .[,unique(Protein)]
+
+   # only create heatmap if more than 1 
+   if (length(sigProtein) > 1){
+     
+    # want to reduce the number of columns in each: try strsplit the label and extract the conditions, then look for something similiar in the data
+    # convert the label to a regex pattern  to match matrix cols and and use to grep
+    regex.pattern <- strsplit(lab, ' ') %>% 
+      lapply(., function(x){
+      paste( x[2], '_', x[5], '|', 
+           x[4], '_', x[5], '|',
+           x[9], '_', x[12],'|',
+           x[11], '_', x[12],  sep='')
+    })
+   
+        # filter just to our data
+      prot.mat <- dcast (p.quant.list[[i]][Protein %in% sigProtein,], Protein~condition+pretreat+SUBJECT, value.var = "LogIntensities") %>% 
+        as.matrix(rownames = "Protein")
+      # extract specific cols to the contrast
+      prot.mat <- prot.mat[, grep(regex.pattern, colnames(prot.mat))]
+
+      # convert to gene names
+      rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+      # median sweep
+      prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+      hm <- Heatmap(prot.mat, 
+                cluster_columns = FALSE, 
+                cluster_rows = rowClusterWithNA(prot.mat),
+                name = 'log2 Ints/Median',
+                show_row_names = T,
+               #column_title = paste0(n[[i]], ' ', lab),
+                row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(prot.mat)),
+                row_names_gp = gpar(fontsize = 4),
+                column_names_gp = gpar(fontsize = 8),#,
+                column_split = ifelse(grepl("_[DL]{1}_", colnames(prot.mat)), 'pre-treatment', "no pre-treatment") )
+  
+
+     BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' ', lab)), paste0(n[[i]], '.', lab, '.interaction.contrasts.fdr<0.05.heatmap'), dimensions = c(8,7))
+   }
+ })
+},x=emm.interactions, n=names(emm.interactions))
+   
+```
+```{r}
+
+emm.interactions$orf3a
+
+# practise strsplit
+regex.test <-strsplit(emm.interactions$nsp6$Label[1], ' ') %>% 
+  lapply(., function(x){
+    print(x)
+    paste( x[2], '_', x[5], '|', 
+           x[4], '_', x[5], '|',
+           x[9], '_', x[12],'|',
+           x[11], '_', x[12],  sep='')
+  })
+
+regex.test
+
+test.str <-  c("UT_Ctrl_1",      "UT_Ctrl_2" ,     "UT_Ctrl_3"  ,    "empty_Ctrl_1" ,  "empty_Ctrl_2",  "empty_Ctrl_3" ,  "empty_D_1" ,     "empty_D_2" ,     "empty_D_3" ,    "nsp6BA1_Ctrl_1"
+,"nsp6BA1_Ctrl_2" ,"nsp6BA1_Ctrl_3", "nsp6BA1_D_1" ,   "nsp6BA1_D_2"  ,  "nsp6BA1_D_3"  ,  "nsp6BA2_Ctrl_1", "nsp6BA2_Ctrl_2", "nsp6BA2_Ctrl_3", "nsp6BA2_D_1" ,   "nsp6BA2_D_2"   
+, "nsp6BA2_D_3",    "nsp6WT_Ctrl_1" , "nsp6WT_Ctrl_2",  "nsp6WT_Ctrl_3",  "nsp6WT_D_1" ,    "nsp6WT_D_2" ,    "nsp6WT_D_3" ,    "nsp6XBB_Ctrl_1" ,"nsp6XBB_Ctrl_2" ,"nsp6XBB_Ctrl_3",
+ "nsp6XBB_D_1",    "nsp6XBB_D_2",    "nsp6XBB_D_3" )
+
+
+grep(regex.test, test.str, value=T)
+```
+
+
+We can specify custom contrasts using emmeans; create character vectors of each condition
+
+```{r}
+nsp6.cont.list <- lm.out$nsp6$postProcess$contrast %>%  unique()
+
+# extract all the within group comparisons
+nsp6.contrasts.oi <- c(grep(".*[[:space:]][D]{1}[[:space:]]-[[:space:]].*[D]{1}", nsp6.cont.list, value = T), 
+                       grep(".*[[:space:]]NA[[:space:]]-[[:space:]].*NA", nsp6.cont.list, value = T))
+
+nsp6.contrasts.oi
+
+grep("nsp6BA1.*D.*empty[[:space:]]D", nsp6.contrasts.oi, value=T)
+nsp6.contrasts.oi <- c( "empty D - nsp6BA1 D", "empty D - nsp6BA2 D", "empty D - nsp6WT D","empty D - nsp6XBB D","empty D - UT D",
+                        )
+
+lm.out$nsp6$postProcess[pretreat_pairwise != '(nothing)']
+
+
+```
+
+
+
+```{r}
+lm.out$orf3a$postProcess[, gene := multiUniprots2multiGenes(Protein, species='HUMAN')]
+
+lm.out$orf3a$postProcess$contrast %>%  unique()
+orf3a.contrasts.oi <- c("L empty - L orf3aWT", )
+
+```
+
+
+
+
+Not used
+----
+
+Lets plot the proteins that behave differently depending on condition
+
+```{r}
+
+rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+
+
+#play with thresholds here
+lapply(seq_along(lm.out), function(x,n,i){
+  dt <- x[[i]][['anova']]
+  
+  sigProtein <- dt[term %in% c( "condition") & fdr < 0.05 & !is.infinite(p.value),] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+
+ print(sigProtein)
+  # filter just to our data
+   prot.mat <- dcast (p.quant.list[[i]][Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") %>% 
+     as.matrix(rownames = "Protein")
+
+
+  rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+               cluster_rows = rowClusterWithNA(prot.mat),
+                name = 'log2 Ints/Median',
+                show_row_names = F,
+              #column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Sites (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8))#,
+              #column_split = list (ifelse(grepl("NP00", colnames(prot.mat)), "NP00", "NP30"),
+              #                  ifelse(grepl("CM00", colnames(prot.mat)), "CM00", "CM15")))
+  
+# BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' CM101 treatment effects')), paste0(n[[i]], '.cm101.pval<0.001.heatmap'), dimensions = c(8,6))
+  
+},x=lm.out, n=names(lm.out))
+```
+Can see many proteins change depending on condition, but this is not super surprising..
+
+contrast of contrasts; what proteins show differential response depending on pretreatment status?
+
+```{r}
+#play with thresholds here
+lapply(seq_along(lm.out), function(x,n,i){
+  dt <- x[[i]][['anova']]
+  
+  sigProtein <- dt[term %in% c("condition:pretreat") & p.value < 0.001 & !is.infinite(p.value),] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+
+ print(sigProtein)
+  # filter just to our data
+   prot.mat <- dcast (p.quant.list[[i]][Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") %>% 
+     as.matrix(rownames = "Protein")
+
+
+  rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+               cluster_rows = rowClusterWithNA(prot.mat),
+                name = 'log2 Ints/Median',
+                #show_row_names = F,
+              #column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Sites (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 4),
+              column_names_gp = gpar(fontsize = 8),#,
+              column_split = ifelse(grepl("^[DL]{1}", colnames(prot.mat)), 'treatment', "no treatment") )
+  
+ #BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' treatment effects')), paste0(n[[i]], '.interaction.pval<0.001.heatmap'), dimensions = c(8,7))
+  
+},x=lm.out, n=names(lm.out))
+```
+contrast_of_contrast
+----
+Identify the proteins that expression changes 
+
+```{r}
+lm.out$orf3a$postProcess$contrast %>%  unique()
+
+lm.out$orf3a$postProcess[contrast %in% c('"(L empty - L orf3aQ57H) - (NA Empty - NA orf3aBeta)") ]
+```
+
+
+
+Write out files to dir
+```{r}
+
+lapply(seq_along(lm.out), function(x,n,i){
+  
+  fwrite(x[[i]][['anova']], paste0(n[[i]], '.anova.contrasts.csv.gz'))
+  
+},x=lm.out, n=names(lm.out))
+
+```
+
+
+
+
+
+clear there is a big jump between the bait and the other baseline measurements.. difficult to compare within groups with differences in log2FC...
+for now, proceed as is with the ts analysis and emm contrast of contrasts; just flag that these conditiions are different
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+not used...
+
+Interaction analysis
+----
+Interested in how response differs between groups, depending on pre-treatment status
+For now just want to compute all pw comparisons for each factor level
+
+
+
+```{r}
+
+# linearModelsAllProteins can this function which computes statistic for a contrast of two different log2FC
+# how does the treatment effect change per antagonist level? basically compare treatment effect within each antagonist level
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~condition|pretreat){  # how does response (expression) change between groups, dependent on pretreatment status?
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+# emmeans pairwise; just run pw comparisons for each factor level for each protein
+
+emmeans.pw <- function (l, factorFormula = ~condition|pretreat){  # do all pw comparisons of the different factor levels
+  emm <- emmeans::emmeans(l,specs = pairwise ~ condition:pretreat) # compare all levels of factor1 within levels of pretreat
+  ##contrast1 <- pairs(emm)
+  #contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(emm$contrasts)) 
+           #    'pw.contrasts'=as.data.table(emm$contrasts)) )
+}
+
+# postProcessFunction = emmeans.contrastOfContrasts tells it to use the function above after doing anova.
+# it is optional, adds significant time to the computation (~5x), but is nice to
+# put a magnitude and p value on specific differences of differences
+#
+# cl = 6 parameter says to use 6 processes.  Set to NULL if multiprocess is failing, or higher or lower as you wish.
+# Numbers near the number of processors available in your machine is probably counterproductive.
+
+lm.out <- lapply(p.quant.list, function(x){
+  
+  # Numbers near the number of processors available in your machine is probably counterproductive.
+  x.lm <- linearModelsAllProteins(x, 
+                                  formulaList = list(full   = LogIntensities~condition + pretreat + condition:pretreat), # full model; 4 way ANOV
+                                  splitColumn = "Protein", postProcessFunction = emmeans.pw, cl = 6) |> suppressWarnings()
+  
+  return(x.lm)
+  
+})
+
+```
+
+need to test this with a single protein to investigate..
+
+```{r}
+p.quant.list
+```
+
+
+
+```{r}
+orf3a.contrasts
+```
+
+
+
+## contrast of contrasts
+------
+Load up the old data
+Now to try contrast of contrast approach to identify relevant changes between conditions
+Simple way to execute this? Can we manually provide contrasts of interest?
+
+```{r}
+#contrast for testing interaction between sex and infection
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## tmp normalisation; not used..
+
+```{r}
+dataDir <- '/Users/martingordon/Documents/projects/121123_DSwaney_APMSFirstRun/data/'
+
+```
+run tmp, subtract the column offset for each sample to 'normalise',  then run TMP normalising by global standards
+```{r}
+spec <- fread(paste(dataDir, 'MSstats.csv', sep=''))
+#remove contaminant proteins
+spec <- spec[!ProteinName %like% 'contam_sp',]
+
+spec[, group_subject := paste(Condition, BioReplicate,sep='_')]
+```
+
+seperate the two bait groups
+
+```{r}
+orf3a.grps <- c('Empty', 'Lempty', 'Lorf3aBeta', 'Lorf3aQ57H', 'Lorf3aS171L', 'Lorf3aWT', 
+               'orf3aBeta', 'orf3aQ57H', 'orf3aS171L', 'orf3aWT', 'UT')
+
+nsp6.gprs <- c('DemptyVector', 'Dnsp6BA1', 'Dnsp6BA2', 'Dnsp6WT', 'Dnsp6XBB', 'Empty',
+               'nsp6BA1', 'nsp6BA2', 'nsp6WT', 'nsp6XBB', 'UT')
+
+
+spec.orf3a <- spec[Condition %in% orf3a.grps,]
+spec.nsp6 <- spec[Condition %in% nsp6.gprs,]
+```
+
+```{r}
+spec.list <-  list(orf3a = spec.orf3a,
+                   nsp6 = spec.nsp6)
+spec.list
+```
+
+get names of baits 
+
+```{r}
+mssGS.list <-  list(orf3a = 'P0DTC3',
+                   nsp6 = 'P0DTC1')
+```
+
+
+## run the medpolish then subtract that from the whole dataset
+Run TMP on just the bait matrix
+Then apply offsets to the data matrix
+
+```{r}
+lapply(seq_along(spec.list),  function(x,y,i){
+  
+  # recover baits
+  sub.x <- x[[i]]
+  sub.x[, uniprot := str_extract(ProteinName,'(?<=\\|).+(?=\\|)')]
+  sub.x[, ProteinName := uniprot]
+  sub.x <- sub.x[ProteinName == y[[i]], ]
+  
+  # make matrix
+  spec.x <- dcast(sub.x, interaction(PeptideSequence,PrecursorCharge)~Condition+BioReplicate, value.var = 'Intensity') %>% 
+   as.matrix(rownames=1)
+  
+  #perform tmp normalisation
+  tmp <- medpolish(spec.x, na.rm = TRUE) #iteratively subtract row and col median values to get the offsets
+  tmp.dt <- data.table(offset = tmp$col, group_subject = names(tmp$col))
+  
+  # merge dts
+  x[[i]][tmp.dt, normalize.offset := i.offset, on = "group_subject"]
+  
+  return(x[[i]])
+  
+},x=spec.list, y=mssGS.list)
+```
+Lets look at this scaling factor vs the log intensities 
+
+
+```{r}
+lapply(seq_along(spec.list), function(x,n,i){
+  
+  ggplot(x[[i]], aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition)) +
+    geom_boxplot() +
+    geom_point(data=x[[i]][normalize.offset > 0,], aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(normalize.offset)), shape=24, fill='red') +
+    geom_point(data=x[[i]][normalize.offset < 0,], aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(abs(normalize.offset))), shape=24, fill='blue') +
+    theme(axis.text.x = element_text(angle=90))
+
+},x=spec.list, n=names(spec.list))
+
+
+(10 - 8) - (10-10)
+(10 - 10) - ( 8 -10)
+
+```
+
+```{r}
+prots.oi <- c("P0DTC1","P0DTC3")
+
+spec.list
+
+lapply(seq_along(spec.list), function(x,n,i){
+  
+  ggplot(x[[i]], aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(normalize.offset), fill=Condition)) +
+    geom_point() +
+    geom_point(data=x[[i]][ProteinName %in% prots.oi,], aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity)))
+
+},x=spec.list, n=names(spec.list))
+
+
+lapply(spec.list, function(x){
+  
+  x[, .N, by=normalize.offset] %>% 
+    .[, log2(normalize.offset)]
+})
+```
+subtract TMP col offset (sample offset) from intensity
+
+```{r}
+ggplot(spec.list$nsp6, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90))
+
+lapply(spec.list,  function(x){
+  x[, Intensity := Intensity - normalize.offset]
+  return(x)
+})
+
+
+# what does this mean? means that the logIntensity 
+ggplot(spec.list$orf3a, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot()  +
+  theme(axis.text.x = element_text(angle=90))
+
+
+# issue is we are trying to plot log of negative value I think
+ggplot(spec.list$orf3a[Intensity < 0, .N, by=.(Condition,BioReplicate)], aes(reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+         geom_bar(stat='identity')
+
+
+ggplot(spec.list$orf3a[is.na(Intensity), .N, by=.(Condition,BioReplicate)], aes(reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+         geom_bar(stat='identity') +
+  theme(axis.text.x = element_text(angle=90) )
+
+
+ggplot(spec.list$orf3a[ProteinName %in% prots.oi,], aes(reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=PeptideSequence, group=PeptideSequence)) +
+  geom_point() +
+         geom_line(stat='identity') +
+  theme(axis.text.x = element_text(angle=90) )
+```
+
+now preprocess spec for msstats summarisation
+
+```{r}
+
+mssInput.list <- lapply(spec.list, function(x){
+  
+  # configure for MSstats input
+  x[, PeptideModifiedSequence := PeptideSequence]
+  mssInput <- specFileToCompleteMSstats(x)
+  mssInput[, IsotopeLabelType := 'L']
+
+  return(mssInput)
+})
+
+```
+**not used**
+Normalising by global standards; not working very well, assumes similiar composition in each of the samples, so retry using the tmp method on just the baits
+test the normalisation process; supply the protein name instead of the peptides as missing peptdies throws errors
+
+*note* when normalising by globalStandards, if providing vector of peptides these need to be present in all samples, else provide proteinName for the normalisation
+
+process each dataset; normalise using global standards with bait peptides
+```{r}
+mss.list <-  lapply(seq_along(mssInput.list), function(x,y,i){
+  
+  mss.x <-  dataProcess(x[[i]], 
+                        normalization = FALSE, #preran with globalStandards and didnt work well...
+                        summaryMethod="TMP",
+                        remove_uninformative_feature_outlier=TRUE,
+                        featureSubset="highQuality",
+                        MBimpute =  FALSE)
+ return(mss.x)
+  
+}, x=mssInput.list, y=mssGS.list)
+
+
+names(mss.list) <- c("orf3a","nsp6")
+```
+
+```{r}
+ggplot(mss.list$orf3a$FeatureLevelData, aes(x=interaction(GROUP,SUBJECT), y=log2(ABUNDANCE))) +  theme(axis.text.x= element_text(angle=90)) + geom_boxplot()
+```
+
+write out the dataProc results
+
+```{r}
+names(mss.list)
+
+lapply(seq_along(mss.list), function(x,n,i){
+  
+  fwrite(x[[i]]$ProteinLevelData, ScriptAndDatedFileName(paste0(n[[i]],"_ProteinLevelData.TMPnorm.csv")))
+  fwrite(x[[i]]$FeatureLevelData, ScriptAndDatedFileName(paste0(n[[i]],"_FeatureLevelData.TMPnorm.csv")))
+  
+},x=mss.list, n=names(mss.list))
+
+
+lapply(seq_along(mss.list), function(x,n,i){
+  
+ saveRDS(x[[i]], paste0('./090124.APMS.contrastofcontrast_data/', n[[i]], '_TMPnorm_mss.rds'))
+  
+},x=mss.list, n=names(mss.list))
+
+
+```
+quick qc of normalisation:
+
+```{r}
+p.quant.tmp.orf3 <- fread('./090124.APMS.contrastofcontrast_data/2024_01_16_orf3a_ProteinLevelData.TMPnorm.csv')
+p.quant.tmp.nsp6 <- fread('./090124.APMS.contrastofcontrast_data/2024_01_16_nsp6_ProteinLevelData.TMPnorm.csv')
+
+
+p.quant.tmp.list <-  list(orf3a=p.quant.tmp.orf3,
+                         nsp6=p.quant.tmp.nsp6)
+
+p.quant.tmp.orf3[GROUP == 'orf3aBeta']
+```
+
+bait corrected, but concentration of the different Proteins is greatly reduced
+
+```{r}
+
+lapply(seq_along(p.quant.tmp.list), function(x,n,i){
+  
+  g <- ggplot(x[[i]], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities)) +
+    stat_summary(fun='mean', color='blue', geom='point') +
+  #  stat_summary(fun='median', color='green', geom='point') +
+    geom_line(data=x[[i]][Protein %in% prots.oi, ], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color='bait', group=Protein)) +
+    ggtitle(n[[i]]) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+  g
+  #BackupAsPDF(g, paste(n[[i]],'bait.ints.linechart.globalStandardsNormWithTMP', sep=''))
+  
+}, x=p.quant.tmp.list, n=names(p.quant.gs.list))
+
+
+# why does the orf3a data constrained to 0
+lapply(seq_along(p.quant.tmp.list), function(x,n,i){
+  
+  g <- ggplot(x[[i]], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot() +
+    theme(axis.text.x = element_text(angle=90))
+  g
+  #BackupAsPDF(g, paste(n[[i]],'bait.ints.linechart.globalStandardsNormWithTMP', sep=''))
+  
+}, x=p.quant.tmp.list, n=names(p.quant.gs.list))
+
+```
+
+```{r}
+ggplot(spec.list[['orf3a']], aes(x=reorder(interaction(Condition,BioReplicate)), y=Intensity)) +
+   stat_summary(fun='mean', color='blue', geom='point') +
+    stat_summary(fun='median', color='green', geom='point') + 
+    theme(axis.text.x = element_text(angle=90))
+       
+       lapply(seq_along(p.quant.tmp.list), function(x,n,i){
+  
+  g <- ggplot(x[[i]], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities)) +
+    stat_summary(fun='mean', color='blue', geom='point') +
+  #  stat_summary(fun='median', color='green', geom='point') +
+    geom_line(data=x[[i]][Protein %in% prots.oi, ], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color='bait', group=Protein)) +
+    ggtitle(n[[i]]) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+  g
+  BackupAsPDF(g, paste(n[[i]],'bait.ints.linechart.globalStandardsNormWithTMP', sep=''))
+  
+}, x=p.quant.tmp.list, n=names(p.quant.gs.list))
+```
+
+
+
+
+just as test try another round of tmp normalisation and visualise
+
+```{r}
+test <- fread('./090124.APMS.contrastofcontrast_data/2024_01_16_orf3a_ProteinLevelData.GSnorm.csv')
+test[, group_subject := paste0(GROUP, '_',SUBJECT)]
+
+test.mat <- dcast(test, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+
+  
+#perform tmp normalisation
+tmp <- medpolish(test.mat, na.rm = TRUE) #iteratively subtract row and col median values to get the offsets
+
+
+tmp.dt <- data.table(offset = tmp$col, group_subject = names(tmp$col))
+
+test[tmp.dt, normalize.offset := i.offset, on = "group_subject"]
+test[, LogIntensities := LogIntensities - normalize.offset]
+
+
+g <- ggplot(test, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities)) +
+    stat_summary(fun='mean', color='blue', geom='point') +
+    stat_summary(fun='median', color='green', geom='point') +
+    geom_line(data=test[Protein %in% prots.oi, ], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color='bait', group=Protein)) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+g
+
+test <- fread('./090124.APMS.contrastofcontrast_data/2024_01_16_orf3a_ProteinLevelData.GSnorm.csv')
+
+g <- ggplot(test, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities)) +
+    #stat_summary(fun='mean', color='blue', geom='point') +
+    stat_summary(fun='median', color='green', geom='point') +
+    geom_line(data=test[Protein %in% prots.oi, ], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color='bait', group=Protein)) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+g
+
+
+```
+
+retry normalisation with just global standard, no tmp prestep
+
+```{r}
+#reload unmodifted data
+spec.list <-  list(orf3a = spec.orf3a,
+                   nsp6 = spec.nsp6)
+```
+
+```{r}
+
+mssInput.list <- lapply(spec.list, function(x){
+  
+  # configure for MSstats input
+  x[, PeptideModifiedSequence := PeptideSequence]
+  mssInput <- specFileToCompleteMSstats(x)
+  mssInput[, IsotopeLabelType := 'L']
+
+
+  # sanity check for remaining contam...
+  # extract the uniprot within '|'; and use this to identify contaminants
+  mssInput[, uniprot := str_extract(ProteinName,'(?<=\\|).+(?=\\|)')]
+  mssInput[, ProteinName := uniprot]
+  
+  return(mssInput)
+})
+
+```
+
+```{r}
+mss.list <-  lapply(seq_along(mssInput.list), function(x,y,i){
+ mss.x <-  dataProcess(x[[i]], 
+                        normalization = 'globalStandards',
+                        nameStandards = y[[i]],
+                        summaryMethod="TMP",
+                        MBimpute =  FALSE, 
+                        featureSubset = "highQuality", 
+                        remove_uninformative_feature_outlier = TRUE)
+ return(mss.x)
+}, x=mssInput.list, y=mssGS.list)
+
+names(mss.list) <- names(mssInput.list)
+```
+
+
+write out the dataProc results
+
+```{r}
+lapply(seq_along(mss.list), function(x,n,i){
+  
+  fwrite(x[[i]]$ProteinLevelData, ScriptAndDatedFileName(paste0(n[[i]],"_ProteinLevelData.GSnorm.noTMP.csv")))
+  fwrite(x[[i]]$FeatureLevelData, ScriptAndDatedFileName(paste0(n[[i]],"_FeatureLevelData.GSnorm.noTMP.csv")))
+  
+},x=mss.list, n=names(mss.list))
+
+
+lapply(seq_along(mss.list), function(x,n,i){
+  
+ saveRDS(x[[i]], paste0('./090124.APMS.contrastofcontrast_data/', n[[i]], '_GSnorm_noTMP_mss.rds'))
+  
+},x=mss.list, n=names(mss.list))
+```
+
+```{r}
+p.quant.gs.orf3 <- fread('./090124.APMS.contrastofcontrast_data/2024_01_16_orf3a_ProteinLevelData.GSnorm.noTMP.csv')
+p.quant.gs.nsp6 <- fread('./090124.APMS.contrastofcontrast_data/2024_01_16_nsp6_ProteinLevelData.GSnorm.noTMP.csv')
+
+
+p.quant.notmp.list <-  list(orf3a=p.quant.gs.orf3,
+                         nsp6=p.quant.gs.nsp6)
+```
+
+replot
+
+```{r}
+
+lapply(seq_along(p.quant.notmp.list), function(x,n,i){
+  
+  
+  g <- ggplot(x[[i]], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities)) +
+    stat_summary(fun='mean', color='blue', geom='point') +
+    stat_summary(fun='median', color='green', geom='point') +
+    geom_line(data=x[[i]][Protein %in% prots.oi, ], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color='bait', group=Protein)) +
+    ggtitle(n[[i]]) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+  g
+  BackupAsPDF(g, paste(n[[i]],'bait.ints.linechart.globalStandardsNormNoTMP', sep=''))
+  
+}, x=p.quant.notmp.list, n=names(p.quant.gs.list))
+
+```
+Counts are the same for tmp and no tmp norm.. why is this? 
+Read in the rds objects and look at the details 
+
+```{r}
+orf3a.notmp <- readRDS("/Users/martingordon/Documents/projects/121123_DSwaney_APMStest/090124.APMS.contrastofcontrast_data/orf3a_GSnorm_noTMP_mss.rds")
+orf3a <- readRDS("/Users/martingordon/Documents/projects/121123_DSwaney_APMStest/090124.APMS.contrastofcontrast_data/orf3a_GSnorm_mss.rds")
+
+orf3a$FeatureLevelData
+orf3a.notmp$FeatureLevelData
+
+```
+
+
+
+```{r}
+orf3.notmp <- fread('./090124.APMS.contrastofcontrast_data/2024_01_16_orf3a_ProteinLevelData.GSnorm.noTMP.csv')
+orf3.tmp <- fread('./090124.APMS.contrastofcontrast_data/2024_01_16_orf3a_ProteinLevelData.GSnorm.csv')
+
+orf3.notmp %>%  head()
+orf3.tmp %>%  head()
+```
+
+
+
+```{r}
+orf3.notmp <- fread('./090124.APMS.contrastofcontrast_data/2024_01_16_orf3a_ProteinLevelData.GSnorm.noTMP.csv')
+orf3.tmp <- fread('./090124.APMS.contrastofcontrast_data/2024_01_16_orf3a_ProteinLevelData.GSnorm.csv')
+
+orf3.notmp %>%  head()
+orf3.tmp %>%  head()
+mss.list[['orf3a']]$ProteinLevelData[Protein %in% prots.oi,]
+
+
+g <- ggplot(mss.list[['orf3a']]$ProteinLevelData, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities)) +
+    stat_summary(fun='mean', color='blue', geom='point') +
+    stat_summary(fun='median', color='green', geom='point') +
+    geom_line(data=mss.list[['orf3a']]$ProteinLevelData[mss.list[['orf3a']]$ProteinLevelData$Protein %in% prots.oi, ], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color='bait', group=Protein)) +
+
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+g
+```
+
+
+For starters, read in the normalised intensity data for both of the baits and plot
+
+We have previously summarised this data using MSstats; load this from 
+```{r}
+dataDir <- '/Users/martingordon/Documents/projects/121123_DSwaney_APMStest/output/'
+
+f.quant <- fread(paste(dataDir, 'mss-FeatureLevelData.txt', sep = ''))
+p.quant <-fread(paste(dataDir, 'mss-ProteinLevelData.txt', sep = ''))
+```
+
+inspect the protein level data 
+normalised samples look relatively consistent..all within one log of each other apply another round of normalisation?
+
+```{r}
+summary(p.quant)
+
+ggplot(p.quant, aes(x=reorder(interaction(GROUP,SUBJECT)),y=LogIntensities, fill=GROUP)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90))
+```
+These look quite variable... may need to rerun the normalization step
+
+Lets try rerunning the normalisation 
+
+For now, reread in the msstats file, convert using BPs script
+
+```{r}
+dataDir <- '/Users/martingordon/Documents/projects/121123_DSwaney_APMStest/data/'
+
+spec <- fread(paste(dataDir, 'MSstats.csv', sep=''))
+
+# configure for MSstats input
+spec[, PeptideModifiedSequence := PeptideSequence]
+mssInput <- specFileToCompleteMSstats(spec)
+mssInput[, IsotopeLabelType := 'L']
+
+spec %>% str()
+mssInput %>%  str()
+```
+
+remove contaminant species before normalising
+```{r}
+# identify contaminants in the ms
+contam.sp <- mssInput %>%
+  .[ProteinName %like% 'contam', str_extract(ProteinName,'(?<=\\|).+(?=\\|)')] %>% #lookahead and lookbehind to capture between | |
+  unique()
+
+# sanity check for remaining contam...
+# extract the uniprot within '|'; and use this to identify contaminants
+mssInput[, uniprot := str_extract(ProteinName,'(?<=\\|).+(?=\\|)')]
+
+# remove the contaminants and rename the protein names
+mssInput <- mssInput[!uniprot %in% contam.sp,]
+
+mssInput[, ProteinName := uniprot]
+```
+
+```{r}
+mss <-  dataProcess(mssInput, 
+                    normalization = 'EQUALIZEMEDIANS',
+                    MBimpute =  FALSE, 
+                    featureSubset = "highQuality", 
+                    remove_uninformative_feature_outlier = TRUE)
+
+#fwrite (mss$ProteinLevelData, ScriptAndDatedFileName("ProteinLevelData.csv"))
+#fwrite (mss$FeatureLevelData, ScriptAndDatedFileName("FeatureLevelData.csv.gz"))
+```
+look at the boxplots of the samples
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(mss$ProteinLevelData$GROUP)))
+
+ggplot(data=mss$ProteinLevelData, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) + 
+  geom_boxplot() +
+  scale_fill_manual(values = col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+```
+Redo;
+lets normalise by the SAINTexpress groups used
+Edit: remove control groups as not of interest
+
+```{r}
+#orf3a.grps <- c('Empty', 'Lempty', 'Lorf3aBeta', 'Lorf3aQ57H', 'Lorf3aS171L', 'Lorf3aWT', 
+#               'orf3aBeta', 'orf3aQ57H', 'orf3aS171L', 'orf3aWT', 'UT')
+
+#nsp6.gprs <- c('DemptyVector', 'Dnsp6BA1', 'Dnsp6BA2', 'Dnsp6WT', 'Dnsp6XBB', 'Empty',
+#               'nsp6BA1', 'nsp6BA2', 'nsp6WT', 'nsp6XBB', 'UT')
+
+orf3a.grps <- c( 'Lorf3aBeta', 'Lorf3aQ57H', 'Lorf3aS171L', 'Lorf3aWT', 
+               'orf3aBeta', 'orf3aQ57H', 'orf3aS171L', 'orf3aWT')
+
+nsp6.gprs <- c('Dnsp6BA1', 'Dnsp6BA2', 'Dnsp6WT', 'Dnsp6XBB',
+               'nsp6BA1', 'nsp6BA2', 'nsp6WT', 'nsp6XBB')
+
+orf3a.spc.dt <-  mssInput[Condition %in% orf3a.grps,]
+orf3a.spc.dt[, .N, by=.(Condition,BioReplicate)]
+
+
+nsp6.spc.dt <- mssInput[Condition %in% nsp6.gprs, ]
+nsp6.spc.dt[, .N, by=.(Condition,BioReplicate)]
+
+
+# add these to a list and process
+mssInput.list <- list(orf3a=orf3a.spc.dt,
+                      nsp6=nsp6.spc.dt)
+```
+
+
+seperate by SAINT groups and then normalise groups seperately
+save rds files and the dt
+```{r}
+mss.list <-  lapply(mssInput.list, function(x){
+  
+ mss.x <-  dataProcess(x, 
+                    normalization = 'EQUALIZEMEDIANS',
+                    MBimpute =  FALSE, 
+                    featureSubset = "highQuality", 
+                    remove_uninformative_feature_outlier = TRUE)
+ return(mss.x)
+})
+  
+
+
+#lapply(seq_along(mss.list), function(x,n,i){
+  
+#  fwrite(x[[i]]$ProteinLevelData, ScriptAndDatedFileName(paste0(n[[i]],"_ProteinLevelData.noapmsctrls.csv")))
+#  fwrite(x[[i]]$FeatureLevelData, ScriptAndDatedFileName(paste0(n[[i]],"_FeatureLevelData.noapmsctrls.csv")))
+  
+#},x=mss.list, n=names(mss.list))
+
+
+#lapply(seq_along(mss.list), function(x,n,i){
+  
+#  saveRDS(x[[i]], paste0('./090124.APMS.contrastofcontrast_data/', n[[i]], '_mss.rds'))
+  
+#},x=mss.list, n=names(mss.list))
+```
+
+Read in the R object and perform the pw contrasts in msstats
+
+```{r}
+
+orf3a.mss <- readRDS("/Users/martingordon/Documents/projects/121123_DSwaney_APMStest/090124.APMS.contrastofcontrast_data/orf3a_mss.rds")
+nsp6.mss <- readRDS("/Users/martingordon/Documents/projects/121123_DSwaney_APMStest/090124.APMS.contrastofcontrast_data/nsp6_mss.rds")
+
+dp.out.list <-  list(orf3a=orf3a.mss,
+                      nsp6=nsp6.mss)
+
+```
+
+```{r}
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  dt <- data.table(x[[i]]$ProteinLevelData)
+  print(dt)
+  g <- ggplot(dt[, .N, by=.(Protein,GROUP,SUBJECT)], aes(x=reorder(interaction(GROUP,SUBJECT)), y=N, fill=GROUP)) + 
+    geom_bar(stat='Identity') +
+    scale_fill_manual(values=col.pal) +
+    ggtitle(paste0(n[[i]], ' Protein counts')) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+ g
+  BackupAsPDF(g, paste0(n[[i]], '.protein.counts.'))
+},x=dp.out.list, n=names(dp.out.list))
+```
+
+heatmaps
+----
+
+```{r}
+p.quant.orf3 <- fread('./090124.APMS.contrastofcontrast_data/2024_01_09_orf3a_ProteinLevelData.csv')
+p.quant.nsp6 <- fread('./090124.APMS.contrastofcontrast_data/2024_01_09_nsp6_ProteinLevelData.csv')
+
+
+p.quant.list <-  list(orf3a=p.quant.orf3,
+                      nsp6=p.quant.nsp6)
+```
+
+
+```{r}
+clusterwNA <- function(x, na.val=0){
+  
+  x[is.na(x)] <- na.val
+  dist(x) %>%  hclust(method='complete')
+}
+
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  p.mat <-  data.table(x[[i]]$ProteinLevelData) %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  subMat <- p.mat[sample(rownames(p.mat),2000), ]
+
+  #heatmap annotation 
+  grp <- sub(".[1-6]$", "", colnames(subMat))
+  treat <- ifelse(grepl("^[D|L]{1}", colnames(subMat)), str_extract(colnames(subMat), "^[D|L]{1}"), 'CTRL')
+  batch <- sub(".","",str_extract(colnames(subMat), ".[1-3]$"))
+
+  
+  ha <- HeatmapAnnotation(group = grp, treatment=treat, batch=batch, col=list(treatment=c('L'='red', 'D'='blue', 'CTRL'='green'),
+                                                                              
+                                                                              batch=c('1'='pink','2'='cyan', '3'='palegreen')))
+  
+  hm <-  Heatmap(subMat, 
+          cluster_rows = clusterwNA(subMat),
+          show_row_names = F,
+          name = 'Log2 Intensities',
+          row_title = sprintf('%s sampled proteins', nrow(subMat)),
+          top_annotation = ha)
+  
+  BackupAsPDF(draw(hm, column_title=n[[i]]), paste0(n[[i]], '.intensity.heatmaps.'),  dimensions=c(8,8))
+  
+}, x=dp.out.list, n=names(dp.out.list))
+```
+heatmaps of median swept plots
+
+```{r}
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  p.mat <-  data.table(x[[i]]$ProteinLevelData) %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  # subtract median vals from rows
+  subMat <- sweep(p.mat, 1, FUN='-', STATS=apply(p.mat, 1, median, na.rm=T))
+  
+  subMat <- subMat[sample(rownames(subMat),2000), ]
+
+  #heatmap annotation 
+  grp <- sub(".[1-6]$", "", colnames(subMat))
+  treat <- ifelse(grepl("^[D|L]{1}", colnames(subMat)), str_extract(colnames(subMat), "^[D|L]{1}"), 'CTRL')
+  batch <- sub(".","",str_extract(colnames(subMat), ".[1-3]$"))
+
+  
+  ha <- HeatmapAnnotation(group = grp, treatment=treat, batch=batch, col=list(treatment=c('L'='red', 'D'='blue', 'CTRL'='green'),
+                                                                              
+                                                                              batch=c('1'='pink','2'='cyan', '3'='palegreen')))
+  
+  hm <-  Heatmap(subMat, 
+          cluster_rows = clusterwNA(subMat),
+          show_row_names = F,
+          name = 'Intensities vs. Median',
+          row_title = sprintf('%s sampled proteins', nrow(subMat)),
+          column_names_gp = gpar(fontsize=6),
+          top_annotation = ha,
+          heatmap_legend_param = list(
+            legend_direction='vertical',
+            legend_width = unit(2, "cm"))
+            
+          )
+  
+  #draw(hm, column_title=n[[i]], heatmap_legend_side="bottom")
+BackupAsPDF(draw(hm, column_title=n[[i]]), paste0(n[[i]], '.mediansweep.heatmaps.'), dimensions=c(8,8))
+  
+}, x=dp.out.list, n=names(dp.out.list))
+```
+
+create contrasts
+----
+TODO continue on the pw contrasts
+
+First things; create two seperate list of contrasts, one for each dataset and add to list
+Give lists same name as the dp.out objects and process
+
+```{r}
+# first MRX2 
+dp.out.list$orf3a$ProteinLevelData$GROUP %>% unique()
+
+orf3a.contrasts <- makeContrast.AllByAll(dp.out.list$orf3a)
+nsp6.contrasts  <- makeContrast.AllByAll(dp.out.list$nsp6)
+
+
+orf3a.contrasts %>%  dim()
+
+orf3a.contrasts[1,]
+rownames(orf3a.contrasts) <-  
+```
+
+
+
+mat.dimnames <- list(rnames='ZC05-ZC00',
+                     cnames= as.character(dp.out.list$MRX2$ProteinLevelData$GROUP %>% unique()))
+
+
+mrx2.contrasts <- matrix(data= c(-1,0,0,1,0,0,0,0,0,0), nrow = 1, dimnames=mat.dimnames)
+mrx2.contrasts <- rbind(mrx2.contrasts, c(-1,0,0,0,0,0,1,0,0,0))
+rownames(mrx2.contrasts)[2] <- 'ZC10-ZC00' 
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,-1,0,0,1,0,0,0,0))
+rownames(mrx2.contrasts)[3] <- 'ZC05_YM-ZC00_YM'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,-1,0,0,0,0,0,1,0))
+rownames(mrx2.contrasts)[4] <- 'ZC10_YM-ZC00_YM'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0, -1,0,0,1,0,0,0,0,0))
+rownames(mrx2.contrasts)[5] <- 'ZC05_PTX-ZC00_PTX'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0, -1,0,0,0,0,0,1,0,0))
+rownames(mrx2.contrasts)[6] <- 'ZC10_PTX-ZC00_PTX'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(-1,0,1,0,0,0,0,0,0,0))
+rownames(mrx2.contrasts)[7] <- 'ZC00_YM-ZC00'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(-1,1,0,0,0,0,0,0,0,0))
+rownames(mrx2.contrasts)[8] <- 'ZC00_PTX-ZC00'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,0,-1,0,1,0,0,0,0))
+rownames(mrx2.contrasts)[9] <- 'ZC05_YM-ZC05'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,0,-1,1,0,0,0,0,0))
+rownames(mrx2.contrasts)[10] <- 'ZC05_PTX-ZC05' 
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,0,0,0,0,-1,0,1,0))
+rownames(mrx2.contrasts)[11] <- 'ZC10_YM-ZC10' 
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,0,0,0,0,-1,1,0,0))
+rownames(mrx2.contrasts)[12] <- 'ZC10_PTX-ZC10'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,0,0,0,0,-1,0,0,1))
+rownames(mrx2.contrasts)[13] <- 'ZC10_YM_PTX-ZC10'
+
+mrx2.contrasts
+
+View(makeContrast.regEx)
+
+```
+Now do the NPFFR1 contrasts 
+
+```{r}
+# first MRX2 
+mat.dimnames <- list(rnames='RF05-RF00',
+                     cnames= as.character(dp.out.list$QRFPR$ProteinLevelData$GROUP %>% unique()))
+
+ 
+qrfpr.contrasts <- matrix(data= c(-1,0,0,1,0,0,0,0,0,0), nrow = 1, dimnames=mat.dimnames)
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(-1,0,0,0,0,0,1,0,0,0))
+rownames(qrfpr.contrasts)[2] <- 'RF10-RF00' 
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,-1,0,0,1,0,0,0,0))
+rownames(qrfpr.contrasts)[3] <- 'RF05_YM-RF00_YM'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,-1,0,0,0,0,0,1,0))
+rownames(qrfpr.contrasts)[4] <- 'RF10_YM-RF00_YM'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0, -1,0,0,1,0,0,0,0,0))
+rownames(qrfpr.contrasts)[5] <- 'RF05_PTX-RF00_PTX'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0, -1,0,0,0,0,0,1,0,0))
+rownames(qrfpr.contrasts)[6] <- 'RF10_PTX-RF00_PTX'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(-1,0,1,0,0,0,0,0,0,0))
+rownames(qrfpr.contrasts)[7] <- 'RF00_YM-RF00'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(-1,1,0,0,0,0,0,0,0,0))
+rownames(qrfpr.contrasts)[8] <- 'RF00_PTX-RF00'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,0,-1,0,1,0,0,0,0))
+rownames(qrfpr.contrasts)[9] <- 'RF05_YM-RF05'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,0,-1,1,0,0,0,0,0))
+rownames(qrfpr.contrasts)[10] <- 'RF05_PTX-RF05' 
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,0,0,0,0,-1,0,1,0))
+rownames(qrfpr.contrasts)[11] <- 'RF10_YM-RF10' 
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,0,0,0,0,-1,1,0,0))
+rownames(qrfpr.contrasts)[12] <- 'RF10_PTX-RF10'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,0,0,0,0,-1,0,0,1))
+rownames(qrfpr.contrasts)[13] <- 'RF10_YM_PTX-RF10'
+
+qrfpr.contrasts
+```
+
+
+ linecharts of expression
+```{r}
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  g <- ggplot(x[[i]], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot() +
+    scale_fill_manual(values=col.pal) +
+    ggtitle(n[[i]]) +
+    theme(axis.text.x = element_text(angle=90))
+  
+  BackupAsPDF(g, paste(n[[i]],'.norm.boxplots', sep=''))
+  
+}, x=p.quant.list, n=names(p.quant.list))
+```
+
+They look comparable
+First generate a linechart with the bait intensity in each sample and then 
+
+```{r}
+# bait proteins
+prots.oi <- c("P0DTC1","P0DTC3")
+
+# now calculate mean and median per group
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  x.dt <- x[[i]][!Protein %in% prots.oi, .(meanLogInts = mean(LogIntensities, na.rm=T),
+                                           medianLogInts = median(LogIntensities, na.rm=T)), by=.(GROUP,SUBJECT)]
+  
+  x.dt <- merge(x=x[[i]][Protein %in% prots.oi, .(GROUP,SUBJECT,Protein,LogIntensities)], y=x.dt, by.y=c('GROUP','SUBJECT'), by.x=c('GROUP','SUBJECT'))
+  
+  print(x.dt)
+  
+  
+  g <- ggplot(x.dt[Protein %in% prots.oi,], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color=Protein, group=Protein)) +
+    geom_line() + 
+    geom_line(aes(x=reorder(interaction(GROUP,SUBJECT)), y=medianLogInts, color='median')) +
+    geom_line(aes(x=reorder(interaction(GROUP,SUBJECT)), y=meanLogInts, color='mean')) +
+    ggtitle(paste(n[[i]], 'normalised intensities (log2)')) +
+    theme(axis.text.x = element_text(angle=90)) +
+    scale_color_manual(values=c(Protein=col.pal[i], 'median'='grey', 'mean'='red')) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+  
+  BackupAsPDF(g, paste(n[[i]],'bait.ints.linechart', sep=''))
+  
+}, x=p.quant.list, n=names(p.quant.list))
+
+
+```
+another attempt
+
+```{r}
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  
+  g <- ggplot(x[[i]], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities)) +
+    geom_line() +
+    stat_summary(fun='median', color='blue', geom='point') +
+    stat_summary(fun='median', color='green', geom='point') +
+    geom_line(data=x[[i]][Protein %in% prots.oi, ], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color='bait', group=Protein))
+    
+  g
+  #BackupAsPDF(g, paste(n[[i]],'bait.ints.linechart', sep=''))
+  
+}, x=p.quant.list, n=names(p.quant.list))
+```
+ContrastofContrast
+-----
+
+clear there is a big jump between the bait and the other baseline measurements.. difficult to compare within groups with differences in log2FC...
+for now, proceed as is with the ts analysis and emm contrast of contrasts; just flag that these conditiions are different
+
+```{r}
+p.quant.list[[1]]$GROUP %>%  unique()
+p.quant.list[[2]]$GROUP %>%  unique()
+
+
+# create a pretreatment col 
+lapply(p.quant.list, function(x){
+  x[, condition   :=  sub("^[LD]{1}", '', GROUP)]
+  # tidy
+  x[ condition == 'Empty' | condition == "emptyVector", condition := 'empty']
+  x[, pretreat := ifelse(grepl("^[LD]{1}.*", GROUP), str_extract(GROUP, "^[LD]{1}"), 'NA')] 
+})
+
+p.quant.list[[1]]$condition %>%  unique()
+```
+
+Interaction analysis
+----
+Interested in how response differs between groups, depending on pre-treatment status
+For now just want to compute all pw comparisons for each factor level
+
+```{r}
+
+# linearModelsAllProteins can this function which computes statistic for a contrast of two different log2FC
+# how does the treatment effect change per antagonist level? basically compare treatment effect within each antagonist level
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~condition|pretreat){  # how does response overe time change with pretreatment status
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+# emmeans pairwise; just run pw comparisons for each factor level for each protein
+
+emmeans.pw <- function (l, factorFormula = ~condition|pretreat){  # do all pw comparisons of the different factor levels
+  emm <- emmeans::emmeans(l,specs = pairwise ~ condition:pretreat) # compare all levels of factor1 within levels of pretreat
+  ##contrast1 <- pairs(emm)
+  #contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(emm$contrasts)) 
+           #    'pw.contrasts'=as.data.table(emm$contrasts)) )
+}
+
+# postProcessFunction = emmeans.contrastOfContrasts tells it to use the function above after doing anova.
+# it is optional, adds significant time to the computation (~5x), but is nice to
+# put a magnitude and p value on specific differences of differences
+#
+# cl = 6 parameter says to use 6 processes.  Set to NULL if multiprocess is failing, or higher or lower as you wish.
+# Numbers near the number of processors available in your machine is probably counterproductive.
+
+lm.out <- lapply(p.quant.list, function(x){
+  
+  # Numbers near the number of processors available in your machine is probably counterproductive.
+  x.lm <- linearModelsAllProteins(x, 
+                                  formulaList = list(full   = LogIntensities~condition + pretreat + condition:pretreat), # full model; 4 way ANOV
+                                  splitColumn = "Protein", postProcessFunction = emmeans.pw, cl = 6) |> suppressWarnings()
+  
+  return(x.lm)
+  
+})
+
+```
+
+looks like lack of interaction for orf3a, but stronger evidence for NSP6 
+```{r}
+lapply(seq_along(lm.out), function(x,n,i){
+
+  dt <- x[[i]][['anova']]
+  str(dt)
+
+ g <- ggplot(dt, aes(x=dt$p.value)) +
+   geom_histogram(boundary=0.0, binwidth = 0.005) +
+   xlim(c(0,0.05)) +
+   ggtitle(n[[i]]) +
+   facet_wrap(~dt$term)
+ 
+ #BackupAsPDF(g, paste0(n[[i]], '.aov.term.pval.historgrams'))
+ 
+},x=lm.out, n=names(lm.out))
+
+```
+## adjust pvalues 
+
+```{r}
+lapply(lm.out, function(x){
+  
+  x[['anova']][, fdr := p.adjust(p.value, method = "BH"), by= term]
+  
+})
+
+```
+ok, now we want to get the list of the pw comparisons, subset to the PW comparisons we are interested in and correct for multiple-testing
+
+We can specify custom contrasts using emmeans; create character vectors of each condition
+
+```{r}
+nsp6.cont.list <- lm.out$nsp6$postProcess$contrast %>%  unique()
+
+# extract all the within group comparisons
+nsp6.contrasts.oi <- c(grep(".*[[:space:]][D]{1}[[:space:]]-[[:space:]].*[D]{1}", nsp6.cont.list, value = T), 
+                       grep(".*[[:space:]]NA[[:space:]]-[[:space:]].*NA", nsp6.cont.list, value = T))
+
+nsp6.contrasts.oi
+
+grep("nsp6BA1.*D.*empty[[:space:]]D", nsp6.contrasts.oi, value=T)
+nsp6.contrasts.oi <- c( "empty D - nsp6BA1 D", "empty D - nsp6BA2 D", "empty D - nsp6WT D","empty D - nsp6XBB D","empty D - UT D",
+                        )
+
+
+lm.out$orf3a$postProcess$contrast %>%  unique()
+
+
+```
+
+
+
+```{r}
+lm.out$orf3a$postProcess[, gene := multiUniprots2multiGenes(Protein, species='HUMAN')]
+
+lm.out$orf3a$postProcess$contrast %>%  unique()
+orf3a.contrasts.oi <- c("L empty - L orf3aWT", )
+
+```
+
+
+
+
+Not used
+----
+
+Lets plot the proteins that behave differently depending on condition
+
+```{r}
+
+rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+
+
+#play with thresholds here
+lapply(seq_along(lm.out), function(x,n,i){
+  dt <- x[[i]][['anova']]
+  
+  sigProtein <- dt[term %in% c( "condition") & fdr < 0.05 & !is.infinite(p.value),] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+
+ print(sigProtein)
+  # filter just to our data
+   prot.mat <- dcast (p.quant.list[[i]][Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") %>% 
+     as.matrix(rownames = "Protein")
+
+
+  rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+               cluster_rows = rowClusterWithNA(prot.mat),
+                name = 'log2 Ints/Median',
+                show_row_names = F,
+              #column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Sites (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8))#,
+              #column_split = list (ifelse(grepl("NP00", colnames(prot.mat)), "NP00", "NP30"),
+              #                  ifelse(grepl("CM00", colnames(prot.mat)), "CM00", "CM15")))
+  
+# BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' CM101 treatment effects')), paste0(n[[i]], '.cm101.pval<0.001.heatmap'), dimensions = c(8,6))
+  
+},x=lm.out, n=names(lm.out))
+```
+Can see many proteins change depending on condition, but this is not super surprising..
+
+contrast of contrasts; what proteins show differential response depending on pretreatment status?
+
+```{r}
+#play with thresholds here
+lapply(seq_along(lm.out), function(x,n,i){
+  dt <- x[[i]][['anova']]
+  
+  sigProtein <- dt[term %in% c("condition:pretreat") & p.value < 0.001 & !is.infinite(p.value),] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+
+ print(sigProtein)
+  # filter just to our data
+   prot.mat <- dcast (p.quant.list[[i]][Protein %in% sigProtein, ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") %>% 
+     as.matrix(rownames = "Protein")
+
+
+  rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+               cluster_rows = rowClusterWithNA(prot.mat),
+                name = 'log2 Ints/Median',
+                #show_row_names = F,
+              #column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Sites (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 4),
+              column_names_gp = gpar(fontsize = 8),#,
+              column_split = ifelse(grepl("^[DL]{1}", colnames(prot.mat)), 'treatment', "no treatment") )
+  
+ #BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' treatment effects')), paste0(n[[i]], '.interaction.pval<0.001.heatmap'), dimensions = c(8,7))
+  
+},x=lm.out, n=names(lm.out))
+```
+contrast_of_contrast
+----
+Identify the proteins that expression changes 
+
+```{r}
+lm.out$orf3a$postProcess$contrast %>%  unique()
+
+lm.out$orf3a$postProcess[contrast %in% c('"(L empty - L orf3aQ57H) - (NA Empty - NA orf3aBeta)") ]
+```
+
+
+
+Write out files to dir
+```{r}
+
+lapply(seq_along(lm.out), function(x,n,i){
+  
+  fwrite(x[[i]][['anova']], paste0(n[[i]], '.anova.contrasts.csv.gz'))
+  
+},x=lm.out, n=names(lm.out))
+
+```
+

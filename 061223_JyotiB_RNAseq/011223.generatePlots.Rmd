@@ -1,0 +1,325 @@
+---
+title: "011223.regeneratePlots"
+author: "Martin Gordon"
+date: "2023-12-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## regenerate plots for Jyoti
+
+First create a plot of the number of sig genes in each group and compare
+Take the filtered list and plot
+
+Normalise counts look good; counts align with DESeq2 res
+Important to note with naming Denominator-Numerator (so Down means reduced in Numerator relativr to Denominator)
+Important note:
+
+
+
+```{r}
+library(randomcoloR)
+library(magrittr)
+library(data.table)
+library(stringr)
+library(ggplot2)
+library(tximport)
+library(ggrepel)
+library(DESeq2)
+# visualisation
+library(ComplexHeatmap)
+library(EnhancedVolcano)
+# annotation & filtering 
+library(AnnotationHub)
+library(genefilter) # not available 
+
+#Ben utils
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+```
+
+
+load in the unfiltered lists
+```{r}
+vic_bris <- fread('011223.share.1st.run.results_data/2023_12_01_Victoria-Brisbanesig.genes.unfiltered.csv')
+mock_vic <-  fread('011223.share.1st.run.results_data/2023_12_01_Mock-Victoriasig.genes.unfiltered.csv')
+mock_bris <-  fread('011223.share.1st.run.results_data/2023_12_01_Mock-Brisbanesig.genes.unfiltered.csv')
+
+degs.dt <- rbind(vic_bris, mock_vic, mock_bris)
+```
+
+wont do as I will need the 
+
+barplot plot by timepoint
+```{r}
+degs.dt[sig != 'Not', .N, by=.(timepoint, comparison,sig)]
+degs.dt[sig != 'Not' & timepoint == 24 & comparison == 'Mock-Victoria', unique(symbol)] %>%  length()
+
+degs.dt[, c("denom", "num") := tstrsplit(comparison, '-', fixed=T)]
+degs.dt[, new_Label := paste0(num, '-', denom)]
+
+drop.cols <-  c('denom', 'num')
+degs.dt[, (drop.cols) := NULL]
+
+
+col.pal<- randomcoloR::distinctColorPalette(k=3)
+
+g <- ggplot(degs.dt[sig != 'Not', .N, by=.(timepoint, new_Label,sig)], aes(x=factor(timepoint), y=N, fill = forcats::fct_rev(sig))) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual('sig', values=c('Up'='darkred', 'Down'='darkblue')) +
+  ylab('Counts (log2 FC > 1 & adj.p < 0.05)') +
+  xlab('Timepoint') +
+  facet_wrap(~new_Label, nrow=3, strip.position="right") +
+  theme_classic()
+
+BackupAsPDF(g, 'Nsig.3comparisons')
+
+g <- ggplot(degs.dt[sig != 'Not' & comparison != 'Victoria-Brisbane', .N, by=.(timepoint, new_Label,sig)], aes(x=factor(timepoint), y=N, fill = forcats::fct_rev(sig))) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual('sig', values=c('Up'='darkred', 'Down'='darkblue')) +
+  ylab('Counts (log2 FC > 1 & adj.p < 0.05)') +
+  xlab('Timepoint') +
+  facet_wrap(~new_Label, nrow=3, strip.position="right") +
+  theme_classic()
+g
+BackupAsPDF(g, 'Nsig.3comparisons')
+```
+To generate the requested heatmap, just rerun the enrichment analysis, simplify the heatmap  
+
+get mapping for ensembl to gene symbol
+```{r}
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+ah <- AnnotationHub()
+#download dbs matching the follwoing query (only one element matching)
+hs.embl.101 <- AnnotationHub::query(ah, c("Hsapiens", "EnsDb", "101"))[[1]]
+
+dds <- readRDS('/Users/martingordon/Documents/projects/061223_JyotiB_RNAseq/output/011223.dds.obj.rds')
+
+# map the names 
+universe <- AnnotationDbi::mapIds(hs.embl.101, keys = rownames(assay(dds)),column = "SYMBOL", keytype = "GENEID", multiVals = "first")
+```
+
+create sig_grps and run the enrichment analysis
+
+041223
+---
+Edit adjusting the min threshold for gene set size from 10 to 6 to include one of the samples
+
+```{r}
+subDT <- degs.dt[new_Label != 'Brisbane-Victoria',]
+
+#subDT[, new_Label := sub('-','.', new_Label)]
+subDT[, enrich_grp := paste0(new_Label,'_',timepoint, '_', sig)]
+subDT$enrich_grp %>% unique() %>%  length() # 20 go in
+
+enrich.dt <- enricherOnGroups(subDT[sig != 'Not',], geneColumn = "symbol", groupColumns = 'enrich_grp', universe=universe, term2gene.gmt = gmt.go, minGSSize=10, numProcessors = 6)
+# best per group enrichment heatmap
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+simp.enrich$simplified$enrich_grp %>%  unique()
+
+col.template <- c("Brisbane-Mock_0_Down","Brisbane-Mock_3_Down","Brisbane-Mock_6_Down","Brisbane-Mock_12_Down","Brisbane-Mock_24_Down")
+col.order <- c(col.template, sub('Brisbane', 'Victoria', col.template))
+col.order <- c(col.order, sub('Down', 'Up', col.template))
+col.order <- c(col.order,c("Victoria-Mock_0_Up","Victoria-Mock_3_Up","Victoria-Mock_6_Up","Victoria-Mock_12_Up","Victoria-Mock_24_Up"))
+
+col.order[!col.order %in% unique(simp.enrich$simplified$enrich_grp)]
+col.order <- col.order[!col.order %in% ("Victoria-Mock_0_Down")]
+
+unique(simp.enrich$simplified$enrich_grp) %in% col.order
+col.order %in% unique(simp.enrich$simplified$enrich_grp) 
+
+#set the column ordering before running
+simp.enrich$simplified[, enrich_grp := factor(enrich_grp, levels=col.order)]
+simp.enrich$clusterInfo$enrich_grp %>%  unique()
+
+hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, cols=col.order, groupColumn = 'enrich_grp', topN=8, upperThreshold=10, 
+                                row_names_gp = gpar(fontsize = 8), column_names_gp = gpar(fontsize = 6), negCols=unique(simp.enrich$simplified$enrich_grp[grep('Down', simp.enrich$simplified$enrich_grp)]),
+                                cluster_columns=FALSE, column_title_gp=gpar(fontsize=7.5),
+                                column_split=list(rep(c('Down', 'Up'), c(9,10)),
+                                                 rep(c('Brisbane', 'Victoria', 'Brisbane', 'Victoria'),c(5,4,5,5)) ) 
+                                )
+
+BackupAsPDF(hm, 'ordered.direction.nocolor.heatmap.',dimensions=c(8,8))                                            
+```
+Extract the victoria mock_3_Down rows and rbind to the dts for the original
+
+```{r}
+dummy.row <- simp.enrich$simplified[enrich_grp == "Victoria-Mock_3_Down",]
+dummy.row$enrich_grp <- "Victoria-Mock_0_Down"
+
+dummy.clusterinfo <-  simp.enrich$clusterInfo[enrich_grp == "Victoria-Mock_3_Down",]
+dummy.clusterinfo$enrich_grp <- "Victoria-Mock_0_Down"
+
+simp.enrich$simplified <- rbind(dummy.row, simp.enrich$simplified)
+simp.enrich$clusterInf <- rbind(dummy.clusterinfo,  simp.enrich$clusterInfo)
+
+
+col.template <- c("Brisbane-Mock_0_Down","Brisbane-Mock_3_Down","Brisbane-Mock_6_Down","Brisbane-Mock_12_Down","Brisbane-Mock_24_Down")
+col.order <- c(col.template, sub('Brisbane', 'Victoria', col.template))
+col.order <- c(col.order, sub('Down', 'Up', col.template))
+col.order <- c(col.order,c("Victoria-Mock_0_Up","Victoria-Mock_3_Up","Victoria-Mock_6_Up","Victoria-Mock_12_Up","Victoria-Mock_24_Up"))
+
+hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, cols = col.order,
+                                groupColumn = 'enrich_grp', topN=8, upperThreshold=10, 
+                                row_names_gp = gpar(fontsize = 8), column_names_gp = gpar(fontsize = 6), negCols=unique(simp.enrich$simplified$enrich_grp[grep('Down', simp.enrich$simplified$enrich_grp)]),
+                                cluster_columns=FALSE, column_title_gp=gpar(fontsize=7.5),
+                                column_split=list(rep(c('Down', 'Up'), c(10,10)),
+                                                 rep(c('Brisbane', 'Victoria', 'Brisbane', 'Victoria'),c(5,5,5,5)) ) 
+                                )
+
+BackupAsPDF(hm, 'ordered.direction.nocolor.heatmap.allSamples.',dimensions=c(8,8))    
+```
+clear that the heatmap is dominated by upregulated sites which are mainly response to infection...
+Not a lot of difference in the virus states.. lets just plot what is downregulated in the host
+
+
+only 4-5 weakly significant negatively enriched terms
+```{r}
+
+hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified[enrich_grp %like% 'Down'], 
+                                groupColumn = 'enrich_grp', topN=8, upperThreshold=10, 
+                                row_names_gp = gpar(fontsize = 8), column_names_gp = gpar(fontsize = 6), negCols=unique(simp.enrich$simplified$enrich_grp[grep('Down', simp.enrich$simplified$enrich_grp)]),
+                                cluster_columns=FALSE, column_title_gp=gpar(fontsize=7.5))
+```
+Not much happening.. lets try Victoria vs Brisbane
+
+```{r}
+subDT <- degs.dt[group %in% c("Victoria_0-Brisbane_0_dds", "Victoria_3-Brisbane_3_dds",  "Victoria_6-Brisbane_6_dds", "Victoria_12-Brisbane_12_dds", "Victoria_24-Brisbane_24_dds"),]
+subDT[, enrich_grp := paste0(new_Label,'_',timepoint, '_', sig)]
+
+
+enrich.dt <- enricherOnGroups(subDT[sig != 'Not',], geneColumn = "symbol", groupColumns = 'enrich_grp', universe=universe, term2gene.gmt = gmt.go, minGSSize=10, numProcessors = 6)
+# best per group enrichment heatmap
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+simp.enrich$simplified$enrich_grp %>%  unique()
+
+col.order <- c("Brisbane-Victoria_0_Down","Brisbane-Victoria_3_Down","Brisbane-Victoria_6_Down","Brisbane-Victoria_12_Down","Brisbane-Victoria_24_Down",
+                  "Brisbane-Victoria_0_Up","Brisbane-Victoria_3_Up","Brisbane-Victoria_6_Up","Brisbane-Victoria_12_Up","Brisbane-Victoria_24_Up")
+
+col.order[!col.order %in% unique(simp.enrich$simplified$enrich_grp)]
+col.order <- col.order[!col.order %in% ("Victoria-Mock_0_Down")]
+
+unique(simp.enrich$simplified$enrich_grp) %in% col.order
+col.order %in% unique(simp.enrich$simplified$enrich_grp) 
+
+#set the column ordering before running
+simp.enrich$simplified[, enrich_grp := factor(enrich_grp, levels=col.order)]
+simp.enrich$clusterInfo$enrich_grp %>%  unique()
+
+hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, cols=col.order, groupColumn = 'enrich_grp', topN=16, upperThreshold=10, 
+                                row_names_gp = gpar(fontsize = 8), column_names_gp = gpar(fontsize = 6), negCols=unique(simp.enrich$simplified$enrich_grp[grep('Down', simp.enrich$simplified$enrich_grp)]),
+                                cluster_columns=FALSE, column_title_gp=gpar(fontsize=7.5),
+                                column_split=list(rep(c('Down', 'Up'), c(5,5))) )
+                             
+BackupAsPDF(hm, 'vic.brisbane.heatmap.',dimensions=c(8,8))    
+
+
+simp.enrich$simplified[, .N, by=.(enrich_grp)]
+fwrite(enrich.dt, '
+```
+write out the simplified enrichment table for virus vs virus
+
+```{r}
+fwrite(enrich.dt, ScriptAndDatedFileName('vic.brisbane.enrichment.csv'))
+
+enrich.dt
+```
+
+
+retry with this
+
+```{r}
+col.template <- c("Brisbane-Mock_0_Down","Brisbane-Mock_3_Down","Brisbane-Mock_6_Down","Brisbane-Mock_12_Down","Brisbane-Mock_24_Down")
+col.order <- c(col.template, sub('Brisbane', 'Victoria', col.template))
+col.order <- c(col.order, sub('Down', 'Up', col.template))
+col.order <- c(col.order,c("Victoria-Mock_0_Up","Victoria-Mock_3_Up","Victoria-Mock_6_Up","Victoria-Mock_12_Up","Victoria-Mock_24_Up"))
+
+
+#col.order[!col.order %in% unique(simp.enrich$simplified$enrich_grp)]
+#col.order <- col.order[!col.order %in% ("Victoria-Mock_0_Down")]
+simp.enrich$simplified$enrich_grp %>%  unique()
+
+unique(simp.enrich$simplified$enrich_grp) %in% col.order
+col.order %in% unique(simp.enrich$simplified$enrich_grp) 
+
+#set the column ordering before running
+simp.enrich$simplified[, enrich_grp := factor(enrich_grp, levels=col.order)]
+simp.enrich$clusterInfo$enrich_grp %>%  unique()
+
+hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, cols=col.order, groupColumn = 'enrich_grp', topN=8, upperThreshold=10, 
+                                row_names_gp = gpar(fontsize = 8), column_names_gp = gpar(fontsize = 6), negCols=unique(simp.enrich$simplified$enrich_grp[grep('Down', simp.enrich$simplified$enrich_grp)]),
+                                cluster_columns=FALSE, column_title_gp=gpar(fontsize=7.5),
+                                column_split=list(rep(c('Down', 'Up'), c(9,10)),
+                                                 rep(c('Brisbane', 'Victoria', 'Brisbane', 'Victoria'),c(5,4,5,5)) ) 
+                                )
+
+```
+
+
+write output
+
+```{r}
+
+# want this but also want the time ordering...
+split.list <- data.table(virus = str_extract(col.order, '(Brisbane|Victoria)'),
+                         direction = str_extract(col.order, '(Up|Down)'))
+
+ifelse(grepl('Down', unique(simp.enrich$simplified$enrich_grp)), 'Down',"up")
+
+fwrite(enrichment.dt, ScriptAndDatedFileName('simplifiedenrichmentResults.csv'))
+
+enrichment.dt
+```
+
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# our universe will be all genes used for the DGE testing
+# read in the deseq2 object
+dds <- readRDS('/Users/martingordon/Documents/projects/061223_JyotiB_RNAseq/output/011223.dds.obj.rds')
+rownames(assay(dds))
+
+# sanity checks look good
+#plotCounts(dds, gene='ENSG00000081248', intgroup = 'grp')
+
+degs.dt[symbol == 'GTF3C2'& comparison == 'Mock-Victoria',]
+count.mat['ENSG00000115207',grep('(Victoria|Mock)_24', colnames(count.mat))]
+
+
+
+lapply(seq_along(comb.res.dt.list), function(x,n,i){
+  #perform enrihcment analysis on each of the groups
+  enrich.comb <- enricherOnGroups(x[[i]][sig != 'Not',], geneColumn = "symbol", groupColumns = c("time","sig"), universe=universe, term2gene.gmt = gmt.go, numProcessors = 6)
+  # best per group enrichment heatmap
+  hm <- enrichHeatmapBestPerGroup(enrich.comb, NULL, groupColumn = 'time.sig', topN=15, upperThreshold=8, title=n[[i]],
+                                 row_names_gp = gpar(fontsize = 6), column_names_gp = gpar(fontsize = 8), negCols = enrich.comb$time.sig[grep("Down", enrich.comb$time.sig)])
+  
+  
+  
+  BackupAsPDF(hm, paste0(n[[i]],"-GO.enrichment_"), dimensions=c(13,11.5))
+}, x=comb.res.dt.list, n=names(comb.res.dt.list))
+
+
+
+read in the DESeq2 obj from the analysis
+clear from the output that the 
+
+```{r}
+dds <- readRDS('/Users/martingordon/Documents/projects/061223_JyotiB_RNAseq/output/011223.dds.obj.rds')
+
+# sanity checks look good
+#plotCounts(dds, gene='ENSG00000081248', intgroup = 'grp')
+
+degs.dt[symbol == 'GTF3C2'& comparison == 'Mock-Victoria',]
+count.mat['ENSG00000115207',grep('(Victoria|Mock)_24', colnames(count.mat))]
+```
+

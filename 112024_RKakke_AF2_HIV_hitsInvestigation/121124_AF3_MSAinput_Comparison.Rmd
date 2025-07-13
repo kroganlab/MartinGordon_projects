@@ -1,0 +1,114 @@
+---
+title: "AF3_MSAInputComparison"
+author: "Martin Gordon"
+date: "2024-12-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r packages}
+
+library(data.table)
+library(ggplot2)
+library(magrittr)
+
+# source afew useful commands 
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+```
+
+
+```{r}
+unpaired.dt <- fread('./output/unpaired_summaryScores.csv')
+paired.dt <- fread('./output/paired_summaryScores.csv')
+
+af3.dt <- list(unpairedAFLabel = unpaired.dt,
+               pairedAFLabel = paired.dt) %>% 
+  rbindlist(idcol='msa')
+
+
+af3.dt[, ppi := gsub('[.]seed.+', '', model)]
+af3.dt <- af3.dt[, lapply(.SD, as.numeric), .SDcols = c('ranking', 'ptm', 'iptm'), by=.(msa,model, ppi)]
+
+af3.wide.dt  <- dcast(af3.dt, ppi~msa, value.var = c('ranking', 'ptm', 'iptm'), fun.aggregate = function(x) mean(x, na.rm=T))
+af3.wide.dt[, delta_iptm := iptm_unpairedAFLabel - iptm_pairedAFLabel]
+
+af3.wide.dt[,lab := '']
+af3.wide.dt[abs(delta_iptm) < 0.01 | abs(delta_iptm) > .6, lab := ppi]
+
+
+
+g <- ggplot(af3.wide.dt, aes(x=iptm_pairedAFLabel, y=iptm_unpairedAFLabel, label=lab)) +
+  geom_point() +
+  geom_text_repel(data=af3.wide.dt[lab != ''], max.overlaps=20) +
+  geom_abline(intercept=0, color='red') 
+
+g
+```
+
+Look at the ipTM distribution per bait with the CRISPR screen
+```{r}
+new.merge.dt[,CRISPR_sig_set := ifelse((!is.na(CRISPRko_pvalue)| !is.na(CRISPRa_pvalue)), 'yes', 'no')]
+
+# looks like slight upwards shift in the meang
+g <- ggplot(new.merge.dt, aes(x=Bait, y=ipTM_mean, fill=CRISPR_sig_set)) +
+  geom_boxplot() +
+  theme_bw()
+
+BackupAsPDF(g, 'ipTM.distributions.boxplots', dimensions = c(8,6))
+```
+Do the correlation of both sets of results seperately
+```{r}
+library(patchwork)
+
+p = ggplot(new.merge.dt, aes(x=ipTM_mean, y=-log10(CRISPRko_adj.pvalue), color=abs(CRISPRko_log2FoldChange))) +
+  geom_point() +
+  facet_wrap(~Bait) +
+  scale_color_viridis_c() +
+#  geom_smooth() +
+  ggtitle('iPTM vs CRISPRko padj') 
+
+q <-  ggplot(new.merge.dt, aes(x=ipTM_mean, y=-log10(CRISPRa_adj.pvalue), colour = abs(CRISPRa_log2FoldChange))) +
+  geom_point() +
+  facet_wrap(~Bait) +
+  scale_color_viridis_c() +
+#  geom_smooth() +
+  ggtitle('iPTM vs CRISPRa padj') 
+
+p/q
+BackupAsPDF(p/q, 'adjpvalVsiPTM.faceted.scatterplot', dimensions = c(14,11))
+```
+Take the top CRISPR hits
+```{r}
+new.merge.dt
+
+p = ggplot(new.merge.dt[-log10(CRISPRko_adj.pvalue) > 3, ], aes(x=ipTM_mean, y=-log10(CRISPRko_adj.pvalue), color=abs(CRISPRko_log2FoldChange), label=paste0(Bait,'__',Protein_1_name))) +
+  geom_point() +
+  facet_wrap(~Bait) +
+  geom_text_repel(data=new.merge.dt[-log10(CRISPRko_adj.pvalue) > 3 & ipTM_mean>=0.5, ]) +
+  scale_color_viridis_c() +
+#  geom_smooth() +
+  ggtitle('iPTM vs CRISPRko padj') 
+
+q <-  ggplot(new.merge.dt[-log10(CRISPRa_adj.pvalue) > 3, ], aes(x=ipTM_mean, y=-log10(CRISPRa_adj.pvalue), colour = abs(CRISPRa_log2FoldChange), label=paste0(Bait,'__',Protein_1_name))) +
+  geom_point() +
+  facet_wrap(~Bait) +
+  geom_text_repel(data=new.merge.dt[-log10(CRISPRa_adj.pvalue) > 3 & ipTM_mean>=0.5, ]) +
+  scale_color_viridis_c() +
+#  geom_smooth() +
+  ggtitle('iPTM vs CRISPRa padj') 
+
+p/q
+BackupAsPDF(p/q, 'adjpvalVsiPTM.faceted.label.scatterplot', dimensions = c(14,11))
+```
+

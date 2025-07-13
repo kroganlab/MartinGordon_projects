@@ -1,0 +1,1514 @@
+---
+title: "060925_methodDev_SECMS"
+author: "Martin Gordon"
+date: "2025-06-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview 
+
+Method dev for BPs SEC-MS data
+Get Bens processed data files and then look at initally our local clean up and then the complex summarization
+
+QC idea; get corum complexes in pairwise table, remove ribo set and look at protein correlation scores per complex
+```{r packages}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+library(eulerr)
+library(CCprofiler)
+#libraryCCprofiler#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# flag consec proteins
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+```
+
+First we need to add in our interpolation mod for peak picking, then a flag to use interpolated or NA values
+```{r}
+# some basic functions
+#' return column with max consecutive detections per protein
+MaxConsecutiveDetections <- function(secLong.dt, idcol='peptideSequence', intsCol='intensity', detectionCutoff=0, plot=F){
+  
+  .oneMatrix <- function(sub.dt){
+    mat <- dcast(sub.dt, sub.dt[[idcol]]~fraction, value.var = intsCol) %>% 
+      as.matrix(rownames = 1)
+    mat[is.na(mat)] <- 0.0
+    mat[order(rownames(mat)),]
+  }
+  
+    #' Identify the max run of consecutive measurmeents
+  .maxConsecFractionMeasurments <- function(row, cutoff=detectionCutoff){
+    detectVec <- rle(row > cutoff)
+    return(max(detectVec$lengths[detectVec$values == TRUE]))
+  }
+  
+  # one matrix per sample 
+  mats <- lapply(split(secLong.dt, list(secLong.dt$sample)), .oneMatrix)
+  
+  consec.dt <- pbapply::pblapply(mats, function(x) {
+    apply(x, 1, function(feature){ .maxConsecFractionMeasurments(row = feature, cutoff = detectionCutoff) }) %>% 
+    as.data.table(keep.rownames=T)
+  }) %>% 
+  rbindlist(idcol='sample')
+  
+  setnames(consec.dt, new=c('sample', 'feature', 'consecutiveDetections'))
+ 
+  if (plot){
+    
+    g <- ggplot(consec.dt, aes(x=consecutiveDetections, col=sample)) +
+      stat_ecdf() +
+      labs(title='Distribution of maximum consecutive detections per protein') +
+      theme_bw()
+    
+    p <- ggplot(consec.dt, aes(x=consecutiveDetections, col=sample)) +
+      geom_density() +
+      labs(title='Distribution of maximum consecutive detections per protein') +
+      theme_bw()
+    
+    print(p); print(g)
+  }
+  
+  sec.dt <- merge(x=secLong.dt, y=consec.dt, by.x=c('sample', idcol), by.y=c('sample', 'feature'), all.x=T)
+  stopifnot(nrow(sec.dt) == nrow(secLong.dt))
+  return(sec.dt)
+}
+
+
+TotalDetections <- function(secLong.dt, idcol='peptideSequence', intsCol='intensity', detectionCutoff=0, plot=F){
+  
+  .oneMatrix <- function(sub.dt){
+    mat <- dcast(sub.dt, sub.dt[[idcol]]~fraction, value.var = intsCol) %>% 
+      as.matrix(rownames = 1)
+    mat[is.na(mat)] <- 0.0
+    mat[order(rownames(mat)),]
+  }
+  
+  .totalFractionMeasurments <- function(row, cutoff=detectionCutoff){
+    return(sum(row > detectionCutoff))
+  }
+  
+  # one matrix per sample 
+  mats <- lapply(split(secLong.dt, list(secLong.dt$sample)), .oneMatrix)
+  nFraction <- max(sapply(mats, ncol))
+  
+  total.dt <- pbapply::pblapply(mats, function(x) {
+    apply(x, 1, function(feature){ .totalFractionMeasurments(row = feature, cutoff = detectionCutoff) }) %>% 
+    as.data.table(keep.rownames=T)
+  }) %>% 
+  rbindlist(idcol='sample')
+  
+  setnames(total.dt, new=c('sample', 'feature', 'totalDetections'))
+ 
+  if (plot){
+    
+    g <- ggplot(total.dt, aes(x=totalDetections, fill=sample)) +
+      geom_histogram(bins=nFraction) +
+      labs(title='Distribution of number of detections per protein') +
+      facet_wrap(~sample) +
+      theme_bw()
+    
+    print(g)
+  }
+  
+  sec.dt <- merge(x=secLong.dt, y=total.dt, by.x=c('sample', idcol), by.y=c('sample', 'feature'), all.x=T)
+  stopifnot(nrow(sec.dt) == nrow(secLong.dt))
+  return(sec.dt)
+}
+
+#' function to interpolate missing values for missing/outlier fractions
+#' requires a sec.dt (longformat) with sample, treatment, replicate and intensity columns
+#' requires a qc.dt generated from the qcSummaryTable() function
+#' datatable join to replace values in problematic fractions with NA
+#' maxGap; treshold for N consec missing values for interpolation default is 1
+interpolateMissingAndOutlierFractions <- function(secLong.dt, qc.dt, fractions, maxGap=1){
+  
+  # create copy to avoid modifying ori DT
+  sec.dt <- copy(secLong.dt)
+  # zero out the intensities of problematic/missing fractions
+  sec.dt[, ori.intensity := intensity]
+  sec.dt[qc.dt[isOutlier == TRUE], on=.(sample, fraction), intensity := NA]
+  
+  # add NA cols for missing fractions
+  .addMissingFractions <- function(subDT){
+    subMat <- dcast(subDT, protein~fraction, value.var='intensity') %>% 
+      as.matrix(rownames='protein')
+    
+    if (!all(colnames(subMat) == fractions)){
+      message('Some fractions are missing. Adding missing fractions populated with NA...')
+      message('Missing fractions:\n', setdiff(fractions, colnames(subMat)))
+      subMat <- subMat[, match(fractions, colnames(subMat)), drop=FALSE] #missing fractions assigned an NA col. drop=FALSE to avoid collapsing to vector
+      colnames(subMat) <- fractions
+    }
+    return(subMat)
+  }
+  
+  .interpolateOutlierFractions <- function(subMat, sampleOI){
+    # interpolate intensity values in matrix rows
+    interpMat <- apply(subMat, 1, function(x) zoo::na.approx(x, na.rm=F, maxgap=maxGap)) %>% 
+      t()
+    # fractions to update; restrict to outlier and/or missing
+    fractionsOI <- c(qc.dt[sample == sampleOI & isOutlier == TRUE, unique(fraction)],
+                     setdiff(fractions, sec.dt[sample == sampleOI, unique(fraction)])
+                     )
+    
+    message('Handling problematic fractions for ', sampleOI, ': ', paste0(fractionsOI, collapse=','))
+    colsToupdate <- colnames(subMat) %in% fractionsOI
+    
+    # now apply the values from the interpolated matrix to the original
+    subMat[, colsToupdate] <- interpMat[, colsToupdate]
+    subdt <- setDT(reshape2::melt(subMat))
+    setnames(subdt, new=c('protein', 'fraction', 'intensity'))
+    
+    # add a flag to identify if the value is interpolated
+    subdt[, interpolated := FALSE]
+    subdt[fraction %in% fractionsOI, interpolated := TRUE]
+    return(subdt)
+  }
+
+  # handling missing/outlir fractions
+  sec.list <- pbapply::pblapply(split(sec.dt, sec.dt$sample), .addMissingFractions)
+  
+  # interpolate missing values
+  message('interpolating missing values...')
+  interp.list <- pbapply::pblapply(names(sec.list), function(n){.interpolateOutlierFractions(subMat = sec.list[[n]], sampleOI = n)}) 
+  names(interp.list) <- names(sec.list)
+  interp.dt <- rbindlist(interp.list, idcol='sample')
+  
+  interp.dt <- merge(x=interp.dt, y=sec.dt[, -c('intensity')], by=c('protein', 'sample', 'fraction'), all.x=T)
+  
+  # santy checks
+  #  nrows for non-missing fractions and intensity vals for non-interpolated should match between input and output
+  stopifnot( nrow(interp.dt[qc.dt, , on=.(sample, fraction)]) == nrow(sec.dt))
+  stopifnot( nrow(interp.dt[interpolated == FALSE & (intensity != ori.intensity), ]) == 0 )
+  return(interp.dt[, -c('ori.intensity')]) # removing once confirmed sanity check 
+}
+
+```
+
+one idea; for the samples with issues between donors, runs months apart, what about batch correction, or including a term for batch in the model?
+Try running batch correction (would want to be after fraction alignment) and then see if the sample-sample cross-correlations look better?
+
+read in the sec data 
+
+```{r}
+files <- list(sonic = "/Users/martingordon/Library/CloudStorage/Box-Box/2025_02_SEC_Lysis_Test/Spectronaut/2.\ NP40-Lysis\ buffer\ +\ Sonication/20241227_104957_MM_Sonic_Lysis_122724_PG_Report.tsv",
+           ft = "/Users/martingordon/Library/CloudStorage/Box-Box/2025_02_SEC_Lysis_Test/Spectronaut/3.\ NP40-Lysis\ buffer\ +\ Freeze-Thaw/20241227_104610_MM_FT_Lysis_122724_PG_Report.tsv",
+           cl = "/Users/martingordon/Library/CloudStorage/Box-Box/2025_02_SEC_Lysis_Test/Spectronaut/Data_72-fractions-Excluding Low Mol wt proteins/20250106_095200_MM_CL_LMW_Rep_010624_PG_Report.tsv")
+```
+
+```{r}
+meltOne <- function(path){
+  dt <- fread (path)
+  dt.long <- melt(dt, id.vars = c("PG.MolecularWeight",
+                                  "PG.ProteinAccessions",
+                                  "PG.Genes",
+                                  "PG.ProteinDescriptions"),
+                  variable.name = "runLabel",
+                  value.name = "intensity")
+  
+  dt.long[, c("treatment", "replicate", "fraction") := tstrsplit(runLabel, "[- _.]", keep = c(2,3,5))]
+  dt.long[, fraction := as.integer(fraction)]
+  
+  return (dt.long)
+}
+
+sec.ls <- pbapply::pblapply(files, meltOne)
+sec.dt <- rbindlist(sec.ls)
+sec.dt[, sample := paste0(treatment, "_", replicate)]
+setnames(sec.dt, old = c("PG.ProteinAccessions", "PG.Genes"), new = c("protein", "gene"))
+setcolorder(sec.dt, c ("treatment", "replicate", "fraction", "protein", "gene", "intensity"))
+
+
+sec.dt
+```
+
+# just get quick overview 
+```{r}
+View(summarizeSECTable)
+```
+
+
+```{r}
+sec.long[consecutiveDetections  & sample == 'Sonic_1',]
+test <- sec.long[consecutiveDetections >= 64 & sample == 'Sonic_1',] %>%  scaledIntensityMatrices()
+intensityHeatmaps(test, showRowNames = T)
+
+sec.long <- MaxConsecutiveDetections(sec.dt, idcol = 'protein', plot=T)
+TotalDetections(sec.dt, idcol='protein', plot=TRUE)
+```
+```{r}
+# different curves as different wet lab preps here
+allFits <- fitLocalCubics(qc.dt, window = 20, sampleTerm = "interaction")
+labelOutliers(qc.dt , allFits, threshold = 2) 
+```
+
+Outliers in early fractions, so not so problematic... see how different interpolation looks, but we shouldn't have any issues with the later fractions
+Normalize first, then normalization isnt impacted by the imputation process
+```{r}
+p <-plotNormAndOutlierFits (qc.dt , allFits)
+print(p)
+```
+Normalize the intensity values then perform the interpolation
+
+```{r}
+normalizeByResiduals(sec.dt, qc.dt)
+```
+```{r}
+sec.interpolated <- interpolateMissingAndOutlierFractions(sec.dt, qc.dt, fractions=seq(1,72,1), maxGap = 2)
+```
+now we have added interpolated values, need to decide on the functions to use the interpolated vs non-interpolated values in 
+or, add option for all?
+
+
+sample all-by-all correlation
+```{r}
+Heatmap(qcFullSampleCorrelation(sec.dt))
+```
+
+This is a type of cross-correlaiton; returns the 
+```{r}
+cor.dt <- crossCorrelationFullSample(sec.dt)
+```
+fraction by fraction correlation, but strange output... why is there three lines per treatment with only two reps?
+```{r}
+corLong.dt <- qcFractionByFractionCorrelation(sec.dt, returnDataTable = T)
+
+g <- qcFractionCorrelationLinePlot(corLong.dt)
+pdf('~/test.pdf')
+grid.draw(g)
+dev.off()
+```
+
+jaccard overlap of protein ids in each set
+```{r}
+proteinOverlap <- qcProteinOverlapByFraction(sec.interpolated)
+jaccardOverlap
+
+pdf('~/Desktop/protOverlap.pdf')
+grid.draw(qcProteinOverlapByFractionPlot(jaccardOverlap))
+dev.off()
+```
+
+Function `goodPeaksFromIntensityMatrices` is used for peak picking... this will just build the matrices from the intensity col
+I think a more modular way is to modify the intensity col when input to generate intensity matrices column.... just use a flag to modify (by default, will take the 'full' matrix)
+
+```{r}
+rawintMat <- scaledIntensityMatrices(sec.interpolated, useInterpolated = F)
+interpintMat <- scaledIntensityMatrices(sec.interpolated, useInterpolated = T)
+```
+# run peak detection on the interpolated 
+```{r}
+peakTables <- lapply(interpintMat, goodPeaksTableFromIntensityMatrix)
+rawpeakTables <- lapply(rawintMat, goodPeaksTableFromIntensityMatrix)
+```
+These are different; not quite sure why they are outside the interpolated fractions.. need to double check 
+```{r}
+allPeaks <- rbindlist(peakTables, idcol = "sample")
+rawallPeaks <- rbindlist(rawpeakTables, idcol = "sample")
+
+ggplot(allPeaks, aes(x= peakLocation, fill = goodPeak)) + 
+  geom_bar() + 
+  facet_grid(sample~.)
+
+ggplot(rawallPeaks, aes(x= peakLocation, fill = goodPeak)) + 
+  geom_bar() + 
+  facet_grid(sample~.)
+```
+adjust the fractions on the sec table 
+
+# fraction adjustments based on peaks
+This will update the peakTables sec.dt with new standardized fraction numbers
+```{r}
+standardizeAllPeakTablesToStandard(peakTables, 
+                                   sec.interpolated, 
+                                   standardIdx = "Sonic_1",
+                                   fitPortion = 0.65,minPeaksPerFraction = 15)
+
+```
+## adjust fractions based on peaks
+
+I don't trust the skew at low fractions. That probalby represents different levels of complexity in the samples rather than a different elution
+Does it even make sense to try align the LMW group? the elution profiles are just completely different..
+```{r}
+standardizeAllPeakTablesToStandard(peakTables, 
+                                   sec.interpolated, 
+                                   standardIdx = "Sonic_1",
+                                   fitPortion = 0.65,minPeaksPerFraction = 15, startFitAtPeak = 35)
+
+```
+## mw standards
+```{r}
+mc <- calculateFractionMassConverters(loadStandardsFractionToMW("~/Library/CloudStorage/Box-Box/2025_02_SEC_Lysis_Test/Cal_std.txt", header = FALSE))
+proteinExpMW <- loadUniprotToMW("~/Library/CloudStorage/Box-Box/2025_02_SEC_Lysis_Test/mw_uniprot.txt")
+
+# label fractions by mass, and fraction/proteins by mass ratio, aka log2MassNumber
+sec.interpolated[, fractionMass := mc$fraction2Mass(standardFraction)]
+sec.interpolated[, log2MassNumber := log2(fractionMass/proteinExpMW[protein, .(mw), on = "protein"])]
+```
+
+```{r}
+fwrite(sec.interpolated, ScriptAndDatedFileName("SEC_Long_normalized.csv.gz"))
+fread('~/Documents/projects/043025_MGordon_SECMS_QCplotsWork/060925_methodDev_data/2025_06_11_SEC_Long_normalized.csv.gz')
+```
+
+## remove peaks less than 150% mass
+This basically tries to remove monomeric peaks
+```{r}
+# pay attention to which cofmX.XXXX is used below
+scorePeakByMassShift <- function(peak.dt, mw){
+  # the 150% fraction; where we expect a protein 1.5times size to elute at
+  peak.dt[proteinExpMW, fiftyPCFraction := mc$mass2Fraction(1.5 * mw), on = "protein"]
+  peak.dt[!is.na(fiftyPCFraction), goodPeak := goodPeak & cofmN.standardized < fiftyPCFraction]
+  peak.dt
+}
+
+purrr::walk(peakTables, scorePeakByMassShift, mw)
+```
+
+## join peaks across runs into clusters
+basically across samples, combine into peak clusters with numeric IDs, basically gives us a grouping to calculate summary stats on the proteins 
+```{r}
+allPeaks <- rbindlist(peakTables, idcol = "sample")
+allPeaks[goodPeak == TRUE, proteinPeakCluster := clusterPeaks(cofmN.standardized, maxDistance = 2.5), by = protein]
+```
+
+
+## detect protein-coelutions
+
+I think we want to take the windowed correlation function output, and just summarize each peak to a corScore
+```{r peak-peak correlations}
+
+interpintMat %>% names()
+peakTables %>% names()
+
+# so here we use peaks from the interpolated, but values from the non-interpolated data
+peakMatrices <- purrr::map2(rawintMat, peakTables, goodPeaksMatFromPeaksTable)
+#corPeaks6 <- windowedCorrelation(npc1Mat, peaksMatrix, outerRadius = 6)
+corPeaks.ls <- purrr::map2(rawintMat, peakMatrices, windowedCorrelation, outerRadius = 6)
+
+allPeakCorrs <- rbindlist(purrr::map(corPeaks.ls, "cor"), idcol = "sample")
+allPeakCorrs[, gene1 := multiUniprots2multiGenes(protein1)]
+allPeakCorrs[, gene2 := multiUniprots2multiGenes(protein2)]
+```
+
+
+```{r gs}
+library (igraph)
+
+decoys <- decoysFromString(unique(sec.interpolated$gene),
+                           links.path ='~/Documents/utils/mg_utils/data/9606.protein.physical.links.detailed.v12.0.txt.gz',
+                           info.path='~/Documents/utils/mg_utils/data/9606.protein.info.v12.0.txt.gz',
+                           )
+
+gs <- goldStandardPairs(unique(sec.interpolated$gene),
+                           corum.path ='~/Documents/utils/mg_utils/data/corum_humanComplexes.txt',
+                           string.links.path ='~/Documents/utils/mg_utils/data/9606.protein.physical.links.detailed.v12.0.txt.gz',
+                           string.info.path='~/Documents/utils/mg_utils/data/9606.protein.info.v12.0.txt.gz',
+                           )
+
+
+# possibly corum et al has something missing in string.
+# remove the overlapping stuff berween the two
+overlaps <- merge (decoys, gs, by= c("gene1", "gene2"))
+
+message ("There are ", nrow(overlaps), " overlapping pairs (",
+         100 * signif(nrow(overlaps)/nrow(decoys), 1),
+         "%) across the decoys and gold standard true sets")
+decoys[overlaps, remove := TRUE, on = c("gene1", "gene2")]
+dim(decoys)
+decoys <- decoys[is.na(remove), .(gene1, gene2)]
+dim(decoys)
+```
+
+```{r label-gs}
+allPeakCorrs[, gs := "unknown"]
+allPeakCorrs[gs ,gs := "interactor" , on = c("gene1", "gene2")]
+allPeakCorrs[decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+```
+
+```{r}
+ggplot (allPeakCorrs[gene1 < gene2][gs != 'unknown'], aes(x = sample, fill = gs)) + geom_bar() + theme_bw() + scale_fill_brewer(type = "qual", palette = "Set2")
+```
+```{r}
+allGenes <- sec.interpolated$gene |> unique()
+denomInteractor <- nrow(gs[gene1 %in% allGenes & gene2 %in% allGenes])
+denomDecoy <- nrow(decoys[gene1 %in% allGenes & gene2 %in% allGenes])
+```
+
+score peak ppi using GS vs decoy recovery
+```{r score peak coelution}
+# we score all peak correlations using start of peak and sample
+scoreByGS(allPeakCorrs, denomDecoy, denomInteractor, column = "corScore", groupByVariable = c("sample", "start"))
+allPeakCorrs
+scoreByGS %>% View()
+```
+
+Summarise PW info to complex level 
+
+# first summarize to protein similarity
+
+```{r}
+stoichDevThreshold <- log2(1 + 0.2)
+
+ # we rank the peaks by the best seperation of GS and decoy
+setorder(allPeakCorrs, sample, -log10RateRatioID )
+
+summary <- allPeakCorrs[, .SD[1], by= .(sample, protein1, protein2, gene1, gene2, prot1Peak, prot2Peak, gs) # best by ppi & peak location
+                          ][, .(sumLLRatio = sum(log10RateRatioID[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]), # only sum peaks that are within 20% of the first
+                                sumCorScore = sum(corScore[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]),
+                                numPeaks = .N,
+                                numSameStoichPeaks  = sum (abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold)),
+                            by = .(sample, protein1, protein2, gene1, gene2, gs) # summarise to ppi
+                            ]
+setorder(summary, sample, -sumLLRatio)
+
+## split this into alist
+prot.cor.ls <- split(summary, summary$sample)
+```
+
+Now we subset to just complexes we want to assess based on the detection of co-eluting members
+```{r test-dats}
+# get test data
+testMat <- interpintMat[['Sonic_1']]
+testPeakTable <- peakTables[['Sonic_1']]
+testCor <- corPeaks.ls[['Sonic_1']][['cor']]
+protTestCor <-  prot.cor.ls[['Sonic_1']]
+
+testPeakTable # this is just he list of detected peaks, but I want to use the peakCor table to 
+```
+
+before more advanced rechecking peak cor, just sum scores to protein complexes and recheck the LLRatio of the two scores;
+this score set actually doesnt give me the info on if the proteins co-elute at the same location... could prefilter using the other script, but I think the better way is to recalculate the correlation over the goodPeaks windows for an all-by-all mat, and then subset the mat per complex and calculatte summary stats on the edges... leave as is for now
+
+## V simple method
+generae complex hypothesis from a database
+Using peakTable, subset our hypothesis set to those with overlapping peaks (n members > 2)
+Using this refined hypothesis set, summarize the pw correlation scores per complex (standard summary statistics at the minute; estimate a score (sumCor/nMembers) (average pw correlation; is this OK?) 
+Using this score and the CORUM/decoy set, set a score threshold to limit FP recoverys to a certain score
+
+subset our peakCor table to coeluting members of that database;
+Using the peak tables to identify the complexes; the coeluting members and their shared peaks
+```{r peak-comp-coelution}
+message('finding coeluting peaks of complex members...')
+#' Use the peak detection table to filter out hypothesis to test
+#' In some cases like below,  the peaks may have a slight offset; we want to cluster peaks to account for this difference
+#' then cofmN_sd will handle this variance of clustering
+#' not sure on other metrics.. need to think on this..
+detectCoelutingComplexPeaks <- function(comp_id, complex.dt, peakTable, maxDistance=2, min.members=2){
+  
+  peaks.dt <- copy(peakTable)
+  members <- complex.dt[complex_id == comp_id, unique(protein)]
+  
+  complex.info <- peaks.dt[protein %in% members & goodPeak] %>% 
+    .[, peakCluster := clusterPeaks(peakLocation,  maxDistance = maxDistance),]
+  
+  complex.info <- complex.info[,.(peakLocations = paste0(unique(peakLocation), collapse=';'),
+                                  complex_id = comp_id,
+                                  complex_name = complex.dt[complex_id == comp_id, unique(complex_name)],
+                                  members=paste0(sort(members), collapse=";"),
+                                  nMembers = length(members),
+                                  CoelutingMembers=paste0(sort(protein), collapse=";"),
+                                  nCoelutingMembers=.N,                                  peakHeight_mean = mean(peakHeight, na.rm=T),
+                                  peakHeight_sd = sd(peakHeight, na.rm=T),
+                                  cofmN_mean=mean(cofmN.standardized, na.rm=T),
+                                  cofmN_sd=sd(cofmN.standardized, na.rm=T), # this or standardised?
+                                  cv_mean=mean(cv, na.rm=T), # not sure on these
+                                  cv_sd=sd(cv, na.rm=T),
+                                  var_man=mean(var, na.rm=T),
+                                  var_sd = sd(var, na.rm=T))
+                                  , by=peakCluster]
+  
+  return(complex.info[nCoelutingMembers >= min.members])
+}
+
+# now use this to further collect summary stats; maybe correlation; window completness per protein other bits..
+#one thing to do is prefilter to just complexes with detected proteins for a start
+detected.complexes.dt <-pbmcapply::pbmclapply(unique(complexes.dt$complex_id), function(comp){ detectCoelutingComplexPeaks(comp_id=comp, complex.dt=complexes.dt, peakTable=testPeakTable, min.members = 2)}, 
+                                              mc.cores=cores) %>% 
+  rbindlist()
+
+detected.complexes.dt[, decoy := 'no']
+detected.complexes.dt[grepl('decoy', complex_id), decoy := 'yes']
+message('Breakdown of Detected Complexes:\n', 'Complexes: ', detected.complexes.dt[decoy == 'no',.N],'\nDecoy: ',detected.complexes.dt[decoy == 'yes',.N])
+```
+this summarization is ok for now... next look at scoring by doing an AUC of decoy over 
+
+```{r}
+summarizeCoelutingComplexes <- function(comp_id, complexes.toScore.dt, cor.dt){
+  
+  # cp & tidy peakCor 
+  peakCor.dt <- copy(cor.dt)
+  print(peakCor.dt)
+  
+  char.vec <- c('protein1', 'protein2')
+  cor.dt[, c(char.vec) := lapply(.SD, as.character), .SDcols=char.vec]
+  cor.dt <- cor.dt[protein1 < protein2,]
+  setkeyv(cor.dt, c('protein1', 'protein2'))
+
+  members <- complexes.toScore.dt[complex_id == comp_id, unique(unlist(strsplit(CoelutingMembers, '[;]')))]
+  colsToKeep <- setdiff(colnames(complexes.toScore.dt), 'peakLocations')
+
+  complexes.toScore.dt[, c("peakStart", "peakEnd") := { peaks <- as.numeric(unlist(strsplit(peakLocations, ";"))); list(min(peaks), max(peaks)) }, by = .(complex_id, peakCluster)]
+  
+  # prepare a dt for merging; need to also merge by peakLocation to ensure we are only scoring co-eluting peaks
+  prot.pairs <- t(combn(members, 2))
+  comp.pairs <- data.table(complex_id = as.character(comp_id),
+                           protein1 = pmin(prot.pairs[,1], prot.pairs[,2]),
+                           protein2 = pmax(prot.pairs[,1], prot.pairs[,2]))
+  setkeyv(comp.pairs, c('protein1', 'protein2'))
+  
+  # inner join faster subset than logical filtering 
+
+  complex.cor.dt <- cor.dt[comp.pairs, on=.(protein1, protein2)]
+  print(complex.cor.dt)
+  #message("subsetting to complex coelutions detected")
+  
+  # subset to best correlated peaks per PPI, and summarize corScore
+  complex.cor.dt <- complex.cor.dt[, .SD[which.max(corScore)], by=.(protein1, protein2, prot1Peak, prot2Peak)]
+  
+  # join all, then filter based on peak range
+  merge.complex.cor.dt <- merge(y=complex.cor.dt, x=complexes.toScore.dt[complex_id == comp_id], by="complex_id", allow.cartesian = TRUE)
+  merge.complex.cor.dt <- merge.complex.cor.dt[prot1Peak >= peakStart & prot1Peak <= peakEnd &prot2Peak >= peakStart & prot2Peak <= peakEnd]
+
+  # now we want to summarize scores per cluster. Sum scores per peak per Cluster, then select the best score
+  # can decide how to summarize across peak; I think for now we might actually want to keep all complex peaks for potential differential testing?
+  merge.complex.cor.dt <- merge.complex.cor.dt[, .(members, 
+                                                   nMembers,
+                                                   CoelutingMembers, 
+                                                   completeness = nCoelutingMembers/nMembers,
+                                                   corScore_sum = sum(corScore, na.rm=T),
+                                                   corScore_mean = mean(corScore, na.rm=T),
+                                                   corScore_sd = sd(corScore, na.rm=T),
+                                                   corScore_min = min(corScore, na.rm=T),
+                                                   corScore_max = max(corScore, na.rm=T)
+                                                   ),by=.(complex_id, complex_name,decoy, peakCluster)] %>% 
+    unique()
+  
+  return(merge.complex.cor.dt)
+}
+
+
+testCor
+```
+Summarize all the coeluting complexes and 
+```{r}
+complex.scores <-pbmcapply::pbmclapply(unique(detected.complexes.dt$complex_id), function(comp){ 
+  summarizeCoelutingComplexes(comp_id=comp, complexes.toScore.dt=detected.complexes.dt, cor.dt=testCor)}, mc.cores=cores) %>% 
+  rbindlist(.)
+
+# probably want to take the best scoring peakCor, atm taking all of them
+complex.scores
+```
+
+Generate an AUC to estimate FDR; plot the scores of the complexes and threshold the FP complex recovery at a reasonable score..
+
+```{r}
+complex.dt %>% str()
+scoreComplexByGS <- function(complex.dt, denomDecoy, denomInteractor, column = "corScore_sum", groupByVariable = "sample", pseudoCount = 1){
+  
+  sub.dt <- copy(complex.dt)
+  sub.dt[, gs := 'corum']
+  sub.dt[grepl('decoy', complex_id), gs := 'decoy']
+  sub.dt[, gs := factor(gs, levels = c("decoy", "corum"))]
+  message ("Counting and scoring decoy complexes...")
+  setorderv(sub.dt, c(column, "gs"), order = c(-1, 1))
+  
+  sub.dt[, decoyCount := 0L]
+  print(sub.dt)
+  sub.dt[gs == "decoy", decoyCount := frankv(.SD,  column, order = -1, ties.method = "max"), by = eval(groupByVariable)]
+  sub.dt[, decoyCount := cummax(decoyCount), by = eval(groupByVariable)] # requires decoy before others at same score, to copy count to other labeled data at same score
+  sub.dt[, decoyCount := decoyCount + pseudoCount]
+  sub.dt[, log10DecoyRate := log10(decoyCount) - log10(denomDecoy)]
+  
+  # reorder the gs labels, interactor before decoy
+  message ("Counting and scoringCORUM complexes...")
+  setorderv(sub.dt, c(column, "gs"), order = c(-1, -1))
+  sub.dt[, interactorCount := 0L]
+  sub.dt[gs == "corum", interactorCount := frankv(.SD, cols = column, order = -1, ties.method = "max"), by = eval(groupByVariable)]
+  sub.dt[, interactorCount := cummax(interactorCount), by = eval(groupByVariable)] # # requires interactor before others at same score, to copy count to other labeled data at same score
+  sub.dt[, interactorCount := pseudoCount + interactorCount]
+  sub.dt[, log10IntRate := log10(interactorCount) - log10(denomInteractor)]
+  
+  sub.dt[is.infinite(log10DecoyRate), log10DecoyRate := NA]
+  sub.dt[is.infinite(log10IntRate), log10IntRate := NA]
+  
+  
+  message ("Calculating ratios per score ", column, " ...")
+  
+  # ratios
+  sub.dt[, log10RateRatioID := max(log10IntRate, na.rm = TRUE) -  max(log10DecoyRate, na.rm = TRUE), 
+         by= c(eval(column), eval(groupByVariable))] #highest recovery at each value of score
+
+  # take care of likelihood ratio apparently shrinking due to low numbers of itneractors at high scores
+  # ... we expect ratio likelihood only increase as threshold increases
+  #reverse order to increasing by score column
+  setorderv(sub.dt, column, 1)
+  sub.dt[, log10RateRatioID := cummax(log10RateRatioID), by = eval(groupByVariable)]
+  
+  #reverse back
+  setorderv(sub.dt, column, -1)
+}
+```
+
+```{r}
+complex.scores %>% str()
+complex.scores[, sample := 'test']
+score.COmp<- scoreComplexByGS(complex.dt = complex.scores, denomDecoy = 367, column='corScore_mean', denomInteractor =1072)
+score.COmp
+```
+I think we score the passing complex set by thresholding those that go above
+
+ROC curve; not great, probably want to control at an FDR of 10% at most, see how we can extract the scores to determine this threshold  for scoring?
+```{r}
+complex.scores[, decoy := factor(decoy, levels=c('no', 'yes'))]
+
+pdf('./output/complex_scoring_meanCor.pdf')
+par(pty = "s") 
+roc1 <- plot(roc(data=complex.scores, response='decoy', predictor='corScore_mean', percent=F, partial.auc=c(1,.9)),
+                # partial.auc.correct=TRUE,          # define a partial AUC (pAUC)
+         print.auc.pattern = "Corrected pAUC (100-90%% SP):\n%.1f%%",
+         print.auc.col = "#1c61b6",
+         auc.polygon = TRUE, 
+         auc.polygon.col = "#1c61b6",       # show pAUC as a polygon
+         max.auc.polygon = TRUE, 
+         max.auc.polygon.col = "#1c61b622", # also show the 100% polygon # show pAUC as a polygon
+              main="Comparison on ASD set",
+              lwd=3,
+              xlab="False Positive Rate (1-Specificity)", 
+              ylab="True Postive Rate (Sensitivity)",
+              legacy.axes = TRUE,
+              col="#55C667FF")
+
+
+roc1
+dev.off()
+```
+
+Look at BPs custom ROC function and use this to set threshold and also generate plot output for Scoring function
+I wonder what is the overlap between these groups and Bens enrichment set?
+```{r}
+
+```
+
+
+
+Will use this filtered complex list to repeat correlation scoring; 
+just subset the intensity mat to this set and drop the correlation threshold
+
+```{r}
+
+unique(unlist(strsplit(detected.complexes.dt$members, '[;]')))
+testMat[rownames(testMat) %in% unique(unlist(strsplit(detected.complexes.dt$members, '[;]'))),]
+
+corPeaks.ls <- purrr::map2(rawintMat, peakMatrices, windowedCorrelation, outerRadius = 6)
+
+windowedCorrelation(testMat[rownames(testMat) %in% unique(unlist(strsplit(detected.complexes.dt$members, '[;]'))),],
+                    peakMatrices[['Sonic_1']][rownames(testMat) %in% unique(unlist(strsplit(detected.complexes.dt$members, '[;]'))),],
+                    outerRadius = 6
+                    )
+
+
+detected.complexes.dt
+```
+
+
+```{r}
+
+char.vec <- c('protein1', 'protein2')
+protTestCor[, c(char.vec) := lapply(.SD, as.character), .SDcols=char.vec]
+protTestCor[protein1 > protein2,]
+
+prot.test <- c('P04264','P13647')
+protTestCor[protein1 %in% prot.test & protein2 %in% prot.test]
+
+scoreProteinComplexCoelutions <- function(comp_id, complex.dt, protCorTable){
+  
+  # copy and simplify ppi cor dt
+  cor.dt <- copy(protCorTable)
+  char.vec <- c('protein1', 'protein2')
+  cor.dt[, c(char.vec) := lapply(.SD, as.character), .SDcols=char.vec]
+  cor.dt <- cor.dt[protein1 < protein2,]
+  
+  # complex summary
+  comp.summary <- complex.dt[, .(complex_name=complex_name,
+                                 members_protein=paste0(sort(protein), collapse=';'),
+                                 members_gene=paste0(sort(gene), collapse=';'),
+                                 nMembers = length(unique(protein))), by=complex_id]
+  
+  # get complex members
+  members <- comp.summary[complex_id == comp_id, unique(unlist(strsplit(members_protein, ';')))]
+  
+  prot.pairs <- t(combn(members, 2))
+  comp.pairs <- data.table(protein1 = pmin(prot.pairs[,1], prot.pairs[,2]),
+                           protein2 = pmax(prot.pairs[,1], prot.pairs[,2]))
+  
+  # inner join faster than logical filtering (according to some blog I saw anyway...)
+  complex.cor.dt <- cor.dt[comp.pairs, on=.(protein1, protein2)]
+  
+  # calculate summary stats on ppi to complex level
+  complex.cor.dt <- complex.cor.dt[, .(complex_id = comp_id,
+                                       nDetectedMembers = length(members),
+                                       detectedMembers = paste0(sort(members), collapse=';'),
+                                       corScore_sum = sum(sumCorScore, na.rm=T),
+                                       corScore_mean = mean(sumCorScore, na.rm=T),
+                                       corScore_sd = sd(sumCorScore, na.rm=T),
+                                       corScore_min = min(sumCorScore, na.rm=T),
+                                       corScore_max = max(sumCorScore, na.rm=T)
+                                       #peak summary; just summarize n same stochiometric peaks
+                                       )]
+  print(complex.cor.dt)
+}
+```
+
+# get the protein complex correlattion scores of peak members
+
+Very slow and also not a good methodology... I think we want to repeat the protein summarization steps, but adjust summarization to complex
+```{r}
+scoreProteinComplexCoelutions(10, complexes.dt, protCorTable = protTestCor)
+
+complex.corScores.dt <-pbmcapply::pbmclapply(unique(detected.complexes.dt$complex_id), function(comp){ scoreProteinComplexCoelutions(comp_id=comp, complex.dt=complexes.dt, protCorTable=protTestCor)}, mc.cores=cores) %>% 
+  rbindlist()
+
+complex.corScores.dt[grepl('decoy', complex_id)]
+```
+
+
+
+
+more advanced/intricate method.. for now just work as is..
+
+
+
+
+
+LLRs
+```{r}
+ggplot (allPeakCorrs, aes(x = corScore, y = log10RateRatioID, color = as.factor(start))) + geom_hline(yintercept = 0.0, lty = "dotted") +  geom_line() + facet_wrap(~sample)
+
+ggplot (allPeakCorrs, 
+        aes(x = interactorCount, y = log10RateRatioID,    color = sample)) +
+  geom_hline(yintercept = 0.0, lty = "dotted") +
+  geom_line() +
+  facet_wrap(~as.factor(start)) +
+  scale_x_log10()
+```
+To not overcount in AUC calc, we want only a single log10RateRatioID per interactorCount, here I take the amx
+
+```{r, fig.width = 12, fig.height = 12}
+ggplot (allPeakCorrs[, .(log10RateRatioID = max(log10RateRatioID)), by = .(sample, interactorCount, start)],
+        aes(x = interactorCount, y = log10RateRatioID,    color = sample)) +
+  geom_hline(yintercept = 0.0, lty = "dotted") +
+  geom_line() +
+  facet_wrap(~as.factor(start)) +
+  scale_x_log10()
+```
+```{r}
+# AUC
+ggplot (allPeakCorrs[, .(log10RateRatioID = max(log10RateRatioID)), by = .(sample, interactorCount, start)][, .(auc = sum(log10RateRatioID)), by = .(sample, start)], aes(x = start, y = auc, color = sample)) + geom_line()  +scale_y_log10()
+ggplot (allPeakCorrs[, .(log10RateRatioID = max(log10RateRatioID)), by = .(sample, interactorCount, start)][, .(auc = sum(log10RateRatioID)), by = .(sample, start)], aes(x = start, y = auc, color = sample)) + geom_line()  +scale_y_sqrt()
+
+ggplot (allPeakCorrs[, .(log10RateRatioID = max(log10RateRatioID)), by = .(sample, interactorCount, start)][, .(auc = sum(log10RateRatioID)), by = .(sample, start)], aes(x = start, y = auc, color = sample)) + geom_line()
+```
+Summarise PW info to complex level 
+
+# we use the protein sim scores to summarize
+
+```{r}
+stoichDevThreshold <- log2(1 + 0.2)
+
+setorder(allPeakCorrs, sample, -log10RateRatioID )
+
+summary <- allPeakCorrs[, .SD[1], by= .(sample, protein1, protein2, gene1, gene2, prot1Peak, prot2Peak, gs) # best correlation per pair of peaks; 
+                          ][, .(sumLLRatio = sum(log10RateRatioID[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]), # only sum peaks that are within 20% of the first
+                                numPeaks = .N,
+                                numSameStoichPeaks  = sum (abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold)),
+                            by = .(sample, protein1, protein2, gene1, gene2, gs)
+                            ]
+setorder(summary, sample, -sumLLRatio)
+```
+
+
+load CORUM pw database;
+think about allowing to load a generic database
+
+
+load CORUM pw database info
+```{r}
+#' get pairwise distances between proteins in the database
+#' Option to use the given db to calcualte distances or base distances on STRING (need to define a reasonable threshold for an edge... look at BP earlier functions)
+# I want to allow it to restrict distances to the given database, or use STRING distances as bg
+calculatePPIDistancesInNetwork <- function(corum.db.path=NULL, 
+                                           geneIDs=NULL,
+                                           useSTRINGdistances=F, 
+                                           string.links.path=NULL,
+                                           string.info.path=NULL,
+                                           stringCombinedScoreThreshold = 600
+                                           ){
+  
+  # load STRING as ppi dt
+  .loadSTRINGPPI<- function(string.links.path, string.info.path){
+    
+    string.dt <- fread(string.links.path)[combined_score > stringCombinedScoreThreshold,]
+    string.anno <- fread(string.info.path)
+    # annotate with gene name
+    string.dt[string.anno, gene1 := i.preferred_name, on=c(protein1 = "#string_protein_id")]
+    string.dt[string.anno, gene2 := i.preferred_name, on=c(protein2 = "#string_protein_id")]
+    
+    string.dt <- string.dt[gene1 < gene2, .(gene1, gene2)]
+    return(string.dt)
+  }
+  
+  if (useSTRINGdistances && (is.null(string.links.path) |is.null(string.links.path))){
+    stop('No STRING database path/info provided. Exiting...')
+
+  } else if (useSTRINGdistances && (!is.null(string.links.path) && !is.null(string.links.path))){
+    
+    message('Calculating pairwise distances on STRING network...')
+    string.db <- .loadSTRINGPPI(string.links.path, string.info.path)
+    ppi.dt <- string.db
+  } else {
+    message('Calculating pairwise distances on CORUM database...')
+    ppi.dt <- corumPairs(corum.db.path)
+  }
+  
+  g <- igraph::graph_from_data_frame(ppi.dt, directed = F)
+  # all-vy-all shortest paths calculation
+  distMat <- igraph::distances(g)
+  distMat <- distMat[rownames(distMat) %in% geneIDs, colnames(distMat) %in% geneIDs]
+  dist.dt <- as.data.table(reshape2::melt(distMat)) %>% 
+    .[value != 0]
+  setnames(dist.dt, new=c('gene1', 'gene2', 'numberOfHops'))
+  cols.oi <- c('gene1', 'gene2')
+  dist.dt[, c(cols.oi) := lapply(.SD, as.character), .SDcols=cols.oi]
+  return(dist.dt[gene1 < gene2])
+}
+
+CORUM.distances <- calculatePPIDistancesInNetwork(corum.db.path = '~/Documents/utils/mg_utils/data/corum_humanComplexes.txt', 
+                                                  geneIDs =  unique(sec.interpolated$gene)
+                                                  )
+STRING.distances <- calculatePPIDistancesInNetwork(corum.db.path = '~/Documents/utils/mg_utils/data/corum_humanComplexes.txt', 
+                                                   geneIDs = unique(sec.interpolated$gene),
+                                                   useSTRINGdistances = T,
+                                                   string.links.path='~/Documents/utils/mg_utils/data/9606.protein.physical.links.detailed.v12.0.txt.gz',
+                                                   string.info.path='~/Documents/utils/mg_utils/data/9606.protein.info.v12.0.txt.gz',
+                                                   stringCombinedScoreThreshold = 250)
+```
+Following CCprofiler, create complex ppi and a decoy ppi
+
+Now using this info, create a GS complex set and a decoy complex set; will use this for complex summarization evaluation
+Now that we have CORUM and the pw distances, use this to also create a decoy complex list and combine the two 
+
+We will then use this information to summarize our pw information to the complex level
+
+We will make a similiar function; for now we will just shuffle CORUM complexes to have members at least 4 steps from each other 
+we make a 50/50 split true and decoy complexes; want our compplexes to be the same size
+
+modded for optimization
+```{r}
+generateComplexTargetsAndDecoys <- function(corum.db.path=NULL,
+                                            ppi_distances=NULL,
+                                            decoy_min_distance=3,
+                                            quantile_threshold=0.1,
+                                            min_complex_size=2,
+                                            retries=3){
+  
+  # database ppi
+  corum.dt <- fread(corum.db.path)[, .(gene = unlist(strsplit(subunits_gene_name, ";")),
+                                       protein = unlist(strsplit(subunits_uniprot_id, ";"))
+                                       ), by=.(complex_id, complex_name)]
+  corum.dt[, complex_size := length(unique(gene)), by=complex_id]
+
+  corumInfo <- corum.dt[, .(complex_id, complex_size)] %>% 
+    .[complex_size >= min_complex_size,] %>% 
+      unique()
+  
+  # subset to distant proteins
+  ppi_distances <- ppi_distances[is.finite(nHops) & nHops >= decoy_min_distance] 
+  allGenes <- ppi_distances[, c(gene1, gene2)]
+
+  # function to create decoy complexes... needs review and can be improved
+  # build a connected graph and seacrch more robust and efficient??
+  .makeDecoyComplex <- function(compID, featureIDs, ppi_distances=ppi_distances, retries=retries, decoy_min_distance, quantile_threshold){
+    
+    size <- corumInfo[complex_id == compID, complex_size]
+    tries <- 0
+    goodDecoySet <- FALSE 
+    
+    while (tries < retries & goodDecoySet == FALSE){
+      
+      genes <- sample(featureIDs, size, replace=F)
+      
+      # previously doing logical filtering but too slow..
+      # make a dt of all possible combos and do a merge
+      gene_pairs <- t(combn(genes, 2))
+      pairs_dt <- data.table(gene1 = pmin(gene_pairs[,1], gene_pairs[,2]),
+                             gene2 = pmax(gene_pairs[,1], gene_pairs[,2]))
+      pairs_dt <- merge(pairs_dt, ppi_distances, by = c("gene1", "gene2"), all.x = TRUE)
+      min_hops <- quantile(pairs_dt$nHops, probs=quantile_threshold, na.rm=T)
+    
+      # either distance exceeds thresh, or no edges
+      if (min_hops >= decoy_min_distance | is.na(min_hops)){
+        goodDecoySet <- TRUE
+        break
+      } else {
+        tries <- tries + 1 
+        genes <- NULL # reset
+      }
+    }
+    if(is.null(genes)){
+      stop("Did not sample ", size, " genes passing ", decoy_min_distance, " distance threshold in ", retries, " retries.\nConsider increasing number of retries and/or reducing the distance threshold")
+    } else {
+      dt <- data.table(complex_id = paste0("decoy_", compID),
+                       complex_name = paste0("decoy_", compID),
+                       complex_size = size,
+                       gene = genes)
+      return(dt)
+    }
+  }
+  message('preparing decoy complexes...')
+  # pbmclappy to use multiple cores
+  cores <- parallel::detectCores() - 2
+  # apply this to each complex
+  #decoys.dt <- pbapply::pblapply(corumInfo[, complex_id],  function(comp) {.makeDecoyComplex(compID = comp, 
+  decoys.dt <- pbmcapply::pbmclapply(corumInfo[, complex_id],  function(comp){ .makeDecoyComplex(compID = comp, 
+                                                                             featureIDs = allGenes, 
+                                                                             ppi_distances = ppi_distances,
+                                                                             retries = retries, 
+                                                                             decoy_min_distance = decoy_min_distance,
+                                                                             quantile_threshold = quantile_threshold
+                                                                             )}, mc.cores = cores) %>% 
+    rbindlist()
+  
+  comb.dt <- rbind(corum.dt, decoys.dt, fill=T)
+  comb.dt[corum.dt, protein := i.protein, on=.(gene)]
+  comb.dt[, decoy := FALSE]
+  comb.dt[grepl('decoy', complex_id), decoy := TRUE]
+  return(comb.dt)
+}
+```
+
+# improved with mclapply; now finishes in ~1.5 min
+```{r}
+system.time(complexes.dt <- generateComplexTargetsAndDecoys(corum.db.path = '~/Documents/utils/mg_utils/data/corum_humanComplexes.txt',
+                                ppi_distances = CORUM.distances,
+                                decoy_min_distance = 3, 
+                                quantile_threshold = 0.1,
+                                min_complex_size = 2,
+                                retries=5))
+```
+complex summarization; instead of doing our own peakFinding, use BPs output
+
+Finding protein features in the data;  a couple of things I guess 
+i) need peakTables, protein-coelution and a database
+ii) first thing to do, inspect peakTables to refine the set of complexes to search to contain only those that contain and share 'good' peaks.
+
+test set; a good complex and a decoy and lets run the analysis for both
+```{r}
+# test complexes to see how things look
+riboset <- sec.interpolated[grepl('^RPL[0-9]{1}$', gene), unique(protein)]
+decoy <- CORUM.distances[nHops > 5, sample(unique(genes),5)]
+# sanity check all distant; take this set of things 
+CORUM.distances[gene1 %in% decoy & gene2 %in% decoy ]
+decoy <- sec.interpolated[gene %in% decoy, unique(protein)]
+```
+test data
+```{r}
+# get test data
+testMat <- interpintMat[['Sonic_1']]
+testPeakTable <- peakTables[['Sonic_1']]
+testCor <- corPeaks.ls[['Sonic_1']][['cor']]
+
+
+message('finding coeluting complex members...')
+#' Use the peak detection table to filter out hypothesis to test
+#' In some cases like below,  the peaks may have a slight offset; we want to cluster peaks to account for this difference
+#' then cofmN_sd will handle this variance of clustering
+#' not sure on other metrics.. need to think on this..
+detectProteinComplexCoelutions <- function(comp_id, complex.dt, peakTable, maxDistance=2, min.members=2){
+  
+  peaks.dt <- copy(peakTable)
+  members <- complex.dt[complex_id == comp_id, unique(protein)]
+  
+  complex.info <- peaks.dt[protein %in% members & goodPeak] %>% 
+    .[, peakCluster := clusterPeaks(peakLocation,  maxDistance = maxDistance),]
+  
+  complex.info <- complex.info[,.(peakLocations = paste0(unique(peakLocation), collapse=';'),
+                                  complex_id = comp_id,
+                                  complex_name = complex.dt[complex_id == comp_id, unique(complex_name)],
+                                  members=paste0(sort(members), collapse=";"),
+                                  nMembers = length(members),
+                                  CoelutingMembers=paste0(sort(protein), collapse=";"),
+                                  nCoelutingMembers=.N,                                  peakHeight_mean = mean(peakHeight, na.rm=T),
+                                  peakHeight_sd = sd(peakHeight, na.rm=T),
+                                  cofmN_mean=mean(cofmN.standardized, na.rm=T),
+                                  cofmN_sd=sd(cofmN.standardized, na.rm=T), # this or standardised?
+                                  cv_mean=mean(cv, na.rm=T), # not sure on these
+                                  cv_sd=sd(cv, na.rm=T),
+                                  var_man=mean(var, na.rm=T),
+                                  var_sd = sd(var, na.rm=T))
+                                  , by=peakCluster]
+  
+  return(complex.info[nCoelutingMembers >= min.members])
+}
+
+# now use this to further collect summary stats; maybe correlation; window completness per protein other bits..
+#one thing to do is prefilter to just complexes with detected proteins for a start
+detected.complexes.dt <-pbmcapply::pbmclapply(unique(complexes.dt$complex_id), function(comp){ detectProteinComplexCoelutions(comp_id=comp, complex.dt=complexes.dt, peakTable=testPeakTable, min.members = 2)}, mc.cores=cores) %>% 
+  rbindlist()
+
+detected.complexes.dt[, nDetectedPeaks := length(unique(peakCluster)), by=complex_id]
+```
+This summarization is ok, but can we also include coeluting information, and maybe some of the structural proteomics info? I think the structural proteomics and GO would be good for denovo prediction, but I'm not sure what would be the best approach here.... 
+probably take a mixture of data-derived and anno-type features and combine
+
+See if we can pull the co-elution info from the what was already run
+```{r}
+# single complex eg
+# loop through the edges
+# protein portion in peak? could be useful to distinguish sharp from smudgy peaks..
+testCor %>% head()
+
+prots.oi <- c('P13645', 'P35908')
+testCor[protein1 %in% prots.oi & protein2 %in% prots.oi,]
+
+# orders the table by descending log10rate ratio (best at top)
+setorder(testCor -log10RateRatioID )
+
+allPeakCorrs
+
+summary <- allPeakCorrs[, .SD[1], by= .(sample, protein1, protein2, gene1, gene2, prot1Peak, prot2Peak, gs) # best correlation per pair of peaks
+                          ][, .(sumLLRatio = sum(log10RateRatioID[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]), # only sum peaks that are within 20% of the best score
+                                sumCorScore = sum(corScore[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]), # same for cor scores
+                                numPeaks = .N,
+                                numSameStoichPeaks  = sum (abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold)),
+                            by = .(sample, protein1, protein2, gene1, gene2, gs)
+                            ]
+
+
+summary[numPeaks > numSameStoichPeaks]
+stoichDevThreshold <- log2(1 + 0.2)
+testCor[, sum(abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold), by=.I]
+```
+I think im just going to focus on proteins with good co-eluting peaks considering the FP issues, so limit to reporting the coeluting set
+```{r}
+summarizeMemberPairwiseCorrelations <- function(comp.id, complexes.dt, pw.cor.dt){
+  
+  cor.dt <- copy(pw.cor.dt)
+  # take the lexicographically sorted subset
+  # bp does not do this until after protein level peak stats summarization,, but summarises prot1-prot2 and prot2-prot1 seperately, so not sure if they impact res
+  #
+  toChr.vec <-c('protein1', 'protein2')
+  cor.dt[, c(toChr.vec) := lapply(.SD, as.character), .SDcols=toChr.vec]
+  cor.dt <- cor.dt[protein1 < protein2]
+  
+  # look for all corr peaks or focus onthe coeluting proteins?
+  members <- complexes.dt[complex_id == comp.id, unlist(strsplit(CoelutingMembers, ';'))]
+
+  # gene pairs 
+  gene_pairs <- t(combn(members,2))
+  pairs_dt <- data.table(protein1 = pmin(gene_pairs[,1], gene_pairs[,2]),
+                         protein2 = pmax(gene_pairs[,1], gene_pairs[,2]))
+  # faster than logical filtering; dont know if we want a left join or an inner join
+  pairs_dt <- merge(pairs_dt, cor.dt, by = c("protein1", "protein2"), all.x = TRUE)
+  
+  cor.members <- sort(pairs_dt[, unique(c(protein1, protein2))])
+  if (length(cor.members) != length(members))
+    message('Warning: some complex members do not pass the peak window correlation threshold (r>.9)')
+  
+  # take the summary of the peak-peak correlations 
+  complex.peakCors <- pairs_dt[, .(complex_id = comp.id,
+                                  #complex_name = complex.dt[complex_id == comp.id, unique(complex_name)], merge to get this
+                                  CorrMembers=paste0(cor.members, collapse=";"),
+                                  nCorrMembers=length(cor.members),
+                                  nCorrPeaks = .N,
+                                  #numSameStoichPeaks  = sum (abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold)), I want something like this
+                                  corScore_sum = sum(corScore, na.rm=T),
+                                  corScore_norm = sum(corScore, na.rm=T)/length(cor.members), # we want to normalize this score by n detected members.
+                                  pearsonR_mean = mean(pearsonR, na.rm=T),
+                                  pearsonR_sd =  sd(pearsonR, na.rm=T),
+                                  pearsonR_min = min(pearsonR, na.rm=T), # dont know if this is meaningful as thresholded at .9 from previous function???
+                                  pearsonR_max = max(pearsonR, na.rm=T))
+                                  ,]
+  
+  return(complex.peakCors)
+  
+}
+
+detected.complexes.dt
+summarizeMemberPairwiseCorrelations(10, detected.complexes.dt, testCor)
+# to label complexes as 'good' or bad, ensure they share good peaks, have a 
+
+protsOI <- detected.complexes.dt[complex_id == '10', unlist(strsplit(members, ';'))]
+
+
+testCor
+
+      gene_pairs <- t(combn(protsOI,2))
+      pairs_dt <- data.table(gene1 = pmin(gene_pairs[,1], gene_pairs[,2]),
+                             gene2 = pmax(gene_pairs[,1], gene_pairs[,2]))
+      
+      pairs_dt <- merge(pairs_dt, corr.dt, by = c("gene1", "gene2"), all.x = TRUE)
+      
+      min_hops <- quantile(pairs_dt$nHops, probs=quantile_threshold, na.rm=T)
+
+combn
+sort(protsOI)
+
+testCor[protsOI %in% testComp & protsOI %in% testComp]
+
+
+getPWCor <- function(compID, featureIDs, ppi_distances=ppi_distances, retries=retries, decoy_min_distance, quantile_threshold){
+    
+    size <- corumInfo[complex_id == compID, complex_size]
+    tries <- 0
+    goodDecoySet <- FALSE 
+    
+    while (tries < retries & goodDecoySet == FALSE){
+      
+      genes <- sample(featureIDs, size, replace=F)
+      
+      # previously doing logical filtering but too slow..
+      # make a dt of all possible combos and do a merge
+      gene_pairs <- t(combn(genes, 2))
+      pairs_dt <- data.table(gene1 = pmin(gene_pairs[,1], gene_pairs[,2]),
+                             gene2 = pmax(gene_pairs[,1], gene_pairs[,2]))
+      pairs_dt <- merge(pairs_dt, ppi_distances, by = c("gene1", "gene2"), all.x = TRUE)
+      min_hops <- quantile(pairs_dt$nHops, probs=quantile_threshold, na.rm=T)
+    
+      # either distance exceeds thresh, or no edges
+      if (min_hops >= decoy_min_distance | is.na(min_hops)){
+        goodDecoySet <- TRUE
+        break
+      } else {
+        tries <- tries + 1 
+        genes <- NULL # reset
+      }
+    }
+    if(is.null(genes)){
+      stop("Did not sample ", size, " genes passing ", decoy_min_distance, " distance threshold in ", retries, " retries.\nConsider increasing number of retries and/or reducing the distance threshold")
+    } else {
+      dt <- data.table(complex_id = paste0("decoy_", compID),
+                       complex_name = paste0("decoy_", compID),
+                       complex_size = size,
+                       gene = genes)
+      return(dt)
+    }
+}
+
+
+```
+
+
+Anyways, for now we need to use protein peak correlation metrics to strengthen the evidence, or perform our own? Maybe leave as is for now 
+```{r}
+sdcols <- c('protein1', 'protein2')
+testCor[, c(sdcols) := lapply(.SD, as.character), .SDcols = sdcols]
+
+testCor[,.N, by=.(protein1, protein2)][order(-N)]
+
+prots.oi <- c('P13645', 'P35908')
+testCor[protein1 %in% prots.oi & protein2 %in% prots.oi,]
+```
+
+
+
+```{r}
+
+test <- findComplexCoelutions(1, testPeakTable)
+test
+test2<- findComplexCoelutions(2, testPeakTable)
+
+test2
+lapply(, function(x){
+  
+  
+  
+  complexMembers <- complexes.dt[complex_id == x, unique(protein)]
+  
+  # very basic; for now just consider overlapping peak locations, good cv & min height (already filtered to elute above monomeic mass)
+  # think of how we can use centerOFMass, variance over peak etc also for filtering, but fine for now
+  complex.info <- testPeakTable[protein %in% complexMembers & goodPeak][, .(complex_id = x,
+                                                                           Members=paste0(complexMembers, collapse=";"),
+                                                                           nMembers = length(complexMembers),
+                                                                           detectedMembers=paste0(protein, collapse=";"),
+                                                                           nDetectedMembers=.N,
+                                                                           complexCompleteness=length(protein)/length(complexMembers),
+                                                                           cofmN_sd=sd(cofmN, na.rm=T)) # do we want this or the standardised centers?
+                                                                           , by=peakLocation]
+  
+})
+complexes.dt[complex_id == 2,]
+# after iterating over the list of proteins, we find the common 'good' peaks between the groups
+
+#' subset to those that contain good peaks
+testPeakTable[protein %in% riboset & goodPeak]
+
+
+
+findProteinFeatures()
+
+undebug(findComplexFeatures)
+proteinFeatures <- findProteinFeatures(traces=example.prot.traces,
+                                       parallelized = TRUE,
+                                       n_cores = 3)
+```
+*not used*
+
+```{r}
+# original code; 10x slower dont use...
+generateComplexTargetsAndDecoysOri <- function(corum.db.path=NULL,
+                                            ppi_distances=NULL,
+                                            decoy_min_distance=3,
+                                            quantile_threshold=0.1,
+                                            min_complex_size=2,
+                                            retries=3){
+  
+  # database ppi
+  corum.dt <- fread(corum.db.path)[, .(gene = unlist(strsplit(subunits_gene_name, ";")),
+                                       protein = unlist(strsplit(subunits_uniprot_id, ";")),
+                                       ), by=.(complex_id, complex_name)]
+  corum.dt[, complex_size := length(unique(gene)), by=complex_id]
+
+  corumInfo <- corum.dt[, .(complex_id, complex_size)] %>% 
+    .[complex_size >= min_complex_size,] %>% 
+      unique()
+  
+  # subset to distant proteins
+  ppi_distances <- ppi_distances[is.finite(nHops) & nHops >= decoy_min_distance] 
+  setkey(ppi_distances, gene1, gene2) # index to make lookups faster
+  allGenes <- ppi_distances[, c(gene1, gene2)]
+
+  # function to create decoy complexes... needs review and can be improved
+  # build a connected graph and seacrch more robust and efficient??
+  .makeDecoyComplex <- function(compID, featureIDs, ppi_distances=ppi_distances, retries=retries, decoy_min_distance, quantile_threshold){
+    
+    size <- corumInfo[complex_id == compID, complex_size]
+    tries <- 0
+    goodDecoySet <- FALSE 
+    
+    while (tries < retries & goodDecoySet == FALSE){
+      
+      genes <- sample(featureIDs, size, replace=F)
+      # either distance exceeds thresh, or no edges
+      if (ppi_distances[(gene1 %in% genes & gene2 %in% genes), quantile(nHops, probs=quantile_threshold)] >= decoy_min_distance | nrow(ppi_distances[(gene1 %in% genes & gene2 %in% genes)]) == 0){
+        goodDecoySet <- TRUE
+        break
+      } else {
+        tries <- tries + 1 
+        genes <- NULL
+      }
+    }
+    if(is.null(genes)){
+      stop("Did not sample ", size, " genes passing ", decoy_min_distance, " distance threshold in ", retries, " retries.\nConsider increasing number of retries and/or reducing the distance threshold")
+    } else {
+      dt <- data.table(complex_id = paste0("decoy_", compID),
+                       complex_name = paste0("decoy_", compID),
+                       complex_size = size,
+                       gene = genes
+                       )
+      return(dt)
+    }
+  }
+  # apply this to each complex
+  decoys.dt <- pbapply::pblapply(corumInfo[, complex_id],  function(comp) {.makeDecoyComplex(compID = comp, 
+                                                                             featureIDs = allGenes, 
+                                                                             ppi_distances = ppi_distances,
+                                                                             retries = retries, 
+                                                                             decoy_min_distance = decoy_min_distance,
+                                                                             quantile_threshold = quantile_threshold
+                                                                             )}) %>% 
+    rbindlist()
+  
+  return(rbind(corum.dt, decoys.dt))
+}
+```
+
+
+
+Convert the complex db to binary matrix, get path lengths between interactors, and then 
+```{r,eval=TRUE}
+corum.dt <- fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/050925_CCprofiler_testRun_data/2025_05_12_corum.5.1.hsComplexes.long.csv.gz')
+# filter to at least two prots per complex
+corum.dt <- corum.dt[complex_id %in% corum.dt[,.N, by=complex_id][N>1, complex_id]]
+# just converts all complexes to pairwise format
+
+corum.path <- fread('~/Documents/utils/mg_utils/data/corum_humanComplexes.txt')
+corum.path %>% colnames()
+binaryHypotheses <- generateBinaryNetwork(corum.path)
+
+pathLength <- calculatePathlength(binaryHypotheses) # just the number of hops between proteins; 0 when a=b
+
+# generating corum complex + decoys 
+corumTargetsPlusDecoys <- generateComplexDecoys(target_hypotheses=corum.dt,
+                                                dist_info=pathLength,
+                                                min_distance = 2,
+                                                append=TRUE)
+
+
+corumTargetsPlusDecoys[, isDecoy := ifelse(grepl('DECOY', complex_name, ignore.case = T), 'yes', 'no')]
+corumTargetsPlusDecoys[,.N, by=isDecoy] # even split of true and false sets
+```
+
+Finding complex features in our data
+```{r}
+# each complex_id is considered a hyptohesis
+# imputes matrix missing values with random sample from bottom 5% of the distribution (per row)
+# loops over each complex and runs a sliding window, subsets imputed ints mat to these protein subunits
+# findComplexFeatureSW; sliding window correlation for all features in complex_id
+# findComplexFeaturesPP: peak picking; 3 up and 3 down to declare a peak, left and right ar ethe margins of hte picked peaks
+# selects peaks within the sliding window defined above to define features
+# collapses features, then correlates features across proteins to get a cor score
+
+example.prot.traces <- readRDS('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/050925_CCprofiler_testRun_data/2025_05_12_protTraces.example.rds')
+
+
+
+debug(findComplexFeatures)
+complexFeatures <- findComplexFeatures(traces=example.prot.traces,
+                                       parallelized = TRUE,
+                                       n_cores = 3,
+                                       complex_hypothesis = corumTargetsPlusDecoys)
+undebug(findComplexFeatures)
+
+```
+
+Finding protein features in the data;  a couple of things I guess 
+i) need peakTables, protein-coelution and a database
+ii) first thing to do, inspect peakTables to refine the set of complexes to search to contain only those that contain and share 'good' peaks.
+
+test set; a good complex and a decoy and lets run the analysis for both
+```{r}
+interpintMat[[1]][rownames(interpintMat[[1]]) %in% grepl('RPL', rownames(interpintMat[[1]])),]
+
+interpintMat[[1]]
+
+riboset <- sec.interpolated[grepl('^RPL[0-9]{1}$', gene), unique(gene)]
+decoy <- CORUM.distances[nHops > 5, sample(unique(genes),5)]
+
+# sanity check all distant; take this set of things 
+CORUM.distances[gene1 %in% decoy & gene2 %in% decoy ]
+```
+
+```{r}
+# get test data
+testMat <- interpintMat[['Sonic_1']]
+testPeakTable <- peakTables[['Sonic_1']]
+testCor <- corPeaks.ls[['Sonic_1']][['cor']] # one of the PW correlation results
+
+
+complexes.dt[gene %in% riboset, ]
+
+complexes.dt[sec.long, protein := i.protein, on=.(gene)]
+complexes.dt
+#' subset to those that contain good peaks
+testPeakTable[]
+
+
+
+findProteinFeatures()
+
+undebug(findComplexFeatures)
+proteinFeatures <- findProteinFeatures(traces=example.prot.traces,
+                                       parallelized = TRUE,
+                                       n_cores = 3)
+```
+
+#.need to iterate over each of the complexes, subset the allPeaks to that set of protein, identify the number of proteins with overlapping goodpeaks
+# this is the core functon
+```{r}
+    sw.results <- foreach(i = seq_along(inputComplexes)) %do% 
+      {
+        setTxtProgressBar(pb, i)
+        query_complex_id <- inputComplexes[i]
+        runSlidingWindow(query_complex_id, complex_hypothesis = complex_hypothesis, 
+          traces = traces, traces.imputed = trace_mat_imputed, 
+          corr_cutoff = corr_cutoff, window_size = window_size, 
+          collapse_method = collapse_method, rt_height = rt_height, 
+          smoothing_length = smoothing_length)
+      }
+```
+
+
+this is the actual sliding window scoring; what does our scoring look like? Dont think we need to reinvent the wheel, just take what Ben has already prepared
+
+```{r}
+
+```
+
+
+```{r}
+function (complex.id, complex_hypothesis, traces, traces.imputed, 
+  corr_cutoff, window_size, collapse_method, rt_height, smoothing_length) 
+{
+  complex.subunits <- complex_hypothesis[complex_id == complex.id, 
+    protein_id]
+  traces.subs <- subset(traces = traces, trace_subset_ids = complex.subunits)
+  traces.imputed.subs <- traces.imputed[rownames(traces.imputed) %in% 
+    complex.subunits, , drop = F]
+  complex.annotation <- subset(complex_hypothesis, complex_id == 
+    complex.id)
+  try({
+    if (nrow(traces.imputed.subs) >= 2) {
+      complexFeaturesSW <- findComplexFeaturesSW(trace.mat = traces.imputed.subs, 
+        corr.cutoff = corr_cutoff, window.size = window_size)
+      if ((dim(complexFeaturesSW)[1] == 0) & (dim(complexFeaturesSW)[2] == 
+        0)) {
+        return(list())
+      }
+      complexFeaturesPP <- findComplexFeaturesPP(traces.obj = traces.subs, 
+        complexFeaturesSW = complexFeaturesSW, smoothing_length = smoothing_length, 
+        rt_height = rt_height)
+      complexFeaturesCollapsed <- collapseComplexFeatures(complexFeature = complexFeaturesPP, 
+        rt_height = rt_height, collapse_method = collapse_method)
+      if (dim(complexFeaturesCollapsed)[1] == 0) {
+        return(list())
+      }
+      complexFeaturesCollapsed.corr <- calculateFeatureCorrelation(traces.imputed.subs, 
+        complexFeaturesCollapsed)
+      complexFeatureStoichiometries <- estimateComplexFeatureStoichiometry(traces.obj = traces.subs, 
+        complexFeaturesPP = complexFeaturesCollapsed.corr)
+      complexFeatureAnnotated <- annotateComplexFeatures(traces, 
+        complexFeatureStoichiometries, complex.annotation)
+      complexFeatureAnnotated
+    }
+    else {
+      list()
+    }
+  })
+}
+
+```
+
+
+
+```{r}
+# quick example of the smoothing in the data
+plot(ksmooth(1:72, sec.dt[sample == 'Sonic_1' & gene == 'VIM', .(fraction,intensity)]$intensity, n.points=72, kernel='normal', bandwidth=2.68)$y)
+plot(sec.dt[sample == 'Sonic_1' & gene == 'VIM', .(fraction,intensity)]$intensity)
+```
+
+
+One thing I do want to try; correct for uncontrolled batch between conditions.
+Would limma work here? Convert a secLong to 
+First generate PCA of each sample
+
+
+ First use the interpolated values for peak picking,
+```{r}
+PCAofSECSamples <- function(sec.L)
+```
+

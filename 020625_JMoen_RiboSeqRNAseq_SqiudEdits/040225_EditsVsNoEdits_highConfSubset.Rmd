@@ -1,0 +1,385 @@
+---
+title: "040225_EditsVsNoEdits_highConfSubset"
+author: "Martin Gordon"
+date: "2025-04-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## libraries
+```{r}
+library(data.table)
+library(Rsamtools)
+library(magrittr)
+library(ggplot2)
+library(devtools)
+library(riboWaltz)
+library(hrbrthemes)
+library(ComplexHeatmap)
+library(viridis)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/bamProcessing.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+```
+
+**04-02-25**
+The inital results are promising, but I think we need to control for the differences in transcripts between the two sets.
+Identify the transcripts with evidence of editing, then subset to those
+
+*filtering thresholds*
+Consider only A->G edits, on the template strand (1) with min 10 bases cov and 0.1 edit frequency; 
+fairly stringent, can tighten if we still see the signal
+
+still good signal; go with this and see what we get
+Do we want to use only transcripts with more than one hit?
+
+Use edits.dt, subset to the OL set and identify the transcripts with at least 1
+Subset to A-G with at least one read coverage
+
+read in our edits file 
+This file contains edits limited to the protein coding region
+```{r}
+edits.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/033125_rnaEdits_data/2025_03_31_proteinCoding.edits.csv.gz')
+
+edits.dt[`Coverage-q30` >= 10 & Frequency >= 0.1,.N, by=.(AllSubs, Strand)]
+
+ggplot(edits.dt[`Coverage-q30` >= 10 & Frequency >= 0.1,.N, by=.(AllSubs, Strand)], aes(x=AllSubs, y=N)) +
+  geom_bar(stat='identity') +
+  facet_grid(Strand~.)
+```
+
+
+```{r}
+#samples.oi <- c("RIBO_OPTIC_4","RIBO_OPTIC_5","RIBO_OPTIC_6","altRIBO_OPTIC_13")
+samples.oi <- c("RIBO_OPTIC_4","RIBO_OPTIC_5","RIBO_OPTIC_6")
+
+ggplot(edits.dt[sample %in% samples.oi & `Coverage-q30` > 10 & ((AllSubs == 'AG' & Strand == 1)|(AllSubs == 'TC' & Strand == 0))][,.N, by=.(sample, AllSubs)], aes(x=AllSubs, y=N)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~sample)
+
+ggplot(edits.dt[sample %in% samples.oi & `Coverage-q30` >= 10 & Frequency >= 0.1,][,.N, by=.(sample,Strand, AllSubs)], aes(x=AllSubs, y=N)) +
+  geom_bar(stat='identity') +
+  facet_grid(Strand~sample)
+```
+
+```{r}
+ggplot(edits.dt[sample %in% samples.oi & `Coverage-q30` >= 10 & Frequency >= 0.1,][,.N, by=.(sample,Strand, AllSubs)], aes(x=AllSubs, y=N)) +
+  geom_bar(stat='identity') +
+  facet_grid(Strand~sample)
+
+edits.sub.dt <- edits.dt[sample %in% samples.oi & `Coverage-q30` >= 10 & Frequency >= 0.1 & Strand == 1 & AllSubs == 'AG',]
+
+# do we want to limit it to sites with known edits? I think so....
+# ~ 1.5k transcripts with edits at above thresholds across all 3
+transcripts.oi <- edits.sub.dt$Region %>%
+  unique()
+```
+
+Now for each OL sample, we want to:
+i) pull out edited transcripts for each 
+ii) pull out unedited transcripts for each
+
+```{r}
+in.reads <- dir(path='./output/reditools/032825_transcriptomeMap', pattern="*outReads", recursive = T, full.names=T)
+in.reads <- grep('\\/RIBO_OPTIC', in.reads, value=T) #subset to these 3 samples
+
+edit.reads <- lapply(in.reads, fread, header=F)
+
+names(edit.reads)  <- gsub('./output/reditools/032825_transcriptomeMap/|/DnaRna_.+', '', in.reads)
+edit.reads %>% names()
+
+reads.dt <- rbindlist(edit.reads, idcol='sample')
+reads.dt <- reads.dt[grepl('>', V1),]
+
+# drop the non-coding references 
+reads.dt[, c('header', 'ref', 'site') := tstrsplit(V1, '[$]', keep=c(1,2,3))]
+reads.dt$V1 <- NULL
+
+# subset jut reads to references we want
+reads.dt <- reads.dt[ref %in% transcripts.oi,]
+reads.dt[, flag := tstrsplit(header, '_', keep=3)]
+reads.dt[, header := gsub('>|_[0]$', '',header)]
+
+#fwrite(reads.dt, ScriptAndDatedFileName('.OL.filteredEdits.csv.gz'))
+reads.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_02_.OL.filteredEdits.csv.gz')
+```
+now we have dt with the transcripts and the reads that match these transcripts;
+added an MD tag to the bam files which highlight the mismatches;
+write an awk file to go through the files, find the mismatches and subset to this
+(maybe handle multimappers in )
+
+```{r}
+# quicly check the proportions
+psite.counts <- fread('./040125_EditVsNoEditComparison_data/2025_04_01_psite.codonusage.csv.gz')
+
+# take the proportion of normalized counts & raw counts and get a proportion per sample
+psite.counts[, propCounts := (count/sum(count)), by=sample]
+psite.counts[, propNormCounts := (norm_count/sum(norm_count)), by=sample]
+
+psite.counts[, condition := gsub('_[123]', '', sample)]
+# summarise the data table 
+summary.dt <- psite.counts[, .(avgProp = mean(propCounts), sdProp = sd(propCounts), avgNormProp=mean(propNormCounts), sdNormProp=sd(propNormCounts)), by=.(condition,codon)]
+
+summary.dt[, .SD[which.max(avgNormProp)], by=.(condition)]
+```
+
+```{r}
+library(tidymodels)
+
+ggplot(summary.wide, aes(x=avgProp_optic_noEdits, y=avgProp_optic_Edits, label=codon)) +
+  geom_point() +
+  geom_abline() +
+  ggrepel::geom_label_repel() +
+  theme_bw() +
+  coord_obs_pred()
+
+ggplot(summary.wide, aes(x=avgNormProp_optic_noEdits, y=avgNormProp_optic_Edits, label=codon)) +
+  geom_point() +
+  geom_abline() +
+  ggrepel::geom_label_repel() +
+  theme_bw() +
+  coord_obs_pred()
+```
+
+How do we know if the edit is in the psite? need to map mutations to the 
+
+## need to limit the analysis to reads where the edit overlaps the p/a site; 
+find the a-site/p-site
+
+subset the filtered bam to just the high quality edits
+```{r}
+filtered.bam.dt <- fread('./040125_EditVsNoEditComparison_data/2025_04_02_.OL.filteredEdits.csv.gz')
+
+hq.filtered.bam <- merge(x=filtered.bam.dt, y=edits.sub.dt, by.x=c('sample', 'ref', 'site'), by.y=c('sample','Region', 'Position'))
+# just keep relevant headerds
+hq.filtered.bam <- hq.filtered.bam[,.(sample, header, ref, site,flag)]
+```
+# now have the high quality set of bam files, just subset to p and a 
+
+```{r}
+anno.dt <- create_annotation(gtfpath = './docs/dorPea.gtf')
+
+anno.ori <-  fread('./output/Dpea_1_genomic_cleanheaders_final.pipelineFiltered.gtf')
+anno.ori
+
+anno.ori[grepl('PAC4GC:38551344', V9)]
+
+new.anno.dt <- create_annotation(gtfpath = './output/Dpea_1_genomic_cleanheaders_final.pipelineFiltered.gtf')
+new.anno.dt
+anno.dt[transcript == 'PAC4GC:38551344']
+
+
+fread('./output/Dpea_1_genomic_cleanheaders_final.pipelineFiltered.gtf')
+```
+gtf investigation
+
+```{r}
+fread('./docs/dorPea.gtf')[grepl('PAC4GC:38551344', V9)]
+
+217*3
+```
+
+
+# get the bam files
+Im pretty sure the reads are already deduplicated (can we try running umitools deduplicate on one of the samples to confirm?)
+```{r}
+reads_list <- bamtolist(bamfolder = "./output/riboseq_bamfiles_firstPass/filtered/riboseq/splitBams", transcript_align = T, annotation = anno.dt)
+# custom names 
+names(reads_list) <- c('altprep_optic_noEdits_1','altprep_optic_Edits_1', 'gill_noEdits_1', 'gill_Edits_1', 'gill_noEdits_2', 'gill_Edits_2', 
+                       'gill_noEdits_3', 'gill_Edits_3','optic_noEdits_1', 'optic_Edits_1', 'optic_noEdits_2', 'optic_Edits_2', 'optic_noEdits_3', 'optic_Edits_3')
+
+```
+
+```{r}
+reads_list <- reads_list[grepl('^RIBO_OPTIC_', names(reads_list))]
+
+filtered_list <- length_filter(data = reads_list,
+ 				length_filter_mode = "periodicity",
+ 				periodicity_threshold = 60) #lets go with higher threshold 2/3 should fall in one frame
+
+psite_offset <- psite(filtered_list, flanking = 5, extremity = "auto", plot=F)
+```
+Use the psite/asite info from the tools alongwith the vairant calls to subset
+We will subset the edits and filter psites info to psite/asite that overlap the edit
+
+```{r}
+psite.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_01_editVsnoedit.annotated.pae.sites.csv.gz')
+psite.dt
+
+```
+
+```{r}
+psite.dt <- psite.dt[sample %in% c("optic_noEdits_1","optic_Edits_1","optic_noEdits_2","optic_Edits_2","optic_noEdits_3","optic_Edits_3")]
+```
+need to merge our edits and p-site table
+```{r}
+edits.sub.dt[sample == 'RIBO_OPTIC_4', sample := 'optic_Edits_1']
+edits.sub.dt[sample == 'RIBO_OPTIC_5', sample := 'optic_Edits_2']
+edits.sub.dt[sample == 'RIBO_OPTIC_6', sample := 'optic_Edits_3']
+
+# remove the unnecessary substitutions
+cols.noi <- grep('^g', colnames(edits.sub.dt), value=T)
+edits.sub.dt[, (cols.noi) := NULL]
+
+#fwrite(edits.sub.dt, ScriptAndDatedFileName('OL.edits.highQuality.csv.gz'))
+edits.sub.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040225_EditsVsNoEdits_highConfSubset_data/2025_04_02_OL.edits.highQuality.csv.gz')
+```
+The psite dt presents the first base pos of the psite as reference. We want to add 3 to create the asite, and also do a rolling join for both seperately
+Then we can summarize the counts for both and look at the differential sites
+
+Using foverlaps simplier than the datatable merge and gives me what I want
+```{r}
+testx <- edits.sub.dt
+
+edits.psite.dt <- psite.dt[grepl('optic_Edits_[123]', sample)]
+testy <- edits.psite.dt
+
+# lets try foverlaps; think this might be simplier
+testx[, `:=`(pos.x = Position, pos.y = Position)]
+testy[, `:=`(pos.x = psite, pos.y = psite+2)] # because p site maps to first base
+
+# sort the joining table and set key; these are the intervals and keys we want to use for the joins
+setkey(testy, sample,transcript,pos.x, pos.y)
+
+# testing overlaps
+# here we want to keep all matches as multiple reads with same transcripts mapping to the same 5' extreme
+overlapEdits <- foverlaps(testx, testy, by.x=c('sample', 'Region', 'pos.x', 'pos.y'), nomatch=NULL)
+overlapEdits[sample == 'optic_Edits_1' & Region == 'PAC4GC:38617568' & end5 == 430]
+psite.dt[sample == 'optic_Edits_1' & transcript == 'PAC4GC:38617568' & end5 == 430]
+
+#sanity check; looks good! the hits match the bam file 
+overlapEdits[sample == 'optic_Edits_1' & Region == 'PAC4GC:38617568' & end5 == 430]
+```
+tidy, write to file and share with Jack
+```{r}
+cols.noi <- c('psite_end', 'pos.x', 'pos.y', 'i.pos.x', 'i.pos.y')
+overlapEdits[, (cols.noi) := NULL]
+
+overlapEdits[, overlapSite := 'pSite']
+
+fwrite(overlapEdits, ScriptAndDatedFileName('OL.highQualEdits.overlappingPSite.csv.gz'))
+```
+Do the same with the A-site, use the remaining set as the background
+```{r}
+testx <- edits.sub.dt
+testy <- edits.psite.dt
+
+#  set keys using the a-sitre
+testx[, `:=`(pos.x = Position, pos.y = Position)]
+testy[, `:=`(pos.x = asite, pos.y = asite+2)]
+
+# sort the joining table and set key; these are the intervals and keys we want to use for the joins
+setkey(testy, sample,transcript,pos.x, pos.y)
+
+# testing overlaps
+# here we want to keep all matches as x datatable contains multiple reads with same transcript alignemnt & 5' end, but different length etc
+overlapEdits <- foverlaps(testx, testy, by.x=c('sample', 'Region', 'pos.x', 'pos.y'), nomatch=NULL)
+
+cols.noi <- c('psite_end', 'pos.x', 'pos.y', 'i.pos.x', 'i.pos.y')
+overlapEdits[, (cols.noi) := NULL]
+overlapEdits[, overlapSite := 'aSite']
+
+#fwrite(overlapEdits, ScriptAndDatedFileName('OL.highQualEdits.overlappingASite.csv.gz'))
+
+allOverlaps <- rbind(fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040225_EditsVsNoEdits_highConfSubset_data/2025_04_02_OL.highQualEdits.overlappingASite.csv.gz'),
+                     fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040225_EditsVsNoEdits_highConfSubset_data/2025_04_02_OL.highQualEdits.overlappingPSite.csv.gz'), fill=T)
+
+allOverlaps$editInPsite <- NULL
+
+
+# confirm that no edit site is both a psite and asite occupier..what are these? They are edits in adjacent positions so no prob!
+allOverlaps[,.N, by=.(sample,Region,end5, end3, overlapSite)][N > 1][,.N, by=.(sample,Region,end5, end3)][N > 1][order(-N)]
+```
+Looks good! these are unique based on umi
+Share these with Jack; 
+```{r}
+fwrite(allOverlaps, ScriptAndDatedFileName('OL.highQualEdits.overlapping.AorPsites.csv.gz'))
+```
+
+write out the full set of results for Jack
+
+```{r}
+pae.sites <- fread('040125_EditVsNoEditComparison_data/2025_04_01_editVsnoedit.annotated.pae.sites.csv.gz')
+
+codonUsage <- rbind(pae.sites[,.(site='psite',.N), by=.(codon=p_site_codon,sample)],
+pae.sites[,.(site='asite',.N), by=.(codon=a_site_codon, sample)])
+
+
+codonUsage[, APratio := N[site == 'psite']/N[site == 'asite'], by=.(codon, sample)]
+
+# ratio of psite to asite
+ggplot(codonUsage[grepl('_Edit', sample) & site == 'psite'], aes(x=codon,  y=APratio, label=codon)) +
+  geom_point() +
+  geom_hline(yintercept = 1) +
+  ggtitle('psite/asite ratio') +
+  ggrepel::geom_label_repel(data=codonUsage[grepl('_Edit', sample) & codon == 'ATT' &  site == 'psite']) +
+  facet_wrap(~sample) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+
+ggplot(codonUsage[grepl('_noEdit', sample) & site == 'psite'], aes(x=codon,  y=APratio, label=codon)) +
+  geom_point() +
+  geom_hline(yintercept = 1) +
+  ggtitle('psite/asite ratio') +
+  ggrepel::geom_label_repel(data=codonUsage[grepl('_noEdit', sample) & codon == 'ATT' &  site == 'psite']) +
+  facet_wrap(~sample) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+```
+## 04-04-25
+
+Now we want to reduce our set for the comparisons. Look at the set of edits, and the set with no edits and subset to the same list of transcripts
+Get the transcripts from the editing set, and subset the no-edits to this, then do the riboWaltz analysis etc (or just filter to the read names we have and use those?)
+
+```{r}
+#all 
+hq.edits <- fread('040225_EditsVsNoEdits_highConfSubset_data/2025_04_02_OL.edits.highQuality.csv.gz')
+# have to filter out gtf to this to keep
+regions.oi <- hq.edits$Region %>% 
+  unique()
+
+regions.oi
+```
+
+Subset the bam files to the overlapping list
+
+```{r}
+sample.oi <- c("altprep_optic_noEdits_1",  "optic_noEdits_1",  "optic_noEdits_2" ,  "optic_noEdits_3")
+noEditBams <- dir('./output/riboseq_bamfiles_firstPass/filtered/riboseq/splitBams_mdTag', pattern="*noEdits*", full.names = T) %>% 
+  grep('OPTIC', ., value=T)
+
+bamlist <- lapply(noEditBams, bamToTable)
+names(bamlist) <- gsub("./output/riboseq_bamfiles_firstPass/filtered/riboseq/splitBams_mdTag/|.mdTags.bam", '', noEditBams)
+```
+Using this to subset to the same bam files. Rerun the analysis to identify differences in the matched bam files (edits vs no edits)
+```{r}
+bam.dt <- rbindlist(bamlist, idcol = 'sample')
+bam.dt <- bam.dt[rname %in% regions.oi,]
+
+# filter this table to just the protein coding s
+bam.dt[, header := tstrsplit(qname, '_', keep=1)]
+
+fwrite(bam.dt[rname %in% regions.oi, .(qname)], col.names = F, sep='\t', ScriptAndDatedFileName('transcriptsToKeep.txt'))
+```

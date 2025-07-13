@@ -1,0 +1,452 @@
+---
+title: "quickQC"
+author: "Martin Gordon"
+date: "2024-02-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Quick QC of the AB proteomics data 
+
+
+```{r}
+library(data.table)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(magrittr)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+```
+sanity check this
+```{r}
+getwd()
+spec <- fread('./data/MSstats.txt')
+p.quant <- fread('./data/results-mss-ProteinLevelData.txt')
+
+keys <- fread('docs/keys.txt')
+
+keys[,.N, by=.(Condition, RawFile, BioReplicate)]
+spec.dt[,.N, by=.(Condition, Run,BioReplicate)]
+
+spec.dt <- merge(x=spec[,!c("Condition", "BioReplicate")], y=keys[,.(Condition, BioReplicate, RawFile, Fraction,IsotopeLabelType)], by.x='Run', by.y='RawFile')
+spec.dt
+
+spec$BioReplicate %>%  unique()
+keys$BioReplicate %>%  unique()
+```
+
+inspect the feature level data for multiple features per peptide ion
+
+Each row in the table should be the intensity from one MS "feature" per run (an elution peak from a single peptide ion). It's possible that there are multiple features per peptide ion and run--if the peptide elutes in two different peaks perhaps.
+
+```{r}
+# no multiple feature peptide ions detected
+spec.dt[,.N, by=.(PeptideSequence,PrecursorCharge,Run)][N >1]
+
+
+hist(log2(spec.dt$Intensity))
+spec.dt <-  spec.dt[Intensity > 2^5, ]
+hist(log2(spec.dt$Intensity))
+```
+
+raw boxplots
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(length(unique(spec.dt$Condition)))
+
+g <- ggplot(spec.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'raw.intensities.boxplot')
+```
+ N features detected per sample
+ 
+```{r}
+g <- ggplot(spec.dt[,.N, by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'rawFeatureCounts.barplot')
+
+
+spec.dt$Condition %>%  unique()
+```
+# assess sample similarity 
+for the outliers
+```{r}
+wide <- dcast(spec.dt, ProteinName+PeptideSequence+PrecursorCharge~Condition+BioReplicate, value.var = "Intensity")
+
+# good agreement between replicates it looks like 
+
+# one of the mocks may be an issue but generally v simialr 
+ggplot (wide, aes (x =log2(Vehicle_7D_1), y = log2(Vehicle_7D_2))) + geom_point(shape = ".") + geom_density_2d() + coord_fixed()
+ggplot (wide, aes (x =log2(x4206_7D_2), y = log2(x4206_7D_4))) + geom_point(shape = ".") + geom_density_2d() + coord_fixed()
+```
+ PCA features 
+ ----
+ 
+```{r}
+featureMat <- dcast (spec.dt,
+                     paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") |> as.matrix(rownames = "PeptideSequence")
+
+featureMat <- featureMat[complete.cases(featureMat), ]
+
+```
+
+
+```{r}
+pcaOut <- prcomp(t(log2(featureMat)))
+
+colInfo <- data.table(colname = colnames(featureMat))
+
+colInfo
+colInfo[,c("status","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+BackupAsPDF(p, "PCA_Complete_Features")
+```
+
+ # pca of the protein summarised data
+ 
+```{r}
+prot.mat <- dcast (p.quant, Protein~SUBJECT, value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+colnames(prot.mat)
+
+prot.mat <- prot.mat[complete.cases(prot.mat),]
+```
+ 
+```{r}
+pcaOut <- prcomp(t(prot.mat))
+
+colInfo <- data.table(colname = colnames(prot.mat))
+colInfo[,c("status", "rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+pcaDT[, `:=`(timepoint = ifelse(grepl("[47]D", rn), str_extract(rn, "[47]D"), 'na'),
+             treat = gsub("[_.].+", "", rn)
+             )]
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA_Complete_Proteins")
+
+pcaDT
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = treat, shape = timepoint)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "PCA_Complete_Proteins_TreatmentandTimepoint")
+```
+split the tp 7 nd tp 4 samples
+
+```{r}
+pcaDT %>%  colnames()
+
+p <- ggplot (pcaDT[timepoint %in% c('na', '4D'),], aes(x=PC1, y=PC3,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC3, %.1f%%", pcaPercentVar[3])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+
+BackupAsPDF(p, 'completeProteins.subsetday4samples.pca')
+
+
+pcaVar.dt <- data.table(PC = seq(1, length(pcaPercentVar)), 
+                        Var = pcaPercentVar)
+
+g <- ggplot(pcaVar.dt[1:10,], aes(x=PC, y=Var, group=Var)) +
+  geom_bar(stat='Identity') + 
+  ggtitle('Mock + D4 samples')
+g
+BackupAsPDF(g, 'pca.scree.day4samples.')
+
+
+qplot(c(1:10), pcaPercentVar[1:10]) + 
+  geom_line() + 
+  xlab("Principal Component") + 
+  ylab("Variance Explained") +
+  ggtitle("Scree Plot") +
+  ylim(0, 1)
+
+p <- ggplot (pcaDT[timepoint %in% c('na', '7D'),], aes(x=PC1, y=PC3,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+#BackupAsPDF(p, 'completeProteins.subsetday7samples.pca')
+
+pcaVar.dt <- data.table(PC = seq(1, length(pcaPercentVar)), 
+                        Var = pcaPercentVar)
+
+g <- ggplot(pcaVar.dt[1:10,], aes(x=PC, y=Var, group=Var)) +
+  geom_bar(stat='Identity') + 
+  ggtitle('Mock + D7 samples')
+g
+BackupAsPDF(g, 'pca.scree.day7samples.')
+
+
+```
+Plot by run ID 
+
+```{r}
+keys[, rn := interaction(Condition,BioReplicate)]
+
+pcaDT
+
+p <- ggplot (pcaDT[timepoint %in% c('na', '4D'),], aes(x=PC1, y=PC3,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC3, %.1f%%", pcaPercentVar[3])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+
+```
+
+maybe rerun the clustering
+
+
+```{r}
+p.quant %>%  str()
+
+prot.mat <- dcast (p.quant, Protein~interaction(SUBJECT), value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+prot.mat <- prot.mat[complete.cases(prot.mat),]
+
+
+prot.mat <- prot.mat[, grepl("Mock|4D", colnames(prot.mat))]
+colnames(prot.mat)
+
+
+pcaOut <- prcomp(t(prot.mat))
+
+colInfo <- data.table(colname = colnames(prot.mat))
+colInfo[,c("status", "rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+#BackupAsPDF(p, "completeProteins.day4.pca.RunID.")
+
+
+q <- qplot(1:10,  pcaPercentVar[1:10]) +
+  geom_line() +
+  xlab('Princpal Component 1:10') +
+  ylab(('% Variance explained')) +
+  ggtitle('Mock + Day4 samples scree plot')
+
+BackupAsPDF(q, 'screeplot.Day4plusMock.')
+
+
+#BackupAsPDF(p, "completeProteins.day4.pca.RunID.")
+
+
+```
+```{r}
+
+prot.mat <- dcast (p.quant, Protein~SUBJECT, value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+prot.mat <- prot.mat[complete.cases(prot.mat),]
+
+prot.mat <- prot.mat[, grepl("Mock|7D", colnames(prot.mat))]
+colnames(prot.mat)
+
+
+pcaOut <- prcomp(t(prot.mat))
+
+colInfo <- data.table(colname = colnames(prot.mat))
+colInfo[,c("status", "rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+#BackupAsPDF(p, "completeProteins.day7.pca.")
+
+q <- qplot(1:10,  pcaPercentVar[1:10]) +
+  geom_line() +
+  xlab('Princpal Component 1:10') +
+  ylab(('% Variance explained')) +
+  ggtitle('Mock + Day7 samples scree plot')
+
+BackupAsPDF(q, 'screeplot.Day7plusMock.')
+
+```
+
+
+
+data looks good; normalised protein intensities
+```{r}
+
+g <- ggplot(p.quant, aes (x= interaction(SUBJECT, GROUP), y = LogIntensities, fill = GROUP)) +
+  geom_boxplot() +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'protein.intensities.boxplot')
+```
+
+Protein Counts per sample
+Counts v consistent
+
+```{r}
+
+g <- ggplot(p.quant[,.N,by=.(GROUP,SUBJECT)], aes(x=SUBJECT, y = N, fill = GROUP)) +
+  geom_bar(stat='Identity') +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'nProteins.barplot')
+```
+finally,some heatmaps to look at sample clustering 
+Really low numbers of missing prots.. only ~200 prots missing..
+
+```{r}
+prot.mat <- dcast (p.quant, Protein~SUBJECT, value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+
+dim(prot.mat)
+dim(prot.mat[complete.cases(prot.mat),])
+colnames(prot.mat)
+
+# create annotation
+ann <- data.table(replicate=str_extract(colnames(prot.mat),'[1-5]$'),
+                  treatment=sub("[_.].+", "", colnames(prot.mat)),
+                  timepoint=ifelse(grepl("[47]D", colnames(prot.mat)), str_extract(colnames(prot.mat), "[47]D"), 'na'))
+
+colours <- list('timepoint' = c('na' = '#4477AA', '4D'="#228833", '7D'="#CCBB44"),
+                'replicate' = c('1' = '#4477AA', '2'='#66CCEE', '3'="#228833", '4'="#CCBB44", '5'='#EE6677'),
+                'treatment' =c('Mock' = col.pal[1], 'Vehicle'=col.pal[2], 'N1062D'=col.pal[3], 'x3769'=col.pal[4], 'x4052'=col.pal[5], 'x4206'=col.pal[6])
+                )
+   
+N1062D             
+x3769
+x4052
+x4206
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+hm <- Heatmap(prot.mat, cluster_rows=T, show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities', column_names_gp = gpar(fontsize=6))
+BackupAsPDF(hm, 'proteins.clustered.heatmap')
+
+submat <- sweep(prot.mat,1, STATS=apply(prot.mat, 1, median, na.rm=T))
+hm <- Heatmap(submat, cluster_rows=T, show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities/Median',  column_names_gp = gpar(fontsize=6))
+BackupAsPDF(hm, 'proteins.clustered.medianscaled.heatmap')
+```
+

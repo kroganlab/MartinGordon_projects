@@ -1,0 +1,487 @@
+---
+title: "sig.features.stringNetwork"
+author: "Martin Gordon"
+date: "2023-10-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Packages 
+
+```{r}
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(circlize)
+library(RCy3)
+library(STRINGdb)
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+
+
+```
+
+##STRING network of sig features
+
+significance threshold: fdr 0.1 and log2FC 0.58
+As a goal of the analysis was to identify significant genes role, one option was to import the differentially expressed genes into STRING to analyse as a 
+
+Note; the AB MS naming convention follows RNAseq denominator-numeratior
+
+```{r}
+prot.ab <- fread('./output/prot.ab.clean.dea.results.csv')
+rna <-fread('./output/rna.clean.dea.results.csv')
+
+p.ab.quant <- fread('~/Documents/projects/051623_DSwaney/2023_05_16_DSwaney_AA08_AB_data/2023_05_25_ProteinLevelData.csv.gz') 
+```
+
+Capture total n of proteins for the STRING enrichment work 
+```{r}
+n.prots <- prot.ab[, unique(Protein)]
+length(n.prots)
+
+prot.ab[, omics := 'ab.ms']
+
+# add adj.pval to graph
+rna[, adj.pvalue := p.adjust(pvalue, method='BH'), by=Label]
+rna[, omics := 'rna']
+```
+
+pull out all significant hits in both comparisons - combine into one dataframe per label for PPI creation
+Reducing significance thresholds to try find more connections in network
+
+```{r}
+sig.prots <- prot.ab[abs(log2FC) > 0.58 & adj.pvalue < 0.1,  .(Label, gene, log2FC, pvalue, adj.pvalue, omics)] 
+
+sig.rna <- rna[abs(log2FC) > 0.58 & adj.pvalue < 0.1, .(Label, gene_symbol, log2FC, pvalue, adj.pvalue, omics)] 
+setnames(sig.rna, old = "gene_symbol", new= "gene")
+
+       
+sig.all <- rbind(sig.prots, sig.rna, fill=T) %>% 
+  split(., .$Label)
+
+#ggplot(sig.all[[1]], aes(x=pvalue)) + geom_histogram() + facet_wrap(~Label+omics)
+```
+
+extract all our signfiicant proteins in each label and 
+```{r}
+sig.prots <- sig.prots[, STRING.id := translateGene2String(gene, species='HUMAN', fillMissing = T)] %>% 
+  .[!is.infinite(abs(log2FC)) & grepl('9606', STRING.id), .(gene, STRING.id, Label,log2FC,pvalue,adj.pvalue, omics)] 
+sig.prots <- split(sig.prots, sig.prots$Label)
+
+names(sig.prots)
+```
+
+map our gene ids to STRING. (Drop unmapped STRING and infinite values)
+```{r}
+sig.all <- lapply(sig.all, function(x){
+  x[, STRING.id := translateGene2String(gene, species='HUMAN', fillMissing = T)]
+  x[!is.infinite(abs(log2FC)) & grepl('9606', STRING.id), .(gene, STRING.id, Label,log2FC,pvalue,adj.pvalue, omics)] 
+})
+```
+Query the upregulated and downregulated genes in the STRINGDB per contrast
+- first query both upreg and downreg together; just looking for interactions between this set
+
+```{r}
+str.query <- lapply(seq_along(sig.prots), function(x){
+  string.cmd <- paste('string protein query query="', paste(sig.prots[[x]]$gene, collapse = '\n'), '" cutoff=0.8 limit=0 species="Homo sapiens"',  sep = "")
+  })
+
+names(str.query) <- names(sig.all.clean)
+
+```
+
+Create networks per label
+```{r}
+lapply(seq_along(str.query), function(x,n,i){
+  commandsRun(x[[i]])
+  
+  net.name <- n[[i]]
+  renameNetwork(net.name)
+  }, x=str.query, n=names(str.query))
+```
+
+Try Edge-weighted Spring Embedded layout, seems best fit for this
+
+```{r}
+layoutNetwork('force-directed edgeAttribute="score"')
+layoutNetwork('kamada-kawai edgeAttribute="score"')
+```
+Map additional characteristics to the networks from the differential expression analysis
+
+```{r}
+loadTableData(sig.prots[[1]],  data.key.column=c("gene"), table.key.column="query term")
+loadTableData(sig.prots[[2]],  data.key.column=c("gene"), table.key.column="query term")
+```
+
+
+Now we have a useful layout, lets alter attributes of the network
+Create a visual style
+
+
+Adjust the Avidd visual style 
+
+```{r}
+setVisualStyle("avidd.style")
+setNodeShapeDefault("ELLIPSE", "avidd.style")
+lockNodeDimensions("TRUE", "avidd.style")
+setNodeSizeDefault("65", "avidd.style")
+setNodeColorDefault("#D3D3D3", "avidd.style")
+setNodeBorderWidthDefault("2", "avidd.style")
+setNodeBorderColorDefault("#616060", "avidd.style")
+setNodeLabelMapping("display name", "avidd.style")
+setNodeFontSizeDefault("15", "avidd.style")
+setEdgeOpacityDefault(100, "avidd.style")
+
+setNodeColorMapping('log2FC', colors=paletteColorBrewerRdBu, style.name="avidd.style")
+setNodeSizeMapping('Degree', c(1,12),c(60,110), style.name="avidd.style")
+#setEdgeLineWidthMapping('stringdb::score', c(0.4,1), c(1,3), style.name="avidd.style")
+```
+
+Want to highlight nodes of interest (those that sig different in both RNAseq and AB data)
+
+read in that datatable, select these nodes and highlight
+```{r}
+exp.sig <- fread('./output/17.06.experimental-omics-sig-genes.csv')
+genes.oi <- exp.sig[omics %in% c('all.sig', 'rna.ab.sig'), unique(gene)]
+
+
+# for these nodes highlight
+selectNodes(genes.oi, by.col = "display name")
+setNodeBorderWidthBypass(getSelectedNodes(), 7)
+setNodeBorderColorBypass(getSelectedNodes(), 'violet')
+```
+Export the intermediate image
+
+```{r}
+# for both networks
+exportImage('ab.ms.WT-ND_IFNg.changelayout', 'PDF')
+exportImage('ab.ms.WT-ND_IFNg.changelayout.test', 'PNG', zoom=200)
+exportNetwork('ab.ms.WT-ND_IFNg.changelayout')
+
+exportImage('ab.ms.EV-WT_IFNg.changelayout.test', 'PNG', zoom=200)
+exportNetwork('ab.ms.EV-WT_IFNg.changelayout')
+
+```
+
+## RNAseq data integration
+
+Integrate with the RNAseq expression data from the experiment
+Want to add RNAseq DEGs to expand the network
+
+identify the sig features that are shared in both datasets
+remove theseRNAseq rows and use the prot.ab data
+```{r}
+shared.sig.feats <- lapply(sig.all, function(x){
+  x[duplicated(gene)]$gene
+})
+```
+sig features, for features that appear in both, highlight and use the ab ms log2FC value
+
+```{r}
+sig.all.clean <- lapply(sig.all, function(x){
+  genes.shared <- x[duplicated(gene),gene]
+  x[!(gene %in% genes.shared & omics == 'rna'),]
+})
+
+#sanity check
+#sig.all.clean[['EV_IFNg-vs-WT_IFNg']][gene %in% shared.sig.feats[['EV_IFNg-vs-WT_IFNg']], ]
+
+names(sig.all.clean) <- c("EV_IFNg-vs-WT_IFNg.combinedNet", "WT_IFNg-vs-ND_IFNg.combinedNet")
+
+lapply(seq_along(sig.all.clean), function(x,n,i){
+  
+  x[[i]][,unique(gene)] %>%  
+    as.data.frame() %>% 
+  fwrite(paste0('./output/',n[[i]],'.Networkgenes.csv'), col.names = F)
+  
+}, x=sig.all.clean, n=names(sig.all.clean))
+
+```
+
+map our gene ids to STRING. (Drop unmapped STRING and infinite values)
+```{r}
+sig.all.clean <- lapply(sig.all.clean, function(x){
+  x[, STRING.id := translateGene2String(gene, species='HUMAN', fillMissing = T)]
+  x[!is.infinite(abs(log2FC)) & grepl('9606', STRING.id), .(gene, STRING.id, Label,log2FC,pvalue,adj.pvalue, omics)] 
+})
+```
+
+
+Query the upregulated and downregulated genes together in the STRINGDB per contrast
+
+Querying both upregulated and downregulated genes together
+Starting at 600 string score
+
+```{r}
+lapply(seq_along(sig.all.clean), function(x,n,i){
+  
+  #extract gene list to make the network
+  gene.list <- x[[i]][,unique(gene)]
+  gene.str <- paste(gene.list, collapse=',')
+  
+  # commands run
+  string.cmd <- paste("string protein query cutoff=0.6 limit=0 query", gene.str, sep = "=")
+  commandsRun(string.cmd)
+
+  
+  # name network (how to merge to same collections)
+  net.name <- n[[i]]
+  renameNetwork(net.name)
+  # load additional node info
+  loadTableData(sig.all.clean[[i]], data.key.column=c("gene"), table.key.column="display name")
+
+  }, x=sig.all.clean, n=names(sig.all.clean))
+```
+Get the network IDs for iterating
+
+```{r}
+
+net.ids <- lapply(names(sig.all.clean), function(x){ 
+  getNetworkSuid(x) })
+
+```
+
+Generate network connectivity statistics using Network Analyzer plugin
+
+```{r}
+lapply(net.ids, function(x){
+  
+  setCurrentNetwork(network=x)
+  analyzeNetwork(directed=F)
+})
+
+```
+Create a visual style for the network and apply
+```{r}
+
+deleteVisualStyle("avidd.style")
+style.name = "avidd.style"
+
+defaults <- list(NODE_SHAPE="ellipse",
+                 LABEL_FONT_SIZE=30,
+                 NODE_SIZE=60,
+                 NODE_COLOR="#D3D3D3",
+                 NODE_BORDER_WIDTH=2,
+                 NODE_BORDER_COLOR="#616060",
+                 EDGE_TRANSPARENCY=100,
+                 EDGE_OPACITY=100)
+                 
+
+nodeLabels  <- mapVisualProperty('node label','gene','p')
+#nodeFills   <- mapVisualProperty('node fill color','log2FC','c',c(-2.5,0,2.5), c('blue', 'white', 'red'))
+nodeFills   <- mapVisualProperty('node fill color','log2FC','c',c(-2,0,2), c('#EF8A62', '#F7F7F7', '#67A9CF'))
+#setNodeColorMapping('log2FC', colors=paletteColorBrewerRdBu, style.name="avidd.style")
+
+nodeSize    <- mapVisualProperty('node size','Degree', 'c', c(0,25), c(60,120))
+nodeShapes  <- mapVisualProperty('node shape', 'omics', 'd', c("ab.ms","rna"), c("ellipse","diamond"))
+edgeWidth   <- mapVisualProperty('edge width','stringdb::score','c', c(0.6,1), c(1,5))
+
+
+createVisualStyle(style.name, defaults, list(nodeLabels,nodeFills,edgeWidth, nodeShapes, nodeSize))
+```
+
+Apply the visual style to the data 
+
+```{r}
+lapply(net.ids, function(x){
+  setVisualStyle(style.name, network = x)
+})
+```
+Lets try apply force directed layout and cluster
+
+```{r}
+
+lapply(net.ids, function(x){
+   #layoutNetwork('force-directed defaultSpringCoefficient=.000012 defaultSpringLength=10', network=x)
+   #layoutNetwork('force-directed defaultSpringCoefficient=.00006 defaultSpringLength=40')
+   layoutNetwork('kamada-kawai', network=x)
+
+})
+
+layoutNetwork('force-directed defaultSpringCoefficient=.00006 defaultSpringLength=10')
+layoutNetwork('force-directed defaultSpringCoefficient=.000012 defaultSpringLength=10')
+layoutNetwork('kamada-kawai')
+```
+
+Save plots
+
+```{r}
+exportImage('ab.ms.rna.WT-ND_IFNg.STRING.600', 'PDF')
+exportImage('ab.ms.rna.WT-ND_IFNg.STRING.600', 'PNG', zoom=200)
+
+
+exportImage('ab.ms.rna.EV-WT_IFNg.STRING.600', 'PDF')
+exportImage('ab.ms.rnaEV-WT_IFNg.STRING.600', 'PNG', zoom=200)
+```
+Highlight the significant features found in both datasets
+
+```{r}
+exp.sig <- fread('./output/17.06.experimental-omics-sig-genes.csv')
+genes.oi <- exp.sig[omics %in% c('all.sig', 'rna.ab.sig'), unique(gene)]
+
+
+# for these nodes highlight
+selectNodes(genes.oi, by.col = "display name")
+setNodeBorderWidthBypass(getSelectedNodes(), 20)
+setNodeBorderColorBypass(getSelectedNodes(), 'violet')
+```
+```{r}
+exportImage('ab.ms.rna.WT-ND_IFNg.STRING.600.sigHighlighted', 'PDF')
+exportImage('ab.ms.rna.WT-ND_IFNg.STRING.600', 'PNG', zoom=200)
+
+
+exportImage('ab.ms.rna.EV-WT_IFNg.STRING.600.sigHighlighted', 'PDF')
+exportImage('ab.ms.rnaEV-WT_IFNg.STRING.600', 'PNG', zoom=200)
+```
+Now, cluster these and enrich against background of all genes detected in the experiment
+Our background is union of genes detected in both experiments
+
+```{r}
+#save clustered networks
+exportImage('ab.ms.rna.EV-WT_IFNg.STRING.600.clustered', 'PDF')
+exportImage('ab.ms.rna.WT-ND_IFNg.STRING.600.clustered', 'PDF')
+```
+export the enrichment results
+```{r}
+#save clustered networks
+exportImage('ab.ms.rna.EV-WT_IFNg.STRING.600.clustered.enrichment', 'PDF')
+exportImage('ab.ms.rna.EV-WT_IFNg.STRING.600.clustered.enrichment', 'PNG', zoom=200)
+
+exportImage('ab.ms.rna.WT-ND_IFNg.STRING.600.clustered.enrichment', 'PDF')
+exportImage('ab.ms.rna.WT-ND_IFNg.STRING.600.clustered.enrichment', 'PNG', zoom=200)
+
+exportImage('ab.ms.rna.WT-ND_IFNg.STRING.600.clustered.enrichment', 'PDF')
+```
+
+
+```{r}
+
+ lapply(sig.all.clean, function(x){
+   gene.list <- x[,unique(gene)]
+   gene.str <- paste(gene.list, collapse=',')
+   string.cmd <- paste("string protein query cutoff=0.6 limit=0 query", gene.str, sep = "=")
+   commandsRun(string.cmd)
+  })
+```
+Create networks per label
+```{r}
+lapply(seq_along(str.query), function(x,n,i){
+  commandsRun(x[[i]])
+  
+  net.name <- n[[i]]
+  renameNetwork(net.name)
+  }, x=str.query, n=names(str.query))
+
+
+
+paste(sig.all$`EV_IFNg-vs-WT_IFNg.combinedNet`$gene, collapse = '\n')
+lapply(str.query, print)
+```
+
+
+
+Cant get enrichment analysis to change bg. When using STRING returns error node not found..
+
+First load in our background network into cytoscape and convert to STRING network
+```{r}
+bg.features <- union(prot.ab[, unique(gene)], rna[, unique(gene_symbol)])
+
+bg.df <- data.frame(id = bg.features)
+
+createNetworkFromDataFrames(
+  nodes = bg.df,
+  edges = NULL, # w/o setting this is just a collection of unconnected nodes
+  collection = 'background features',
+  title = 'background network')
+
+```
+
+After enrichment is completed, take the enrichment tables for each and combine
+
+EV-WT 
+```{r}
+path <- "/Users/martingordon/Documents/projects/061423_AVIDD_DataIntegration"
+
+input <- dir(path=path, pattern = "*enrichment.csv$", recursive = T, full.names = TRUE) %>% 
+  data.table() %>% 
+  setnames('.', 'path') %>% 
+  .[, type := str_extract(path, 'Ev-WT|WT-ND')]
+
+# combine EV-WT
+WT.ND.enrich <- lapply(input[type == 'WT-ND', path], function(x){
+  
+  e.dt <- fread(x)
+  # remove cols not of interest
+  cols.noi <- c('chart color','PMID', 'network.SUID','nodes.SUID','year', 'transferred FDR value')
+  col.order <- c('cluster', 'category', 'description', 'term name','p-value', 'FDR value', '# genes', '# background genes', 'genes')
+  
+  e.dt[, !..cols.noi] %>% 
+    .[, cluster := str_extract(x, 'MCL[0-9]{1,2}')] %>% 
+    .[, ..col.order]
+  
+}) %>%  rbindlist()
+
+fwrite(WT.ND.enrich, 'WT-ND_IFNg.enrichment.csv')
+
+
+EV.WT.enrich <- lapply(input[type == 'Ev-WT', path], function(x){
+  
+  e.dt <- fread(x)
+  # remove cols not of interest
+  cols.noi <- c('chart color','PMID', 'network.SUID','nodes.SUID','year', 'transferred FDR value')
+  col.order <- c('cluster', 'category', 'description', 'term name','p-value', 'FDR value', '# genes', '# background genes', 'genes')
+  
+  e.dt[, !..cols.noi] %>% 
+    .[, cluster := str_extract(x, 'MCL[0-9]{1,2}')] %>% 
+    .[, ..col.order]
+  
+}) %>%  rbindlist()
+
+fwrite(EV.WT.enrich, 'EV-WT_IFNg.enrichment.csv')
+```
+
+
+
+
+
+```{r}
+apms.data<-read.csv(file="https://raw.githubusercontent.com/cytoscape/cytoscape-automation/master/for-scripters/R/notebooks/AP-MS/ap-ms-demodata.csv", stringsAsFactors = FALSE)
+
+```
+
+
+```{r}
+string.cmd <- paste('string protein query query="', paste(bg.prots, collapse = '\n'), '" cutoff=0.4 limit=0 species="Homo sapiens"',  sep = "")
+
+```
+
+
+*test data*
+
+```{r}
+de.genes <- read.table("https://raw.githubusercontent.com/cytoscape/cytoscape-tutorials/gh-pages/protocols/data/TCGA-Ovarian-MesenvsImmuno_data.csv", header = TRUE, sep = ",", quote="\"", stringsAsFactors = FALSE)
+de.genes.up <- de.genes[which(de.genes$logFC >= 1.8 & de.genes$FDR.adjusted.Pvalue <= 0.05),]
+
+string.cmd = paste('string protein query query="', paste(de.genes.up$Gene, collapse = '\n'), '" cutoff=0.4 limit=0 species="Homo sapiens"', sep = "")
+
+
+commandsRun(string.cmd)
+
+```
+
+*using the STRING network*
+Define the STRING network to use; we want high confidence interactions so threshold at 600 string score
+
+```{r}
+# want function interactions rather than full or just physical
+string_db <- STRINGdb$new( version="12", species=9606, score_threshold=600, network_type="full", input_directory="")
+```
+

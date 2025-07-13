@@ -1,0 +1,436 @@
+---
+title: "012125_plasmidDenominatorContrasts"
+author: "Martin Gordon"
+date: "2025-01-22"
+output: html_document
+---
+Interested in the plasmid comparisons as the library is selected from earlier step in the selection process (not selecting the lentivrirus infected with antibiotics)
+
+
+Work through Ronalds todo list:
+Give an excel file with all mutants label beside the grna ( Nevan wanted this). 
+2. Pten and Interactors- alpha fold pairwise (identify the region of interaction and position and see if we they also appear in base editing screen.
+3. Regarding the lollipop plot....we still have to improve to ensure grey circles are smaller in size ( let's do for just one gene and see if it can be further improved).
+4.we need to do but keep this as the last option. Is it possible to do the analysis with the plasmid library as a control rather than day 0 Ctrl? Do not want all the analysis. May be for just pik3ca and pten and let's see whether it increases drug independent mutation. 
+
+Start on 4 as this is a necessary comparison
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(seqinr)
+library(readxl)
+library(tidymodels)
+
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+```
+
+We want the plasmid denominator pair-wise comparisons for each group, so regenerate the input matrix and metadata for DESeq 
+```{r}
+summary.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgCount.summary.csv')
+count.mat <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt')
+
+# counts look very consistent between the different groups
+boxplot(log2(count.mat[,-c('Gene', 'sgRNA')]))
+```
+get the count matrix of the normalized counts (normalized using non-targeting guides)
+```{r}
+rawMat <- count.mat[,-c('Gene')] %>% 
+  as.matrix(rownames='sgRNA')
+```
+
+Need to split the matrix into two groups based on editor: bemax and abe8e
+Keep the plasmid group counts in both matrices/metadata
+```{r}
+abe8e.vec <- grep('sgRNA|Gene|abe8|plasmid', colnames(count.mat), value=T)
+bemax.vec <- grep('sgRNA|Gene|bemax|plasmid', colnames(count.mat), value=T)
+
+abe8e.mat <- count.mat[, ..abe8e.vec]
+bemax.mat <- count.mat[, ..bemax.vec]
+
+mat.list <- list('abe8e'= abe8e.mat,
+                 'bemax' = bemax.mat)
+
+
+#convert to matrix
+mat.list <- lapply(mat.list, function(x) as.matrix(x[,-c('Gene')], rownames='sgRNA'))
+```
+
+Creating metadata for the analysis
+```{r}
+summary.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgCount.summary.csv')
+
+metadata <- summary.dt[, .(sample=paste(editor,treatment,timepoint,rep, sep='_'), group=paste(editor,treatment,timepoint, sep='_'), editor, treatment, timepoint, rep)] %>% 
+  as.data.table()
+
+# tidy some of the conditions
+metadata[treatment == 'control', treatment := 'DMSO']
+metadata[treatment == 'librep', treatment := 'LibraryRep']
+metadata[, treatment := factor(treatment, levels=c('LibraryRep', 'DMSO', 'Paxalisib', 'Alpelisib'))]
+metadata[, timepoint := factor(timepoint, levels=c('0','7', '22'))]
+  
+# tidy the plasmid comparison group
+metadata[group == 'plasmid_librep_0', c('editor', 'treatment', 'timepoint') := .('na', 'Plasmid', '0')]
+metadata[group == 'plasmid_librep_0', condition := factor(paste0(treatment, '_',timepoint))]
+
+# make condition group and plasmid our baseline measurement
+metadata[, condition := factor(paste0(treatment, '_',timepoint))]
+metadata[, condition := relevel(condition, ref='Plasmid_0')]
+
+abe8e.meta <- metadata[grepl('abe8|plasmid', sample),] %>% 
+    as.data.frame(row.names = .$sample)
+bemax.meta <- metadata[grepl('bemax|plasmid', sample),] %>% 
+  as.data.frame(row.names = .$sample)
+
+
+meta.list <- list('abe8e'= abe8e.meta,
+                 'bemax' = bemax.meta)
+
+meta.list[[1]]$condition %>%  unique()
+meta.list[[1]]$treatment %>%  unique()
+```
+```{r}
+# reorder the matrix columns
+mat.list <- lapply(names(mat.list), function(i){
+  
+  mat.list[[i]] <- mat.list[[i]][, rownames(meta.list[[i]])]
+  return(mat.list[[i]])
+  
+})
+names(mat.list) <- c('abe8e', 'bemax')
+
+# all true
+colnames(mat.list[[1]]) == rownames(meta.list[[1]])
+colnames(mat.list[[2]]) == rownames(meta.list[[2]])
+```
+
+Run DESeq2
+First create the DESeq2 object a
+
+```{r}
+# first run DESeq2 with the full set on the two editors seperately
+deseq.list <-lapply(names(mat.list), function(x,y,i){
+  
+  dds <- DESeqDataSetFromMatrix(countData = round(x[[i]]),
+                              colData = y[[i]],
+                              design = ~condition)
+  
+  dds <- estimateSizeFactors(dds)
+  print(sizeFactors(dds))
+  # run DESeq2 w/o normalization
+  # replace the size factors
+  sizeFactors(dds) <- replace(sizeFactors(dds), 1:length(sizeFactors(dds)), 1)
+  return(dds)
+},x=mat.list, y=meta.list)
+
+names(deseq.list) <-  names(mat.list)
+```
+Remove low count guides (want at least 10 reads for a guide in 75% of the groups)
+```{r}
+deseq.list <- lapply(names(deseq.list), function(x,i){
+    
+  keep <- rowSums(counts(x[[i]]) >= 10) >= 11
+  dds <-  x[[i]][keep,]
+  
+  message('Retaining ', nrow(dds), ' guides ', 'from ', nrow(counts(x[[i]])))
+  return(dds)
+  
+},x=deseq.list)
+
+names(deseq.list) <-  names(mat.list)
+```
+
+Save the two deseq objects to file
+
+```{r}
+lapply(names(deseq.list), function(x,i){
+  print(x[[i]])
+  saveRDS(x[[i]], ScriptAndDatedFileName(paste0(i, '.dds.plasmidBaselvl.rds')))
+},x=deseq.list)
+```
+Load in the two deseq2 objects
+
+```{r}
+deseq.list <- list('abe8e' = readRDS('012125_plasmidDenominatorContrasts_data/2025_01_22_abe8e.dds.plasmidBaselvl.rds'),
+                   'bemax' = readRDS('012125_plasmidDenominatorContrasts_data/2025_01_22_bemax.dds.plasmidBaselvl.rds'))
+```
+
+Run the differential tests vs Plasmid at day 0
+```{r}
+de.list  <- lapply(deseq.list, function(x){
+  
+  dds <- DESeq(x)
+  
+  contrasts.oi<- grep('Intercept', resultsNames(dds), invert=T, value = T)
+  print(contrasts.oi)
+  
+  all.res <- lapply(contrasts.oi, function(n){
+    
+    res <- results(dds, name=n) %>% 
+      as.data.table(., keep.rownames=T) %>% 
+      .[, contrast := n]
+    
+  }) %>% rbindlist()
+})
+```
+combine the results from each set and change the file names
+Question: why are some padj set to NA? Seems it is flagged as an outlier by independent filtering see here in vignette:
+https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#indfilt
+The adjusted p values for the genes which do not pass the filter threshold are set to NA; this is to optimize power by filtering out tests with v little chance of passing threshold
+```{r}
+de.dt <- rbindlist(de.list, idcol='editor')
+setnames(de.dt, old='rn', new='sgRNA')
+```
+
+Question: why are some padj set to NA? Seems it is flagged as an outlier by independent filtering see here: https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#indfilt
+So these are outliers and best to be ignored?
+```{r}
+de.dt[!is.na(padj)]
+raw.mat[rownames(raw.mat) %in% c('BE_1', 'BE_10'), grepl('plasmid|Alpelisib_22', colnames(raw.mat))]
+```
+set quite a low pvalue threshold for significance pval < 0.005 & abs(log2FoldChange) > 1 as not many guides pass
+
+```{r}
+de.dt[, sig := 'not']
+de.dt[abs(log2FoldChange) >= 1 & pvalue < 0.005, sig := ifelse(log2FoldChange > 0, 'up', 'down')]
+de.dt[, contrast := gsub('condition_','', contrast)]
+de.dt[, c('numerator', 'denominator') := tstrsplit(contrast, '_vs_', keep=c(1,2))]
+de.dt[, treatment := gsub('_[0-9]+', '', numerator)]
+de.dt[, numeratorTimepoint := str_extract(numerator, '[027]+$')]
+
+# how many sighits in each contrast?
+de.dt[sig != 'not',.N, by=contrast] #290 pass threshold our sig threshold
+```
+**annotate guides**
+First we annotate the guides with gene ID
+```{r}
+
+sginfo.dt <- read_xlsx('./docs/PIK3CA pathway base editing.xlsx', sheet=1) %>%  
+  as.data.table()
+sginfo.dt <- sginfo.dt[, .(gene = toupper(Gene), sgRNA=`Sl No`, guide=Guide)]
+sginfo.dt[grepl('SGINTERGENIC', gene), gene := 'Intergenic']
+
+
+de.dt <- merge(de.dt, sginfo.dt, by='sgRNA')
+de.dt[gene == 'NON-TARGETING', gene := 'Non-targeting']
+
+# write out the annotated contrasts to file
+#fwrite(de.dt, ScriptAndDatedFileName('deseq.pwContrasts.vsPlasmid.T0.csv'))
+```
+
+now add all the gene/guide annotation information; do these sites fall over known mutants? 
+```{r}
+# read back in the PW comparisons
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/012125_plasmidDenominatorContrasts_data/2025_01_22_deseq.pwContrasts.vsPlasmid.T0.csv')
+
+# this includes all the annotation information from my script CRISPR functions
+guides.anno <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/110724_annotateCRISPRguides_Functions_data/2024_11_20_guides.mutant.anno.collapsed.txt')
+guides.anno[, first_peptide_pos :=  stringr::str_extract(peptide_position, '[0-9]+'), by=.I]
+guides.anno[, first_nuc_pos :=  stringr::str_extract(nucelotide_position, '[0-9]+'), by=.I]
+
+# includes all the clinvar annotations mapped to each guide
+clinvar.anno <- fread('./110724_annotateCRISPRguides_Functions_data/2024_11_14_guides.clinvar.anno.collapsed.txt')
+
+# merge with our mutation annotationinformation
+de.dt <- merge(de.dt, guides.anno[, .(guide, editor, gene_start, gene_end,  transcript_start, transcript_end, genome_index, 
+                                      ref_codon, alt_codon, nucelotide_position, ref_peptide, alt_peptide, peptide_position, 
+                                      nuc_mutant_id, pep_mutant_id, first_peptide_pos, first_nuc_pos,
+                                      splice.site, mutant_type, most_severe_mutant, most_common_mutant)], by.x=c('guide', 'editor'), by.y=c('guide', 'editor'), all.x=T)
+
+#add clinvar annotations
+de.dt <- merge(de.dt, clinvar.anno[,.(guide, editor, hgvs, clinicalSignificance, nuc_site, ref_prot, alt_prot, prot_site)], by.x=c('guide', 'editor'), by.y=c('guide', 'editor'), all.x=T)
+
+de.dt[gene == 'Intergenic']
+de.dt[gene == 'NON-TARGETING', gene := 'non-targeting']
+de.dt[gene == 'NON-TARGETING', gene := 'non-targeting']
+#fwrite(de.dt, ScriptAndDatedFileName('deseq.pwContrasts.vsPlasmid.T0.allAnnotations.csv'))
+```
+
+ok, read back in the pw comparisons with the annotation data and lets look at the plots
+
+```{r}
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/012125_plasmidDenominatorContrasts_data/2025_01_22_deseq.pwContrasts.vsPlasmid.T0.allAnnotations.csv')
+
+# set factor levels for plotting
+de.dt[, numerator := factor(numerator, levels=c("DMSO_7","DMSO_22","Alpelisib_7","Alpelisib_22", "Paxalisib_7", "Paxalisib_22", "LibraryRep_0"))]
+de.dt[, numeratorTimepoint := factor(numeratorTimepoint, levels=c("0","7","22"))]
+de.dt[, treatment := factor(treatment, levels=c('Alpelisib', 'Paxalisib', 'DMSO', 'LibraryRep'))]
+de.dt[, gene := factor(gene, levels=c('PTEN', 'PIK3CA', 'MTOR', 'AKT1', 'Non-targeting', 'Intergenic'))]
+
+# simplified clinvar anme
+de.dt[, clinvarSimplified := paste0(gene,':',ref_prot, prot_site, alt_prot)]
+
+de.dt
+```
+
+
+plot the number of hits per contrast/gene
+```{r}
+# breakdown by contrast
+g <- ggplot(de.dt[,.N, by=.(sig, numerator, editor, numeratorTimepoint)][sig != 'not',], aes(x=reorder(numerator, as.numeric(numeratorTimepoint)), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Contrasts vs Plasmid D0') +
+  labs(x='numerator condition', y='N sig hits: |LFC| > 1 & pval < 0.005') +
+  facet_wrap(~editor, scales='free') +
+  scale_fill_manual(values=c('up'=col.pal[2], 'down'=col.pal[1])) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'NsigHits.barchart')
+
+
+# look at direction of movement
+# seems equal distribution of things moving, but most of the sig resulta are the upregulated...
+g <- ggplot(de.dt[abs(log2FoldChange) > 1, .N, by=.(direction, numerator, editor, numeratorTimepoint)], aes(x=reorder(numerator, as.numeric(numeratorTimepoint)), y=N, fill=direction)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~editor, scales='free') +
+  ggtitle('N sgRNA with large fold changes |LFC| > 1') +
+  labs(x='numerator condition', y='N |LFC| > 1') +
+  scale_fill_manual(values=c('up'=col.pal[2], 'down'=col.pal[1])) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+
+# breakdown by contrast
+g <- ggplot(de.dt[sig != 'not',.N, by=.(gene, numerator, editor, numeratorTimepoint)], aes(x=reorder(numerator, as.numeric(numeratorTimepoint)), y=N, fill=gene)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Contrasts vs Plasmid D0') +
+  labs(x='numerator condition', y='N sig hits: |LFC| > 1 & pval < 0.005') +
+  facet_wrap(~editor, scales='free') +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'NsigHits.bygene.barchart')
+```
+
+volcanoplot; lets look at the distribution of guides in our data; look fine but not many passing significance
+
+```{r}
+g <- ggplot(de.dt[editor == 'bemax' & !grepl('Library', numerator),], aes(x=log2FoldChange, y=-log10(pvalue), col=sig)) +
+  geom_point(sixze=1.25) + 
+  ylab('-log10 p-value') +
+  ggtitle('bemax editor: contrasts vs plasmid day 0') +
+  ggrepel::geom_text_repel(data=de.dt[editor == 'bemax' & sig != 'not' & !grepl('Library', numerator)], 
+                           aes(label=ifelse(!is.na(ref_prot), paste0(gene,':',ref_prot, prot_site, alt_prot), '')),
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  #facet_grid(treatment~numeratorTimepoint, scales='free') +
+  facet_wrap(~numerator, ncol=2, scales='free') +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+BackupAsPDF(g, 'bemax.contrasts.vsplasmid.volcano', dimensions=c(16,11))
+
+
+g <- ggplot(de.dt[editor == 'abe8e' & !grepl('Library', numerator),], aes(x=log2FoldChange, y=-log10(pvalue), col=sig)) +
+  geom_point(size=1.25) + 
+  ylab('-log10 p-value') +
+  ggtitle('abe8e editor: contrasts vs plasmid day 0') +
+  ggrepel::geom_text_repel(data=de.dt[editor == 'abe8e' & sig != 'not' & !grepl('Library', numerator)], 
+                           aes(label=ifelse(!is.na(ref_prot), paste0(gene,':',ref_prot, prot_site, alt_prot), '')),
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  #facet_grid(treatment~numeratorTimepoint, scales='free') +
+  facet_wrap(~numerator, ncol=2, scales='free') +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+BackupAsPDF(g, 'abe8e.contrasts.vsplasmid.volcano', dimensions=c(16,11))
+```
+For a basic first pass, this is probably enough to share with Ronald;
+Write out the data, along with the numerator and denominator counts
+```{r}
+de.dt.simplified <- de.dt[, .(editor,gene,sgRNA,guide,contrast, log2FoldChange, pvalue, padj, sig, ref_codon, alt_codon, nucelotide_edit_position=nucelotide_position, ref_peptide, alt_peptide, peptide_edit_position=peptide_position, splice.site, mutant_type, most_severe_mutant, hgvs, clinicalSignificance)]
+
+#fwrite(de.dt.simplified, ScriptAndDatedFileName('pwcomparisons.vsPlasmidD0.simplifiedToshare.csv'))
+
+fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/012125_plasmidDenominatorContrasts_data/2025_01_22_pwcomparisons.vsPlasmidD0.simplifiedToshare.csv')
+#now add our count information to the dataset
+count.dt <- reshape2::melt(raw.mat) %>% 
+  setDT()
+setnames(count.dt, old=c('Var1', 'Var2', 'value'), new=c('sgRNA', 'sample', 'normalizedCounts'))
+
+count.dt[, c('editor', 'treatment','timepoint', 'replicate') := tstrsplit(sample, '_', keep=c(1,2,3,4))]
+# collapse the replicate counts into one row
+count.dt <- count.dt[, lapply(.SD, function(x) paste(x, collapse=',')), .SDcols=c('normalizedCounts'), by=.(sgRNA, editor, treatment, timepoint)]
+```
+
+```{r}
+rawMat <- count.mat[,-c('Gene')] %>% 
+  as.matrix(rownames='sgRNA')
+
+
+rawMat[rownames(rawMat) == 'BE_1257',]
+```
+
+
+```{r}
+de.dt[id == 'BE_1257']
+
+
+```
+
+

@@ -1,0 +1,656 @@
+---
+title: "042325_DifferentialAnalysis_RegeneratePlots"
+author: "Martin Gordon"
+date: "2025-04-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+*Todo*
+Update on the analysis performed on 041525
+Remove S12N from analysis (not looking to validate this group; drop this genotype from all plots)
+Reorder color scale on heatmaps
+Look at cytokines, chemokines, ISGs macrophages geneSets: rerun enrichment and share FC output for this set of genes 
+Focus on HKCA dEX11 vs WT
+
+*Notes*
+After speaking to Atoshi, it is possible there are some confounders upstream as Atoshi did not prepare the cells (eg possible they are in different stages of the cell cycle etc.) would explain huge differences in the groups
+
+```{r packages}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(DESeq2)
+library(tximport) # doubt this is needed if we just use the gene summarisation of the nf-core pipeline
+library(ggh4x) # additional functionality for ggplot2 obj; eg facet_grid allow x/y axis to vary
+library(scales) # axis and legend params
+library(patchwork)
+library(RColorBrewer)
+library(cluster) # pam clustering of genes
+library(eulerr) # eulerr plot 
+library(viridis)
+library(IHW) # independent hypothesis weighting for DESeq2; improved statistical power
+library(ggforce)
+library(eulerr)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+col.pal <- getQualitativePalette(n=6)
+redbluColpal <- c('#D01B1B', '#FF4242', '#FFFFFF', '#95D2EC','#47abd8')
+
+
+# for the different groups
+condition.col <- c('WT'="#1B9E77", 'dEX11'="#D95F02", 'S12N'="#7570B3")
+treatment.col <- c('LPS'= "#E6AB02",'HKCA'="#666666")
+#treatment.col <- c('LPS'= "#E6AB02", "#E7298A", "#A6761D", "#666666")
+
+
+# isgs for plotting; set passed around by Adrian
+isGenes <- fread('/Users/martingordon/Documents/projects/022624_AViDD_AB_PH_data/docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+```
+
+Read in all the data we need and subset the groups to the contrasts we are interested in
+
+## Read in data
+```{r readcounts}
+counts.dt <- fread('./output/salmon.merged.gene_counts.tsv')
+#tpm.dt <- fread('./output/salmon.merged.gene_tpm.tsv') # normalized values for vi
+
+counts.dt[gene_name == gene_id] # all idnetical 
+counts.dt[, gene_id := NULL]
+
+counts.mat <- as.matrix(counts.dt, rownames='gene_name')
+
+# drop the S12N mat
+counts.mat <- counts.mat[, !grepl('S12N', colnames(counts.mat))]
+```
+create a metadata table for the analysis
+```{r metadata}
+meta.dt <- data.table(sample=colnames(counts.dt))
+meta.dt[, `:=`(condition = gsub('[_].+', '', sample),
+               treatment = stringr::str_extract(sample, 'HKCA|LPS'),
+               rep = stringr::str_extract(sample, '[123]$'))]
+
+meta.dt <- meta.dt[, group := paste0(condition,'_', treatment)] %>% 
+  .[condition != 'gene']
+
+
+meta.dt$group %>% unique()
+# set factor levels; only natural referece is for condition
+meta.dt[, `:=`(condition = factor(condition, levels=c('WT', 'dEX11', 'S12N')),
+               treatment = factor(treatment, levels=c('LPS','HKCA')),
+               group = factor(group, levels=c("WT_LPS","WT_HKCA","dEX11_HKCA","dEX11_LPS","S12N_HKCA","S12N_LPS")))
+               ]
+
+meta.dt <- meta.dt[condition != 'S12N']
+```
+This is the set of genes that have been filtered to only include consistent counts;
+subset to the group of interest
+```{r}
+comb.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_18_DESeqContrasts.combined.wLFCshrinkage.filtered.csv.gz')
+comb.dt <- comb.dt[!grepl('S12N', contrast),]
+```
+
+We also want the normalized counts; read in the deseq2 obj and extract 
+```{r}
+dds <- readRDS('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_15_dds.CARD9variants.wInteractionTerm.rds')
+
+norm.mat <- assay(vst(dds, blind=T))
+norm.mat <- norm.mat[, !grepl('S12N', colnames(norm.mat))]
+
+
+norm.mat
+
+# same counts in dt format
+counts.long <- fread('041525_DifferentialAnalysis_FirstPass_data/2025_04_15_norm.counts.csv.gz')
+counts.long <- counts.long[condition != 'S12N']
+
+counts.long[, group := factor(group, levels=c('WT_LPS','WT_HKCA', 'dEX11_HKCA', 'dEX11_LPS'))]
+```
+
+PCA
+
+```{r, pca, fig.height=5, fig.width=7}
+pcaOut <- prcomp(t(norm.mat))
+
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, meta.dt, by.x = "rn", by.y = "sample", all.x = TRUE)
+
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(pcaDT$condition)))
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = group, shape = rep)) + 
+  geom_point(size=4) +
+  ggrepel::geom_text_repel(aes(label=gsub('[.]quant[.]sf', '', rn)), show.legend = FALSE, size = 2) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_fill_brewer(type = "qual", palette = 2) +
+  scale_shape_manual(values = 21:25) +
+ # scale_fill_manual(values=col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'conditionCol.pca')
+
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = condition, shape = rep)) + 
+  geom_point(size=4) +
+  ggrepel::geom_text_repel(aes(label=gsub('[.]quant[.]sf', '', rn)), show.legend = FALSE, size = 2) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_fill_brewer(type = "qual", palette = 4) +
+  scale_shape_manual(values = 21:25) +
+ # scale_fill_manual(values=col.pal) +
+  guides(fill = guide_legend('genotype',override.aes = list(shape =21) ) ,
+         color = guide_legend('genotype',override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'genotypeCol.pca')
+```
+```{r heatmap,  fig.height=6, fig.width=8}
+# median scale the rows to find submats
+submat <- sweep(norm.mat, 1, apply(norm.mat,1, median, na.rm=T), FUN='-')
+submat <- submat[sample(rownames(submat), 2000),]
+
+colAnn <- HeatmapAnnotation(df = meta.dt[,.(group,condition, treatment, rep)])
+
+hm <- Heatmap(submat,
+              column_split = list(tstrsplit(colnames(submat), '_', keep=1, '_'),
+                                  tstrsplit(colnames(submat), '_', keep=2, '_')),
+              column_title_gp = gpar(fontsize=10, fontface='bold'),
+              col = colorRamp2(colors=redbluColpal, breaks=c(4,2,0,-2,-4)),
+              column_names_gp = gpar(fontsize=7),
+              name='normCounts/median',
+              row_title = sprintf('%s randomly sampled genes',nrow(submat)),
+              border=T,
+              show_row_names = F)
+hm
+BackupAsPDF(hm, 'randomSubset.medianScaled.heatmap')
+```
+
+
+```{r}
+# its fine we know the counts are in log scale at higher counts; key point is dont trust the values at low LFCs..
+g <- ggplot(counts.long, aes(x=group, y=vstCounts, fill=group)) +
+  geom_boxplot() +
+  labs(x='Group', y='vstCounts') +
+  scale_fill_brewer(type = "qual", palette = 2) +
+  theme_bw() +
+  coord_cartesian() # adjusting margins
+
+g
+BackupAsPDF(g, 'vstDistributions.boxplots')
+```
+Number of significant hits from the differential analysis
+
+```{r nSig, fig.width=5, fig.height=6}
+comb.dt[, sig := 'not']
+comb.dt[abs(log2FoldChange) > 1 & adj.pvalue < 0.05, sig := ifelse(log2FoldChange > 0, 'up', 'down')]
+
+g <- ggplot(comb.dt[sig != 'not' & !grepl('interaction', contrast), .N, by=.(sig,contrast)], aes(x=contrast, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  #facet_wrap(.~grepl('interaction', contrast), scales='free_x') +
+  scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  labs(title=expression("Significant genes from pairwise contrasts"),
+       subtitle=expression("abs" ~ log[2] ~ "FC > 1 & p.adj < 0.05"),
+       y='N genes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        axis.title.x= element_blank())
+g
+BackupAsPDF(g, 'nSigHits.pairwise.barplot')
+```
+
+Just look at the subset of genotype contrasts
+```{r, fig.width=4, fig.height=6}
+contrast.subset <- c("dEX11_LPS-WT_LPS","dEX11_HKCA-WT_HKCA")
+
+g <- ggplot(comb.dt[sig != 'not' & contrast %in% contrast.subset, .N, by=.(sig,contrast)], aes(x=contrast, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  #facet_wrap(.~grepl('interaction', contrast), scales='free_x') +
+  scale_fill_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+  labs(title=expression("Significant genes from pairwise contrasts"),
+       subtitle=expression("abs" ~ log[2] ~ "FC > 1 & p.adj < 0.05"),
+       y='N genes') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        axis.title.x= element_blank())
+g
+BackupAsPDF(g, 'nSigHits.pairwise.genoTypeContrasts.barplot')
+```
+volcanoplots
+
+```{r, volcanoplots, fig.width=8, fig.height=6}
+lapply(contrast.subset, function(x){
+
+ g <-  ggplot(comb.dt[contrast==x,], aes(y=-log10(plotPAdj), x=log2FoldChange, colour = sig, label=gene)) +
+    geom_hline(yintercept = -log10(0.05), linetype='dashed', alpha=0.5) +
+    geom_vline(xintercept = c(-1,1), linetype='dashed', alpha=0.5) +
+    geom_point(size=1) +
+    scale_x_continuous(breaks=seq(-15,15,5)) +
+    ggrepel::geom_text_repel(data=comb.dt[sig != 'not' & contrast==x,][order(pvalue),][1:100,], max.iter = 1000, max.overlaps = 20, size=2.5, segment.alpha=.5, segment.linetype='dashed') +
+    labs(title=x, y=expression(-log[10] ~' adj.pvalue'))  +
+    scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    theme_classic() +
+    coord_cartesian(xlim=c(-15,15))
+   
+    print(g)
+    BackupAsPDF(g, paste0(x,'LFCxlimitSet.volcanoplot'))
+})
+```
+```{r, volcanoplots, fig.width=8, fig.height=6}
+lapply(contrast.subset, function(x){
+
+ g <-  ggplot(comb.dt[contrast==x,], aes(y=-log10(plotPAdj), x=log2FoldChange, colour = sig, label=gene)) +
+    geom_hline(yintercept = -log10(0.05), linetype='dashed', alpha=0.5) +
+    geom_vline(xintercept = c(-1,1), linetype='dashed', alpha=0.5) +
+    geom_point(size=1) +
+    #scale_x_continuous(breaks=seq(-15,15,5)) +
+    ggrepel::geom_text_repel(data=comb.dt[sig != 'not' & contrast==x,][order(pvalue),][1:100,], max.iter = 1000, max.overlaps = 20, size=2.5, segment.alpha=.5, segment.linetype='dashed') +
+    labs(title=x, y=expression(-log[10] ~' adj.pvalue'))  +
+    scale_color_manual(values=c('not'='grey', 'up'='#FF4242', 'down'="#47abd8")) +
+    theme_classic() 
+   
+    print(g)
+    BackupAsPDF(g, paste0(x,'.noXlimit.volcanoplot'))
+})
+```
+Heatmaps
+For now just plot the n differential heatmaps in each (just adjust the color scale)
+
+```{r}
+lapply(contrast.subset, function(x){
+  
+  # ge tthe sig genes
+  genes.oi <- comb.dt[contrast == x & sig != 'not', unique(gene)]
+  
+  condRegx <- strsplit(x, '-') %>% 
+    unlist(.) %>% 
+    paste(., collapse='|')
+  # get the conditions we are contrasting
+  submat <- norm.mat[rownames(norm.mat) %in% genes.oi, grepl(condRegx, colnames(norm.mat))]
+  
+  submat <- sweep(submat, 1, apply(submat, 1, mean, na.rm=T))
+  
+  colAnn <- HeatmapAnnotation(df=data.table(condition=unlist(tstrsplit(colnames(submat), '_', keep=1)),
+                                            treatment=unlist(tstrsplit(colnames(submat), '_', keep=2))
+                                            ),
+                              col=list('condition'=condition.col, 
+                                       'treatment'=treatment.col))
+  hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =T,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        show_row_names = F,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+        row_title = paste0(nrow(submat), ' genes (|LFC| > 1 & padj < 0.05)'), 
+        #column_split = factor(stringr::str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(3,1.5,0,-1.5,-3), colors=redbluColpal),
+        name=('Counts vs rowMean'),
+        border=T)
+
+  hm <- draw(hm, column_title=paste(unlist(strsplit(x, '-')), collapse=' vs '))
+  #BackupAsPDF(hm, paste0(x, '.sigGenes.meanSweep.heatmap'))
+ })
+```
+Combined heatmap of the DE genes
+
+```{r comb_heatmap, fig.height=9, fig.width=7}
+genes.oi <- comb.dt[contrast %in% contrast.subset & sig != 'not', unique(gene)]
+
+submat <- norm.mat[rownames(norm.mat) %in% genes.oi,]
+submat <- sweep(submat, 1, apply(submat, 1, mean, na.rm=T))
+  
+colAnn <- HeatmapAnnotation(df=data.table(condition=unlist(tstrsplit(colnames(submat), '_', keep=1)),
+                                            treatment=unlist(tstrsplit(colnames(submat), '_', keep=2))
+                                            ),
+                              col=list('condition'=condition.col, 
+                                       'treatment'=treatment.col))
+
+rowAnno <- rowAnnotation(sigContrasts=comb.dt[contrast %in% contrast.subset & gene %in% genes.oi & sig != 'not', 
+                                              .(.N, significantContrasts=paste0(contrast, collapse=';')), by=.(gene)]$significantContrasts)
+
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        row_split = comb.dt[contrast %in% contrast.subset & gene %in% genes.oi & sig != 'not', 
+                            .(.N, significantContrasts=paste0(contrast, collapse='\n')), by=.(gene)]$significantContrasts,
+        row_title_rot = 0,
+        row_title_gp=gpar(fontsize=8),
+        #right_annotation = rowAnno,
+        cluster_columns =T,
+        column_names_gp = gpar(fontsize=8),
+        show_column_names = T,
+        show_row_names = F,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=8), #to reordr , treat the extracted vector as factor and set levls
+        #row_title = paste0(nrow(submat), ' genes (|LFC| > 1 & padj < 0.05)'), 
+        #column_split = factor(stringr::str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(3,1.5,0,-1.5,-3), colors=redbluColpal),
+        name=('Counts vs rowMean'),
+        border=T)
+hm
+#BackupAsPDF(hm, 'combinedGenotypeSig.deGenes.heatmap')
+```
+ISG heatmap
+```{r fig.height=5,fig.width=7}
+
+sig.genes <- filtered.dt[contrast %in% lps.comparisons & sig != 'not', unique(gene)]
+
+submat <- norm.mat[rownames(norm.mat) %in% isGenes, grepl('LPS', colnames(norm.mat))]
+# lets do a median sweep and see what falls out;
+# could also sweep WT from the counts
+submat <- sweep(submat, 1, apply(submat,1, mean, na.rm=T))
+
+# heatmap 
+colAnn <- HeatmapAnnotation(df=data.table(condition=unlist(tstrsplit(colnames(submat), '_', keep=1)),
+                                            treatment=unlist(tstrsplit(colnames(submat), '_', keep=2))
+                                            ),
+                              border=TRUE,
+                              col=list('condition'=condition.col, 
+                                       'treatment'=treatment.col))
+  
+rowAnn <- rowAnnotation(`|LFC| > 1 &\npadj < 0.05`=ifelse(rownames(submat) %in% sig.genes, 'yes', 'no'),
+                          border=TRUE,
+                          col=list(`|LFC| > 1 &\npadj < 0.05`=c('yes'="#26828EFF", 'no'="white")))
+  
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        left_annotation = rowAnn,
+        cluster_columns =T,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        show_row_names = T,
+        column_split = unlist(tstrsplit(colnames(submat), '_', keep=1)),
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+   #     row_title = paste0(nrow(submat), ' ISGs'), 
+        #column_split = factor(stringr::str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(-3,-1.5,0,1.5,3), colors=redbluColpal),
+        name=('Counts vs Mean'),
+        border=T)
+
+hm <- draw(hm)
+#BackupAsPDF(hm, paste0(plot.dir,'genotype.LPS.ISGs.meanSweep.heatmap'))
+
+```
+
+combined ISG heatmap
+```{r comb_heatmap, fig.height=9, fig.width=9}
+genes.oi <- comb.dt[contrast %in% contrast.subset & gene %in% isGenes, unique(gene)]
+
+submat <- norm.mat[rownames(norm.mat) %in% genes.oi,]
+submat <- sweep(submat, 1, apply(submat, 1, mean, na.rm=T))
+  
+colAnn <- HeatmapAnnotation(df=data.table(condition=unlist(tstrsplit(colnames(submat), '_', keep=1)),
+                                            treatment=unlist(tstrsplit(colnames(submat), '_', keep=2))
+                                            ),
+                              col=list('condition'=condition.col, 
+                                       'treatment'=treatment.col))
+
+comb.dt[contrast %in% contrast.subset & gene %in% isGenes, .(gene, sigIn=ifelse(sig != 'not', contrast, 'not'))][, .(.N, significantContrasts=paste0(sigIn, collapse=';')), by=.(gene)]
+
+
+sigAnno <- comb.dt[contrast %in% contrast.subset & gene %in% isGenes, .(gene, significant=ifelse(sig != 'not', contrast, 'no'))][, .(significant=gsub('[;]{0,1}no[;]{0,1}', '', paste0(significant,collapse=';'))), by=gene]
+
+sigAnno$significant %>% 
+  unique()
+
+rowAnno <- rowAnnotation(significant = sigAnno$significant, 
+                         col=list(significant=c("dEX11_LPS-WT_LPS"="palegreen2", "dEX11_LPS-WT_LPS;dEX11_HKCA-WT_HKCA"=  "#CAB2D6")))
+
+getQualitativePalette(n=20)
+"dodgerblue2"   "#E31A1C"       "green4"        "#6A3D9A"       "#FF7F00"       "black"         "gold1"         "skyblue2"      "#FB9A99"       "palegreen2"    "#CAB2D6"       "#121111"      
+[13] "gray70"        "khaki2"        "maroon"        "orchid1"       "deeppink1"     "blue1"         "steelblue4"    "darkturquoise"
+
+hm <- Heatmap(submat,
+        top_annotation = colAnn,
+       # row_split = sigAnno$significant,
+       # row_split = comb.dt[contrast %in% contrast.subset & gene %in% isGenes, 
+      #                      .(.N, significantContrasts=paste0(contrast, collapse='\n')), by=.(gene)]$significantContrasts,
+        row_title_rot = 0,
+        row_title_gp=gpar(fontsize=8),
+        right_annotation = rowAnno,
+        cluster_columns =T,
+        column_names_gp = gpar(fontsize=8),
+        show_column_names = T,
+        show_row_names = T,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=8), #to reordr , treat the extracted vector as factor and set levls
+        #row_title = paste0(nrow(submat), ' genes (|LFC| > 1 & padj < 0.05)'), 
+        #column_split = factor(stringr::str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(3,1.5,0,-1.5,-3), colors=redbluColpal),
+        name=('Counts vs rowMean'),
+        border=T)
+hm
+BackupAsPDF(hm, 'combinedGenotypeSig.ISGGenes.heatmap')
+```
+
+plot the ISG genes for each contrast seperately
+
+```{r}
+lapply(contrast.subset, function(x){
+  
+  # ge tthe sig genes
+  genes.oi <- comb.dt[contrast == x & gene %in% isGenes, unique(gene)]
+  
+  condRegx <- strsplit(x, '-') %>% 
+    unlist(.) %>% 
+    paste(., collapse='|')
+  # get the conditions we are contrasting
+  submat <- norm.mat[rownames(norm.mat) %in% genes.oi, grepl(condRegx, colnames(norm.mat))]
+  
+  submat <- sweep(submat, 1, apply(submat, 1, mean, na.rm=T))
+  
+  colAnn <- HeatmapAnnotation(df=data.table(condition=unlist(tstrsplit(colnames(submat), '_', keep=1))
+                                            #treatment=unlist(tstrsplit(colnames(submat), '_', keep=2))
+                                            ),
+                              col=list('condition'=condition.col 
+                                      # 'treatment'=treatment.col
+                                      ))
+  hm <- Heatmap(submat,
+        top_annotation = colAnn,
+        cluster_columns =T,
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = T,
+        show_row_names = T,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+        row_names_gp = gpar(fontsize=6), #to reordr , treat the extracted vector as factor and set levls
+        row_title = paste0(nrow(submat), ' genes (|LFC| > 1 & padj < 0.05)'), 
+        #column_split = factor(stringr::str_extract(colnames(submat), '[0-9]{1,2}h'), levels=c('Na', '6h','12h', '24h','48h')),
+        col = colorRamp2(breaks=c(3,1.5,0,-1.5,-3), colors=redbluColpal),
+        name=('Counts vs rowMean'),
+        border=T)
+
+  hm <- draw(hm, column_title=paste(unlist(strsplit(x, '-')), collapse=' vs '))
+  BackupAsPDF(hm, paste0(x, '.ISGenes.meanSweep.heatmap'))
+ })
+```
+```{r}
+
+```
+
+
+*todo*
+Not working... fix tomorrow
+ok the heatmaps are done; lets limit of Gene ontology analysis to IM response stuff; regenerate enrichment, and maybe plot the boxplotso of the different genes
+Lets look at MSigDB; also look at 
+```{r}
+gmt.dt <- fread("~/Downloads/c7.immunesigdb.v2024.1.Hs.symbols.gmt", header = F, fill=T)
+
+convertGMTtoDatatable <- function(GMTpath){
+  # weird format; genes as cols.. convert to matrix to iterate over
+  gmt.mat <- tryCatch(fread(GMTpath, header=F, fill=T)) %>% 
+    .[, V2 := NULL] %>% 
+    as.matrix(rownames='V1')
+
+  # split rows (geneSets) into list
+  gmt.list <- split(gmt.mat, rownames(gmt.mat))
+  
+  gmt.dt <- lapply(gmt.list, function(x) {data.table(gene=x)}) %>% 
+  rbindlist(idcol='pathway')
+  
+  return(gmt.dt[gene != ''])
+}
+
+imSigDb <- convertGMTtoDatatable("~/Downloads/c7.immunesigdb.v2024.1.Hs.symbols.gmt")
+imSigDb[, ont:= pathway]
+```
+Also look at GO BP subset to macrophage IM resposne stuff
+
+```{r}
+gmt.go <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+imGenes <- gmt.go[grepl('immune|macrophage|cytokine|chemokine', ont), unique(gene)] # just look for a subset of things
+
+universe <- comb.dt$gene %>% 
+  unique()
+```
+
+```{r}
+comb.dt[, enrich.grp := paste0(contrast,'.',sig)]
+
+enrich.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/041525_DifferentialAnalysis_FirstPass_data/2025_04_18_enrich.go.bp.csv.gz')
+
+# subset to the contrasts we are interested in 
+enrich.dt <- enrich.dt[grepl(paste0(contrast.subset, collapse='|'), enrich.grp), ]
+# simplify the enrichment by GO terms 
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                         gmt=gmt.go, 
+                                                         groupColumn = 'enrich.grp',
+                                                         max_pAdjust = 0.1)
+
+#fwrite(simp.enrich$simplified, ScriptAndDatedFileName('enrich.simplified.go.bp.contrastSubset.csv.gz'))
+simp.enrich <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/042325_DifferentialAnalysis_RegeneratePlots_data/2025_04_24_enrich.simplified.go.bp.contrastSubset.csv.gz')
+```
+
+subset this to just terms in the enrichment group
+```{r, fig.height=9, fig.width=7}
+subdt <- simp.enrich[grepl('immune|macrophage|cytokine|chemokine', ID),]
+subdt[, enrich.grp := factor(enrich.grp)]
+simp.enrich[, enrich.grp := factor(enrich.grp)]
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich,
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  #column_split=stringr::str_extract(levels(subdt$enrich.grp), 'up|down'),
+                                  upperThreshold = 8,
+                                  negCols=unique(grep('down', subdt$enrich.grp, value=T)),
+                                  topN=15,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+ht
+BackupAsPDF(ht, 'go.bp.allSets.heatmap')
+```
+Run enrichment on the MSigDB set
+
+```{r}
+ # run  enrichment on each group seperately
+enrich.dt <- enricherOnGroups(comb.dt[sig != 'not' & contrast %in% contrast.subset], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = imSigDb, 
+                              universe = universe)
+ 
+fwrite(enrich.dt, ScriptAndDatedFileName('enrich.IMsigDB.csv.gz'))
+enrich.dt <- fread('~/Documents/projects/032125_ABanerjee_RNAseq/042325_DifferentialAnalysis_RegeneratePlots_data/2025_04_24_enrich.IMsigDB.csv.gz')
+
+# simplify the enrichment by GO terms 
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                         gmt=imSigDb, 
+                                                         groupColumn = 'enrich.grp',
+                                                         max_pAdjust = 0.1)
+
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('enrich.simplified.ImsigDB.csv.gz'))
+```
+
+```{r}
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified,
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  #column_split=stringr::str_extract(levels(subdt$enrich.grp), 'up|down'),
+                                  upperThreshold = 8,
+                                  negCols=unique(grep('down', subdt$enrich.grp, value=T)),
+                                  topN=15,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6))
+
+ht
+BackupAsPDF(ht, 'go.bp.allSets.heatmap')
+```
+write out the results for the two contrasts in wide format an the subset of ISGs in another table
+```{r}
+fwrite(dcast(comb.dt[gene %in% imGenes & contrast %in% contrast.subset,], gene~contrast, value.var=c('log2FoldChange', 'pvalue', 'padj')), ScriptAndDatedFileName('IMresponseRelatedGenes.diffAnalysisRes.csv.gz'))
+
+fwrite(dcast(comb.dt[contrast %in% contrast.subset,], gene~contrast, value.var=c('log2FoldChange', 'pvalue', 'padj')), ScriptAndDatedFileName('allGenes.diffAnalysisRes.csv.gz'))
+
+fwrite(norm.mat[rownames(norm.mat) %in% imGenes,], row.names = T, ScriptAndDatedFileName('IMresponseRelatedGenes.normalizedcounts.csv.gz'))  
+fwrite(norm.mat, row.names = T, ScriptAndDatedFileName('allGenes.normalizedcounts.csv.gz'))  
+
+```
+
+Maybe run GSEA on the enrichment results; diff score can be the pval (or sd of the pvalue)
+For a start; use the signed pvalue, but the extreme values might make this an issue; weight down by FC? (take geometric mean?)
+For a start; take the geometric mean of the pval and LFC (hopefully help downweight extreme outliers).
+```{r}
+# geometric mean of log2 values
+# take the adjusted pvalues so no 0s and (Inf on log scale)
+# not actually geomean as not taking exponent; but I think
+comb.dt[, diffScore := -log10(plotPval) * sign(log2FoldChange)] # first attempt; use signed Pvalue
+comb.dt[, diffScore := mean(c(-log10(plotPval), log2FoldChange)), by=.I]
+
+allsea <- lapply(contrast.subset, 
+       function(contOI){
+         print(comb.dt[!is.na(pvalue) & contrast == contOI])
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(gmt.go$gene, gmt.go$ont),
+                                           comb.dt[!is.na(pvalue) & contrast == contOI][, setNames(diffScore, gene)],
+                                           scoreType = "pos")
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) %>% 
+  rbindlist(idcol = "contrast")
+```
+First pass; look at enrichment using the signed pvalue (-log10 scaled)
+```{r}
+allsea[, p.adjust := padj]
+
+# leading edge ratio to bg
+allsea[, Count := length(unlist(leadingEdge))/size, by=.I]
+# need a pathway
+allsea[, ID := pathway]
+allsea[, Description := pathway]
+allsea[, geneID := paste0(unlist(leadingEdge), collapse='/'), by=.I]
+allsea[order(length(leadingEdge)),]
+# cant rem how to do this... try later
+```
+
+need to plot the GSEA analysis again...  find out why I cant extract the genes as a character vector too
+```{r}
+#fwrite(allsea[size >= 10,], ScriptAndDatedFileName('gsea.gobp.subsetContrasts.csv.gz'))
+```
+
+

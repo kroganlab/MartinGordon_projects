@@ -1,0 +1,452 @@
+---
+title: "100824.PCP.PerturbSeqClustersComparison"
+author: "Martin Gordon"
+date: "2024-10-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Quick comparison of the perturb seq clusters and the PCProphet output; can we find any overlap of our groups with the others 
+
+```{r packages}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(viridis)
+library(ComplexHeatmap)
+
+source('~/Documents/utils/mg_utils/r_utils/SEC_MS_utils.mgupdate.R')
+source('~/Documents/utils/bp_utils/ManageScriptData.R')
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+```
+Read in the PCProphet results, the raw matrices for reps 1,2 & 3 and also the pertrbSeq clusters
+
+```{r}
+# read in the clusters and the transcript correlation matrix
+pSeq.clusters <- fread('./data/KOLF2-SrongPerturbation-Clusters.csv')
+pSeq.mat <- fread('./data/KOLF2-SrongPerturbation-PearsonCorr.csv') %>% 
+  as.matrix(rownames=1)
+
+
+# read in PCprophet  input matrices
+secms.list <- list(ctrl_1=fread('100324.makePCPFOrmatFiles_data/2024_10_04_Parental_052324_Report.mat.txt'),
+                  ctrl_2=fread('100324.makePCPFOrmatFiles_data/2024_10_04_Parental_091024_Report.mat.txt'),
+                  ctrl_3=fread('100824.PCP.perturbSeq_data/2024_10_08_Parental_100724_Report.mat.txt'))
+
+
+# convert to long format
+secms.long <- lapply(secms.list, function(x){
+  long.dt <- as.data.table(reshape2::melt(x, id.vars=c('GN', 'ID')))
+  return(long.dt)
+}) %>%  rbindlist(idcol='sample')
+
+#tidy
+secms.dt <- secms.long[, .(sample=sample, gene = GN, protein = ID, fraction=as.integer(gsub('frac_', '', variable)), intensity=value)]
+
+# read in the output of PCprophet for the complexes using the human database
+# this is for replicate 1&2 vs human complex
+pcp.dt <- fread('./output/output/100424_PCPRun_tmux/ComplexReport.txt')
+
+# this is using the clusters as the database
+pcp.cluster.dt <- fread('./output/output/100724_PCPClusters/ComplexReport.txt')
+```
+
+Do a quick QC summary of the data
+```{r}
+qcOut <- qcSummaryTable(secms.dt)
+```
+
+```{r}
+g <- ggplot(qcOut, aes(x = fraction, y = log2(medIntensity), grou=))  + 
+    geom_line(alpha = 0.5) + 
+    geom_point(aes(color = "median")) +
+    geom_point(aes(y = medPolishIntensity, color = "median polish"), alpha = 0.5) +
+    geom_line(aes(y = medPolishIntensity, color = "median polish"), alpha = 0.5) +
+    scale_color_manual(values = c(median = "black", `median polish` = "red")) +
+    facet_grid(~sample) +
+    theme_bw()
+
+BackupAsPDF(g, 'medianInts.linechart')
+```
+Now plot heatmap
+We want to convert each to matrix, scale to max intensity
+
+```{r}
+secms.mat <- scaledIntensityMatrices(secms.dt, scaleDenom = 'max')
+
+lapply(seq_along(secms.mat), function(x,n,i){
+  
+  #submat <- x[sample(rownames(x), 1000),]
+  # subset the matrices to non-missing
+  emptyRowsFilter <- apply(x[[i]], 1, function(f) sum(f == 0) != ncol(x[[i]]))
+  
+  submat <- x[[i]][emptyRowsFilter,]
+  
+  #submat <- x[apply(x, 1, function(f) sum(f, na.rm=))]
+  
+  hm <- Heatmap(submat, 
+          cluster_rows=T,
+          name='Scaled Intensity (row max = 1)',
+          col=viridis(100),
+       #   row_title = paste0(nrow(submat), ' total proteins detected'),
+          show_row_names = F,
+          column_names_gp = gpar(fontsize=4.5),
+          cluster_columns=F)
+  
+ BackupAsPDF(hm, paste0(n[[i]],'.scaledInts.matrix'))
+  
+},x=secms.mat, n=names(secms.mat))
+
+# new plot the same thing with linechart on top highlighting the number of proteins samples in each group
+# just use the QC id and plot that 
+
+```
+Subset to the same genes clustered using pertb seq and enforce the same clustering; do we see any obvious trends in the clustering?
+
+```{r}
+pSeq.clusters[, clusterID := cluster + 1]
+pSeq.clusters[,.N, by=cluster]
+
+gmt.go.bp <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+
+# pull out bg
+universe <-  unique(pSeq.clusters$gene_target)
+  
+# create enrichment groups
+pSeq.clusters[, enrich.grp := as.factor(clusterID)]
+  
+# run GO enrichment on each group seperately
+enrich.dt <- enricherOnGroups(pSeq.clusters, 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene_target", 
+                              term2gene.gmt = gmt.go.bp,
+                              minGSSize = 10,
+                              universe = universe)
+
+
+# simplify enrichment, extract the top enriched term per cluster and use that 
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                         gmt=gmt.go.bp, 
+                                                         groupColumn = 'enrich.grp',
+                                                         max_pAdjust = 0.1)
+
+
+pSeq.clusters <- merge(x=pSeq.clusters, y=simp.enrich$simplified[, .SD[which.min(p.adjust)], by=enrich.grp][,.(enrich.grp, ID, pvalue, p.adjust, geneID)], by='enrich.grp', all.x = T)
+pSeq.clusters[,.(enrich.grp, gene=gene_target, clusterID,ID,pvalue,p.adjust, geneID)]
+
+# subset the heatmap genes to these targets in the pertrub seq dataset, and split the clustering by these clusterID; is there any clear trend in the gene expression across the clusters?
+# collapse and generate linecharts for this
+```
+Losing a lot of geens 
+```{r}
+genes.oi <- unique(pSeq.clusters$gene_target)
+
+secms.f.mat <- lapply(secms.mat, function(x){
+ 
+  submat <- x
+  rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='HUMAN')
+  
+ #prots.oi <- unique(unlist(sapply(prots.oi, function(x) strsplit(x, ';'))))
+ submat <-  submat[rownames(submat) %in% genes.oi,]
+ return(submat)
+ 
+})
+
+# only 845 of the clusters found
+lapply(secms.f.mat, dim)
+```
+```{r}
+sub.dt <- pSeq.clusters[gene_target %in% rownames(secms.f.mat[[1]]),.(gene_target,ID)]
+rm(sub.dt)
+
+secms.f.mat
+
+lapply(seq_along(secms.f.mat), function(x,n,i){
+  
+  
+  anno.dt <- as.data.table(copy(pSeq.clusters))
+  
+  genes.OI <- rownames(x[[i]])
+  anno.dt <- anno.dt[gene_target %in% genes.OI, .(gene=gene_target, clusterID)]
+  
+  # reorder heatmap rows to match the anno.dt$gene order
+  submat <-  x[[i]][match(anno.dt$gene, rownames(x[[i]])),]
+  
+  hm <- Heatmap(submat, 
+          col=viridis(100),
+          name='Scaled Intensity (row max = 1)',
+          cluster_columns=FALSE,
+          show_row_names = FALSE,
+          column_names_gp = gpar(fontsize=6),
+          row_title_gp = gpar(fontsize=6),
+          cluster_row_slices = FALSE,
+          row_split = anno.dt$clusterID)
+  
+  
+  BackupAsPDF(draw(hm, column_title=n[[i]]), paste0(n[[i]],'.pertubSeq.geneclusters.scaled.heatmap'), dimensions = c(9,17))
+}, x=secms.f.mat, n=names(secms.f.mat))
+
+```
+Split the matrices into lists of matrices based on the perturbSeq clusterings; run all-by-all cosine similiarity on each gene in the set, and return 
+
+```{r}
+
+cosine.list <- lapply(secms.f.mat, function(x){
+  
+  anno.dt <- as.data.table(copy(pSeq.clusters))
+  genes.OI <- rownames(x)
+  anno.dt <- anno.dt[gene_target %in% genes.OI, .(gene=gene_target, clusterID, ID)]
+  
+  # reorder heatmap rows to match the anno.dt$gene order
+  submat <-  x[match(anno.dt$gene, rownames(x)),]
+  #return(split(as.data.table(submat, keep.rownames = T), anno.dt$clusterID))
+  
+  # run all-by-all cosine similarity for each group
+  message('Splitting genes into perturbSeq cluster...')
+  c.mat.list <- split(as.data.table(submat, keep.rownames=T), anno.dt$clusterID)
+  
+  
+  cosine.dt <- lapply(c.mat.list, function(x){ 
+  
+    clustmat <- as.matrix(x, rownames='rn')
+    
+    cor.dt <- lsa::cosine(t(as.matrix(x, rownames='rn'))) %>% 
+      reshape2::melt() %>% 
+      as.data.table()
+    
+    setnames(cor.dt, new=c('prot1', 'prot2', 'cosine'))
+    cor.dt <- cor.dt[prot1 != prot2,]
+   }) %>%  rbindlist(idcol='clusterID')
+  
+  message('Returning datatable of consine similarities...')
+  return(cosine.dt)
+})
+
+# collapse to dt
+cosine.dt <- rbindlist(cosine.list, idcol = 'sample')
+
+# calculate relevant metrics
+cosine.dt[, nMeasurements := .N, by=.(sample, cosine)]
+cosine.dt[, avgCosine := mean(cosine), by=.(sample,cosine)]
+
+
+# add in the cluster ID so we can identify these members
+cosine.dt <-  merge(x=cosine.dt, y=unique(pSeq.clusters[,.(enrich.grp, ID, pvalue, p.adjust)]), by.x='clusterID', by.y='enrich.grp', all.x=T)
+
+
+pSeq.clusters[, .(enriby=.(enrich.grp, ID)]
+
+
+cosine.dt
+lapply(secms.f.mat, function(x){
+  
+  anno.dt <- as.data.table(copy(pSeq.clusters))
+  genes.OI <- rownames(x)
+  anno.dt <- anno.dt[gene_target %in% genes.OI, .(gene=gene_target, clusterID, ID)]
+  
+  anno.dt[,.N, by=clusterID]
+  
+})
+
+# looks like we might have some clusters 
+ggplot(cosine.dt, aes(x=reorder(clusterID, avgCosine), y=cosine, fill=clusterID)) +
+  geom_boxplot() +
+  facet_grid(sample~.) +
+  theme_bw()
+
+```
+
+
+
+
+
+Lets plot the subset of genes here and group by 
+
+# perhaps an issue with the clustering; run the functions you wrote to iteratively pull out the closely clustered genes, use this to regenerate a new PCProphet DB and run PCProphet overnight with this set
+
+```{r}
+# convert to. a distance matrix and perform hierarchical clusterin
+dist.mat <- 1 - pSeq.mat 
+
+# perform hierarichcial clustering of the distance matr
+
+# I think we want complete linkage as we want all the things in the same cluster to be very similar as considering as part of a complex
+hc <- hclust(as.dist(dist.mat), method='complete')
+
+
+Heatmap(dist.mat, 
+        cluster_rows = hc,
+        name='1 - Pearsons R',
+        col = viridis(3),
+        cluster_columns = hc, 
+        show_row_names = F,
+        show_column_names = F)
+```
+
+Functions 
+
+```{r}
+# give a node id; pull out the genes that are members of this cluster
+extractLabelsfromClusters <- function(hc, nodeID){
+  
+  # if its a negative value, just return the gene
+  if(sign(nodeID) == -1){
+    
+    # this ID is negative, return gene name
+    return(hc$labels[[-nodeID]])
+    
+  } else {
+    # if clusterID is positive, it means it has been previously merged
+    # the merge matrix points to the row where this took place 
+    node1 <- hc$merge[nodeID, 1]
+    node2 <- hc$merge[nodeID, 2]
+    
+    # recursively search for the nodes
+    leftSetNodes <- extractLabelsfromClusters(hc, node1)
+    rightSetNodes <- extractLabelsfromClusters(hc, node2)
+    
+    return(c(leftSetNodes, rightSetNodes))
+  }
+}
+
+
+pSeq.mat[rownames(pSeq.mat) %in% c('POU5F1B', 'POU5F1'), colnames(pSeq.mat) %in% c('POU5F1B', 'POU5F1')]
+c('POU5F1B', 'POU5F1')
+extractLabelsfromClusters(hc, -848)
+extractLabelsfromClusters(hc, -849)
+
+
+
+# now extract sets that meet these thresholds
+extractClustersfromDendogram <- function(hc, threshold){
+  
+  message(paste0('found ',length(unique(hc$labels)), ' leaf nodes. Extracting clusters..'))
+
+  if (missing(threshold)){
+    message(paste0('No threshold specified. Extracting all clusters (maximum distance =', threshold, ')...'))
+    threshold <- max(hc$height)
+  }
+  message(paste0('Iterating through the dendogram and pruning groups with distance < ', threshold, '...'))
+  
+  # iterate through the dendogram
+  clusters.dt <- lapply(1:nrow(hc$merge), function(i){
+    # if the distance is below the threshold, extract all cluster members
+    if (hc$height[i] < threshold){
+    
+      dt <- data.table(index = i,
+                       members =  paste0(extractLabelsfromClusters(hc, i), collapse=';'))
+    
+    }
+  }) %>% rbindlist()
+  
+  message(paste0('Found ', nrow(clusters.dt), ' clusters with a maximum distance < ', threshold))
+  
+  return(clusters.dt)
+}
+
+
+extractClustersfromDendogram(hc,max(hc$height)) %>% View()
+```
+Whats the distance distribution
+
+```{r}
+
+```
+
+
+Next step: what 
+
+Plot ideas; produce a dendogram of both clustering apporaches and use the dendoextend package to 'align/compare the dendograms'?
+Would be nice if we could clearly see some overlap in clustering
+
+
+Run enrichment on the clusters to find more interesting names
+Looks to me like most things are not very similair...
+```{r}
+
+g <- ggplot(data.table(x=hc$height), aes(x=x)) +
+  geom_histogram() +
+  geom_vline(xintercept=0.69, color='red') +
+  theme_bw()
+g
+BackupAsPDF(g, 'perturbSeq.hc.completelinkage.histogram')
+
+
+quantile(dist.mat, probs=c(0.05, 0.1, 0.2, 0.25, 0.30))
+
+# for distance, go with 0.69 distance as this encloses top 25% of the
+newclusters.dt <- extractClustersfromDendogram(hc,threshold = 0.7699758)
+
+# want to determine which of these genes belong to which cluster; will use this for the naming convention for the DB
+# iterate through the elements fromt he string split
+newclusters.dt[, perturbSeqClusterID := sapply(strsplit(members, ';'), function(clustMembers){
+  
+  groupIDs <- sapply(clustMembers, function(oneMember){ pSeq.clusters[oneMember == gene_target, unique(clusterID)] }) %>% 
+    unique() %>% 
+    paste(., collapse=';')
+  
+}), by=index]
+
+
+
+newclusters.dt
+translateGeneName2Uniprot(c('POU5F1;POU5F1B'),species='HUMAN')
+translateGeneName2Uniprot(newclusters.dt$members, species="HUMAN")
+
+newclusters.dt[, `:=`(`subunits(UniProt IDs)`=translateGeneName2Uniprot(members, species="HUMAN"),
+                       `subunits(Entrez IDs)`=translateGeneName2Entrez(members, species="HUMAN", fillMissing = FALSE) )]
+
+fwrite(newclusters.dt[, .(ComplexID=index, ComplexName=paste0('cluster_',perturbSeqClusterID,'__', members), Organism='Human', "subunits(Gene name)"=members)], sep='\t', ScriptAndDatedFileName('newPerturbSseq.db.txt'))
+#fread('~/Documents/projects/100324_AForget_PCProphetPipeline/100824.PCP.perturbSeq_data/2024_10_08_newPerturbSseq.db.txt')
+```
+
+First, lets just plot the 
+
+1- Classic heat map of the fractions (could go in sup) with number of proteins identified per fractions. ( Now also try a heatmap of the 3; annotate each with the N proteins detected in each fraction? Linechart)
+2- Global metric of the overlap between SEC-MS and Perturb-Seq.
+3- PCprophet output with clusters and / or CORUM (overview could go in sup). Display clusters with nice overlap between Perturb-seq and SEC-MS (Mitochondrial cluster 20/48/41/42, Ragulator 34, BAF 40)
+I would suggest to eventually also have other global approaches (thrawing idea here):
+1- Cosine similarity score of the different cluster compared to random (I know that it may not be entirely ideal but not bad to show some trend for robust clusters).
+2- I noticed that some clusters when overlayed on SEC-MS do not show proteins included in the clusters interacting directly but you can observe that they locate in a specific area of the network. I could be great to have some way to systematically score that (particularly true for cluster 32 and 27).
+3- Use SEC-MS PPI clusters to assess similarity in Perturb-seq data.
+4- For a few example, should we think of trying some AlphaFold scoring?
+
+plot all 3 heatmaps, generate another 
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=3)
+
+g <- ggplot(qcOut, aes(x=fraction, y=numProteins, color=sample)) +
+  geom_point() +
+  geom_line(alpha = 0.5) + 
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 73)) +
+  scale_color_manual(values=col.pal) +
+  facet_grid(.~sample) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1)) 
+g
+BackupAsPDF(g, 'nProteinsPerfraction.linechart')
+
+# superimpose the points
+g <- ggplot(qcOut, aes(x=fraction, y=numProteins, color=sample)) +
+  geom_point() +
+  geom_line(alpha = 0.5) + 
+  scale_x_continuous(expand = c(0, 0), breaks=seq(1,72,1), labels=seq(1,72,1)) +
+  scale_color_manual(values=col.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1, size=6)) 
+g
+BackupAsPDF(g, 'nProteinsPerfraction.collapsed.linechart')
+```
+Plot heatmaps of the different samples, cluster by rows, not columns
+Think here we need to consider our normalization and scaling approach
+  I think TMP normalization, with max scaled per row for visualization
+  Generate the heatmaps seperately and then all together, maybe also look at the residual matrix
+
+```{r}
+
+```
+

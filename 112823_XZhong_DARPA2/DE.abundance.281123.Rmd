@@ -1,0 +1,672 @@
+---
+title: "de.abundance"
+author: "Martin Gordon"
+date: "2023-11-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overivew
+----
+
+Differential expression analysis of AB data
+Murine origin, so be wary of this when converting between identifiers
+
+Simple experimental set-up: 4 conditions; control (veh), compound (Nbon), antagonist (M100), M100_Nbon (antagonist + compound)
+$ replicates per condition
+
+Have both phospho and abundance data available
+Goal is to present by Dec 4 DARPA II meeting
+
+libraries and custom scripts
+-----
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(magrittr)
+library(ComplexHeatmap)
+library(randomcoloR)
+library(stringr)
+library(emmeans)
+
+#source BP utility scripts
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/linearModels.R")
+
+# mg utility functions
+source("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+```
+
+first off read in the data
+AB DIA data produced by spectronaut
+
+```{r}
+spec <- fread('./data/MB03/AB/20231114_222317_MB03_AB_dirDIA_Report.tsv')
+keys <-  fread('./data/MB03/AB/MB03_AB_dirDIA_ConditionSetup.tsv') # not really needed for this, think this file is used for artMS
+spec %>%  str()
+```
+
+Investigate intensity distributions
+Known issue with Spectronaut that it produces low-intensity 'garbage' measurements that can be removed
+
+```{r}
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram()
+
+
+spec <-  spec[log2(Intensity) > 4]
+
+# check clean data
+# all looks good so far
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram() +
+  facet_wrap(~Condition+BioReplicate)
+```
+Each row in the table should be the intensity from one MS "feature" per run (an elution peak from a single peptide ion). It's possible that there are multiple features per peptide ion and run--if the peptide elutes in two different peaks perhaps.
+
+are there any multiple-feature peptide ions?
+
+```{r}
+# FALSE, so we dont need to consider Precursor Charge when counting fragment ions for plotting
+any(spec[, .N, by=.(PeptideSequence, Run, PrecursorCharge)]$N) > 1
+```
+
+How many fragment ions per run?
+Counts per run look consistent
+
+```{r}
+# generate a distinct color palette for each condition
+col.pal <-  randomcoloR::distinctColorPalette(length(unique(spec$Condition)))
+
+g <- ggplot(spec, aes(x=reorder(interaction(Condition, BioReplicate)), fill=Condition)) +
+  geom_bar(stat='Count') +
+  scale_fill_manual(values=c(col.pal)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'peptideion.counts.barplot.')
+
+```
+
+Peptide Intensity distributions
+Raw run intensities look good; consistent between runs
+```{r}
+g <- ggplot(spec, aes(x=reorder(interaction(Condition, BioReplicate)), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  scale_fill_manual(values=c(col.pal)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+g
+# BP function in manageScritData.R file
+# 3 main arguments: the ggplot obj, file name, and dimensions (optional; default is dev.size(units = "in"))
+BackupAsPDF(g, 'rawIntensity.boxplots.')
+```
+How ds sample clustering look based on the raw peptide intensities
+
+Heatmap of peptide intensities
+```{r}
+# create a intensity matrix
+f.mat <- dcast(spec, interaction(PeptideSequence,PrecursorCharge)~Condition+BioReplicate, value.var = 'Intensity') %>% 
+  as.matrix(rownames='PeptideSequence')
+
+f.mat <- log2(f.mat)
+
+#66k measured unique peptide ion intensities
+dim(f.mat)
+#54k measured unique peptide ion intensities
+dim(f.mat[complete.cases(f.mat),])
+
+# as we hae missing values in our dt, need to define function handle clustering of these 
+
+clusterwNA <- function(mat, na.val=0,...){
+  
+  # assign val to missing
+  mat[is.na(mat)] <- na.val
+  return(hclust(dist(mat)))
+}
+
+```
+
+```{r}
+
+#defining our annotation vecotrs for the bar charts
+colnames(f.mat)
+condition <- sub('_[1-4]{1}$', '', colnames(f.mat))
+bioreplicate <- str_extract(colnames(f.mat), '[1-4]$')
+
+ha <- HeatmapAnnotation(condition=condition,
+                        bioreplicate=bioreplicate,
+                        # set cols for levels
+                        col=list(condition=c("M100"='red', "M100_Nbon"='blue',"Nbon"='green', "Veh"='yellow'),
+                                  bioreplicate=c('1'='orange', '2'='black', '3'='pink', '4'='purple'))
+                        )
+
+
+mat.size <-  2000
+
+#subsample the matrix to visualise
+subMat <-  f.mat[sample(rownames(f.mat), mat.size), ]
+
+hm <- Heatmap(subMat,
+        cluster_rows = clusterwNA(subMat), #ComplexHeatmap can accept a function as input for clustering. This handles NA vals by converting to 0
+        name='(Log2) Ints.',
+        cluster_columns = T,
+        show_row_names = F,
+        top_annotation = ha,
+        row_title = sprintf('%s peptide ions', mat.size)
+        )
+
+BackupAsPDF(hm, 'peptideion.rawintensity.heatmap') 
+
+```
+looking at the heatmap its clear the raw intensity values are driving the clustering
+Subtract the median peptide value across runs (rows) to better see differences between the runs
+
+```{r}
+# sweep subtracts a vector of values from either rows (dimension = 1) or columns (dimension = 2)
+# apply applies a function (median here) to each row (dimension = 1 )
+# used together here we are subtracting row medians
+subMat <-  sweep(f.mat, MARGIN=1, FUN='-', STATS = apply(f.mat, 1, median, na.rm=T))
+
+
+#subsample the matrix to visualise
+subMat <-  subMat[sample(rownames(subMat), mat.size), ]
+
+hm <- Heatmap(subMat,
+        cluster_rows = clusterwNA(subMat), #ComplexHeatmap can accept a function as input for clustering. This handles NA vals by converting to 0
+        name='(Log2) Ints./Median',
+        cluster_columns = T,
+        show_row_names = F,
+        top_annotation = ha,
+        row_title = sprintf('%s peptide ions', mat.size)
+        )
+
+BackupAsPDF(hm, 'peptideion.rawintensity.mediansweep.heatmap') 
+```
+PCA plot of samples
+No clear clustering of samples on 1st and second PCs
+
+```{r}
+# for PCA we need to remove any missing vals from our matrix
+f.mat <-  f.mat[complete.cases(f.mat),]
+
+
+pcaOut <- prcomp(t(f.mat))
+
+
+colInfo <- data.table(colname = colnames(f.mat))
+colInfo[colname %like% 'M100_Nbon', colname := sub('_', '.', colname)]
+
+colInfo[,c("condition", "rep") := tstrsplit(colname, "[_]",  keep = c(1,2)) ] # split the string and transpose into two columns
+
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaDT[rn  %like% 'M100_Nbon', rn := sub('_', '.', rn)]
+
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = condition, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "complete.features.rawintensity.PCA")
+```
+
+
+How much variance is explained by the individual PCs?
+
+```{r}
+barplot(pcaPercentVar)
+```
+
+```{r}
+p <- ggplot (pcaDT, aes(x=PC3, y=PC4,  fill = condition, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC3, %.1f%%", pcaPercentVar[3])) + 
+  ylab (sprintf ("PC4, %.1f%%", pcaPercentVar[4])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+```
+
+protein summarisation and normalisation
+```{r}
+# MSStats like NA values explicit (assigned row with 'emtpy' val NA etc...) this BP function handles this
+mssInput <- specFileToCompleteMSstats(spec)
+
+# colunm necessay to run MSstats and not output by spectronuat
+mssInput[, IsotopeLabelType := 'L']
+```
+
+```{r}
+dp.out <- MSstats::dataProcess(setDF(mssInput), #convert to data.frame
+                              MBimpute =  FALSE, # turn off imputation
+                              normalization = 'EQUALIZEMEDIANS', # default normalisation method
+                              summaryMethod = "TMP", #tukey median polish for protein summarisation
+                              featureSubset = "highQuality", # only yse
+                              remove_uninformative_feature_outlier = TRUE)
+
+# save the output of msstats data.process 
+#saveRDS(dp.out, './output/281123.msstats.dp.rds')
+```
+
+
+```{r}
+# read in the data 
+dp.out <- readRDS('./output/281123.msstats.dp.rds')
+```
+
+QC check of the summarised data; Protein counts, boxplots of logIntensities
+
+```{r}
+p.quant <- data.table(dp.out$ProteinLevelData)
+f.quant <-data.table(dp.out$FeatureLevelData)
+
+# protein intensities look good
+g <- ggplot(p.quant, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) +
+  geom_boxplot() +
+  scale_fill_manual(values=c(col.pal)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'proteinintensity.boxplots.')
+
+
+g <- ggplot(p.quant, aes(x=reorder(interaction(GROUP,SUBJECT)), fill=GROUP)) +
+  geom_bar(stat='Count') +
+  scale_fill_manual(values=c(col.pal)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'protein.counts.barplot.')
+```
+Sample clustering at the protein level 
+
+```{r}
+p.mat <- dcast(p.quant, Protein~GROUP+SUBJECT, value.var="LogIntensities") %>% 
+  as.matrix(rownames='Protein')
+```
+
+heatmap of subsample of proteins
+
+```{r}
+#defining our annotation vecotrs for the bar charts
+condition <- sub('_[1-4]{1}$', '', colnames(p.mat))
+bioreplicate <- str_extract(colnames(p.mat), '[1-4]$')
+
+ha <- HeatmapAnnotation(condition=condition,
+                        bioreplicate=bioreplicate,
+                        # set cols for levels
+                        col=list(condition=c("M100"='red', "M100_Nbon"='blue',"Nbon"='green', "Veh"='yellow'),
+                                  bioreplicate=c('1'='orange', '2'='black', '3'='pink', '4'='purple'))
+                        )
+
+
+mat.size <-  2000
+
+#subsample the matrix to visualise
+subMat <-  p.mat[sample(rownames(p.mat), mat.size), ]
+
+hm <- Heatmap(subMat,
+        cluster_rows = clusterwNA(subMat), #ComplexHeatmap can accept a function as input for clustering. This handles NA vals by converting to 0
+        name='(Log2) Ints.',
+        cluster_columns = T,
+        show_row_names = F,
+        top_annotation = ha,
+        row_title = sprintf('%s Proteins', mat.size)
+        )
+
+hm
+BackupAsPDF(hm, 'proteinIntensity.heatmap') 
+```
+sweep median values to visualise run-run differences 
+
+```{r}
+#subsample the matrix to visualise
+subMat <-  sweep(p.mat, MARGIN=1, FUN='-', STAT=apply(p.mat, 1, median, na.rm=T))
+
+subMat <-  subMat[sample(rownames(subMat), mat.size), ]
+
+hm <- Heatmap(subMat,
+        cluster_rows = clusterwNA(subMat), #ComplexHeatmap can accept a function as input for clustering. This handles NA vals by converting to 0
+        name='(Log2) Ints./Median',
+        cluster_columns = T,
+        show_row_names = F,
+        top_annotation = ha,
+        row_title = sprintf('%s Proteins', mat.size)
+        )
+
+BackupAsPDF(hm, 'proteinIntensity.heatmap')
+```
+PCA plot at the protein level
+No strong signal differentiating treatment groups
+```{r}
+# 'full' matrix
+dim(p.mat) #4682 prots
+p.mat <- p.mat[complete.cases(p.mat),]
+dim(p.mat) #4570 prots
+
+
+colInfo <- data.table(colname = colnames(p.mat))
+colInfo[colname %like% 'M100_Nbon', colname := sub('_', '.', colname)]
+colInfo[,c("condition", "rep") := tstrsplit(colname, "[_]",  keep = c(1,2)) ] # split the string and transpose into two columns
+
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaDT[rn  %like% 'M100_Nbon', rn := sub('_', '.', rn)]
+
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = condition, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+
+BackupAsPDF(p, "complete.proteins.PCA")
+```
+plot the other PCs
+```{r}
+barplot(pcaPercentVar)
+```
+Before performing contrasts between conditions, we want to remove proteins with only 1 identified feature as likely a mislabelling
+The `NumMeasuredFeature` column in the msstats `ProteinLevelData`  gives the number of measured features per run/protein
+
+I think for now will record the names of the 'troublesome' proteins and inspect sig results (still issue of MT correction...)
+#Drop the proteins with 1 measured feature detected in > 5/16 runs ( 
+
+```{r}
+#bar plot of number of measured features per protein/run
+# ~6.5 k instances of 1 feature protein
+ggplot(p.quant[NumMeasuredFeature %in% seq(1,10,by=1)], aes(x=NumMeasuredFeature)) + 
+  geom_bar(stat = 'Count') +
+  scale_x_continuous(breaks=seq(0,10, 1), limits=c(0,11)) +
+  theme_bw()
+
+
+# remove all proteins with 1 measured feature
+# count of number of proteins with N missing values; we can see that over 300 proteins have only 1 meadured feature in all runs
+p.quant[NumMeasuredFeature == 1, .N, by=Protein] %>% 
+  ggplot(., aes(x=(N))) + geom_bar(stat='Count')
+
+
+# what di the proteins with only one measured feature in one run look like?
+quick.look <- p.quant[NumMeasuredFeature == 1, .N, by=Protein] %>% .[N %in% c(1),Protein]
+# majority of these just have two measured features..
+p.quant[Protein %in%  quick.look, NumMeasuredFeature] %>%  summary()
+
+# remove proteins from dt with 1 measured feature in all runs
+#Drop the proteins with 1 measured feature detected in 10 or more runs based on hist (increase in )
+drop.prots <-  p.quant[NumMeasuredFeature == 1, .N, by=Protein] %>% 
+  .[N %in% seq(5,16, by=1), Protein]
+
+# dropping 440 proteins
+drop.prots %>%  length()
+
+# inspect the distruibution of measured features in these proteins
+# out of near 7k protein/run combos, only 331 have 2 measured features and none more
+p.quant[Protein %in% drop.prots, .N,by=NumMeasuredFeature]
+
+
+# record the other proteins with 1 measured feature per run/protein in up to 4 runs
+suspect.prots <-  p.quant[NumMeasuredFeature == 1, .N, by=Protein] %>% 
+  .[N %in% seq(1,4, by=1), Protein]
+
+#233 retained in the dataset
+suspect.prots %>%  length()
+
+# remove the proteins 
+p.quant <-  p.quant[!Protein %in% drop.prots, ]
+```
+
+Run MSstats pw comparisons for now
+
+create a contrast matrix for the msstats contrasts
+4 conditions, so prob 
+
+ag - ctrl
+treat - ctrl
+ag_treat - ctrl
+ag_treat - treat # key question; what are the things changing 
+
+key question here is...
+(ag_treat - ctrl) - (ag_treat - treat) # use emmeans to answer this q
+
+```{r}
+# first MRX2 
+mat.dimnames <- list(rnames='M100-Veh',
+                     cnames= c('M100', 'M100_Nbon', 'Nbon', 'Veh'))
+
+mss.contrasts <- matrix(data=c(1,0,0,-1), nrow = 1, dimnames=mat.dimnames)
+mss.contrasts <- rbind(mss.contrasts, c(0,0,1,-1))
+rownames(mss.contrasts)[2] <- 'Nbon-Veh'
+mss.contrasts <- rbind(mss.contrasts, c(0,1,0,-1))
+rownames(mss.contrasts)[3] <- 'M100_Nbon-Veh'
+mss.contrasts <- rbind(mss.contrasts, c(0,1,-1,0))
+rownames(mss.contrasts)[4] <- 'M100_Nbon-Nbon'
+
+# sanity check
+#p.quant$GROUP %>%  unique() %in% colnames(mss.contrasts)
+```
+
+```{r}
+# use SUBJECT as a batch term to correct for batch effect in linear modelling
+p.quant[, SUBJECT := paste0('batch.', SUBJECT)]
+
+# write out p.quant for reuse in contrast of contrasts
+#fwrite(p.quant, './output/mss.dp.ProteinLevelData.processed.csv')
+
+# now replace PLD with the modified data.table
+dp.out$ProteinLevelData <- setDF(p.quant)
+
+mss <- MSstats::groupComparison(contrast.matrix = mss.contrasts, dp.out)
+mss.dt <- setDT(mss$ComparisonResult)
+
+#fwrite(mss.dt, './output/mss.grpcomparison.ori.csv')
+```
+
+```{r}
+# read in the data
+mss.dt <- fread('./output/mss.grpcomparison.ori.csv')
+```
+
+plot the DEPs; volcano plots of each contrasts
+Get all the DEGs and run GO enrichment; plot heatmaps
+write out the results in long format
+
+no significant prots @ log2FC > 50% adj.pval < 0.05, adj.pval < 0.1
+pval histograms look un
+
+```{r}
+# why is there NA vals in the group comparison result?
+mss.dt
+
+proc.dt <- mss.dt[,gene := multiUniprots2multiGenes(as.character(Protein), species='MOUSE')] %>% #needed as in factor format
+  .[!issue %in% c('completeMissing','oneConditionMissing'), ] %>% 
+  .[!is.na(log2FC), ] %>% 
+  .[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)] %>% 
+  .[, sig := 'not'] %>% 
+  .[abs(log2FC) > 0.58 & p.adj < 0.1, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+# output the res
+fwrite(proc.dt, './output/mss.grpcomparison.processed.csv')
+
+proc.dt[, .N, by=.(sig,Label)]
+
+# what do the pvalue histograms looking like 
+# slight spike at low pval for treatment, antagonist vs ctrl. treat+antagonist looks uniform distribution 
+ggplot(mss.dt, aes(x=pvalue)) + 
+  geom_histogram() +
+  facet_wrap(~Label)
+
+proc.dt <- mss.dt[,gene := multiUniprots2multiGenes(as.character(Protein), species='MOUSE')] %>% #needed as in factor format
+  .[!issue %in% c('completeMissing','oneConditionMissing'), ] %>% 
+  .[!is.na(log2FC), ] %>% 
+  .[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)] %>% 
+  .[, sig := 'not'] %>% 
+  .[abs(log2FC) > 0.58 & pvalue < 0.01, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+```
+generate volcanoplots of the 4 comparisons
+nothing at adj.pval < 0.05, so drop threshold to pval < 0.01
+
+```{r}
+
+g <- ggplot(proc.dt, aes(x=log2FC, y=-log10(pvalue), color=sig, label=gene)) + 
+      geom_point() +
+      geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+      geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+      ggrepel::geom_text_repel(data=proc.dt[sig != 'not',],  size = 2, max.overlaps = 20) +
+      scale_color_manual(values=c('up'='red', 'down'='blue', 'not'='grey')) +
+      ggtitle(' (FC +/ 50% & pval < 0.01)') +
+      facet_wrap(~Label, scales = 'free') +
+      theme_bw() +
+      theme(strip.text.x = element_text(size = 5))
+      
+g
+BackupAsPDF(g, 'grpcontrasts.pval.0.01.multipanel.volcanoplot.')
+
+```
+sanity check...
+```{r}
+ggplot(p.quant[Protein == 'P07759',], aes(x=reorder(GROUP), y=LogIntensities, color=GROUP)) + geom_point() + theme(axis.text.x = element_text(angle=90))
+```
+
+Not going to recover much here from the enrichment analysis
+lets look at the contrast of contrasts instead and plot these heatmaps per condition
+
+```{r}
+p.quant <- fread('./output/mss.dp.ProteinLevelData.processed.csv')
+
+# create a treatment and batch factor for lm 
+p.quant[, batch := factor(SUBJECT)]
+p.quant[, treatment := factor(GROUP, levels=c('Veh', 'M100','Nbon', 'M100_Nbon'))]
+
+
+# example of single lm controlling for batch (P07759 used as significant in msstats modelling)
+lm(LogIntensities~treatment+batch, data = p.quant[Protein == "P07759"]) %>% summary()
+
+model <- aov(LogIntensities ~ batch+treatment, data=p.quant[Protein == "P07759"])  
+summary(model)
+```
+
+```{r}
+# linearModelsAllProteins can this function which computes statistic for a contrast of two different log2FC
+# how does the treatment effect change per antagonist level? basically compare treatment effect within each antagonist level
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~treatment){  # how does response overe time change with pretreatment status
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm) # pairwise contrasts of condiitona
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none") # contrasts of the contrasts.
+  return (as.data.table(contrast2))
+}
+
+# perform pairwise comparisons of each grp
+lm.out <- linearModelsAllProteins(p.quant, formulaList = list(basic = LogIntensities~treatment+batch), splitColumn = "Protein", 
+                                  cl = 6, emmeansFormula = pairwise~treatment,
+                                  postProcessFunction = emmeans.contrastOfContrasts)
+
+
+```
+
+generally looks uniform, but for Veh-M100_Nbon & Veh-Nbon there seems to be a clear spike at pval < 0.05 although they look very similiar
+```{r}
+dt <- lm.out[["contrast"]]
+
+g <- ggplot(dt, aes(x=dt$p.t)) +
+   geom_histogram(boundary=0.0, binwidth = 0.01) +
+   facet_wrap(~dt$contrast)
+g
+```
+
+write out the significant results of each of the contrasts
+again, no significant hits after correction (p.adj < 0.05)
+but at pval < 0.01 more significiant results Veh - M100_Nbon compared to Nbon alone vs ctrl
+
+```{r}
+dt[, p.adj := p.adjust(p.t, method='BH'), by=contrast]
+
+dt[, gene := multiUniprots2multiGenes(Protein, species = 'MOUSE')]
+dt[, sig := 'not']
+dt[p.t < 0.001 & abs(estimate) > 0.58, sig := ifelse(estimate > 0, 'up', 'down')]
+
+# only 10 sig hits in total...
+dt[sig != 'not',]
+
+
+dt <- dt[, .(Protein, gene, contrast, estimate, p.t, p.adj, sig)] %>% 
+  setnames(new=c('Protein', 'gene', 'contrast', 'log2FC', 'pvalue', 'p.adj', 'sig'))
+
+fwrite(dt, './output/ab.lm.contrasts.csv')
+```
+
+Now lets look at interaction analysis for the different hits.
+
+What is the impact of antagonist addition on treatment effect?
+"(Veh - Nbon) - (Veh - M100_Nbon)" this is our contrast of contrasts; is there a significant difference between contrasts to control?
+
+```{r}
+lm.out$postProcess$contrast %>%  unique()
+contrast.oi <- c("(Veh - Nbon) - (Veh - M100_Nbon)", "(Veh - M100) - (Veh - M100_Nbon)" )
+
+# jsut extract the contrast we are interested in
+dt <- lm.out$postProcess[contrast %in% contrast.oi,]
+
+dt[, sig := 'not']
+dt[, gene := multiUniprots2multiGenes(Protein, species="MOUSE")]
+# only 4 genes are significant at pval < 0.001 and thats w/o adjusting log2FC thresholds..
+dt[p.value < 0.001, ]
+
+# sanity check 
+# addition of M100 agonist leads to reduction
+ggplot(p.quant[Protein == 'P23953',], aes(x=(GROUP), y=LogIntensities, color=GROUP)) + geom_point() + theme(axis.text.x = element_text(angle=90))
+
+# this one looks a little more interesting. Seems combo of M100 and Nbon leads to a reduction relative to other groups, but not v large effect size
+# Shisa9; involved in neuronal plasticity
+ggplot(p.quant[Protein == 'Q9CZN4',], aes(x=(GROUP), y=LogIntensities, color=GROUP)) + geom_point() + theme(axis.text.x = element_text(angle=90))
+```
+
+
+
+Initial look
+----
+V few significant changes between conditions 
+Few hits (4) found in contrast of contrasts, although Shisa9 may be interesting
+Check out the phospho data tomorrow and see if we find any sig hits of interest
+

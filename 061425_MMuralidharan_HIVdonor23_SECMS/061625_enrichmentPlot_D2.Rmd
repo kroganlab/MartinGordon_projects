@@ -1,0 +1,383 @@
+---
+title: "061625_enrichmentPlot_D2"
+author: "Martin Gordon"
+date: "2025-06-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview 
+
+Enrichment plot comparing D2 Infected vs Mock
+
+```{r packages}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(CCprofiler)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+Extract the two donors
+```{r}
+anova.dt <- fread('../040825_MMuralidharan_PCProphet_HIV_CD4Tcells/060225_differentialAnalysisSeperateDonors_data/2025_06_02_allPWcontrasts.anova.toShare.csv.gz')
+```
+
+Run the enrichment analysis on each of the pw contrasts seperately
+
+plot the number of differential proteins in each comparison
+```{r}
+anova.dt[, donor := stringr::str_extract(contrast, '[12]$')]
+anova.dt[, grp_comparison := gsub('_[12]$', '', contrast)]
+
+g <- ggplot(anova.dt[treatmentDiff.adjP < 0.05, .N, by=.(grp_comparison, donor)],  aes(x=paste0(grp_comparison, '.', donor), y=N, fill=donor)) +
+  geom_bar(stat='identity') +
+  theme_bw() +
+  labs(title='Number of significant differentially eluting proteins', y = 'N proteins (adj.pval < 0.05)', x='contrast') +
+  scale_fill_brewer(type='qual',palette=6) +
+  customTheme
+
+g
+BackupAsPDF(g, 'nSig.hits2donorComparison.barplot')
+```
+Prepare gene sets from the GO ontology dataset
+```{r}
+geneSets.dt <- fread('~/Documents/utils/mg_utils/data/stringDB/9606.protein.enrichment.terms.v12.0.txt.gz')
+# merge this with our data
+idmapper <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_StringGeneProtein.idMapper.csv.gz')
+idmapper[, simplifiedGene := gsub('[.].+','', gene)]
+
+geneSets.dt[idmapper, protein := i.protein, on = c(`#string_protein_id` = "stringID")]
+
+go <- geneSets.dt[grep ("Gene Ontology", category)][, .(description,  stringID = `#string_protein_id`)]
+# subset to minimal size
+smallish <- go[, .N, by= description][ N< 100, description]
+go <- go[description %in% smallish]
+```
+
+```{r}
+allContrasts[idmapper, stringID := i.stringID, on = c(protein = "protein")]
+
+setorder(allContrasts, treatmentDiff.p, na.last = TRUE)
+# take top scoring peak per protein
+contrast.singleProt <- allContrasts[, .SD[1], by= .(gene, contrast) ] # taking hte top scoring peak per protein
+contrast.singleProt[, diffScore := -log10(treatmentDiff.p)]
+
+contrasts <- contrast.singleProt$contrast %>% 
+  unique()
+names(contrasts) <- contrasts
+
+allsea <- lapply(contrasts, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(go$stringID, go$description),
+                                           contrast.singleProt[contrast == contOI][diffScore > 0, setNames(diffScore, stringID)],
+                                           scoreType = "pos")
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) |> rbindlist(idcol = "contrast")
+
+#fwrite(allsea, ScriptAndDatedFileName('GO.enrichment.hiv_d12.csv.gz'))
+```
+enrichment results
+```{r}
+go.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_enrichmentPlot_D2_data/2025_06_17_GO.enrichment.hiv_d12.csv.gz')
+```
+
+```{r, fig.width = 10, fig.height = 5}
+# merge the contrast scores with a subset of enriched corum
+sigPathways  <- allsea[size > 1 & padj < 0.05, unique(pathway)]
+shortComplexLength = 80
+
+# subset enrichment table
+sigEnrichedPathways <- allsea[pathway %in% sigPathways]
+sigEnrichedPathways # over 1k significant scores
+# join with corum to get full genes
+genesInEnrichedPathways <- go[sigEnrichedPathways,, on = c(description = "pathway")]
+ 
+# join with contrast protein scores
+genesWDiffScores <- contrast.singleProt[genesInEnrichedPathways,,on = c("contrast", stringID = "stringID")]
+
+genesWDiffScores[, diffScore := -log10(treatmentDiff.p)]
+
+# add total as a 'total' complex
+genesWDiffScores <- rbind(genesWDiffScores, contrast.singleProt, fill = TRUE)
+genesWDiffScores[is.na(description), description := "total"]
+setorder(genesWDiffScores, pval, na.last = TRUE) # order by SEA score
+genesWDiffScores[, description := factor(description, levels = rev(unique(genesWDiffScores$description))  )]
+
+
+p <- ggplot(genesWDiffScores[!is.na(diffScore)] , aes(y = description, x = diffScore, color = padj < 0.05, shape = description == "total")) +
+  ggforce::geom_sina(scale = "width",   show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #ggforce::geom_sina(data = genesWDiffScores[complex == "total"], shape = ".", scale = "count", show.legend = FALSE) +
+  facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched:") +
+  #scale_color_viridis_d(option = "H") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+ # ggrepel::geom_text_repel(data  = genesWDiffScores[, .SD[order (-diffScore)][1:4], by = .(description, contrast)], show.legend = FALSE, size = 2, direction = "y", box.padding = 0) +
+  theme_bw() +
+  # uncomment to get shortened names in y axis
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle = "") +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+p
+BackupAsPDF(p, format = "png")
+```
+```{r, enrich, fig.width=10, fig.height=12}
+p  <- ggplot(genesWDiffScores[!is.na(diffScore) & contrast == 'infected_uninfected_2' & size > 1 & padj < 0.05,], 
+             aes(y = description, x = diffScore, color = padj < 0.05, label=gene, shape = description == "total")) +
+  ggforce::geom_sina(scale = "width",   show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #ggforce::geom_sina(data = genesWDiffScores[complex == "total"], shape = ".", scale = "count", show.legend = FALSE) +
+  #facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched (p.adj < 0.05):") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+  ggrepel::geom_text_repel(data  = genesWDiffScores[!is.na(diffScore) & contrast == 'infected_uninfected_2' & size > 1 & padj < 0.05, .SD[order (-diffScore)][1:4], by = .(description, contrast)], show.legend = FALSE, size = 2, box.padding = 0) +
+  theme_bw() +
+  # uncomment to get shortened names in y axis
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle='Infected vs Mock Donor 2') +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+p
+BackupAsPDF(p, 'go.bp.d2.infectedVsMock.enrihcment')
+
+# all enrichments
+p  <- ggplot(genesWDiffScores[!is.na(diffScore) & contrast == 'infected_uninfected_2' & size > 1,], 
+             aes(y = description, x = diffScore, color = padj < 0.05, label=gene, shape = description == "total")) +
+  ggforce::geom_sina(scale = "width",   show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #ggforce::geom_sina(data = genesWDiffScores[complex == "total"], shape = ".", scale = "count", show.legend = FALSE) +
+  #facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched (p.adj < 0.05):") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+  ggrepel::geom_text_repel(data  = genesWDiffScores[!is.na(diffScore) & contrast == 'infected_uninfected_2' & size > 1 & padj < 0.05, .SD[order (-diffScore)][1:4], by = .(description, contrast)], show.legend = FALSE, size = 2, box.padding = 0) +
+  theme_bw() +
+  # uncomment to get shortened names in y axis
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle='Infected vs Mock Donor 2') +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom", axis.text.y=element_text(size=5))
+p
+BackupAsPDF(p, 'go.bp.d2.infectedVsMock.extended.enrihcment')
+```
+Make a scatterplot of the enrichment in both donors; how do the terms compare?
+
+```{r, fig.width=10, fig.height=6}
+enrich.wide <- dcast(sigEnrichedPathways[grepl('infected_uninfected', contrast)], pathway~contrast, value.var = 'pval')
+
+enrich.wide[, sig := 'not']
+enrich.wide[, sig := ifelse(infected_uninfected_1 < 0.05 & infected_uninfected_2 < 0.05, 'both donors significant',
+                            ifelse(infected_uninfected_1 > 0.05 & infected_uninfected_2 < 0.05, 'donor 2 significant',
+                                   ifelse(infected_uninfected_1 < 0.05 & infected_uninfected_2 > 0.05, 'donor 1 significant', 'not')))]
+               
+g <- ggplot(enrich.wide, aes(x=-log10(infected_uninfected_1), y=-log10(infected_uninfected_2), color=sig)) +
+  geom_point() +
+  ggrepel::geom_text_repel(data=enrich.wide[sig == 'both donors significant'], aes(label=pathway), size=2.5, color='black', max.overlaps = 10) +
+  geom_vline(xintercept=-log10(0.05), linetype=2) +
+  geom_hline(yintercept=-log10(0.05), linetype=2) +
+  labs(title='Infected vs Uninfected Enrichment Comparisons', x='Donor1 GO enrichment score (-log10 p.adj)', y='Donor2 GO enrichment score (-log10 p.adj)') +
+  scale_color_brewer(type='qual', palette=2) +
+  theme_bw()
+g
+BackupAsPDF(g, 'GO.enrichment.D12comparisons.scatteplot')
+```
+```{r, fig.width=10, fig.height=6}
+
+g <- ggplot(enrich.wide[!grepl('ribosom', pathway)], aes(x=-log10(infected_uninfected_1), y=-log10(infected_uninfected_2), color=sig)) +
+  geom_point() +
+  ggrepel::geom_text_repel(data=enrich.wide[!grepl('ribosom', pathway) & sig == 'both donors significant'], aes(label=pathway), size=2, color='black', max.overlaps = 10) +
+  geom_vline(xintercept=-log10(0.05), linetype=2) +
+  geom_hline(yintercept=-log10(0.05), linetype=2) +
+  labs(title='Infected vs Uninfected Enrichment Comparisons', x='Donor1 GO enrichment score (-log10 p.adj)', y='Donor2 GO enrichment score (-log10 p.adj)') +
+  scale_color_brewer(type='qual', palette=2) +
+  theme_bw()
+g
+BackupAsPDF(g, 'GO.enrichment.D12comparisons.noRiboSubset.scatteplot')
+```
+maybe look at the cor scores for each of the samples; see if there is any agreement between the donors
+Use a pw similarity scatterplot
+```{r}
+cor.mat <- dcast(sigEnrichedPathways, pathway~contrast, value.var='pval') %>% 
+  as.matrix(rownames='pathway') %>% 
+  cor(., use='pairwise.complete.obs', method='pearson')
+
+od =  hclust(dist(cor.mat))$order
+cm = cor.mat[od, od]
+
+
+hm <- Heatmap(cm, 
+        name='Sample Pearson Corr.',
+        rect_gp = gpar(type = "none"),  # turn off 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=8),
+        col=colorRamp2(breaks=c(-1,0,1), colors=c('cornflowerblue', 'white', 'firebrick')),
+	cell_fun = function(j, i, x, y, w, h, fill) {
+		if(i >= j) {
+			grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='black'))
+		}
+	})
+
+BackupAsPDF(draw(hm, column_title='GO enrichment HIV donor sample correlations'), 'go.sampleCor.heatmap')
+```
+Now try CORUM enrichment 
+
+```{r}
+corum.db <- fread('/Users/martingordon/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/docs/corum.hs.5.1.txt') %>% 
+  .[, .(protein=unlist(strsplit(subunits_uniprot_id, ';'))), by=complex_name]
+
+allContrasts <- anova.dt
+setorder(allContrasts, treatmentDiff.p, na.last = TRUE)
+contrast.singleProt <- allContrasts[, .SD[1], by= .(protein, contrast)] # taking hte top scoring peak per protein
+contrast.singleProt[, diffScore := -log10(treatmentDiff.p)]
+
+contrasts <- contrast.singleProt$contrast %>% 
+  unique()
+names(contrasts) <- contrasts
+
+corum.allsea <- lapply(contrasts, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(corum.db$protein, corum.db$complex_name),
+                                           contrast.singleProt[contrast == contOI][diffScore > 0, setNames(diffScore, protein)],
+                                           scoreType = "pos")
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) |> rbindlist(idcol = "contrast")
+
+fwrite(corum.allsea, ScriptAndDatedFileName('CORUM.enrichment.hiv_d12.csv.gz'))
+```
+
+save and plot the CORUM enrihcment results
+
+```{r}
+corum.allsea <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_enrichmentPlot_D2_data/2025_06_17_CORUM.enrichment.hiv_d12.csv.gz')
+```
+
+```{r, fig.width = 10, fig.height = 5}
+# merge the contrast scores with a subset of enriched corum
+sigPathways  <- corum.allsea[size > 1 & padj < 0.1, unique(pathway)]
+shortComplexLength = 80
+
+# subset enrichment table
+sigEnrichedPathways <-  corum.allsea[pathway %in% sigPathways]
+
+# join with corum to get full genes
+genesInEnrichedPathways <- go[sigEnrichedPathways,, on = c(description = "pathway")]
+
+# extend this to plot the 
+genesInEnrichedPathways.long <- genesInEnrichedPathways[, lapply(.SD, function(x) unlist(tstrsplit(x, "[|]"))),
+   .SDcols = "leadingEdge",by = c('description', 'contrast', 'pval', 'padj', 'ES','NES', 'size')]
+
+# join with contrast protein scores
+genesWDiffScores <- contrast.singleProt[genesInEnrichedPathways.long,,on = c("contrast", protein = "leadingEdge")]
+genesWDiffScores[, diffScore := -log10(treatmentDiff.p)]
+
+# add total as a 'total' complex
+genesWDiffScores <- rbind(genesWDiffScores, contrast.singleProt, fill = TRUE)
+genesWDiffScores[is.na(description), description := "total"]
+setorder(genesWDiffScores, pval, na.last = TRUE) # order by SEA score
+genesWDiffScores[, description := factor(description, levels = rev(unique(genesWDiffScores$description))  )]
+
+
+fwrite(genesWDiffScores, ScriptAndDatedFileName('corum.enrich.rbindGeneDiffScores.csv.gz'))
+```
+
+```{r, enrich, fig.width=8, fig.height=8}
+p  <- ggplot(genesWDiffScores[!is.na(diffScore) & contrast == 'infected_uninfected_2' & size > 1 & padj < 0.05,], 
+             aes(y = description, x = diffScore, color = padj < 0.05, label=gene, shape = description == "total")) +
+  ggforce::geom_sina(scale = "width",   show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #ggforce::geom_sina(data = genesWDiffScores[complex == "total"], shape = ".", scale = "count", show.legend = FALSE) +
+  #facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched (p.adj < 0.05):") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+  ggrepel::geom_text_repel(data  = genesWDiffScores[!is.na(diffScore) & contrast == 'infected_uninfected_2' & size > 1 & padj < 0.05, .SD[order (-diffScore)][1:4], by = .(description, contrast)], show.legend = FALSE, size = 2, box.padding = 0) +
+  theme_bw() +
+  # uncomment to get shortened names in y axis
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle='Infected vs Mock Donor 2') +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+p
+BackupAsPDF(p, 'corum.bp.d2.infectedVsMock.enrihcment')
+
+# all enrichments
+p  <- ggplot(genesWDiffScores[!is.na(diffScore) & contrast == 'infected_uninfected_2' & size > 1,], 
+             aes(y = description, x = diffScore, color = padj < 0.05, label=gene, shape = description == "total")) +
+  ggforce::geom_sina(scale = "width",   show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #ggforce::geom_sina(data = genesWDiffScores[complex == "total"], shape = ".", scale = "count", show.legend = FALSE) +
+  #facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched (p.adj < 0.05):") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+  ggrepel::geom_text_repel(data  = genesWDiffScores[!is.na(diffScore) & contrast == 'infected_uninfected_2' & size > 1 & padj < 0.05, .SD[order (-diffScore)][1:4], by = .(description, contrast)], show.legend = FALSE, size = 2, box.padding = 0) +
+  theme_bw() +
+  # uncomment to get shortened names in y axis
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle='Infected vs Mock Donor 2') +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom", axis.text.y=element_text(size=5))
+p
+BackupAsPDF(p, 'corum.d2.infectedVsMock.extended.enrichment')
+```
+now look at protein1 and 
+```{r, fig.width=10, fig.height=6}
+enrich.wide <- dcast(sigEnrichedPathways[grepl('infected_uninfected', contrast)], pathway~contrast, value.var = 'pval')
+sigEnrichedPathways
+enrich.wide[, sig := 'not']
+enrich.wide[, sig := ifelse(infected_uninfected_1 < 0.05 & infected_uninfected_2 < 0.05, 'both donors significant',
+                            ifelse(infected_uninfected_1 > 0.05 & infected_uninfected_2 < 0.05, 'donor 2 significant',
+                                   ifelse(infected_uninfected_1 < 0.05 & infected_uninfected_2 > 0.05, 'donor 1 significant', 'not')))]
+
+g <- ggplot(enrich.wide, aes(x=-log10(infected_uninfected_1), y=-log10(infected_uninfected_2), color=sig)) +
+  geom_point() +
+  ggrepel::geom_text_repel(data=enrich.wide[sig == 'both donors significant'], aes(label=pathway), size=2, color='black', max.overlaps = 10) +
+  geom_vline(xintercept=-log10(0.05), linetype=2) +
+  geom_hline(yintercept=-log10(0.05), linetype=2) +
+  labs(title='Infected vs Uninfected Enrichment Comparisons', x='Donor1 GO enrichment score (-log10 p.adj)', y='Donor2 GO enrichment score (-log10 p.adj)') +
+  scale_color_brewer(type='qual', palette=2) +
+  theme_bw()
+g
+BackupAsPDF(g, 'CORUM.enrichment.D12comparisons.scatteplot')
+```
+Correlations of CORUM scores in D1 D2
+```{r}
+cor.mat <- dcast(sigEnrichedPathways, pathway~contrast, value.var='pval') %>% 
+  as.matrix(rownames='pathway') %>% 
+  cor(., use='pairwise.complete.obs', method='pearson')
+
+od =  hclust(dist(cor.mat))$order
+cm = cor.mat[od, od]
+
+
+hm <- Heatmap(cm, 
+        name='Sample Pearson Corr.',
+        rect_gp = gpar(type = "none"),  # turn off 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=8),
+        col=colorRamp2(breaks=c(-1,0,1), colors=c('cornflowerblue', 'white', 'firebrick')),
+	cell_fun = function(j, i, x, y, w, h, fill) {
+		if(i >= j) {
+			grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='black'))
+		}
+	})
+hm
+BackupAsPDF(draw(hm, column_title='CORUM enrichment HIV donor sample correlations'), 'CORUM.sampleCor.heatmap')
+```
+

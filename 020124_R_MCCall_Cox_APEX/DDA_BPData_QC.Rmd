@@ -1,0 +1,533 @@
+---
+title: "DDA_BPdata_firstLook"
+author: "Martin Gordon"
+date: "2024-02-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+packages
+```{r}
+library(data.table)
+library (ComplexHeatmap)
+library (circlize)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(magrittr)
+library(MSstats)
+library(ggrepel)
+library(circlize)
+library(ggvenn)
+library(readxl)
+library(MSstats)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/bp_utils/EvidenceFile2MSstatsInput.R")
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+
+## BP data check
+
+Due to issues of low counts in my maxquant search output, perform quick QC of BPs run and compare N detected features etc.
+Low count issues still an issue so not related to my MQ params ( I think)
+
+
+Next steps:
+----
+Look at the fasta; should we blast it to identify the spec it maps to?
+
+```{r}
+#spec <- fread('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/combined/txt/evidence.txt')
+#keys.subset <- keys[RawFile %in% spec$`Raw file`,]
+#fwrite(keys.subset, './docs/keys.subset.txt')
+
+
+spec.proc <- prepareDataForMSStats('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/combined/txt/evidence.txt',
+                                   './docs/keys.txt')
+```
+
+```{r}
+g <- ggplot(spec.proc[!is.na(Intensity),.N, by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N detected features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'Nfeaturesdetected.UCSF.barplot')
+```
+Compare this to Ritas evidence.txt
+
+```{r}
+spec <- fread('~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/code/evidenceApex12.txt')
+spec$`Raw file` %>%  unique()
+spec$Experiment %>%  unique()
+
+#keys <- fread('~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/keys.txt')
+#keys[,RawFile := sub('S','', RawFile)]
+#fwrite(keys, '~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/keys.tidy.txt')
+keys <- fread('~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/keys.tidy.txt')
+
+spec.proc <- prepareDataForMSStats('~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/code/evidenceApex12.txt',
+                                   '~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/keys.tidy.txt')
+```
+
+```{r}
+
+g <- ggplot(spec.proc[!is.na(Intensity),.N, by=.(BioReplicate,Run)], aes(x=reorder(interaction(BioReplicate,Run)), y=N, fill=BioReplicate)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N detected features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+
+g
+
+BackupAsPDF(g, 'Nfeaturesdetected.berkely.barplot')
+
+```
+
+Lets look at the output from MaxQuant; view the txt.summary file
+Seems that their search returned ~ 30% more identifications on average... how can we correct this?
+
+```{r}
+# compare to our summary DT
+sum.dt <- fread ('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/combined/txt/summary.txt')
+summary.dt <- fread('~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/summary.txt')
+
+summary.dt
+
+wide.dt <- merge(x=sum.dt, y=summary.dt, by.x='Raw file', by.y='Raw file', suffixes = c(x=".ucsf", y=".berkely"))
+wide.dt <- merge(x=wide.dt, y=keys, by.x='Raw file', by.y='RawFile')
+
+# peptides seem the same
+g <-  ggplot(wide.dt, aes(x=`Peptide sequences identified.ucsf`, y=`Peptide sequences identified.berkely`, color=interaction(Condition,BioReplicate))) +
+  geom_point(size=2.4) +
+  geom_abline(intercept=0, slope = 1) +
+    xlim(0,20000) +
+  ylim(0,20000) 
+g
+#BackupAsPDF(g, 'npeptidesMQout.scatterplot')
+
+# lets plot more than one variable.... peptides and MS/MS scans?
+g <-  ggplot(wide.dt, aes(x=`MS/MS identified.ucsf`, y=`MS/MS identified.berkely`, color=interaction(Condition,BioReplicate))) +
+  geom_point(size=2.4) +
+  geom_abline(intercept=0, slope = 1) +
+  xlim(5000,22000) +
+  ylim(5000,22000) 
+g
+
+#BackupAsPDF(g, 'nscansIdentified.scatterplot')
+
+
+g <- ggplot(comb.dt[`Raw file` != 'Total'], aes(x=id, y=`Peptide sequences identified`, fill=id)) +
+  geom_bar(stat='Identity') + 
+  theme(axis.text.x = element_text(angle=90))
+
+#BackupAsPDF(g, 'oldVsNewMQsearch.peptides identified')
+
+
+
+# get amt
+comb.dt[, `Peptide sequences identified` := as.double(`Peptide sequences identified`)]
+comb.dt[, N.diff := (`Peptide sequences identified`[id == 'berkley'] - `Peptide sequences identified`[id == 'ucsf']), by=.(`Raw file`)]
+
+ggplot(comb.dt, aes(x=`Raw file`, y=N.diff)) +
+  geom_bar(stat='Identity') +
+   theme(axis.text.x = element_text(angle=90))
+
+
+head(comb.dt)
+
+comb.dt[,.N,by=.( `Peptide sequences identified`, `Raw file`, `id`, N.diff )]
+```
+
+What about PEP scores in both files
+Berkley has a greater spread of PEP values... less trustworhty?
+PEP scores are NA for peptides identified through matching
+
+```{r}
+# compare to our summary DT
+spec.ucsf <- fread('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/combined/txt/evidence.txt')  
+spec.ucsf[, source := 'ucsf']
+spec.berkley <- fread('~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/code/evidenceApex12.txt')
+spec.berkley[, source := 'berkley']
+
+files.oi <- spec.berkley$`Raw file` %>% unique()
+
+spec.merge <- rbind(spec.ucsf, spec.berkley, fill=T)
+
+
+# boxplots of pep; more variance in berkley scores
+ggplot(spec.merge[`Raw file` %in% files.oi & !is.na(PEP), ], aes(y=PEP, color=source)) +
+  geom_boxplot() +
+  facet_wrap(~`Raw file`) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+
+# plot this 
+# proportion of NA PEP scores
+g <- ggplot(spec.merge[`Raw file` %in% files.oi, ], aes(x=source, fill=is.na(PEP))) +
+  geom_bar() +
+  facet_wrap(~`Raw file`)
+g
+
+# what are the PEP  NA vals? these are all from multi-matches
+g <- ggplot(spec.merge[`Raw file` %in% files.oi, ], aes(x=source, fill=Type)) +
+  geom_bar() +
+  facet_wrap(~`Raw file`)
+g
+```
+Look at breakdown of mods in each set; could the unexplained be related to the deamination proportion?
+
+```{r}
+# look at the mods; the top ones are the ones we have included...
+#< Modifications included in protein quantification      Oxidation (M);Acetyl (Protein N-term)
+#> Modifications included in protein quantification      Oxidation (M);Acetyl (Protein N-term);Deamidation (NQ)
+
+spec.merge[, Mod := ifelse(grepl('Acetyl', Modifications), 'Acetyl',
+                                       ifelse(grepl('Deamidation', Modifications), 'Deamidation',
+                                                          ifelse(grepl('Oxidation', Modifications), 'Oxidation',
+                                                                 ifelse(grepl('Glu->pyro-Glu', Modifications), 'Glu-Pyro-Glue',
+                                                                             'Unmodified' ))) )]
+
+# lets simplify even further; just seperate into modifiied and unmodified
+spec.merge[, Mod.simplified := ifelse(Modifications == 'Unmodified', 'Unmodified', 'Modified')]
+
+col.vec <- randomcoloR::distinctColorPalette(k=length(unique(spec.merge$Mod)))
+
+g <- ggplot(spec.merge[`Raw file` %in% files.oi, .N, by=.(source, Mod, `Raw file`)], aes(x=interaction(source), y=N, fill=Mod)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.vec) +
+  facet_wrap(~`Raw file`)
+g
+#BackupAsPDF(g, 'ModificationCounts.barplots')
+
+```
+Lets look again at the Venn Diagrams
+Exclude the TIMS=MULTI-MSMS category and lets look within those detected directly in the run only
+
+No still doesnt seem to resolve the issue....
+
+```{r}
+spec.merge[`Raw file` %in% files.oi,  .N, .(source, Sequence, Mod)] %>% 
+  .[order(Sequence)]
+
+
+# convert to a list of sequences assigned to each of these groups and inspect overlap in both
+# I think we only want to look at one run at a time for this...
+
+spec.merge[`Raw file` == "14Apr2023_DDH_RM1_2_S3-A2_1_5548" & !is.na(PEP), .N, by=.(source, Mod.simplified)]
+
+venn.list <- list(ucsf.unmodified = spec.merge[`Raw file` == "14Apr2023_DDH_RM1_2_S3-A2_1_5548" & !is.na(PEP) & source == 'ucsf' & Modifications =='Unmodified', Sequence],
+                  ucsf.modified = spec.merge[`Raw file` == "14Apr2023_DDH_RM1_2_S3-A2_1_5548"  & !is.na(PEP)   & source == 'ucsf' & Modifications !='Unmodified', Sequence],
+                  berkley.unmodified = spec.merge[`Raw file` == "14Apr2023_DDH_RM1_2_S3-A2_1_5548" & !is.na(PEP)  & source == 'berkley' & Modifications =='Unmodified', Sequence],
+                  berkley.modified = spec.merge[`Raw file` == "14Apr2023_DDH_RM1_2_S3-A2_1_5548"  & !is.na(PEP)   & source == 'berkley' & Modifications !='Unmodified', Sequence]
+                  )
+
+g <- ggvenn(venn.list)
+g
+#BackupAsPDF(g, 'run5548.peptideBreakdown.vennDiagram')
+
+```
+
+What about the subset of sequences not in ours, what do their scores look like
+more unique. sequecnes identified in our data than theres, but only when NA peptides with PEP scores included...
+
+```{r}
+
+pep.berkley <- spec.merge[source == 'berkley', unique(Sequence)]
+pep.ucsf<- spec.merge[source == 'ucsf', unique(Sequence)]
+
+# looks 
+pdf('pepCompareSource.histograms.pdf')
+par(mfrow=c(1,2))
+hist(spec.merge[`Raw file` %in% files.oi & source == 'berkley' & !Sequence %in% pep.ucsf, ]$PEP) # this is saying many of the sequences in the dataset
+hist(spec.merge[`Raw file` %in% files.oi & source == 'ucsf' & !is.na(PEP) & !Sequence %in% pep.berkley, ]$PEP)
+dev.off()
+
+seq.counts.dt <- spec.merge[, unique(Sequence), by=.(`Raw file`,source)] %>% 
+  .[, .N, by=.(source, `Raw file`)]
+
+ggplot(seq.counts.dt[`Raw file` %in% files.oi,], aes(x=source, y=N, fill=source)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~`Raw file`)
+
+```
+At this stage, maybe best to summarise both to proteins and see what is different between the two
+-----------------
+Straight off, we are not importing the matched peptides from the MQ run
+
+
+```{r}
+nrow(spec.proc[PeptideSequence %in% no.match.peps,]) == nrow(spec.proc)
+
+# lets get list of the na PEP scores and see if they are included in the output after processing 
+match.peps <- spec.merge[source == 'ucsf' & is.na(PEP), unique(`Modified sequence`)]
+no.match.peps <- spec.merge[source == 'ucsf' & !is.na(PEP), unique(`Modified sequence`)]
+
+spec.merge[is.na(PEP), .N, .(Type, Sequence, `Modified sequence`)]$`Modified sequence` %>%  unique()
+
+spec.proc <- prepareDataForMSStats('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/combined/txt/evidence.txt',
+                                   './docs/keys.txt')
+
+spec.rmc.proc <- prepareDataForMSStats('~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/code/evidenceApex12.txt',
+                                       '~/Library/CloudStorage/Box-Box/APEX\ Data\ to\ Share/keys.tidy.txt')
+```
+lets process this data oursleves..
+```{r}
+spec <- fread('/Users/martingordon/Documents/projects/020124_R_MCCall_Cox_APEX/data/RitaMC_MQOut/combined/txt/evidence.txt')
+keys <- fread('./docs/keys.txt')
+
+spec <- merge(x=spec, y=keys, by.x='Raw file', by.y='RawFile')
+
+#remove contaminants
+spec <- spec[!grepl("^$|CON__|REV__", Proteins),]
+
+# just map to sequences for the matches...
+spec[Type ==  "TIMS-MULTI-MATCH", `Modified sequence` := Sequence]
+
+# sum the intensity values for multiple peptides in each run
+spec.noDups <- spec[, .(Intensity = sum(Intensity), count.features = .N),
+                                by = .(Proteins, 
+                                       `Modified sequence`,
+                                        Charge,
+                                        IsotopeLabelType,
+                                        Condition,
+                                        BioReplicate,
+                                        Run)]
+
+
+spec.mod.proc <- spec.noDups[,.(ProteinName = Proteins,
+                                               PeptideSequence = `Modified sequence`,
+                                                PrecursorCharge = Charge,
+                                                FragmentIon = NA,
+                                                ProductCharge  = NA,
+                                                IsotopeLabelType,
+                                                Condition,
+                                                BioReplicate,
+                                                Run,
+                                                Intensity)]
+
+
+```
+
+no multifeatures detected 
+
+```{r}
+# no multiple feature peptide ions detected
+spec.proc[!is.na(Intensity),.N, by=.(PeptideSequence,PrecursorCharge,Run)][N >1]
+spec.mod.proc[!is.na(Intensity),.N, by=.(PeptideSequence,PrecursorCharge,Run)][N >1]
+```
+
+```{r}
+spec.list <-  list('ori'=spec.proc,
+                   'cox'=spec.rmc.proc,
+                   'ori-w-matches' = spec.mod.proc)
+
+
+
+col.pal <-  randomcoloR::distinctColorPalette(length(unique(spec.proc$Condition)))
+
+
+lapply(spec.list, function(x){
+
+g <- ggplot(x[!is.na(Intensity),.N, by=.(Condition,BioReplicate,Run)], aes(x=reorder(interaction(Condition,BioReplicate,Run)), y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+g
+
+#BackupAsPDF(g, 'rawFeatureCounts.barplot')
+
+})
+#BackupAsPDF(g, 'rawFeatureCounts.barplot')
+spec.list
+```
+try this modified mapping... definitely better than just pasting sequences together...
+```{r}
+
+
+# identify the modified sequences in each group
+mod.seq <- spec[Type !=  "TIMS-MULTI-MATCH", .(`Modified sequence`, count.mods = .N), by=.(
+                                                                                Sequence,
+                                                                                Modifications
+                                                                                )]
+
+
+mod.seq
+# now merge these identifications to the mod table 
+# look up this... 
+test <- merge(x=spec, y=mod.seqs, by.x=c('Sequence', 'Modifications'), by.y=c('Sequence', 'Modifications'))
+
+spec.mod.proc <- spec.noDups[,.(ProteinName = Proteins,
+                                              PeptideSequence = `Modified sequence`,
+                                                PrecursorCharge = Charge,
+                                                FragmentIon = NA,
+                                                ProductCharge  = NA,
+                                                IsotopeLabelType,
+                                                Condition,
+                                                BioReplicate,
+                                                Run,
+                                                Intensity)]
+
+
+# no; for this match, you want to get the IDs of the other 
+mod.seqs <- spec[Type !=  "TIMS-MULTI-MATCH", .(`Modified sequence`), by=.(
+                                        Sequence,
+                                        Modifications)]
+
+mod.seqs[.SD, on=.(Sequence, Modifications)]
+
+# looking at htis but look later...
+table1[is.na(C), C := table2[.SD, on=.(A, B), x.C]]
+
+
+# 
+
+
+
+spec[Type ==  "TIMS-MULTI-MATCH", `Modified sequence` := mod.seqs[.SD, on=.(Sequence, Modifications), x.`Modified sequence`] ]
+
+
+
+mod.seqs[.SD, on=.(Sequence, Modifications)]
+spec[Type ==  "TIMS-MULTI-MATCH", `Modified sequence` := Sequence]
+
+```
+
+lets compare the peptides in the new processed vs old
+
+```{r}
+spec.mod.proc[PeptideSequence %in% match.peps,]
+
+nrow(spec.proc[PeptideSequence %in% no.match.peps,]) == nrow(spec.proc)
+
+
+nrow(spec.mod.proc)
+nrow(spec.proc)
+nrow(spec.rmc.proc)
+
+spec.proc[is.na(Intensity),]
+
+```
+
+
+
+
+
+g <- ggplot(spec.merge[`Raw file` %in% files.oi, ], aes(x=PEP, fill=source)) +
+  geom_histogram(binwidth = 0.01) +
+  facet_wrap(~`Raw file`)
+g
+#BackupAsPDF(g, 'PEPscores.histogram')
+
+# plot this 
+# proportion of NA PEP scores
+g <- ggplot(spec.merge[`Raw file` %in% files.oi, ], aes(x=source, fill=is.na(PEP))) +
+  geom_bar() +
+  facet_wrap(~`Raw file`)
+g
+
+#BackupAsPDF(g, 'PEPscores.propNA.barplots')
+
+
+# peptides seem the same
+g <-  ggplot(wide.dt, aes(x=`Peptide sequences identified.ucsf`, y=`Peptide sequences identified.berkely`, color=interaction(Condition))) +
+  geom_point(size=2.4) +
+  geom_abline(intercept=0, slope = 1) +
+    xlim(0,20000) +
+  ylim(0,20000) 
+
+g
+
+#BackupAsPDF(g, 'npeptidesMQout.scatterplot')
+
+PEP score... why so many NA values in our runs??
+PEP NA scores are found across all modification groups.... ! reason we have these PEP NA scores is match between Runs!!!
+Still doesnt explain why we find less hits...
+```{r}
+ggplot(spec.merge[`Raw file` %in% files.oi, .N, by=.(source, `Raw file`, is.na(PEP))], 
+       aes(x=source, y=N, fill=is.na)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~`Raw file`)
+
+spec.merge[`Raw file` %in% files.oi & is.na(PEP), .N, by=.(source, Mod)]
+
+
+spec.merge[is.na(PEP),]
+```
+Seems that UCSF has more detected, but more of our PEP values are NA.. why??
+```{r}
+# look at the mods; the top ones are the ones we have included...
+#< Modifications included in protein quantification      Oxidation (M);Acetyl (Protein N-term)
+#> Modifications included in protein quantification      Oxidation (M);Acetyl (Protein N-term);Deamidation (NQ)
+
+
+spec.merge[, Mod := ifelse(grepl('Acetyl', Modifications), 'Acetyl',
+                                       ifelse(grepl('Deamidation', Modifications), 'Deamidation',
+                                                          ifelse(grepl('Oxidation', Modifications), 'Oxidation',
+                                                                 ifelse(grepl('Glu->pyro-Glu', Modifications), 'Glu-Pyro-Glue',
+                                                                             'Unmodified' ))) )]
+
+
+spec.merge[Mod == 'Unmodified', unique(Modifications)]
+
+col.vec <- randomcoloR::distinctColorPalette(k=length(unique(spec.merge$Mod)))
+
+g <- ggplot(spec.merge[`Raw file` %in% files.oi, .N, by=.(source, Mod, `Raw file`)], aes(x=interaction(source), y=N, fill=Mod)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.vec) +
+  facet_wrap(~`Raw file`)
+g
+BackupAsPDF(g, 'ModificationCounts.barplots')
+```
+peptide IDs; 
+Look for how many times peptide IDs may have cropped up; are the same IDs in the unmodified and other modified group
+
+venn diagram
+Problem is, even though Berkley has many more sequences, the
+
+```{r}
+spec.merge[`Raw file` %in% files.oi,  .N, .(source, Sequence, Mod)] %>% 
+  .[order(Sequence)]
+
+
+# convert to a list of sequences assigned to each of these groups and inspect overlap in both
+# I think we only want to look at one run at a time for this...
+
+(spec.merge[`Raw file` == "14Apr2023_DDH_RM1_2_S3-A2_1_5548", .N, by=.(source, Mod)])
+
+
+venn.list <- list(ucsf.unmodified = spec.merge[`Raw file` == "14Apr2023_DDH_RM1_2_S3-A2_1_5548"  & source == 'ucsf' & Modifications =='Unmodified', Sequence],
+                  ucsf.modified = spec.merge[`Raw file` == "14Apr2023_DDH_RM1_2_S3-A2_1_5548"  & source == 'ucsf' & Modifications !='Unmodified', Sequence],
+                  berkley.unmodified = spec.merge[`Raw file` == "14Apr2023_DDH_RM1_2_S3-A2_1_5548"  & source == 'berkley' & Modifications =='Unmodified', Sequence],
+                  berkley.modified = spec.merge[`Raw file` == "14Apr2023_DDH_RM1_2_S3-A2_1_5548"  & source == 'berkley' & Modifications !='Unmodified', Sequence]
+                  )
+
+
+g <- ggvenn(venn.list)
+g
+BackupAsPDF(g, 'run5548.peptideBreakdown.vennDiagram')
+
+
+files.oi
+
+spec.merge
+```
+

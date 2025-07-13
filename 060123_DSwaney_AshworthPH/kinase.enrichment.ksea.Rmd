@@ -1,0 +1,129 @@
+---
+title: "kinase-enrichment-ksea"
+author: "Martin Gordon"
+date: "2023-07-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library("RColorBrewer") 
+library(data.table)
+library(dplyr)
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(MSstats)
+library(OmnipathR)
+library(VennDiagram)
+
+# load bens util scripts for the analysis
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../..//utils/bp_utils/MSstats_Helper_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/KinaseActivityScores.R")
+```
+
+
+
+## Rerun of the enrichment analysis for the AViDD project using the KSEA algorthm
+
+
+Read in the data from msstats contrast
+```{r}
+gc.mss <- fread('/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_msstats_groupcomparisons.csv.gz')
+```
+
+```{r}
+gc.mss
+
+# multiproteins will be excluded from enrichment by the enrichment process itself 
+# because (e.g.) the string "A0A0B4J2F2;P57059" does not match any uniprot exactly (likewise for genes)
+gc.mss[, uniprot := strsplit(gsub( "_[STY][0-9]+(;|$)", "\\1",  Protein),";") |> #\1 means return first capture group (in parenthesis)
+          lapply(FUN = unique) |> #REMOVE DUPS
+          sapply(FUN = paste, collapse = ";")] #collapse with ; seperared vals
+
+
+#groups are the unique proteins
+universe <- gc.mss$uniprot |> unique()
+```
+
+Run the KSEA algorith `do.ksea = TRUE`
+
+```{r}
+#db of ppi, kinase-subtrate info
+kinaseData <- loadKinaseDataOmniPath(species = 'HUMAN')
+
+
+
+# convert to single site info based on gene names
+singleSiteResults <- prepare_AMSS_ResultsFile(gc.mss, column = 'gene')
+
+labels <- unique(singleSiteResults$Label)
+
+
+kinActList <- lapply (labels, FUN=function(lab){kinaseActivity(singleSiteResults[Label == lab & representative==TRUE],
+                                                               plots = TRUE,
+                                                               do.sea = TRUE,
+                                                               kinaseData = kinaseData)})
+names(kinActList) <- labels
+
+
+kinActFull.scores <- rbindlist(lapply(kinActList, FUN = function(x)x$scores), idcol="Label") #bind the score dts together, creating a label id column
+kinActFull.mapped <- rbindlist(lapply(kinActList, FUN = function(x)x$kinaseMapped)) # Label is already in these tables
+
+
+#fwrite(kinActFull.scores, ScriptAndDatedFileName("kinaseSummaryScores.ksea.csv"))
+#fwrite(kinActFull.mapped, ScriptAndDatedFileName("kinaseSubstrateData.ksea.csv"))
+```
+
+
+```{r kinase heatmaps}
+sigKinases <-  kinActFull.scores[padj.sea < 0.05 & N >= 2, unique(CTRL_GENE_NAME)] #signiicant enrichment & at least 2 targets?
+
+sigKinase.mat.k <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "NES"),
+                              rownames = "CTRL_GENE_NAME")
+
+sigKinase.mat.N <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "N"),
+                                  rownames = "CTRL_GENE_NAME")
+
+
+hm <- Heatmap (sigKinase.mat.k, 
+         cluster_columns=TRUE, 
+         name = "Normalized Enrichment Score",
+         column_split = tstrsplit(colnames(sigKinase.mat.k), split="[_. ]")[[1]],
+         #column_split = colnames(sigKinase.mat.z),
+         col = circlize::colorRamp2(breaks = c(-3, 0, 0, 3), colors = c("blue", "gray", "gray", "red")),  # two midpoints in case you want to have a wider gray bar around 0
+         row_names_gp = gpar(fontsize = 7),
+         cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=7, col="white")) #if value is not NA, grid.text adds the value in the mat to the cell
+                                  }
+                                })
+hm
+
+BackupAsPDF(hm, prefix = "Sig-PH-Heatmap_SigKinases_ksea")
+
+hm <- Heatmap (sigKinase.mat.k, 
+         cluster_columns=FALSE, 
+         name = "Normalized Enrichment Score",
+         #column_split = colnames(sigKinase.mat.z),
+         column_split = tstrsplit(colnames(sigKinase.mat.k), split="[ ]")[[1]],
+         col = circlize::colorRamp2(breaks = c(-3, 0, 0, 3), colors = c("blue", "gray", "gray", "red")),  # two midpoints in case you want to have a wider gray bar around 0
+         row_names_gp = gpar(fontsize = 7),
+         cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){ #if value is not NA, grid.text adds the value in the mat to the cell
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=7, col="white"))
+                                  }
+                                })
+hm
+BackupAsPDF(hm, prefix = "Sig-PH-Heatmap_SigKinases_noColCluster_ksea")
+```
+
+

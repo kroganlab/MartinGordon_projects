@@ -1,0 +1,322 @@
+---
+title: "geneSetEnrichments"
+author: "Martin Gordon"
+date: "2024-02-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## z-score 
+
+Gene set enrichmemt for ISG and proinflammatory genes
+Get the median/mean z-score, sample randomly same number of genes and calculate median z-score, acquire p-val for how many times they have been found
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(nichenetr)
+library(patchwork) # combine plots
+
+
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("../../utils/bp_utils/Localization_CellMap.R") # functions to enrich for cell pos localisation
+source("../../utils/mg_utils/r_utils/HelperFunctions.R") #
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+Read in the data
+```{r}
+
+piGenes <- read_xlsx('docs/1-s2.0-S0092867423009157-mmc4.xlsx', col_names = T, sheet=7) %>% 
+  setDT(.) %>% 
+  .[category == 'Proinflammatory'] %>% 
+  .[,unique(gene)]
+
+isGenes <- fread('./docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+
+# p.quant 
+p.quant <- fread ("./output/AB.ProteinLevelData.csv")
+p.quant[, REP := SUBJECT]
+p.quant[, SUBJECT := interaction(GROUP,SUBJECT)]
+# for plotting group averages
+p.quant[, mean.LogIntensities := mean(LogIntensities, na.rm=T), by=.(Protein,GROUP)]
+
+#msstats output
+mss <- fread('./output/mss.contrasts.ab.csv')
+
+#clean the res
+mss <- mss[!is.infinite(abs(log2FC)) & !issue %in% c("oneConditionMissing","completeMissing"), ] %>% 
+  .[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')] %>% 
+  .[, sig := 'not'] %>% 
+  .[abs(log2FC) > 0.58 & adj.pvalue < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+
+mss %>%  colnames()
+```
+
+Map to human homologs using db on file and remove dups
+```{r}
+# lets map the homologs to the mss output and write the complete and tidied data to file 
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+new.mss <- merge.data.table(x=mss, y=mh_mappings[,.(Symbol.mouse, Symbol.human, SWISS_PROT_IDs.mouse, SWISS_PROT_IDs.human)], by.x='Protein', by.y='SWISS_PROT_IDs.mouse', all.x=T)
+# nearly 7k more rows added... need to filter these out dups.
+# just take unqiue rows of DT based on Protein Label combo
+mss <- unique(new.mss, by=c("Protein", "Label"))
+
+new.p.quant <- merge.data.table(x=p.quant, y=mh_mappings[,.(Symbol.mouse, Symbol.human, SWISS_PROT_IDs.mouse, SWISS_PROT_IDs.human)], by.x='Protein', by.y='SWISS_PROT_IDs.mouse', all.x=T)
+p.quant <- unique(new.p.quant, by=c('Protein', 'GROUP', 'SUBJECT'))
+```
+ look at histograms of the log2FCs per label
+ 
+```{r}
+
+for (i in unique(mss$Label)){
+  g <- ggplot(mss[Label == i,], aes(x=log2FC)) +
+    ggtitle(paste0(i, ' log2FC ISG distribution')) +
+    geom_histogram() +
+    geom_bar(data=mss[Label == i & Symbol.human %in% isGenes,], aes(x=log2FC, y=3000), color='red', fill='red', stat='Identity') +
+    theme_classic()
+  print(g)
+}
+
+# save the plot with all ISG 
+g <-  ggplot(mss, aes(x=log2FC)) +
+    ggtitle(paste0('log2FC ISG distribution')) +
+    geom_histogram() +
+    geom_bar(data=mss[Symbol.human %in% isGenes,], aes(x=log2FC, y=3000), color='red', fill='red', stat='Identity') +
+    theme_classic() +
+    facet_wrap(~Label, ncol=3, scales = 'free')
+
+BackupAsPDF(g, 'log2FC.ISG.distribution', dimensions=c(12,16))
+
+
+
+# save the plot with all PI genes
+g <-  ggplot(mss, aes(x=log2FC)) +
+    ggtitle(paste0('log2FC Pro-Inflamatory gene distribution')) +
+    geom_histogram() +
+    geom_bar(data=mss[Symbol.human %in% piGenes,], aes(x=log2FC, y=3000), color='blue', fill='blue', stat='Identity') +
+    theme_classic() +
+    facet_wrap(~Label, ncol=3, scales = 'free')
+
+BackupAsPDF(g, 'log2FC.PIG.distribution', dimensions=c(12,16))
+
+```
+ 
+```{r}
+# calculate geom mean of log2FC and pval; we will use this for our computations
+#mss[, magSig := magSigScore(log2FC, pvalue)]
+
+# convert this to wide
+#mag.mat <- dcast(mss, Protein~Label, value.var = 'magSig') %>% 
+#  as.matrix(rownames='Protein')
+
+# how do we consider sign here? Just use log2FC so they dont cancel each other out...
+# convert this to wide
+lfc.mat <- dcast(mss, Protein~Label, value.var = 'log2FC') %>% 
+  as.matrix(rownames='Protein')
+
+
+#' ColwiseZScorePermutation Function
+#'
+#' Calculate z-score for a given subset of genes in a matrix column, assess significance with permutations.
+#'
+#' @param colName The name of the column/sample for which z-scores are calculated.
+#' @param mat The input matrix.
+#' @param set A set of genes for which the z-score is assessed.
+#' @param npermutations Number of permutations.
+#' @return A data.table with results.
+#'
+#' @examples
+#' ColwiseZScorePermutation("GeneExpression", myMatrix, geneSet, npermutations = 100)
+#'
+ColwiseZScorePermutation <- function(colName, mat, set, npermutations=10, center = TRUE, scale = TRUE){
+  
+  if (!colName %in% colnames(mat)) {
+    stop("The specified column name does not exist in the matrix.")
+  }
+  message(paste0('Working on ', colName, '...'))
+  # named vector
+  scores <- mat[,colName]
+
+  # remove infinite and na vals 
+  scores <- scores[!is.na(scores)]
+  if (any (is.infinite(scores))){
+    message (sprintf ("Removing %d infinite values from scores for %s", sum(is.infinite(scores)), colName))
+     scores <- scores[is.finite(scores)]
+  }
+  
+  # calcultate z-score of the genes 
+  scores.z <- scale(scores, center=center, scale=scale)
+  names(scores.z) <- names(scores)
+  
+  sample_size <- sum(names(scores.z) %in% set)
+  if ( sample_size < 2){
+    message('check geneset..')
+    return(NULL)
+  }
+
+  # get median value of LFC
+  set_score <- scores.z[names(scores.z) %in% set] %>% 
+    median(na.rm=T)
+  # 
+  message(paste0('permuting scores for ', npermutations, ' permutations....'))
+   
+  perm_cols <-  do.call(cbind, (lapply(1:npermutations, function(x){
+    
+    # sample length of geneSet
+    perm_sample <- sample(names(scores.z), sample_size)
+    perm_scores <- scores.z[names(scores.z) %in% perm_sample]
+  }))) 
+  
+  #calculate summary statistics
+  message("Summarizing Z statistics")
+  permutedMeans <- apply(perm_cols, 2, mean)
+  permutedMedians <- apply(perm_cols,2,  median)
+  permutedSD  <- apply(perm_cols,2, sd) 
+  
+  
+  # by chance, how often is median LFC exceeded?
+  # take abs value of FC 
+  deltaLFC <- abs(permutedMedians) - abs(set_score)
+  pValue <- sum(deltaLFC > 0)/ncol(perm_cols)
+  
+  results <- data.table (Label = colName,
+                         set.log2FC = set_score,
+                         pvalue = pValue,
+                         mean.perm.lfc = permutedMeans,
+                         median.perm.lfc = permutedMedians,
+                         delta.lfc = deltaLFC,
+                         sd.perm.lfc = permutedSD)
+  return(results)
+}
+
+ISset <- mss[Symbol.human %in% isGenes, unique(Protein)]
+
+test <- ColwiseZScorePermutation(colName = "N1062D_7D-N1062D_4D", lfc.mat, set=ISset, npermutations = 10000)
+test
+
+```
+
+calculate GS enrichment 
+
+```{r}
+## subset mss to contrasts we are interested in
+contrasts.oi <- grep('-Mock|x4052|x3769', unique(mss$Label), invert = T, value=T)
+
+
+
+ISset <- mss[Symbol.human %in% isGenes, unique(Protein)]
+
+contrasts.zscores <-lapply(colnames(lfc.mat), function(x){
+  print(paste0('permuting label ', x ))
+  ColwiseZScorePermutation(colName = x, mat = lfc.mat, set=ISset, npermutations = 10000)
+})
+
+perm.dt <- rbindlist(contrasts.zscores)
+perm.dt %>%  head()
+
+perm.dt[, sig := ifelse(pvalue < 0.05, 'yes', 'not')]
+
+g <- ggplot(perm.dt[Label %in% contrasts.oi,], aes(x=Label, y=median.perm.heat)) +
+  geom_boxplot() +
+  geom_point(data=perm.dt[Label %in% contrasts.oi,], aes(x=Label, y=set.log2FC, color='median log2FC z-score'), size=2) + 
+  ylab('permuted log2FC z-scores') +
+  xlab('Contrast') +
+  #labs(color='median log2FC (z-score)') +
+  scale_color_manual(values=c('median log2FC z-score' = 'darkred')) +
+  #ggrepel::geom_text_repel(data=perm.dt[sig != 'not',], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  #scale_color_manual(values=c('not'='darkgrey', 'yes'='#440154FF')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+BackupAsPDF(g, 'isg.zscore.distributions.boxplot')
+
+# plot the histograms
+g <-  ggplot(perm.dt[Label %in% contrasts.oi,], aes(x=median.perm.lfc)) +
+  geom_histogram() +
+  geom_vline(data=perm.dt[Label %in% contrasts.oi], aes(xintercept = set.log2FC), color='darkred') +
+  theme_classic() +
+  facet_wrap(~Label, ncol=3, scales = 'free')
+
+BackupAsPDF(g, 'isg.zscore.distributions.histograms') 
+```
+look at the heatmap... does this look correct?
+
+```{r}
+subset <- lfc.mat[rownames(lfc.mat) %in% ISset, colnames(lfc.mat) %in% contrasts.oi]
+rownames(subset) <- multiUniprots2multiGenes(rownames(subset), species='MOUSE')
+
+BackupAsPDF(Heatmap(subset), 'isg.lfc.heatmap', dimensions=c(8,8))
+```
+now run for the PI genes 
+
+```{r}
+PIset <- mss[Symbol.human %in% piGenes, unique(Protein)]
+
+contrasts.zscores <- lapply(colnames(lfc.mat), function(x){
+  print(paste0('permuting label ', x ))
+  ColwiseZScorePermutation(colName = x, mat = lfc.mat, set=PIset, npermutations = 10000)
+})
+
+perm.dt <- rbindlist(contrasts.zscores)
+perm.dt %>%  head()
+
+perm.dt[, sig := ifelse(pvalue < 0.05, 'yes', 'not')]
+
+g <- ggplot(perm.dt[Label %in% contrasts.oi,], aes(x=Label, y=median.perm.lfc)) +
+  geom_boxplot() +
+  geom_point(data=perm.dt[Label %in% contrasts.oi,], aes(x=Label, y=set.log2FC, color='median log2FC z-score'), size=2) + 
+  ylab('permuted log2FC z-scores') +
+  xlab('Contrast') +
+  #labs(color='median log2FC (z-score)') +
+  scale_color_manual(values=c('median log2FC z-score' = 'darkred')) +
+  #ggrepel::geom_text_repel(data=perm.dt[sig != 'not',], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  #scale_color_manual(values=c('not'='darkgrey', 'yes'='#440154FF')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+BackupAsPDF(g, 'proinflammatorygenes.zscore.distributions.boxplot')
+
+
+#show the distirbutions of the medians and overlay with recorded
+
+# plot the histograms
+g <-  ggplot(perm.dt[Label %in% contrasts.oi,], aes(x=median.perm.lfc)) +
+  geom_histogram() +
+  geom_vline(data=perm.dt[Label %in% contrasts.oi], aes(xintercept = set.log2FC), color='darkred') +
+  theme_classic() +
+  facet_wrap(~Label, ncol=3, scales = 'free')
+
+BackupAsPDF(g, 'proinflammatroygenes.zscore.distributions.histograms') 
+
+```
+
+
+
+
+

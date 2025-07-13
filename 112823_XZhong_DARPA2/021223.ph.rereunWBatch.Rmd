@@ -1,0 +1,626 @@
+---
+title: "ED.ph.Redo.wBatch"
+author: "Martin Gordon"
+date: "2023-12-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Rerun the analysis controlling for batch effect outlined by Xiaofang
+
+```{r}
+library(ggplot2)
+library(data.table)
+library(magrittr)
+library(ComplexHeatmap)
+library(randomcoloR)
+library(stringr)
+library(OmnipathR)
+library(circlize)
+library(ggsignif)
+
+
+#source BP utility scripts
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/linearModels.R")
+
+# kinase enrichment analysis
+source("/Users/martingordon/Documents/utils/bp_utils/KinaseActivityScores.R")
+
+# mg utility functions
+source("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+```
+
+
+
+```{r}
+msinput <- fread("./output/MSstatsInput.PH.csv")
+
+dp.out <- MSstats::dataProcess(setDF(msinput),
+                               MBimpute = FALSE,
+                               featureSubset = "highQuality",
+                               remove_uninformative_feature_outlier = TRUE)
+
+saveRDS(dp.out, ScriptAndDatedFileName('ph.mss.dataproc.rds'))
+```
+
+```{r}
+contrast.mat <- makeContrast.regEx(dp.out,c( 
+                               "^M100-Veh",
+                               "^Nbon-Veh",
+                               "^M100_Nbon-Veh",
+                               "^M100_Nbon-Nbon",
+                               "^M100_Nbon-M100"
+                               ))
+```
+
+run mss pw comparisons between groups w Batch controlled
+```{r}
+dp.out <- readRDS('~/Documents/projects/112823_XZhong_DARPA2/DE.ph.LMredo.noBatch_data/2023_11_30_ph.mss.dataproc')
+
+p.quant<- setDT(dp.out$ProteinLevelData)
+
+p.quant[, OLD_SUBJECT := paste0(GROUP,'.',SUBJECT)]
+
+p.quant$OLD_SUBJECT %>%  unique()
+
+p.quant[, SUBJECT := fcase(
+  OLD_SUBJECT %in% c('Nbon.3', 'Nbon.2', 'M100.4', 'M100_Nbon.1'), 'pseudobatch.1',
+  OLD_SUBJECT %in% c('M100_Nbon.2', 'M100_Nbon.4', 'M100.3', 'Veh.1'), 'pseudobatch.2',
+  OLD_SUBJECT %in% c('M100_Nbon.3', 'Veh.4','Veh.2','M100.1'), 'pseudobatch.3',
+  OLD_SUBJECT %in% c('Veh.3', 'M100.2', 'Nbon.4', 'Nbon.1'), 'psuedobatch.4'
+)]
+
+# sanity check.. looks good
+p.quant[,.N, by=.(SUBJECT, OLD_SUBJECT)] %>% 
+  .[order(SUBJECT)]
+
+dp.out$ProteinLevelData <- p.quant
+
+gc <- MSstats::groupComparison(contrast.mat, dp.out)
+```
+
+setting pval threshold at fc +/- 50% and pval< 0.005
+```{r}
+mss.dt <- setDT(gc$ComparisonResult)
+
+fwrite(mss.dt, ScriptAndDatedFileName('mss.pwcomparisons.newbatch.raw.csv'))
+
+proc.dt <- mss.dt[,gene := multiUniprotSites2multiGeneSites(Protein, species='MOUSE')] %>% #needed as in factor format
+  .[!issue %in% c('completeMissing','oneConditionMissing'), ] %>% 
+  .[is.finite(log2FC) & !is.na(pvalue), ] %>% 
+  .[is.finite(log2FC), ] %>% 
+  .[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)] %>% 
+  .[, sig := 'not'] %>% 
+  .[abs(log2FC) > 0.58 & pvalue < 0.005, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+
+fwrite(proc.dt, ScriptAndDatedFileName('mss.pwcomparisons.newbatch.processed.csv'))
+
+# v few sig hits a adj.pval < 0.05 & log2FC +/- 50%, so dropped to pval < 0.001
+# 10 more hits removing batch term
+proc.dt[sig != 'not',.N, by=.(sig,Label)]$N %>% sum()
+```
+
+```{r}
+ggplot(mss.dt, aes(x=pvalue)) + 
+  geom_histogram() +
+  facet_wrap(~Label)
+```
+
+```{r}
+g <- ggplot(proc.dt, aes(x=log2FC, y=-log10(pvalue), color=sig, label=gene)) + 
+      geom_point() +
+      geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+      geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+      ggrepel::geom_text_repel(data=proc.dt[sig != 'not',],  size = 2, max.overlaps = 20) +
+      scale_color_manual(values=c('up'='red', 'down'='blue', 'not'='grey')) +
+      ggtitle(' (FC +/ 50% & pval < 0.005)') +
+      facet_wrap(~Label, scales = 'free') +
+      theme_bw() +
+      theme(strip.text.x = element_text(size = 5))
+      
+BackupAsPDF(g, 'ph.grpcontrasts.pval.0.005.multipanel.volcanoplot.', dimensions=c(13,10))
+```
+generate individual volcano plots
+
+```{r}
+labels.oi <- proc.dt[, unique(Label)]
+
+for (lab in labels.oi){
+  
+  g <- ggplot(proc.dt[Label == lab,], aes(x=log2FC, y=-log10(pvalue), color=sig, label=gene)) + 
+      geom_point() +
+      geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+      geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+      ggrepel::geom_text_repel(data=proc.dt[Label == lab & sig != 'not',],  size = 2, max.overlaps = 20) +
+      scale_color_manual(values=c('up'='red', 'down'='blue', 'not'='grey')) +
+      ggtitle(paste0(lab, ' (FC +/ 50% & pval < 0.005)')) +
+      theme_bw() +
+      theme(strip.text.x = element_text(size = 5))
+
+  BackupAsPDF(g, paste0(lab, '.pval.0.005.volcano'))
+}
+```
+What about kinase enrichment?
+```{r}
+# modified function to avoid omnipath kinase download and read from file
+loadKinaseDataOmniPath <- function(species = "HUMAN", removeNonKinases = TRUE, fixNames = TRUE, omniPathFile = './data/mouse.omnipath.csv', ...){
+  species <- toupper(species)
+  organismID <- c(HUMAN = 9606, RAT = 10116, MOUSE = 10090)[species]
+  if(is.na(organismID))
+    stop(species, " not a recognized organism")
+  enzsub <- fread(omniPathFile)
+  setDT (enzsub)
+  # for consistency with loadKinaseData I need columns: "CTRL_GENE_NAME", "TARGET_GENE_NAME", "TARGET_RES", "TARGET_POS", "TARGET_UP_ID"
+  
+  if (any(grepl("ProtMapper", enzsub$sources))){
+    message ("OmniPath includes ProtMapper data which has many non-kinases.")
+    
+    if(removeNonKinases == TRUE) {
+      message ("Removing all enzymes that are not kinases according to org.Hs.eg.db GO:0016301")
+      # get GO kinase list
+      
+      if (species == "HUMAN"){
+        library(org.Hs.eg.db)
+        kinaseTable <- AnnotationDbi::select (org.Hs.eg.db, get(c("GO:0016301"), org.Hs.egGO2ALLEGS), c("ENTREZID", "GENENAME", "SYMBOL")) 
+      } else if (species == "MOUSE"){
+        library(org.Mm.eg.db)
+        kinaseTable <- AnnotationDbi::select (org.Mm.eg.db, get(c("GO:0016301"), org.Mm.egGO2ALLEGS), c("ENTREZID", "GENENAME", "SYMBOL")) 
+      } else{
+        stop ("I don't yet know how to find kinases for ", species)
+      }
+      
+      kinases <- unique(kinaseTable$SYMBOL)
+      #label and filter into a new table
+      enzsub[, is_kinase := enzyme_genesymbol %in% kinases]
+      enzsub <- enzsub[is_kinase == TRUE]
+    }
+  }
+  
+  if (fixNames){
+    setnames(enzsub, 
+             old = c("enzyme_genesymbol", "substrate_genesymbol", "residue_type", "residue_offset", "substrate"), 
+             new = c("CTRL_GENE_NAME", "TARGET_GENE_NAME", "TARGET_RES", "TARGET_POS", "TARGET_UP_ID"))
+  }
+  
+  return (enzsub[modification == "phosphorylation"])
+}
+
+kinaseData  <- loadKinaseDataOmniPath(species='MOUSE')
+
+# just look at enrichment of the complete set
+mss.dt <-  proc.dt
+
+
+mss.dt[,gene := multiUniprotSites2multiGeneSites(Protein, species = "MOUSE")]
+singleSiteResults <- prepare_AMSS_ResultsFile(mss.dt, column = "gene")
+
+
+
+labels <- unique(singleSiteResults$Label)
+
+kinActList <- lapply (labels, FUN=function(lab){kinaseActivity(singleSiteResults[Label == lab & representative==TRUE],
+                                                               plots = FALSE,
+                                                               kinaseData = kinaseData, 
+                                                               do.sea = TRUE)})
+
+
+names(kinActList) <- labels
+
+kinActFull.scores <- rbindlist(lapply(kinActList, FUN = function(x)x$scores), idcol="Label")
+kinActFull.mapped <- rbindlist(lapply(kinActList, FUN = function(x)x$kinaseMapped)) # Label is already in these tables
+
+
+fwrite(kinActFull.scores, ScriptAndDatedFileName("kinaseSummaryScores.csv"))
+fwrite(kinActFull.mapped, ScriptAndDatedFileName("kinaseSubstrateData.csv"))
+message (sprintf("Writing kinase output files to\n\t%s\n\t%s", kinaseSummaryScores.csv, kinaseSubstrateData.csv))
+```
+
+## Heatmap of significant kinases
+less hits than ori run... leave as is for now...
+```{r, fig.width = 6, fig.height= 4}
+sigKinases <-  kinActFull.scores[fdr.BH < 0.05 & N > 2, unique(CTRL_GENE_NAME)]
+
+sigKinase.mat.z <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "Z"),
+                              rownames = "CTRL_GENE_NAME")
+
+sigKinase.mat.N <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "N"),
+                                  rownames = "CTRL_GENE_NAME")
+
+
+hm <- Heatmap (sigKinase.mat.z, 
+         cluster_columns=TRUE, 
+         name = "Kinase Z Score",
+         #column_split = tstrsplit(colnames(sigKinase.mat.z), split="[-_.]")[[1]],
+         col = circlize::colorRamp2(breaks = c(-3, -1, 1, 3), colors = c("blue", "gray", "gray", "red")),  # two midpoints in case you want to have a wider gray bar around 0
+         row_title = '',
+         cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=10, col="white"))
+                                  }
+                                })
+
+hm
+BackupAsPDF(hm, prefix = "Heatmap_SigKinases")
+
+hm <- Heatmap (sigKinase.mat.z, 
+         cluster_columns=FALSE, 
+         name = "Kinase Z Score",
+        # column_split = tstrsplit(colnames(sigKinase.mat.z), split="[-_.]")[[1]],
+         col = circlize::colorRamp2(breaks = c(-3, -1, 1, 3), colors = c("blue", "gray", "gray", "red")),  # two midpoints in case you want to have a wider gray bar around 0
+         row_title = '',
+         cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=10, col="white"))
+                                  }
+                                })
+hm
+BackupAsPDF(hm, prefix = "Heatmap_SigKinases_noColCluster")
+```
+
+
+Plot Go enrichment results of the significant genes
+
+```{r}
+# load mouse gmt file 
+gmt.go <- loadGmtFromBioconductor(dbName='org.Mm.eg.db', ontology = "ALL", keyType = "UNIPROT")
+
+p.quant <-  fread('./DE.ph.291123_data/2023_11_29_MSstatsInput.csv')
+# get matching col
+p.quant[, Protein := gsub("_[STY][0-9]+", "",ProteinName)]
+
+universe <-  p.quant$Protein %>%  unique()
+length(universe) # ~6.2k
+
+# get a simplifed dt of gene names of the moving sites
+gene.dt <-  proc.dt[sig != 'not', ] %>% 
+  .[, ProteinName := gsub("_[STY][0-9]+", "",Protein)] %>% 
+  .[, .(Label, ProteinName, sig)] %>% 
+  .[order(Label,ProteinName)]
+
+# create an ernich grouping col
+gene.dt[, enrich_grp := paste0(Label, '.', sig)]
+
+
+enrich.dt <- enricherOnGroups(gene.dt, groupColumns = 'enrich_grp', geneColumn = "ProteinName", term2gene.gmt = gmt.go, universe = universe)
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'enrich_grp', topN = 8, title='GO term enrichment', 
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 8), upperThreshold = 4)
+BackupAsPDF(ht, 'go.enrichment.msstats.pwgroups.nobatchCor.heatmap.')
+```
+Interaction Analysis
+----
+Rerun the lm model with a batch term
+
+```{r}
+dp.out <- readRDS(ScriptAndDatedFileName('mss.pwcomparisons.newbatch.processed.csv'))
+
+p.quant<- setDT(dp.out$ProteinLevelData)
+
+p.quant[, OLD_SUBJECT := paste0(GROUP,'.',SUBJECT)]
+
+p.quant$OLD_SUBJECT %>%  unique()
+
+p.quant[, SUBJECT := fcase(
+  OLD_SUBJECT %in% c('Nbon.3', 'Nbon.2', 'M100.4', 'M100_Nbon.1'), 'pseudobatch.1',
+  OLD_SUBJECT %in% c('M100_Nbon.2', 'M100_Nbon.4', 'M100.3', 'Veh.1'), 'pseudobatch.2',
+  OLD_SUBJECT %in% c('M100_Nbon.3', 'Veh.4','Veh.2','M100.1'), 'pseudobatch.3',
+  OLD_SUBJECT %in% c('Veh.3', 'M100.2', 'Nbon.4', 'Nbon.1'), 'psuedobatch.4'
+)]
+
+# sanity check.. looks good
+p.quant[,.N, by=.(SUBJECT, OLD_SUBJECT)] %>% 
+  .[order(SUBJECT)]
+
+# now want 3 factors: batch, treatment, antagonist in model
+p.quant[, `:=`(batch = SUBJECT,
+               ant = ifelse(GROUP %like% 'M100', 'M100', 'No_Ag'),
+               treat = ifelse(GROUP %like% 'Nbon', 'Nbon', 'No_Treat') )]
+
+#sanity.check 
+p.quant[,.N, by=.(ant,treat,OLD_SUBJECT,batch)]
+
+# example of single lm controlling for batch (P07759 used as significant in msstats modelling)
+lm(LogIntensities~treat+ant+batch+ant:treat, data = p.quant[Protein == "Q9D0E1_S452"]) %>% summary()
+model <- aov(LogIntensities ~ treat+ant+batch+ant:treat, data=p.quant[Protein == "Q9D0E1_S452"])  
+summary(model)
+```
+
+```{r}
+# linearModelsAllProteins can this function which computes statistic for a contrast of two different log2FC
+# puts pval and log2FC on sig differences of differences
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~treat|ant){  # how does treatment effect change per agonist level
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+
+  
+  # Numbers near the number of processors available in your machine is probably counterproductive.
+lm.out <- linearModelsAllProteins(p.quant, 
+                            formulaList = list(full   = (LogIntensities~batch+treat+ant+ ant:treat)),
+                            splitColumn = "Protein", postProcessFunction = emmeans.contrastOfContrasts, cl = 6) %>%  suppressWarnings()
+
+
+#saveRDS(lm.out, ScriptAndDatedFileName('lm.newBatch.obj'))
+```
+
+inspect anova table 
+not a lot of interaction between the terms
+
+```{r}
+ggplot(lm.out$anova, aes(x=p.value)) +
+  geom_histogram() +
+  facet_wrap(~term)
+
+lm.out$anova[ term %in% c('treat', 'ant', 'treat:ant')] %>% 
+  .[, fdr := p.adjust(p.value, method='fdr'), by=term]
+
+fwrite(lm.out$anova, ScriptAndDatedFileName('anova.table.nobatch.csv'))
+```
+
+plot of the significant interaction terms
+
+```{r}
+# cluster w NA
+clusterwNA <- function(x, na.val=0){
+  
+  x[is.na(x)] <- na.val
+  dist(x) %>%  hclust(method='complete')
+}
+
+```
+
+
+```{r}
+sig.prots <- lm.out$anova[term %in% 'treat:ant' & p.value < 0.005]
+sig.prots %>% length()
+
+sig.prots[, gene := multiUniprotSites2multiGeneSites(Protein, species='MOUSE')]
+
+p.mat <- dcast(p.quant, Protein~OLD_SUBJECT, value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+
+column.vec <- sub('.[1-6]$', '', colnames(p.mat))
+
+rownames(p.mat) <- multiUniprotSites2multiGeneSites(rownames(p.mat), species='MOUSE')
+
+subMat <-  p.mat[rownames(p.mat) %in% sig.prots$gene,]
+subMat <-  sweep(subMat, 1, FUN='-', STATS = apply(subMat, 1, median, na.rm=T))
+
+subMat
+
+hm <- Heatmap(subMat, 
+              cluster_columns = FALSE, 
+              name = 'log Ints/Median',
+              cluster_rows = clusterwNA(subMat),
+              #column_title = '(M100+Nbon vs Veh) - (M100 vs Veh)',
+              row_title = paste0(nrow(subMat), ' sites p.val < 0.005)'),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 6),
+              col=colorRamp2(breaks=c(-2,0,2), colors=c('blue', 'white', 'red')),
+              column_split = column.vec,
+              row_title_gp = gpar(fontsize=9),
+              column_title_gp = gpar(fontsize=7))
+
+hm
+BackupAsPDF(draw(hm, column_title = "Differential Response to NBON w/wo M100"),'m100.nbon.vs.nbon.interaction.newbatch.mediansweep.clean.heatmap', dimensions = c(8,8))
+```
+
+
+Continue running from here
+------
+
+```{r}
+
+# droping cols with many missing values
+subMat <-  p.mat[rownames(p.mat) %in% sig.prots$gene,]
+subMat <-  sweep(subMat, 1, FUN='-', STATS = apply(subMat, 1, median, na.rm=T))
+
+missing.prots <- rownames(subMat)[apply(subMat, 1, function(x){ sum(is.na(x)) >= 5})]
+missing.prots
+
+cleanMat <- subMat[!rownames(subMat) %in% missing.prots,]
+dim(cleanMat)
+
+hm <- Heatmap(cleanMat, 
+              cluster_columns = FALSE, 
+              name = 'log Ints/Median',
+              cluster_rows = clusterwNA(cleanMat),
+              #column_title = '(M100+Nbon vs Veh) - (M100 vs Veh)',
+              row_title = paste0(nrow(cleanMat), ' sites p.val < 0.005)'),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 6),
+              col=colorRamp2(breaks=c(-2,0,2), colors=c('blue', 'white', 'red')),
+              column_split = column.vec,
+              row_title_gp = gpar(fontsize=9),
+              column_title_gp = gpar(fontsize=10))
+
+hm
+
+
+BackupAsPDF(draw(hm, column_title = "Differential Response to NBON w/wo M100"),'m100.nbon.vs.nbon.interaction.newbatch.rmnoisyrows.mediansweep.clean.heatmap', dimensions = c(8,8))
+```
+
+now generate plots of Htr2a, check if any of these are sig
+
+```{r}
+mss.dt <- fread(ScriptAndDatedFileName('mss.pwcomparisons.newbatch.processed.csv'))
+
+# ok, so one sig site in the comparisos w/o correction
+mss.dt[gene %like% 'Htr2a' & sig != 'not',]
+```
+```{r}
+p.quant<- setDT(dp.out$ProteinLevelData)
+p.quant[, gene := multiUniprotSites2multiGeneSites(Protein, species='MOUSE')]
+
+p.quant %>%  str()
+sites.oi <- c('Htr2a_S298','Htr2a_S421')
+
+lab.col.pal <- randomcoloR::distinctColorPalette(5)
+
+
+
+p.quant[gene %like% sites.oi,]
+
+g <- ggplot(p.quant[gene %in% sites.oi,], aes(x=GROUP, y=LogIntensities, color=GROUP)) +
+  geom_point() + 
+  stat_summary(fun.dat='mean_cl_boot', color='grey', size=0.2) +
+  scale_color_manual(values=col.pal) +
+  ggtitle('HTR2A PH sites') +
+  facet_wrap(~gene) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, vjust = 0.7))
+g
+BackupAsPDF(g, 'htr2a.sites.oi.linechart.fixedxaxis',dimensions=c(8,6))
+```
+lollipop plot with pval 
+```{r}
+# annotate with pval if < 0.05
+mss.dt[, lab := '']
+mss.dt[pvalue < 0.05, lab := ifelse(pvalue < 0.01, '**', '*')]
+mss.dt[pvalue < 0.001, lab := '***']
+
+g <- mss.dt[gene %in% sites.oi,] %>% 
+  ggplot(., aes(x=Label, y=log2FC, color=Label, label=paste0(lab, ' ', round(pvalue, 3) )) ) +
+  geom_segment(aes(x=Label, xend=Label, y=0, yend=log2FC), color='grey', lwd=.5, linetype=1) +
+  geom_point(size=3) +
+  geom_hline(yintercept=0, alpha=0.4, linetype=2) +
+  geom_text(data=mss.dt[gene %in% sites.oi & pvalue < 0.05], color='black', size=3, vjust=-2) +
+  facet_wrap(~gene) +
+  ylim(c(-1,2)) +
+  theme_bw() + 
+  #coord_flip() +
+  scale_color_manual(values=c(lab.col.pal)) +
+  theme(
+    axis.text.x = element_text(angle=90, vjust=0.6)
+  )
+
+g
+
+BackupAsPDF(g, 'htr2a.lollipop.pvals.')
+
+```
+
+```{r}
+g <- mss.dt[gene %in% sites.oi,] %>% 
+  ggplot(., aes(x=Label, y=log2FC, color=Label, label=paste0(lab, ' ', round(pvalue, 4) )) ) +
+  geom_segment(aes(x=Label, xend=Label, y=0, yend=log2FC), color='grey', lwd=.5, linetype=1) +
+  geom_point(size=3) +
+  geom_hline(yintercept=0, alpha=0.4, linetype=2) +
+  geom_text(data=mss.dt[gene %in% sites.oi & pvalue < 0.05], color='darkgrey', size=3, vjust=-2) +
+  facet_wrap(~gene) +
+  ylim(c(-1,2)) +
+  theme_bw() + 
+  coord_flip() +
+  scale_color_manual(values=c(lab.col.pal)) +
+  theme(
+    axis.text.x = element_text(angle=90, vjust=0.6)
+  )
+
+g
+
+BackupAsPDF(g, 'htr2a.lollipop.pvals.rotated.')
+```
+```{r}
+mss.dt[gene %in% sites.oi & pvalue < 0.05,]
+
+annotation_data <- data.table(
+  GROUP = c('M100', 'M100_Nbon', 'Nbon', 'Veh'),
+  xend = c('M100_Nbon', 'M100_Nbon', 'Nbon', 'M100_Nbon'),
+  y = c(15.4, 15, 15.5, 15.3),
+  annotation = c("**", "", "", "*"),
+  gene = rep(sites.oi[1], 4)
+)
+
+new.anno <- data.table(
+  GROUP = c('M100', 'M100_Nbon', 'Nbon', 'Veh'),
+  xend = c('M100_Nbon', 'M100_Nbon','Nbon', 'Veh'),
+  y = c(14.8, 15, 15.5, 15.3),
+  annotation = c("*", "", "", ""),
+  gene = rep(sites.oi[2], 4)
+)
+
+
+
+annotation_data <-  rbind(annotation_data, new.anno)
+annotation_data
+
+g <- ggplot(p.quant[gene %in% sites.oi,], aes(x=GROUP, y=LogIntensities, color=GROUP)) +
+  geom_boxplot(color='grey') +
+  geom_point() + 
+  geom_signif(stat="identity",
+             data=annotation_data,
+            aes(x=GROUP, y=y, xend=xend, yend=y, annotation=annotation),color='darkgrey', size=4) +
+  scale_color_manual(values=col.pal) +
+  ggtitle('HTR2A PH sites') +
+  facet_wrap(~gene) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, vjust = 0.7))
+g
+
+BackupAsPDF(g, 'htr2a.S298.sites.siglabelled.boxplots.')
+log2(1.5)
+```
+
+
+041223
+----
+Load in the data and convert to wide format for sharing
+msstats
+
+```{r}
+mss.out <- fread('./021223.ph.rereunWBatch_data/2023_12_02_mss.pwcomparisons.newbatch.processed.csv')
+anova.out <- fread('./021223.ph.rereunWBatch_data/2023_12_02_anova.table.nobatch.csv')
+
+mss.dt <- mss.out[, .(gene, Protein, Label, log2FC, pvalue, adj.pvalue, SE, Tvalue)]
+setnames(mss.dt, new=c('geneSite', 'proteinSite', 'Label', 'log2FC','pvalue', 'adj.pvalue', 'SE', 'Tvalue'))
+
+
+fwrite(mss.dt, ScriptAndDatedFileName('mss.pwcomparisons.csv'))
+
+# also present in wideformat
+fwrite(dcast(mss.dt[,.(geneSite,proteinSite, Label, log2FC, pvalue, adj.pvalue)], geneSite+proteinSite~Label, value.var=c('log2FC', 'pvalue', 'adj.pvalue')),
+       ScriptAndDatedFileName('mss.pwcomparisons.wide.csv'))
+
+
+# anova table 
+anova.out %>%  str()
+anova.dt <- anova.out[term == 'treat:ant',]
+anova.dt[, geneSite := multiUniprotSites2multiGeneSites(Protein, species='MOUSE')]
+
+anova.dt <-  anova.dt[, .(Protein, geneSite, term, p.value)] %>% 
+  .[order(p.value)]
+
+setNames(anova.dt, c('proteinSite', 'geneSite', 'term', 'p.value'))
+anova.dt[ , term := 'NBON-M100 interaction']
+anova.dt[, adj.pval := p.adjust(p.value, method='BH')]
+
+fwrite(anova.dt, ScriptAndDatedFileName('interaction.analysis.csv'))
+
+```
+
+
+anova results
+```{r}
+
+
+lm.out <-  readRDS('./021223.ph.rereunWBatch_data/2023_12_02_lm.newBatch.obj')
+
+```
+

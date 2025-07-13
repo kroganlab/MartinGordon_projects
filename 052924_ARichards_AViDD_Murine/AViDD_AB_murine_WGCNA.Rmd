@@ -1,0 +1,380 @@
+---
+title: "AViDD_AB_murine_WGCNA"
+author: "Martin Gordon"
+date: "2024-06-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+PW comparisons of the groups did not return many interesting results..
+I think we need to take the sig hits vs Mock for all samples and then perform a WGCNA clustering
+
+*Notes* 
+I've joined clusters based on WARD distance; advantage of ward is it tried to reduce intra-cluster variance (idea is to have smaller, tight clusters)
+
+## packages
+
+```{r packages}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(viridis)
+library(ggvenn)
+library(hrbrthemes)
+library(viridis)
+library(ggbeeswarm)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj
+library(scales)
+library(seqinr)
+library(WGCNA)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+Read in the normalized count data
+```{r}
+p.quant <-  fread('~/Documents/projects/052924_ARichards_AViDD_Murine/AViDD_AB_murine_DE_data/2024_05_31_AB.ProteinLevelData.tmpNormNewCol.csv')
+mss.dt <- fread('~/Documents/projects/052924_ARichards_AViDD_Murine/AViDD_AB_murine_DE_data/2024_06_03_mss.pwcontrasts.unfiltered.tmpNorm.csv')
+
+contrasts.oi <- unique(grep('-Mock', mss.dt$Label, value=T))
+
+#For the input, we will subtract the Mock counts from the others and input this to the contrast matrix
+prots.oi <- mss.dt[Label %in% contrasts.oi & pvalue < 0.05, unique(Protein)]
+```
+
+get the heatmap of the proteins 
+Lets try PAM clustering (more robust to noise)
+```{r}
+library(cluster)
+
+p.mat <- dcast(p.quant, Protein~GROUP+SUBJECT, value.var = 'newLogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+# remove rows with lots of NA
+subMat <- p.mat[rowSums(is.na(p.mat)) < 10,]
+
+
+# euclidean as we want the strong signal to stand alone in a cluster
+pamOut <- pam(subMat, k=4, diss=FALSE, metric='euclidean', stand=FALSE)
+
+subMat <-  sweep(subMat, 1, STAT=apply(subMat, 1 , median, na.rm=T))
+
+hm <- Heatmap(subMat, 
+        row_split = pamOut$clustering,
+        row_gap=unit(2, "mm"),
+        show_row_names = F,
+        column_title_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=2),
+        border=TRUE,
+        column_split = gsub('.[1-6]$', '', colnames(subMat)))
+
+BackupAsPDF(hm, 'pamClust.cluster medianScaled.heatmap', dimensions=c(14,20))
+
+#just plot the subset of the interesting clusters 
+# yeah looks like we have recovered. cluster4 from the data 
+
+# subset to cluster 4 and plot
+subMat <- subMat[rownames(subMat) %in% names(pamOut$clustering[pamOut$clustering %in% c(4)]),]
+rownames(subMat) <- multiUniprots2multiGenes(rownames(subMat), species='MOUSE')
+
+hm <- Heatmap(subMat,
+        row_gap=unit(2, "mm"),
+        name = 'Clust4 Vs rowMedian',
+        show_row_names = T,
+        column_title_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=2),
+        border=TRUE,
+        column_split = gsub('.[1-6]$', '', colnames(subMat)))
+hm
+
+BackupAsPDF(hm, 'pamClust.cluster4.medianScaled.heatmap', dimensions=c(14,17))
+
+
+
+#subdivide cluster 4
+hm <- Heatmap(subMat[complete.cases(subMat),],
+        row_gap=unit(2, "mm"),
+        row_km = 2,
+        name = 'Clust4 Vs rowMedian',
+        show_row_names = T,
+        column_title_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=3),
+        border=TRUE,
+        column_split = gsub('.[1-6]$', '', colnames(subMat)))
+hm
+BackupAsPDF(hm, 'pamClust.cluster4.subSplit.medianScaled.heatmap', dimensions=c(14,17))
+
+
+#fwrite(data.table(gene=multiUniprots2multiGenes(names(pamOut$clustering[pamOut$clustering == 4]), species='MOUSE')), ScriptAndDatedFileName('batchAffectedCluster.txt'))
+```
+
+Calculate the difference of logIntensities vs Mock
+how do we want to do this? Take the average value of mock samples and substract?
+
+```{r}
+# calculate difference vsMock
+p.quant[, vsMock := newLogIntensities - mean(newLogIntensities[GROUP == 'Mock'], na.rm=T), by=.(Protein)]
+
+p.mat <- dcast(p.quant, Protein~paste0(GROUP,'.',SUBJECT), value.var = 'vsMock') %>% 
+  as.matrix(rownames='Protein')
+
+p.mat <-  p.mat[rownames(p.mat) %in% prots.oi,]
+```
+5.5k proteins in input with this minimal filtering 
+Now filter for missing values, want at least 80% completeness
+
+4.5k after filtering out missing rows
+```{r}
+rm.cols <- apply(p.mat, 1, function(x) {sum(is.na(x)) })
+
+submat <- p.mat[rm.cols < 14,]
+dim(submat)
+```
+Heatmap of the input data
+
+```{r}
+colnames(submat)
+
+hm <- Heatmap(submat, 
+              cluster_rows = T, 
+              cluster_columns = F,
+              name='vsMock',
+              na_col = 'darkgrey',
+              column_split = gsub('.[0-9]+$', '', colnames(submat)), 
+              row_title=sprintf('%s proteins', nrow(submat)), 
+              show_row_names = F, 
+              column_names_gp = gpar(fontsize=5), 
+              column_title_gp = gpar(fontsize = 8))
+
+hm
+BackupAsPDF(draw(hm, column_title='WGCNA input'), 'wgcna.input.mat')
+```
+
+Now filter out mock and review
+
+Clustering on WGCNA output
+
+```{r}
+submat <- p.mat[rm.cols < 14, grep('Mock', colnames(submat), invert=T)]
+
+pamOut <- pam(submat, k=4, diss=FALSE, metric='euclidean', stand=FALSE)
+
+
+# add annotation for cluster 4
+# bracket enclosed is the filter
+batch_anno <- rownames(submat) %in% names(pamOut$clustering[pamOut$clustering == 4]) # creates a filter; use this to extract the rownames
+batch_genes <- rownames(submat)[batch_anno]
+
+names_bar = rownames(submat) %in% batch_genes
+
+hm <- Heatmap(submat, 
+              cluster_rows = T, 
+              cluster_columns = F,
+              row_split = pamOut$clustering,
+              na_col = 'darkgrey',
+              name = 'Ints. vs Mock',
+              column_split = gsub('.[0-9]+$', '', colnames(submat)), 
+             # row_title=sprintf('%s proteins', nrow(submat)), 
+              show_row_names = F, 
+              border = T,
+              column_names_gp = gpar(fontsize=5), 
+              column_title_gp = gpar(fontsize = 8))
+
+hm
+BackupAsPDF(hm, 'wgnca.input.pamClust.heatmap', dimensions=c(12,19))
+
+clust.dt <- extractClustersfromHeatmap(draw(hm), submat)
+clust.dt[, gene := multiUniprots2multiGenes(feature, species='MOUSE')]
+
+
+genes.oi <- multiUniprots2multiGenes(names(pamOut$clustering[pamOut$clustering == 4]), species='MOUSE')
+
+rownames(submat) <-  multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+
+hm <- Heatmap(submat[rownames(submat) %in% genes.oi,], 
+              cluster_rows = T, 
+              cluster_columns = F,
+            #  row_split = pamOut$clustering,
+              na_col = 'darkgrey',
+              name = 'Ints. vs Mock',
+              column_split = gsub('.[0-9]+$', '', colnames(submat)), 
+             # row_title=sprintf('%s proteins', nrow(submat)), 
+              show_row_names = T, 
+              border = T,
+              row_names_gp = gpar(fontsize=2),
+              column_names_gp = gpar(fontsize=5), 
+              column_title_gp = gpar(fontsize = 8))
+
+hm
+BackupAsPDF(hm, 'wgcnaInput.pamClust.Cluster4.heatmap', dimensions = c(15,20))
+
+fwrite(clust.dt[cluster ==4,], ScriptAndDatedFileName('wgcnaInput.cluster4.csv'))
+```
+
+Look at the sample clustering 
+```{r}
+#Group data in a dendogram to check outliers
+sampleTree = hclust(dist(t(submat)), method = "average")
+
+pdf(file = "./AViDD_AB_murine_WGCNA_data/sampleClustering.pdf", width = 12, height = 9); 
+par(cex = 0.6)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering", sub="", xlab="", cex.lab = 1.5, 
+     cex.axis = 1.5, cex.main = 2)
+#Plot a line showing the cut-off
+abline(h = 56, col = "red") #This value of 31000 was chosen based on my data, you need to check the best value to your data
+
+dev.off()
+```
+
+Now that we have looked at the samples, lets checkout the genes we have selected
+```{r}
+gsg <- goodSamplesGenes(t(submat))
+summary(gsg)
+gsg$allOK
+```
+
+Lets go with 5 as it is the last signficant jump in R2 and reaches R > .9
+
+```{r}
+net.in <- t(submat)
+
+s.thres <- data.table(pickSoftThreshold(net.in)$fitIndices)
+s.thres
+s.thres %>%  
+  ggplot(aes(x=Power, y=SFT.R.sq)) + 
+  geom_point() +
+  geom_hline(yintercept = 0.8, color='darkred') +
+  labs(y="Scale Free Topology Model Fit, signed R^2") +
+  theme_classic()
+
+s.thres %>%  
+  ggplot(aes(x=Power, y=mean.k.)) + 
+  geom_point() +
+  labs(y='Mean Connectivity') +
+  theme_classic() 
+```
+
+```{r}
+softPower = 5 #Chosen in the graphs before
+adj.mat = adjacency(net.in, power = softPower, corFnc = 'bicor', type = "signed") #Calculating the adjacency matrix
+#help(adjacency )
+```
+
+Define our topological overlap matrix
+```{r}
+TOM <- TOMsimilarity(adj.mat)
+TOM.dissimilarity <- 1-TOM
+
+#creating the dendrogram 
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average") 
+#plotting the dendrogram
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity", 
+labels = FALSE, hang = 0.04)
+```
+
+I dont think these clusters look too promising, but lets run the analysis and see
+```{r}
+hm <- Heatmap(TOM[1:1000,1:1000], cluster_rows = T, cluster_columns=T, column_title = 'adjacency matrix', show_row_names = F, show_column_names = F)
+hm
+#BackupAsPDF(hm, 'tom.mat.st5.')
+hm <- Heatmap(adj.mat[1:1000,1:1000], cluster_rows = T, cluster_columns=T, column_title = 'TOM similiary', show_row_names = F, show_column_names = F)
+#BackupAsPDF(hm, 'tom.mat.st4.')
+```
+
+```{r}
+#detected six modules; want to correlate these 
+Modules <- cutreeDynamic(dendro = geneTree, distM = TOM.dissimilarity, deepSplit = 4, pamRespectsDendro = FALSE, minClusterSize = 20)
+table(Modules)
+```
+
+Only three modules detected... try with the adjacency matrix as this tends to avoid merging larger modules
+
+```{r}
+adj.dissimilarity <-  1 - adj.mat
+
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "ward.D2") 
+plot(geneTree, xlab='', sub='', labels = F)
+
+help(hclust)
+```
+```{r}
+# detected 13 modules
+Modules <- cutreeDynamic(dendro = geneTree, distM = TOM.dissimilarity, deepSplit = 4, pamRespectsDendro = FALSE, minClusterSize = 30)
+table(Modules)
+```
+
+```{r}
+modules.tom <- as.character(Modules)
+```
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(length(unique(Modules)))
+
+# add wgcna module annotation
+row_ha <- rowAnnotation(wgcna.modules=modules.tom, col=list(wgcna.modules = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3], '4'=col.pal[4], '5'=col.pal[5], 
+                                                                              '6'=col.pal[6], '7'=col.pal[7], '8'=col.pal[8], '9'=col.pal[9], '10'=col.pal[10],
+                                                                              '11'=col.pal[11], '12'=col.pal[12], '13'=col.pal[13]
+                                                                              )))
+
+# add split order
+split <- factor(modules.tom, levels=c('1','2','3','4','5','6','7','8','9','10','11','12','13'))
+
+hm <- Heatmap(submat, 
+              cluster_columns = FALSE, 
+              #show_row_names = FALSE,
+              split = split,
+              right_annotation = row_ha,
+              name = "Ints vs Mock",
+              column_split = tstrsplit(colnames(submat), "[.]")[[1]],
+              na_col = 'darkgrey',
+              row_title =sprintf("%d Proteins",
+                            nrow(submat)),
+              row_names_gp = gpar (fontsize= 1),
+              column_names_gp = gpar (fontsize= 3),
+              cluster_row_slices = T,
+              column_title_gp = gpar (fontsize= 7))
+hm
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+
+BackupAsPDF(hm, 'heatmap.wgcna.modules.ordered',dimensions=c(12,16))
+```
+Reorder the column clustering based on the PCA
+
+
+
+Poor results with the TOM distance matrix
+As this merges different ones together, lets try the adj distance matrix
+```{r}
+Modules <- cutreeDynamic(dendro = geneTree, distM = TOM.dissimilarity, deepSplit = 4, pamRespectsDendro = FALSE, minClusterSize = 20)
+table(Modules)
+
+Modules <- cutreeDynamic(dendro = geneTree, distM = adj.dissimilarity, deepSplit = 4, pamRespectsDendro = FALSE, minClusterSize = 20)
+table(Modules)
+```

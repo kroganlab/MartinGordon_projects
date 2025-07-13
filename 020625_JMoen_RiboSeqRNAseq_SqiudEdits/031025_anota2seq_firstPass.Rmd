@@ -1,0 +1,400 @@
+---
+title: "031025_anota2seq_firstPass"
+author: "Martin Gordon"
+date: "2025-03-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Looking at investigating mRNA translation efficiency using anota2seq 
+Following workflow provided by package creators at: https://link.springer.com/book/10.1007/978-1-0716-1920-9
+(Also looking at vignette)
+
+First pass is to compare the tissues, next will be to extract the edited reads and compare those profiles
+Keep it simple with tissue comparison for first pass of the conditions
+
+```{r}
+library(ggplot2)
+library(magrittr)
+library(data.table)
+library(ComplexHeatmap)
+library(anota2seq)
+library(gridExtra)
+library(tximport) #make count matrix for anotaSeq import
+library(hrbrthemes)
+library(RColorBrewer)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90,size=6)
+        )
+```
+
+read in the RNAseq and Riboseq quant.sf files
+Run Salmon quant on the edited and non-edited files
+```{r}
+rna.files <- dir('./output/salmonQuant/rnaSeq', full.names = T,recursive =T, pattern = 'quant.sf')
+rna.list <- lapply(rna.files, fread)
+names(rna.list) <- sapply(strsplit(rna.files, '[/]'), function(x){x[5]})
+names(rna.files) <- sapply(strsplit(rna.files, '[/]'), function(x){x[5]})
+
+# and riboseq
+ribo.files <- dir('./output/salmonQuant/riboSeq/salmon', full.names = T,recursive =T, pattern = 'quant.sf')
+ribo.list <- lapply(ribo.files, fread)
+names(ribo.list) <- sapply(strsplit(ribo.files, '[/]'), function(x){x[6]})
+names(ribo.files) <- sapply(strsplit(ribo.files, '[/]'), function(x){x[6]})
+
+# read int he trasncirpt to gene name mapper
+tx2gene <- fread('./output/salmonQuant/riboSeq/tx2gene.tsv')
+setnames(tx2gene, new=c('tID', 'gID', 'gID2'))
+tx2gene <- tx2gene[,.(tID, gID)]
+```
+
+```{r}
+rna.txi <- tximport(rna.files, type = "salmon", tx2gene = tx2gene)
+ribo.txi <- tximport(ribo.files, type = "salmon", tx2gene = tx2gene)
+```
+
+Write out the counts (raw;not scaled)
+
+
+Two of the samples look similar must be the alt prep.. yes they are
+```{r}
+compare <- !rna.list[[1]]$NumReads == rna.list[[2]]$NumReads
+rna.list[[1]][compare]
+rna.list[[2]][compare]
+```
+#save the input matrices to file
+```{r}
+fwrite(rna.txi$counts, row.names = T, sep='\t', ScriptAndDatedFileName('rna.tximport.counts.txt'))
+fwrite(ribo.txi$counts,row.names = T, sep='\t', ScriptAndDatedFileName('ribo.tximport.counts.txt'))
+```
+
+read in the count matrices 
+
+```{r}
+rna.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/031025_anota2seq_firstPass_data/2025_03_10_rna.tximport.counts.txt') 
+ribo.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/031025_anota2seq_firstPass_data/2025_03_10_ribo.tximport.counts.txt')
+
+count.mat <- merge(rna.dt, ribo.dt, by='V1', all.x=T, all.y=T) %>% 
+  as.matrix(rownames='V1')
+
+# remvoe the altRibo set as different wetlab prep
+count.mat <- count.mat[, !grepl('^alt', colnames(count.mat))]
+```
+
+Just take the nf-core pipeline sample sheet and adjust
+```{r}
+#meta.dt <- readxl::read_xlsx('./docs/sample_description_Riboseq_RNAseq.xlsx')
+meta.dt <- fread('./docs/samplesheet.csv')
+meta.dt <- meta.dt[!grepl('^alt', sample), .(sample, type, tissue = ifelse(grepl('gill', sample_description), 'gill', 'optic_lobe'), rep=gsub('rna_[a-z]+_|ribo_[a-z]+_', '', sample_description), name=gsub('ribo_|rna_', '', sample_description))]
+# convert subset cols to fctr, create vecotr and refer to that
+fkt = c('type', 'tissue', 'rep')
+meta.dt[, (fkt) := lapply(.SD, factor), .SDcols = fkt]
+
+meta.dt <- as.data.frame(meta.dt, row.names = meta.dt$sample)
+# confirm they match matrix cols 
+rownames(meta.dt) == colnames(count.mat)
+#fwrite(meta.dt, ScriptAndDatedFileName('metadata.csv'))
+```
+*Running anota2seq*
+First, lets check if modelling assumptions by the package are met
+
+```{r}
+anno.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/031025_anota2seq_firstPass_data/2025_03_10_metadata.csv')
+
+counts.dt <- reshape2::melt(count.mat) %>% 
+  setDT()
+setnames(counts.dt, new=c('gene', 'sample', 'counts'))
+
+counts.dt <- merge(counts.dt, anno.dt, by='sample', all.x=T)
+#fwrite(counts.dt, ScriptAndDatedFileName('combined.counts.csv.gz'))
+#counts.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/031025_anota2seq_firstPass_data/2025_03_10_combined.counts.csv.gz')
+```
+
+Most of the counts are 0, there is a huge number of genes annotated in the reference... what do we do with these?
+Just take the transcripts with at least 3 measurements in one RNAseq group
+```{r}
+noCounts <- counts.dt[counts==0,.N, by=gene][N == 12, gene]
+
+# genes with = 3 measurements in a rnaseq group
+goodCounts <- counts.dt[counts!= 0 & !gene %in% noCounts & type== 'rnaseq',.N, by=.(gene, tissue)][, max(N) == 3, by=.(gene)][V1 == TRUE, unique(gene)]
+```
+
+
+```{r}
+counts.dt[gene == 'Dopeav2000002m.g',]
+
+
+
+```
+
+```{r}
+g <- ggplot(counts.dt[!gene %in% noCounts,], aes(y=log2(counts+1), x=name, fill=tissue)) +
+  geom_boxplot() +
+  scale_fill_brewer(type='qual', palette='Set1') +
+  facet_grid(type~., scales='free_x') +
+  customTheme
+BackupAsPDF(g, 'rawCount.boxplots')
+
+
+# write out the file with noNoCoutns and use the same input matirx
+#fwrite(counts.dt[!gene %in% noCounts,], ScriptAndDatedFileName('combined.counts.csv.gz'))
+counts.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/031025_anota2seq_firstPass_data/2025_03_10_combined.counts.csv.gz')
+```
+plot a PCA; with NA
+Looks good, but is this difference just down to seq depth? center AND scale
+```{r}
+counts.mat <- dcast(counts.dt[gene %in% goodCounts], gene~sample, value.var = 'counts') %>% 
+    as.matrix(rownames=1)
+  
+
+dim(counts.mat) %>% print()
+message('Subsetting to complete cases for PCA...')
+submat <- counts.mat[complete.cases(counts.mat),]
+dim(counts.mat) %>% print()
+
+submat <- log2(submat +1)
+
+submat[submat == 0] <- NA
+submat <- submat[complete.cases(submat),]
+
+pcaOut <- prcomp(t(submat), center=T, scale. =T)
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+pcaDT <- merge(pcaDT, anno.dt, by.x = "rn", by.y = "sample", all.x = TRUE)
+  
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = tissue, shape = type)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_brewer(type='qual', palette='Set1') +
+    customTheme +
+    ggtitle(label=paste0("PCA using ",  nrow(submat), ' genes')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'tissue.raw.pca')
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = type, shape = type)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_brewer(type='qual', palette='Set2') +
+    customTheme +
+    ggtitle(label=paste0("PCA using ",  nrow(submat), ' genes')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'type.raw.pca')
+```
+Now try with 0 imputed
+Much bigger proportion of variance explained when the 0s are remved, which makes sense
+Should we think of subsetting to only genes with 10 reads per sample? Want things with reliable counts...
+
+```{r}
+counts.mat <- dcast(counts.dt, gene~sample, value.var = 'counts') %>% 
+    as.matrix(rownames=1)
+  
+submat <- counts.mat[!rownames(counts.mat) %in% noCounts,]
+
+submat <- log2(submat +1)
+
+pcaOut <- prcomp(t(submat), center=T, scale. =T)
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+pcaDT <- merge(pcaDT, anno.dt, by.x = "rn", by.y = "sample", all.x = TRUE)
+  
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = tissue, shape = type)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_brewer(type='qual', palette='Set1') +
+    customTheme +
+    ggtitle(label=paste0("PCA using ",  nrow(submat), ' genes')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'tissue.raw.zeroImpute.pca')
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = type, shape = type)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_brewer(type='qual', palette='Set2') +
+    customTheme +
+    ggtitle(label=paste0("PCA using ",  nrow(submat), ' genes')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+BackupAsPDF(p, 'type.raw.zeroImpute.pca')
+```
+data quality looks pretty good from here
+Lets run an anota2seq analysis
+
+```{r}
+rna.mat <- counts.mat[, anno.dt[type == 'rnaseq', sample]]
+colnames(rna.mat)
+ribo.mat <- counts.mat[, anno.dt[type == 'riboseq', sample]]
+colnames(ribo.mat)
+
+
+# create vecotr flagging condition cols in each matrix 
+phenoVec <- anno.dt[type == 'riboseq', tissue]
+```
+prepare the import 
+```{r}
+counts.mat <- dcast(counts.dt[gene %in% goodCounts], gene~sample, value.var = 'counts') %>% 
+    as.matrix(rownames=1)
+
+ads <- anota2seqDataSetFromMatrix(dataP=ribo.mat,
+                                  dataT=rna.mat,
+                                  phenoVec = phenoVec,
+                                  dataType = "RNAseq",
+                                  transformation = 'TMM-log2',
+                                  normalize = T)
+
+#saveRDS(ads, ScriptAndDatedFileName('anotaSeq.tmmNorm.obj.rds'))
+ads <- readRDS('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/031025_anota2seq_firstPass_data/2025_03_11_anotaSeq.tmmNorm.obj.rds')
+
+# run anota2seqPerformQC
+ads <- anota2seqPerformQC(ads)
+# run anota2seqResidOutlerTest(ads)
+ads <- anota2seqResidOutlierTest(ads)
+```
+generae contrast matrix
+```{r}
+myContrast <- matrix(nrow=length(levels(as.factor(phenoVec))),
+ncol=length(levels(as.factor(phenoVec)))-1)
+rownames(myContrast) <- levels(as.factor(phenoVec))
+myContrast[,1] <- c(-1,1)
+
+colnames(myContrast) <- c('optic_lobe-gill')
+```
+perform the differential analysis 
+
+Anota2seq performs separate analyses for changes in:
+translated mRNA (riboseq)
+total mRNA
+translation (modulation in translated mRNA adjusted for corresponding changes in total mRNA) and 
+buffering (alterations in total mRNA adjusted for corresponding changes in translated mRNA)
+
+changes in translation and buffering both indicate altered translational efficiency (a change in the proportion of transcripts transcribed from a gene that is translated), 
+it is crucial to separate these two modes of regulation as changes in translation, but not buffering, are expected to modulate protein level
+```{r}
+ads <- anota2seqAnalyze(ads, contrasts=myContrast, fileStem='optic_lobe-vs-gill')
+#saveRDS(ads, ScriptAndDatedFileName('anotaSeq.tmmNorm.obj.rds'))
+ads <- readRDS('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/031025_anota2seq_firstPass_data/2025_03_11_anotaSeq.tmmNorm.obj.rds')
+```
+
+plots of the pvalues, LFC, genes from the contrast
+
+```{r}
+anota2seqPlotPvalues(ads, useRVM = TRUE, selContrast = 1, contrastName='optic_lobe-vs-gill', 
+  myBw = 0.05, plotToFile = TRUE, fileStem='031125')
+```
+flag the significant genes we want to show; we want at least a fold change in expression
+```{r}
+# to flag an effect, we want to see a doubling.
+ads <- anota2seqSelSigGenes(ads,
+                            selContrast = 1,
+                            selDeltaPT = log2(2),
+                            selDeltaTP = log2(2),
+                            selDeltaP = log2(2),
+                            selDeltaT = log2(2),
+                            maxPAdj = 0.05)
+```
+plot sig single genes
+```{r}
+#anota2seqPlotGenes(ads, selContrast = 1, analysis = "buffering", plotToFile = T)
+
+anota2seqPlotGenes(ads, selContrast=1, analysis='translation', geneNames = NULL, 
+plotToFile = TRUE, fileStem = "031125_significantGenes_plot")
+```
+
+```{r}
+#Run the anota2seqRegModes function
+ads <- anota2seqRegModes(ads)
+
+#saveRDS(ads, ScriptAndDatedFileName('anotaSeq.tmmNorm.obj.rds'))
+ads <- readRDS('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/031025_anota2seq_firstPass_data/2025_03_11_anotaSeq.tmmNorm.obj.rds')
+ads@selectedBuffering
+ads@
+# plot LFCs
+anota2seqPlotFC(ads, visualizeRegModes = "all",
+  selContrast=1, contrastName='optic_lobe-vs-gill', fileStem = "031125_LFC_", plotToFile = TRUE, myYlim = NULL, myXlim = NULL)
+```
+Get the gene-level statistics
+
+```{r}
+anota2seqGetOutput(ads, output = "full", selContrast = 1, getRVM = T, analysis = 'total mRNA')
+)
+
+data.table(anota2seqGetOutput(ads, output = "full", selContrast = 1, getRVM = T, analysis = 'total mRNA'), keep.rownames = T)
+
+anota2seq.dt <- list(RNAseq = data.table(anota2seqGetOutput(ads, output = "full", selContrast = 1, getRVM = T, analysis = 'total mRNA'),keep.rownames=T, fill=TRUE),
+                     Riboseq = data.table(anota2seqGetOutput(ads, output = "full", selContrast = 1, getRVM = T, analysis = 'translated mRNA'),keep.rownames=T, fill=TRUE),
+                     Translation = data.table(anota2seqGetOutput(ads, output = "full", selContrast = 1, getRVM = T, analysis = 'translation'),keep.rownames=T, fill=TRUE), 
+                     Buffering = data.table(anota2seqGetOutput(ads, output = "full", selContrast = 1, getRVM = T, analysis = 'buffering'),keep.rownames=T, fill=TRUE)) %>% 
+  rbindlist(., idcol=T, fill=T)
+
+cols.noi <- c('apvRvmMSerror', 'apvRvmF', 'residRvmDf', 'fill')
+anota2seq.dt[, (cols.noi) := NULL]
+
+setnames(anota2seq.dt, old='rn', new='gene')
+fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/031025_anota2seq_firstPass_data/2025_03_12_anota2seq.deAnalysis.csv.gz')
+
+
+5016/2
+```
+

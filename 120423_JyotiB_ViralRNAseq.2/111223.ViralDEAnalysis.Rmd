@@ -1,0 +1,758 @@
+---
+title: "111223.ViralDEAnalysis"
+author: "Martin Gordon"
+date: "2023-12-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Differential Expression Analysis of Viral Strains
+
+currently have:
+bam file with N mapped reads to viral segments using idxstat
+quant.sf but no viral sequences contained within... gene_id (ensembl identifier) missing from gtf so dropped
+
+Quantification step
+----
+issue is with the RSEM refernece index generation for the transcriptome; seems it searched for ensembl ids to build reference idx and then threw out the viral segments with no ensembl ids...
+Options: see if there is an option with the pipeline to build the reference idx and use directly, or else use featureCounts etc. to map directly to this and count.
+
+
+Takehome:
+---
+Issue is I didnt create the STAR indices prior to the run and enforce use of specific indx
+To continue, just take the gff file and the mapped bam files and run featureCounts to get counts per segment.. simplier quick-fix
+use unstranded option for featureCounts
+use unstran
+
+12/12/23
+---
+Rerun the quantification and summarised counts using featureCount
+Import the individual datasets, extracts cols needed, merge by geneName and import into DESeq2
+
+13/12/23
+----
+Redo; take the new dataset with overlaps counted and plot
+
+Read in packages 
+```{r load-packages, message=FALSE, warning=FALSE, echo=TRUE}
+library(data.table)
+library(tidyverse)
+library(ggplot2)
+library(tximport)
+library(DESeq2)
+library(ashr) #adaptive shrinkage estimator to improve lFC estimates in DESEq2
+library(apeglm)
+library(IHW) # Independent Hypothesis Weighting 
+library(ComplexHeatmap)
+library(stringr)
+library(AnnotationHub)
+library(org.Hs.eg.db)
+library(ggrepel)
+
+
+library(genefilter) # not available 
+
+# annotations
+#library(biomaRt)
+
+source ("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+```
+
+13/12/23
+---
+read in the new featureCounts data 
+
+```{r}
+path <- 'output/overlapping.res'
+
+input <- dir(path=path, pattern = "*featureCounts.txt$", recursive = T, full.names = TRUE) %>% 
+  data.table() %>% 
+  setnames('.', 'path') %>% 
+  .[, file.names := gsub("output/overlapping.res/(brisbane|victoria).host.featureCounts.overlapping/|.featureCounts.txt", "", path) ] %>% 
+  .[, hybrid.genome := str_extract(path, '(brisbane|victoria).host')]
+
+# drop the mock files; just want to look at Victoria vs Brisbane
+input <- input[!file.names %like% 'Mock' ]
+```
+create sample metadata
+
+```{r}
+
+sample.meta <- dir(path=path, pattern = "*featureCounts.txt$", recursive = T, full.names = TRUE) %>% 
+  data.table() %>% 
+  setnames('.', 'path') %>% 
+  .[, file.names := gsub("output/overlapping.res/(brisbane|victoria).host.featureCounts.overlapping/|.featureCounts.txt", "", path) ] %>% 
+  .[, hybrid.genome := str_extract(path, '(brisbane|victoria).host')]
+
+# add metadata
+sample.meta[, condition := str_extract(file.names, '(Brisbane|Victoria|Mock)' ) ]
+sample.meta[, biorep := str_extract(path, '[123]{1}(?=.featureCounts.txt)')] #positve lookahead to extract final int before *.host prefix
+sample.meta[, timepoint := str_extract(path, '(0|3|6|12|24){1}(?=_[123]{1}.featureCounts.txt)')] #positve lookahead to extract final int before *.host prefix
+#sample.meta[, sample.names := paste0(hybrid.genome, '.', file.names)]
+
+sample.meta <-  sample.meta[!file.names %like% 'Mock',]
+sample.meta[, group := as.factor(paste0(condition,'_', timepoint))]
+
+sample.meta <-  sample.meta %>% 
+  as_tibble() %>% 
+  column_to_rownames('file.names')
+```
+Now need to convert the featureCount output cols to same naming convention as sample metadata
+First lets merge featureCount.. can this be done more easily outside of R? Need to match genenames for merging 
+
+read in the data.tables and merge cols by geneID
+
+```{r}
+input.list <- lapply(input$path, function(x){
+  x.dt <- fread(x)
+  x.dt <- x.dt[, .SD, .SDcols=c(1,7)]
+})
+
+# recursively bind the datatables by row
+comb.count.mat <- Reduce(function(x,y) merge(x,y, by='Geneid', all=TRUE), input.list)
+```
+lets merge the data.tables
+
+```{r}
+# rename all cols
+old.cols <- colnames(comb.count.mat)[-1]
+new.cols <- str_extract(old.cols, '(Brisbane|Victoria)_[0|3|6|12|24]{1,2}_[123]{1}')
+
+setnames(comb.count.mat, old=old.cols, new=new.cols)
+
+comb.count.mat <-  as.matrix(comb.count.mat, rownames='Geneid')
+
+# looks good; some of the genes dont have mapping stats
+inf.genes <- rownames(comb.count.mat)[!rownames(comb.count.mat) %like% 'ENSG']
+```
+
+looks good, finally!
+Confirm the metadata and count.mat share ids(colnames and rownames)
+looks good; may need to convert to matrix cols
+
+```{r}
+# all matches
+rownames(sample.meta) == colnames(comb.count.mat)
+```
+NS2 and NEP are aliases and different in the annotation files? Rename NEP to NS2 and merge
+
+```{r}
+#fix.rows <- comb.count.mat[rownames(comb.count.mat) %in% c('gene-NS2', 'gene-NEP'),]
+#NS2.vic <- fix.rows[rownames(fix.rows) == 'gene-NS2', grepl('Victoria', colnames(fix.rows))]
+
+#NS2.vic
+#NEP.bris <- fix.rows[rownames(fix.rows) == 'gene-NEP', grepl('Brisbane', colnames(fix.rows))]
+#merge.row <- as.matrix(c(NEP.bris, NS2.vic, nrow=1), colnames='gene-NS2/NEP')
+#merge.row
+#colnames(comb.count.mat)
+
+
+#fix.rows.bak <- fix.rows
+#fix.rows[rownames(fix.rows) == 'gene-NS2',  grepl('Brisbane', colnames(fix.rows))]
+#fix.rows
+  
+# modify count mat; just add the Brisbane NEP vals to NS2 
+comb.count.mat[rownames(comb.count.mat) == 'gene-NS2', grepl('Brisbane', colnames(comb.count.mat))] <- comb.count.mat[rownames(comb.count.mat) == 'gene-NEP', grepl('Brisbane', colnames(comb.count.mat))]
+
+# drop NEP from the mat
+comb.count.mat <- comb.count.mat[rownames(comb.count.mat) != 'gene-NEP',]
+
+# ok looks good
+comb.count.mat[rownames(comb.count.mat) %in% inf.genes,]
+```
+
+
+just extract the rows and merge
+
+run DESeq2 for library normalisation
+```{r}
+
+#rows_with_na <- which(is.na(comb.count.mat), arr.ind = TRUE)[, "row"]
+#print(comb.count.mat[rows_with_na, ])
+
+# gene-NS2 # gene-NEP have NAs as not in the other condition gtf... convert to 0 for now
+#comb.count.mat[is.na(comb.count.mat)] <-  0
+
+#comb.count.mat[rownames(comb.count.mat) %in% inf.genes,]
+
+dds <- DESeqDataSetFromMatrix(countData = comb.count.mat,
+                              colData = sample.meta,
+                              design = ~ group)
+dds
+```
+
+
+
+filter out low count genes (>= 10)
+leave for now as want to keep viral genes present...
+
+```{r}
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,] 
+```
+
+run DESeq2
+```{r}
+dds <- DESeq(dds)
+#saveRDS(dds, './output/121223.dds.obj.rds')
+```
+create a contrast matrix for running the analysis
+
+```{r}
+comparison.matrix <- data.table(Denom=as.character(c(rep(c('Mock_0', 'Mock_3', 'Mock_6', 'Mock_12', 'Mock_24'),2),'Victoria_0', 'Victoria_3', 'Victoria_6', 'Victoria_12', 'Victoria_24')),
+                                     Num=as.character(c('Brisbane_0', 'Brisbane_3', 'Brisbane_6', 'Brisbane_12', 'Brisbane_24', 'Victoria_0', 'Victoria_3', 'Victoria_6', 'Victoria_12',
+                                           'Victoria_24','Brisbane_0','Brisbane_3','Brisbane_6', 'Brisbane_12', 'Brisbane_24')))
+
+
+comparison.matrix <- comparison.matrix[!Denom %like% 'Mock',] %>% 
+  data.frame()
+
+comparison.matrix
+```
+```{r}
+##Function to run deseq2 on each of the comparisons listed. Will let Adrian decide on the Relevant group comparisons
+#Denominator is the first group
+
+# lfcShrink gives more accurate estimate of fold changes - recommended by authors to both visualise and rank lfc 
+# Use ashr as works with contrast and also preserves large lfc values
+# the reference is the denominator value (ie the baseline expression, so either up or downreg compred to this group )
+
+
+run_deseq2 <- function(contrast_df,dds_obj,group_col) {
+  denominator=contrast_df[1]
+  numerator=contrast_df[2]
+
+  # log2FC > 0 overexpressed in numerator 
+  dds_res <- results(dds_obj, contrast = c(group_col, numerator, denominator), independentFiltering = T, alpha = 0.05, pAdjustMethod = "BH")
+  
+  #shrinkage of lfc useful for visualisation and gene ranking
+  dds_lfcs <- lfcShrink(dds_obj, contrast = c(group_col, numerator, denominator), res=dds_res, type="ashr")
+
+  
+  # Return the results as a data frame
+  return(dds_res)
+}
+
+dds_lfcs_list <- apply(comparison.matrix, MARGIN=1, run_deseq2, dds_obj = dds, group_col = "group")
+
+# Name each element of the list after the function call
+dds_lfcs_list  <- setNames(dds_lfcs_list, apply(comparison.matrix, 1, paste, collapse = "_vs_"))
+```
+
+read in annotation info
+
+```{r}
+#load db
+ah <- AnnotationHub()
+#download dbs matching the follwoing query (only one element matching)
+hs.embl.101 <- query(ah, c("Hsapiens", "EnsDb", "101"))[[1]]
+
+#transcript to gene mapping
+tx <- transcripts(hs.embl.101, columns =c('tx_id', 'gene_id', 'gene_name'), return.type="DataFrame")
+```
+
+```{r}
+
+dds_lfcs_list
+comparison.matrix # victoria is the denominator, so change is relative to victoria
+```
+
+convert to data.table and return res for the viral genes..
+```{r}
+dds_lfcs_list_dt <- lapply(dds_lfcs_list, function(x){
+  
+  x$geneid <- rownames(x)
+  x <- as.data.table(x) 
+  x[, gm.pval.log2fc := sqrt(padj*abs(log2FoldChange))]
+  x[, sig := "Not"]
+  x[padj < 0.05 & abs(log2FoldChange) > 1,
+         sig := ifelse (log2FoldChange  > 0, "Up", "Down")]
+  
+  x[geneid %in% inf.genes,]
+})
+
+
+viral.de.dt <- rbindlist(dds_lfcs_list_dt, idcol = T)
+
+fwrite(viral.de.dt, ScriptAndDatedFileName('inf.viral.DE.tsv'))
+
+
+fread('~/Documents/projects/120423_JyotiB_ViralRNAseq.2/111223.ViralDEAnalysis_data/2023_12_13_inf.viral.DE.tsv')
+```
+Viral vs Mock Infected
+------
+I dont think a DE analysis vs Mock infected makes sense as this is the 
+
+RNAseq is heterskedastic so need a different type of transformation(eg vst)  to give homoskedastic data (stable mean variance relationship)
+
+```{r}
+vsd <- vst(dds)
+# <- assay(vsd)[rownames(assay(vsd)) %in% inf.genes,]
+assay(vsd)[rownames(assay(vsd)) == 'gene-NS2']
+```
+
+process the data 
+
+```{r}
+quant.mat <- assay(vsd)
+
+plot.dat <- melt(quant.mat, id.vars=rownames(quant.mat))  %>% 
+  data.table()
+
+setnames(plot.dat, new=c('geneid', 'sample', 'counts(vst-transformed)'))
+
+plot.dat[, strain := str_extract(sample, '(Brisbane|Victoria|Mock)')]
+plot.dat[, biorep := str_extract(sample, '[123]{1}$')]
+plot.dat[, timepoint := str_extract(sample,  '(0|3|6|12|24){1}(?=_[123]{1})')] #pos lookahead for biorep extension
+plot.dat[, timepoint := factor(timepoint, levels=c('0','3','6','12','24'))] 
+plot.dat[, condition := paste0(strain, '_', timepoint)]
+
+# look at the sample breakdown
+plot.dat[,.N, by=.(timepoint, biorep, condition, sample)]
+
+# jsut extract the viral genes
+plot.dat <- plot.dat[geneid %in% inf.genes,]
+plot.dat[,.N, by=.(strain,geneid,timepoint)]
+```
+plot the timepoints
+
+Heatmap of the normalised counts for the viral genes 
+
+```{r}
+# subset to Influenza genes
+subMat <-  quant.mat[rownames(quant.mat) %in% inf.genes,]
+
+col.order <- c("Brisbane_0_1","Brisbane_0_2","Brisbane_0_3",
+               "Brisbane_3_1", "Brisbane_3_2" , "Brisbane_3_3",
+               "Brisbane_6_1","Brisbane_6_2", "Brisbane_6_3",
+               "Brisbane_12_1", "Brisbane_12_2", "Brisbane_12_3",
+               "Brisbane_24_1", "Brisbane_24_2", "Brisbane_24_3")
+
+col.order <-  c(col.order, sub('Brisbane', 'Victoria', col.order))
+    
+#reorder mat
+subMat <-  subMat[, col.order]
+
+rownames(subMat) <-  sub('gene-', '', rownames(subMat))
+
+
+# create annotation
+ann <- data.table(timepoint=str_extract(colnames(subMat),'(0|3|6|12|24){1}(?=_[123]{1})'))
+names(ann) <- 'timepoint(h)'
+
+
+colours <- list('timepoint(h)' = c('0' = '#4477AA', '3'='#66CCEE', '6'="#228833", '12'="#CCBB44",'24'='#EE6677'))
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+# draw heatmap
+hm <- Heatmap(subMat,
+        top_annotation = colAnn,
+        cluster_rows = T,
+        cluster_columns = F,
+        show_column_dend = TRUE,
+        show_row_dend = TRUE,
+        show_row_names = TRUE,
+        column_names_gp = gpar(fontsize = 8),
+        #row_title = 'viral gene expression',
+        column_split = ifelse(grepl('Victoria', colnames(subMat)), 'Victoria', 'Brisbane'),
+        name = "Counts (vst transformed)")
+hm
+
+BackupAsPDF(hm, 'strain.expression.norm.counts.', dimension=c(8,6))
+```
+create a median scaled heatmap to look at changes to median values
+
+```{r}
+scaled.mat <- sweep(quant.mat, 1, STATS = apply(quant.mat, 1, median, na.rm=T))
+
+# subset to Influenza genes
+subMat <-  scaled.mat[rownames(quant.mat) %in% inf.genes,]
+
+col.order <- c("Brisbane_0_1","Brisbane_0_2","Brisbane_0_3",
+               "Brisbane_3_1", "Brisbane_3_2" , "Brisbane_3_3",
+               "Brisbane_6_1","Brisbane_6_2", "Brisbane_6_3",
+               "Brisbane_12_1", "Brisbane_12_2", "Brisbane_12_3",
+               "Brisbane_24_1", "Brisbane_24_2", "Brisbane_24_3")
+
+col.order <-  c(col.order, sub('Brisbane', 'Victoria', col.order))
+    
+#reorder mat
+subMat <-  subMat[, col.order]
+
+rownames(subMat) <-  sub('gene-', '', rownames(subMat))
+
+
+# create annotation
+ann <- data.table(timepoint=str_extract(colnames(subMat),'(0|3|6|12|24){1}(?=_[123]{1})'))
+names(ann) <- 'timepoint(h)'
+
+
+colours <- list('timepoint(h)' = c('0' = '#4477AA', '3'='#66CCEE', '6'="#228833", '12'="#CCBB44",'24'='#EE6677'))
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+# draw heatmap
+hm <- Heatmap(subMat,
+        top_annotation = colAnn,
+        cluster_rows = T,
+        cluster_columns = F,
+        show_column_dend = TRUE,
+        show_row_dend = TRUE,
+        show_row_names = TRUE,
+        column_names_gp = gpar(fontsize = 8),
+        #row_title = 'viral gene expression',
+        column_split = ifelse(grepl('Victoria', colnames(subMat)), 'Victoria', 'Brisbane'),
+        name = "Counts (vst transformed)/Median")
+hm
+
+BackupAsPDF(hm, 'strain.expression.norm.counts.medianScaled.', dimension=c(8,6))
+```
+plot with no labels
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(k=length(unique(plot.dat$geneid)) )
+
+#plot mean per strain, gene,timepoint
+plot.dat[, mean.counts := mean(`counts(vst-transformed)`, na.rm=T), by=.(condition,geneid, timepoint)]
+plot.dat[, .N, by=.(condition,geneid, timepoint, mean.counts)]
+
+g <- ggplot(plot.dat, aes(x=timepoint, y=mean.counts, color=geneid, label=geneid)) + 
+  geom_point(size=2) + 
+  geom_line(aes(group=geneid), alpha=0.5) +
+  scale_color_manual(values=col.pal) +
+  ylab(' mean counts (vst trasnformed)') +
+ #geom_text_repel(data=plot.dat[timepoint==24,],) +
+  facet_wrap(~strain, ncol=2) +
+  theme_classic()
+
+BackupAsPDF(g, 'linechart.nolabels', dimensions=c(6,10))
+```
+
+plot with labels
+```{r}
+#neded to create a seperate dt for labels
+dat_text <-  plot.dat[, .(timepoint, geneid, strain, mean.counts)] %>% unique()
+#fix as using factor names...
+dat_text[,geneid := as.character(geneid)]
+dat_text[, lab := '']
+dat_text[, lab := ifelse(timepoint == 24, geneid, lab)]
+
+g <- ggplot(plot.dat, aes(x=timepoint, y=mean.counts, color=geneid)) + 
+  geom_point(size=2) + 
+  geom_line(aes(group=geneid), alpha=0.8) +
+  scale_color_manual(values=col.pal) +
+  ylab(' mean counts (vst trasnformed)') +
+  facet_wrap(~strain, ncol=2) +
+  theme_classic()
+
+g <-  g + geom_text_repel(
+  data = dat_text,
+  aes(label = lab),
+  size=2,
+  box.padding = 0.5,
+  point.padding = 0.5,
+  nudge_x = 0.5
+)
+
+BackupAsPDF(g, 'linechart.wlabels.2col', dimensions=c(10,8))
+```
+use with regular labelling
+
+```{r}
+#neded to create a seperate dt for labels
+dat_text <-  plot.dat[, .(timepoint, geneid, strain, mean.counts)] %>% unique()
+#fix as using factor names...
+dat_text[,geneid := as.character(geneid)]
+dat_text[, lab := '']
+dat_text[, lab := ifelse(timepoint == 24, geneid, lab)]
+
+g <- ggplot(plot.dat, aes(x=timepoint, y=mean.counts, color=geneid)) + 
+  geom_point(size=2) + 
+  geom_line(aes(group=geneid), alpha=0.8) +
+  scale_color_manual(values=col.pal) +
+  ylab(' mean counts (vst trasnformed)') +
+  facet_wrap(~strain, ncol=2) +
+  theme_classic()
+
+g <-  g + geom_text(
+  data = dat_text,
+  aes(label = lab),
+  size=2,
+  nudge_x = 0.3
+)
+
+BackupAsPDF(g, 'linechart.wlabelsnorepel.2col', dimensions=c(10,8))
+```
+maybe a vs T0 linechart? Will reduce the yaxis lim and help better distinguish points
+
+```{r}
+plot.dat[, vsTimeZero := mean.counts - mean.counts[timepoint == '0'], by=.(geneid, strain)]
+
+# sanity check.. looks good
+plot.dat[geneid == 'gene-HA',.N, by=.(geneid, strain, timepoint, vsTimeZero, mean.counts)]
+#20.17622 - 11.36414 one gene checked for thr two strains
+#18.70498 - 10.73068
+```
+produce plots
+
+```{r}
+#neded to create a seperate dt for labels
+dat_text <-  plot.dat[, .(timepoint, geneid, strain, vsTimeZero)] %>% unique()
+#fix as using factor names...
+dat_text[,geneid := as.character(geneid)]
+dat_text[, lab := '']
+dat_text[, lab := ifelse(timepoint == 24, geneid, lab)]
+
+g <- ggplot(plot.dat, aes(x=timepoint, y=vsTimeZero, color=geneid)) + 
+  geom_point(size=2) + 
+  geom_line(aes(group=geneid), alpha=0.8) +
+  scale_color_manual(values=col.pal) +
+  ylab(' mean counts vs T0') +
+  facet_wrap(~strain, nrow=2) +
+  theme_classic()
+
+g <-  g + geom_text_repel(
+  data = dat_text,
+  aes(label = lab),
+  size=2,
+  nudge_x = 0.3
+)
+
+BackupAsPDF(g, 'linechart.wlabelsnorepel.meanvsT0.2row', dimensions=c(8,11))
+```
+```{r}
+fwrite(plot.dat[, .(geneid, sample, `counts(vst-transformed)`,mean.counts, vsTimeZero)], sep='\t', ScriptAndDatedFileName('influenza.counts.tsv'))
+
+counts.dt <- fread('~/Documents/projects/120423_JyotiB_ViralRNAseq.2/111223.ViralDEAnalysis_data/2023_12_13_influenza.counts.tsv')
+
+
+counts.dt.wide <- dcast(counts.dt, geneid~sample, value.var = c('counts(vst-transformed)'))
+
+fwrite(counts.dt.wide, sep='\t', ScriptAndDatedFileName('influenza.counts.wide.tsv'))
+
+
+```
+
+
+
+```{r}
+g <- ggplot(plot.dat, aes(x=timepoint, y=vsTimeZero, color=geneid, label=geneid)) + 
+  geom_point() + 
+  geom_line(aes(group=geneid), alpha=0.5) +
+  scale_color_manual(values=col.pal) +
+ geom_text_repel(data=plot.dat[timepoint==24,],) +
+  facet_wrap(~strain, ncol=2) +
+  theme_classic()
+
+g
+```
+
+
+
+```{r}
+g <- ggplot(plot.dat, aes(x=timepoint, y=mean.counts, color=geneid, label=geneid)) + 
+  geom_point() + 
+  geom_line(aes(group=geneid), alpha=0.5) +
+  scale_color_manual(values=col.pal) +
+ geom_text_repel(data=plot.dat[timepoint==24,],) +
+  facet_wrap(~strain, ncol=2) +
+  theme_classic()
+
+g
+
+```
+
+plot.dat[geneid == 'gene-HA']
+
+ggplot(plot.dat, aes(x = timepoint, y = mean.counts, color = geneid, label = ifelse(timepoint == 24, as.character(geneid), ""))) +
+  geom_point() +
+  geom_line(aes(group = geneid)) +
+  geom_text_repel(data = plot.dat[plot.dat$timepoint == 24, unique(gene.id)], segment.size = 0, nudge_x = 0.1) +
+  scale_color_manual(values = col.pal) +
+  ylim(4, 20) +
+  facet_wrap(~strain, ncol = 2) +
+  theme_classic()
+
+ggplot(plot.dat, aes(x = timepoint, y = mean.counts, color = geneid, label = ifelse(timepoint == 24, as.character(geneid), ""))) +
+  geom_point() +
+  geom_line(aes(group = geneid)) +
+  geom_text_repel(data = unique(plot.dat[plot.dat$timepoint == 24, .(geneid, strain, timepoint)]), 
+                  segment.size = 0, nudge_x = 0.1) +
+  scale_color_manual(values = col.pal) +
+  ylim(4, 20) +
+  facet_wrap(~strain, ncol = 2) +
+  theme_classic()
+
+
+
+
+unique(plot.dat[plot.dat$timepoint == 24, c("geneid", "strain")])
+```
+
+
+Not needed 
+-----
+
+```{r}
+library("pasilla")
+pasCts <- system.file("extdata",
+                      "pasilla_gene_counts.tsv",
+                      package="pasilla", mustWork=TRUE)
+pasAnno <- system.file("extdata",
+                       "pasilla_sample_annotation.csv",
+                       package="pasilla", mustWork=TRUE)
+cts <- as.matrix(read.csv(pasCts,sep="\t",row.names="gene_id"))
+coldata <- read.csv(pasAnno, row.names=1)
+coldata <- coldata[,c("condition","type")]
+coldata$condition <- factor(coldata$condition)
+coldata$type <- factor(coldata$type)
+```
+
+```{bash}
+# get the count
+ls -1  ./output/brisbane.host.featureCounts.new/*featureCounts.txt | parallel 'cat {} | sed '1d' | cut -f7 {} > {/.}_clean.txt' 
+ls -1 ./output/brisbane.host.featureCounts.new/*featureCounts.txt | head -1 | xargs cut -f1 > ./genes.txt
+paste genes.txt *featureCounts_clean.txt > output.txt
+```
+
+```{bash}
+ls -1  ./output/brisbane.host.featureCounts.new/*featureCounts.txt | parallel 'cat {} | sed '1d' | cut -f7 {} > {/.}_clean.txt'
+
+```
+
+
+```{r}
+# read in all files
+input.list <- lapply(input$path, function(x){
+  x.dt <- fread(x) %>%  data.table()
+  x.dt <- x.dt[, .SD, .SDcols=c(1,6,7)]
+})
+
+# now colbind the dts, by geneID and length cols
+merge.dts <-  function(x,y,byCols){
+  
+  merge.dt <- merge(x=x, y=y, by=byCols)
+  return(merge.dt)
+}
+
+
+#
+lapply(input.list, head)
+
+
+#histogram of counts
+lapply(input.list, function(x){
+  
+  hist(x[,3])
+   })
+
+merge.dts(input.list[[1]], input.list[[2]], byCols = c('Geneid', 'Length'))
+
+input.list[[2]]
+```
+
+
+
+
+Not needed
+-----
+need file names as rownames for the metadata so convert to tibble
+```{r}
+input.list <-  lapply(input.list, function(x){
+  
+  x <- as.tibble(x) %>% 
+    column_to_rownames('file.names')
+  
+  rownames(x) <-  gsub('[.](brisbane|victoria).host' ,'', rownames(x))
+  return(x)
+})
+
+```
+read in the txt2gene output
+-----
+Issue here is salmon has discarded the viral references for quantification
+look for gene segments belonging to the viral genomes, if absent, add rows to txt2gene for Influneza 
+Issue here... our txt2gene file only contains reads mapped to virus...
+
+lets look at one of the quant.sf files and try extract reads mapping to non-human
+Seems here that each of the outpu salmon quant files only map to human reads...
+Can see from our bam file output that we also have counts mapped to each viral segment
+
+Lets return to the STAR alignment output and see if we can identify a file with the viral mapped reads retained
+
+
+```{r}
+vic.txt2g <- fread('./output/victoria.host.quant/victoria.host_salmon_tx2gene.tsv', col.names = c('transcript', 'gene', 'symbol')) 
+bris.txt2g <- fread('./output/brisbane.host.quant/brisbane.host_salmon_tx2gene.tsv') 
+
+vic.txt2g[]
+colnames(nf.txt2g) <- c('transcript', 'gene', 'symbol')
+
+vic.txt2g[grep('ENSG', gene, invert=T)]
+
+
+test.quant <-  fread('./output/victoria.host.quant/Victoria_24_1.victoria.host.quant.sf')
+dim(test.quant) # 229486 transcript IDs identified
+
+
+test.quant[, grep('ENST', Name, invert=T)] %>%  length()
+
+test.quant
+```
+```{bash}
+head ./output/victoria.host.quant/victoria.host_salmon_tx2gene.tsv
+```
+
+
+
+read in txt2gene from output
+```{r}
+# txt2gene from nf pipeline run - no lost transcripts
+nf.txt2g <- read_tsv('./output/star_salmon/salmon_tx2gene.tsv', col_names = F) 
+nf.txt2g
+colnames(nf.txt2g) <- c('transcript', 'gene', 'symbol')
+```
+
+Summarising transcript level abundances to the gene level using tximport
+
+```{r tximport-txt2gene}
+txi_files <- input$path
+names(txi_files) <- input$file.names
+
+#tximport: convert transcript level abundances to gene
+txi <- tximport(files = txi_files, type = "salmon", tx2gene = nf.txt2g) 
+
+# safety check; assert that col in txi match order and rownames in metadata table. # TRUE
+all(rownames(sample_meta) == colnames(txi[["counts"]])) 
+```
+
+
+```{r}
+View(input)
+input <- dir(path=path, pattern = "*.host.quant/*quant.sf$", recursive = T, full.names = TRUE)
+```
+
+
+```{r}
+DESeqDataSetFromFeatureCounts <- function (sampleTable, directory = ".", design, ignoreRank = FALSE, ...) 
+{
+    if (missing(design)) 
+        stop("design is missing")
+    l <- lapply(as.character(sampleTable[, 2]), function(fn) read.table(file.path(directory, fn), skip=2))
+    if (!all(sapply(l, function(a) all(a$V1 == l[[1]]$V1)))) 
+        stop("Gene IDs (first column) differ between files.")
+    tbl <- sapply(l, function(a) a$V7)
+    colnames(tbl) <- sampleTable[, 1]
+    rownames(tbl) <- l[[1]]$V1
+    rownames(sampleTable) <- sampleTable[, 1]
+    dds <- DESeqDataSetFromMatrix(countData = tbl, colData = sampleTable[, 
+        -(1:2), drop = FALSE], design = design, ignoreRank, ...)
+    return(dds)
+}
+
+```

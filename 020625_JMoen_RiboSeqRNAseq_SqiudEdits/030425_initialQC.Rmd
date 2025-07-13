@@ -1,0 +1,454 @@
+
+---
+title: "030425_initalQC"
+author: "Martin Gordon"
+date: "2025-03-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+*note*
+Riboseq has issues identifying the correct offset with low input material; important we run with enough data. See here: https://github.com/LabTranslationalArchitectomics/riboWaltz/issues/79
+I wonder if we want to renalayze with a reduced periodicity? significant gap at .66 cutoff
+
+```{r}
+library(data.table)
+library(Rsamtools)
+library(magrittr)
+library(ggplot2)
+library(devtools)
+library(riboWaltz)
+library(hrbrthemes)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+#library(extrafont)
+#font_import()
+#loadfonts()
+
+# directly from google font
+#sysfonts::font_add_google("Roboto Condensed")
+#showtext_auto()
+
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90,size=6)
+        )
+```
+
+create two lists; one of the rnaseq and one of riboseq
+read in the bam files
+```{r}
+rna.files <- dir(path='./output/', full.names = T, recursive=T, pattern="*RNA_OPTIC.+bam$")
+ribo.files <- dir(path='./output/', full.names = T, recursive=T, pattern="*RIBO.+bam$")
+ribo.files
+rna.list <- lapply(rna.files, BamFile)
+ribo.list <- lapply(ribo.files, BamFile)
+```
+
+read in the ribo bam files; we want to plot histograms of th
+just take a subset of fields for our plots and also look at the flag param
+```{r}
+# set up global params for reading in bam files; subset fields and also only take mapped
+param <- ScanBamParam(what=c('rname', 'qwidth'), flag=scanBamFlag(isUnmappedQuery=FALSE))
+
+ribo.list <- lapply(ribo.list, function(x) scanBam(x, param = param))
+
+names(ribo.list) <- gsub(".+[/]|[.]umi_dedup.transcriptome.sorted.bam", '', ribo.files)
+```
+
+function to convert list obj to data.table
+```{r}
+bamObjToDT <- function(bamObj){
+  
+  .unlist <- function (x)
+  {
+    ## do.call(c, ...) coerces factor to integer, which is undesired
+    x1 <- x[[1L]]
+    if (is.factor(x1)) {
+        structure(unlist(x), class = "factor", levels = levels(x1))
+    } else {
+        do.call(c, x)
+    }
+  }
+  bam <- unname(bamObj) # names not useful in unlisted result
+  elts <- setNames(bamWhat(param), bamWhat(param))
+  lst <- lapply(elts, function(elt) .unlist(lapply(bam, "[[", elt)))
+  
+  df <- do.call(data.table, lst)
+  return(df)
+}
+```
+
+```{r}
+ribo.list <- lapply(ribo.list, function(x){
+  return(bamObjToDT(x))
+})
+```
+
+Not really sure why the distribution is bimodal? maybe try blast a couple of these longer reads and see what we find?
+```{r}
+lapply(names(ribo.list), function(x){
+  
+  print(x)
+  g <- ggplot(ribo.list[[x]], aes(x=qwidth)) +
+    geom_histogram(bins=50) +
+    ggtitle(paste(x, 'aligned read length distribution')) +
+    customTheme
+  BackupAsPDF(g, paste0(x, 'readlength.histogram'))
+})
+
+
+ribo.dt <- rbindlist(ribo.list, idcol='sample')
+
+ribo.dt[, tissue := ifelse(grepl('OPTIC', sample), 'optic', 'gill')]
+
+g <- ggplot(ribo.dt, aes(x=qwidth, fill=sample, alpha=0.5)) +
+  geom_histogram() +
+  facet_wrap(~tissue) +
+  scale_fill_ipsum() +
+  ggtitle('aligned read length distribution') +
+  customTheme
+
+BackupAsPDF(g, 'aligned.readLength.distribution.histogram')
+```
+
+Lets just do a quick first pass of our data as is
+----
+create an annotation file to use for this analysis
+```{r}
+anno.dt <- create_annotation(gtfpath = './docs/dorPea.gtf')
+```
+
+# get the bam files
+Im pretty sure the reads are already deduplicated (can we try running umitools deduplicate on one of the samples to confirm?)
+```{r}
+reads_list <- bamtolist(bamfolder = "./output/riboseq_bamfiles_firstPass/riboseq", transcript_align = T, annotation = anno.dt)
+# custom names 
+names(reads_list) <- c('altprep_ribo_optic_1', 'ribo_gill_1', 'ribo_gill_2', 'ribo_gill_3', 'ribo_optic_1', 'ribo_optic_2', 'ribo_optic_3')
+```
+I think for now we ignore the deduplication.. but do include a read_length filter
+periodicity threshold (read extremities must fall into one of the 3 reading frames along the CDS); at least 2/3 of the length
+```{r}
+# it finds the frame of the reads (derived from the trasncript annotation included in dt..)
+# then groups by read length and filters read lenght by periodicity (should fall into one frame in at least periodicty threshold of reads)
+# looks at both 5' and 3' exteemities, and takes the intersection of the passing set and returns as filtered
+filtered_list <- length_filter(data = reads_list,
+ 				length_filter_mode = "periodicity",
+ 				periodicity_threshold = 50) #lets go with higher threshold 2/3 should fall in one frame
+
+
+lapply(filtered_list, function(x){
+  
+  print(unique(x$length) %>% sort())
+})
+```
+
+plot histogram of the filtered set; looks like the gill samples are v poor quality and not v usable; just proceed with optic
+
+```{r}
+filtered.dt <- rbindlist(filtered_list, idcol='sample', fill=T)
+filtered.dt[, tissue := ifelse(grepl('gill', sample), 'gill', 'tissue')]
+
+reads.dt <- rbindlist(reads_list, idcol='sample', fill=T)
+reads.dt[, tissue := ifelse(grepl('gill', sample), 'gill', 'tissue')]
+```
+
+*RiboWaltz*
+P-site: defined by the position of its first nucleotide (of the start codon) within the reads
+Identify the P-site offset; distance between read extremeties and the first nucleotide of peptidyl-site in ribosome
+Reference codon is either the start, or the second to last codon 
+How is P-site offset calculated:
+Read length-specific POs are inferred in two steps.
+1. Bin reads by lenght
+2. Remove reads too close to the reference codon?? (flanking parameter; leave as is for first pass). 
+3. Generate occupancy profiles of the read extremities for each bin (the number of 5' and 3' ends in region of start codon) (these are the profile plots)
+4. Identify the global 5' and3' maximum per bin (ie the offset with the most N)
+5. 
+For each bin temporary 5' and 3' POs are defined as the distances between the first nucleotide of the reference codon and the nucleotide corresponding to the global maximum found in the profiles of the 5' and the 3' end at the left and at the right of the reference codon, respectively. 
+After the identification of the P-site for all reads aligning on the reference codon, the POs corresponding to each length are assigned to each read of the dataset. Second, the most frequent temporary POs associated with the optimal extremity (see the extremity parameter) and the predominant bins are exploited as reference values for correcting the temporary POs of smaller bins. Briefly, the correction step defines for each length bin a new PO based on the local maximum, whose distance from the reference codon is the closest to the most frequent temporary POs.
+
+
+```{r}
+plotDir <- './030425_initialQC_data/pdfs'
+
+# remove this as majority of reads were filtered out
+filtered_list[['ribo_gill_3']] <- NULL
+
+psite_offset <- psite(filtered_list, flanking = 6, extremity = "auto", plot=T, plot_dir = plotDir, plot_format = 'pdf')
+
+#fwrite(psite_offset, ScriptAndDatedFileName('ribowaltz.psiteOccupancy.allSamples.csv'))
+psite_offset <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/030425_initialQC_data/2025_03_05_ribowaltz.psiteOccupancy.allSamples.csv')
+```
+data.table is per sample/read length; get the total percentage of total reads per read length
+```{r}
+psite_offset[, tissue := ifelse(grepl('gill', sample), 'gill', 'optic')]
+
+ggplot(psite_offset, aes(x=length, y=total_percentage, fill=tissue)) +
+  geom_bar(stat='identity') +
+  scale_fill_ipsum() +
+  facet_grid(sample~., scales='free') +
+  customTheme
+```
+Another way to look at this; what is the total proportion of reads in each sample under a certain length threshold? Will use this to detect and remove outlier samples and also possibly filter out additional read lenghts
+
+To understand how ribowaltz works its best to look at the occupancy profile plots
+```{r}
+prop.dt <- lapply(unique(psite_offset$length), function(x){
+  prop.dt <- psite_offset[length <= x, .(length=x, totalProportionofReads=sum(total_percentage)), by=.(tissue,sample)]
+}) %>% rbindlist()
+
+
+g <- ggplot(prop.dt, aes(x=as.factor(length), y=totalProportionofReads, fill=tissue)) +
+  geom_bar(stat='Identity') +
+  scale_fill_ipsum() +
+  facet_grid(sample~.) +
+  customTheme 
+
+g
+BackupAsPDF(g, 'sumOfTotalReads.barplot', dimensions=c(10,9))
+```
+```{r}
+psite_offset[(offset_from_5 != corrected_offset_from_5 | offset_from_3 != corrected_offset_from_3) & tissue == 'optic', ] %>% 
+  .[order(!total_percentage)]
+```
+
+add additional annotation information to the datatable
+```{r}
+reads_psite_list <- psite_info(filtered_list, psite_offset, site=c('psite','asite', 'esite'), 
+                               fastapath = './data/wynton_downloads/Dpea_1_genomic_cleanheaders_final.fna', 
+                               gtfpath = './data/wynton_downloads/dorPea.gtf',
+                               fasta_genome=T)
+
+#psite.dt <- rbindlist(reads_psite_list, idcol='sample', fill=T)
+fwrite(psite.dt, ScriptAndDatedFileName('annotated.psites.csv.gz'))
+```
+
+codon coverage
+transcript-specific codon coverages: defined as either N p-sites per codon or read footprints per codon (difference?)
+For each triplet, the output dt contains: 
+- the transcript id from the annotation
+- its leftmost and rightmost position with respect to the 1st nucleotide of the reference sequence
+- its position with respect to the 1st and the last codon of the annotated CDS of the reference sequence 
+- the region of the transcript (5' UTR, CDS, 3' UTR) it is in
+- the number of read footprints or P-sites falling in that region
+
+
+*difference between p-site and read footprint*
+I think footprint is across the read, so counts all mapped codons, p-site is just the actively transcribed site
+
+```{r}
+# psite True retunrs number of p-sites per codon, false returns number of read foodprints per codon
+psite.cov <- codon_coverage(reads_psite_list, annotation = anno.dt, psite = T)
+footprint.cov <- codon_coverage(reads_psite_list, annotation = anno.dt, psite = F)
+
+# computes total number of p-sites falling in each transcript CDS
+cds.cov <- cds_coverage(reads_psite_list, anno.dt)
+
+
+
+# problem here looking at sum is that we know we have much more depth in the noEdit....
+psite.cov[from_cds_start == 0, lapply(.SD, sum), .SDcols = c("altprep_ribo_optic_1","ribo_gill_1" ,"ribo_gill_2" ,
+                                                     "ribo_optic_1","ribo_optic_2","ribo_optic_3" )]
+
+footprint.cov[from_cds_start == 0, lapply(.SD, sum), .SDcols = c("altprep_ribo_optic_1","ribo_gill_1" ,"ribo_gill_2" ,
+                                                     "ribo_optic_1","ribo_optic_2","ribo_optic_3" )]
+
+# save footprint and psite coverage
+fwrite(psite.cov, ScriptAndDatedFileName('psite.codon.coverage.csv.gz'))
+# save footprint and psite coverage
+fwrite(footprint.cov, ScriptAndDatedFileName('footprint.codon.coverage.csv.gz'))
+fwrite(cds.cov, ScriptAndDatedFileName('cds.coverage.csv.gz'))
+```
+
+
+```{r}
+g <- rlength_distr(reads_psite_list, sample=names(reads_psite_list), multisamples = 'independent', plot_style = 'facet', cl = 90,
+				     colour = c( "#39827c", "#333f50", "#333f50", "#39827c", "#39827c", "#39827c"))
+
+g
+BackupAsPDF(g, 'readLength.proportion.barplot')
+
+
+# lets compare the averqges of the counts
+input_samples <- list("ribo_gill" = c("ribo_gill_1","ribo_gill_2"),
+                      "alt_ribo_gill" = "altprep_ribo_optic_1",
+                      "ribo_optic" = c("ribo_optic_1", "ribo_optic_2", "ribo_optic_3"))
+
+g <- rlength_distr(reads_psite_list,
+              sample = input_samples,
+              multisamples = "average",
+              plot_style = "dodge",
+              cl = 70, colour = c("#333f50", "#39827c", "gray70")) %>% 
+  .[['plot']] 
+g
+BackupAsPDF(g, 'readlengthprop.combined.barplot')
+```
+read extremity localization
+4 meta heatmaps; displays abundance of 5' and3' extremity of reads  mapping on or close to stop codon of CDS, stratified by length
+Use this plot to identify optimal read extremity and correct the temporary p-site offsets
+
+Clear the default method for p-site offset detection worked well; here it looks like the 5' read extreme and TIS distance (and 5' end extremem and stop codon distance) is very stable across read lengths, while the 3' extremes vary according to length (here the shorter the read, the closer to the TIS), so the 5' end for adjustment seems better
+
+Use this info to correct the p-site offsets,
+```{r}
+g <- rends_heat(reads_psite_list, anno.dt, 
+                sample=names(reads_psite_list),
+                multisamples = 'independent',
+                plot_style = 'split', 
+                cl = 60,
+                utr5l = 30, cdsl = 50, utr3l = 30,
+				        colour = c( "#39827c"))
+
+for (i in names(g[3:8])){
+  BackupAsPDF(g[[i]], paste0(i, '.readExtremity.tileplot'), dimensions = c(10,6))
+}
+```
+basically shows we do much better than random at capturing these sites
+```{r}
+example_psite_per_region <- region_psite(reads_psite_list, anno.dt,
+					 sample = input_samples,
+           multisamples = "average",
+					 cl = 60,
+					 colour = c("#333f50", "gray70", "#39827c"))
+
+BackupAsPDF(example_psite_per_region[["plot"]], 'p.sites.perregion.barplot', dimensions = c(10,6))
+```
+*trinucleotide periodicity*
+rinucleotide periodicity of ribosome footprints along the coding sequences is a fundamental property of riboseq data
+
+Looks like this is the breakdown when taking the sum of the columns (footprint much more abundant)
+
+Can we find differences between the matched gill and optic samples?
+Compute he number of read footprints or p-sites  mappping on each triplet of annotated coding sequences and UTRs
+Frame of the p-site for the 3 trasncript regions... interesting the 5' UTR seems to have some bias towards the first frame? possible that these are misannotated?
+This funciton looks at read lengths independently
+
+*why is this periodic pattern not the same for the 3' end?*
+See github related issue: https://github.com/LabTranslationalArchitectomics/riboWaltz/issues/64
+Possibly action of RNAses and the standard size of ribosomes that make some populations of reads more "reliable" than others. 
+Hopefully, lengths which are associated to in-frame reads are the most frequent and only a negligible amount of reads are >31 nts long and they are not going to affect downstream analyses. Can always filter out..
+```{r}
+frame_psite <- frame_psite_length(reads_psite_list, 
+                    anno.dt,
+                    sample = input_samples,
+                    multisamples = "average",
+                    plot_style = "facet",
+                    region = "all",
+                    cl = 95, colour = "#333f50")
+
+BackupAsPDF(frame_psite[['plot']], 'psite.frame.tileplot', dimensions=c(10,8))
+```
+Interesting: why is there a reduction in frame0 for 5' and 3' utr? perhaps missannotation?
+```{r}
+frame_psite <- frame_psite(reads_psite_list, anno.dt,
+                               sample = input_samples,
+                               multisamples = "average",
+                               plot_style = "facet",
+                               region = "all",
+                               colour = c("#333f50", "gray70", "#39827c"))
+
+BackupAsPDF(frame_psite[['plot']], 'psite.frame.byFeature.barplot', dimensions=c(10,8))
+#fwrite(frame_psite$count_dt, ScriptAndDatedFileName('psite.frame.byFeature.counts.csv.gz'))
+```
+*metaplots*
+A visual representation of the trinucleotide periodicity along the coding sequences
+```{r}
+metaprofile <- metaprofile_psite(reads_psite_list, anno.dt,
+					 sample = input_samples,
+					 multisamples = "average",
+					 plot_style = "overlap",
+					 utr5l = 30, cdsl = 50, utr3l = 30,
+					 colour = c("#333f50", "gray70", "#39827c"))
+
+#fwrite(metaprofile$count_dt, ScriptAndDatedFileName('metaprofile.psiteDistancefromFeature.csv.gz'))
+BackupAsPDF(metaprofile[['plot']], 'psite.metaprofile.overlap.linechart', dimensions=c(12,5))
+```
+codon usage across sites: what codons display higher or lower ribosome density? Look at the empirical codon usage across samples
+Normalized to the most abundant codon; strange AUG is not the most abundanct...
+
+Does squid have an alternative start codon? GGU-G possibly? Ask Jack
+```{r}
+codonUsage <- codon_usage_psite(reads_psite_list,
+                  anno.dt,
+ 					        sample = input_samples,
+ 					        multisamples = "average",
+ 					        plot_style = "facet",
+ 					        fastapath = "./data/wynton_downloads/Dpea_1_genomic_cleanheaders_final.fna",
+ 					        gtfpath = "./data/wynton_downloads/dorPea.gtf",
+ 					        fasta_genome = TRUE,
+ 					        frequency_normalization = TRUE)
+
+BackupAsPDF(codonUsage[['plot']], 'codonusage.barplot', dimensions=c(12,9))
+
+
+codonUsage$count_dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/030425_initialQC_data/2025_03_05_riboSeq.codonUsage.csv.gz')
+
+```
+codon usage psite; scatterplot of the usage index of different conditions
+
+```{r}
+codonUsage <- codon_usage_psite(reads_psite_list,
+                  anno.dt,
+ 					        sample = input_samples,
+ 					        contrast_sample = c('ribo_gill', 'ribo_optic'),
+ 					        multisamples = "average",
+ 					        fastapath = "./data/wynton_downloads/Dpea_1_genomic_cleanheaders_final.fna",
+ 					        gtfpath = "./data/wynton_downloads/dorPea.gtf",
+ 					        fasta_genome = TRUE,
+ 					        label_scatter = TRUE,
+ 					        frequency_normalization = FALSE)
+
+BackupAsPDF(codonUsage[['plot']], 'gillVsoptic.codonUsage.scatterplot', dimensions = c(9,7))
+#fwrite(codonUsage$count_dt, ScriptAndDatedFileName('riboSeq.codonUsage.csv.gz'))
+```
+
+Codon usage is very similar across tissues... why am I missing lengths
+
+```{r}
+psite.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/030425_initialQC_data/2025_03_05_annotated.psites.csv.gz')
+
+g <- ggplot(psite.dt, aes(x=sample,fill=psite_region)) +
+  geom_bar() +
+  ggtitle('P-site localization of ribosome bound reads') +
+  scale_fill_ipsum() +
+  customTheme
+g
+BackupAsPDF(g, 'readRegionLocalization.totalReads.barplot')
+
+# plot the percentage
+g <- ggplot(psite.dt, aes(x=sample,fill=psite_region)) +
+  geom_bar(position='fill') +
+  ggtitle('P-site localization of ribosome bound reads') +
+  scale_fill_ipsum() +
+  scale_y_continuous(name = "percent",
+                     breaks = c(0, 0.5, 1), 
+                     labels = scales::percent(c(0, 0.5, 1))) +
+  customTheme
+g
+BackupAsPDF(g, 'readRegionLocalization.proportions.barplot')
+```
+
+
+

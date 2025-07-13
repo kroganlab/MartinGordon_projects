@@ -1,0 +1,107 @@
+---
+title: "020325_EnrichPCProphetOutput"
+author: "Martin Gordon"
+date: "2025-02-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Have run PCProphet on Antoines data of data through PCProphet pipeline
+```{r}
+library(magrittr)
+library(data.table)
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+library(stringr)
+library(ggrepel)
+library(readxl)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(showtext)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("../../utils/mg_utils/r_utils/HelperFunctions.R") 
+source ("../../utils/bp_utils/UniprotIDMapping.R") #u
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R") 
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_ipsum_rc() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+```
+read in the differential complex report
+```{r}
+de.dt <- fread('./output/013125_firstPass/DifferentialProteinReport.txt')
+
+# get the conditions
+de.dt[, Condition := gsub('_[2]','', Sample_ID)]
+de.dt[, Contrast := paste0(Condition, '-vs-Parental')]
+
+# parental is baseline so compare NPC and neuron to that,
+# rerun the pipeline with a different baseline to do an all by all comparison
+
+de.list <- split(de.dt, de.dt$Contrast)
+```
+
+Run GSEA on these two sets; rank by probability differential abundance (highest is best)
+
+```{r}
+#load in the genesets 
+bp.gmt <- loadGmtFromBioconductor(ontology='BP', keyType='SYMBOL')
+cc.gmt <- loadGmtFromBioconductor(ontology='CC', keyType='SYMBOL')
+
+
+kegg.gmt <- loadKegg(organism='hsa', keyType = 'uniprot')
+kegg.gmt[, newGene :=  multiUniprots2multiGenes(gene, species='HUMAN', simplify = F)]
+kegg.gmt[, gene := newGene]
+kegg.gmt[, newGene := NULL]
+kegg.gmt[, gene := gsub('[.].+$', '', gene)]
+
+
+de.mat <- dcast(de.dt, GeneName~Contrast, value.var = 'Probability_differential_abundance') %>% 
+  as.matrix(rownames='GeneName')
+
+
+# run BP gsea
+bp.enrich <- matrixFGSEA(de.mat, sets=bp.gmt)
+cc.enrich <- matrixFGSEA(de.mat, sets=cc.gmt)
+
+cc.enrich[, geneSet := 'GO CC']
+bp.enrich[, geneSet := 'GO BP']
+
+enrich.dt <- rbind(bp.enrich, cc.enrich)
+#fwrite(enrich.dt, ScriptAndDatedFileName('SECMS.vsParentalProteinContrasts.enrich.dt'))
+```
+
+
+
+
+

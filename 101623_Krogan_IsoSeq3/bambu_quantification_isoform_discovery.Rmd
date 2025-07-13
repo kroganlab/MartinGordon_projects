@@ -1,0 +1,482 @@
+---
+title: "bambu_quantification"
+author: "Martin Gordon"
+date: "2024-02-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Bambu quantification
+
+Attempt to quantify the transcripts aligned to the SARS-CoV2 reference genome
+New attempt in Jan '23: align to reference rather than assembled genomes, also just testing the bambu tool
+
+## import the aligned bam files
+First we will try with just the raw aligned files
+
+
+## all files ran individually, but not matches togehter... why?
+### packages
+```{r}
+library(magrittr)
+library(ggplot2)
+library(data.table)
+library(bambu)
+library(Rsamtools) # investigate alignemnts
+library(randomcoloR)
+library(stringr)
+```
+
+# read in the input bam files (mm2 alignments first)
+read in the fasta and gtf also 
+
+```{r}
+path <- 'output/020124_refSARS_run/variants_alignments'
+
+input <- dir(path=path, pattern = "align.bam$", recursive = T, full.names = TRUE) %>% 
+  data.table() %>% 
+  setnames('.', 'path') %>% 
+  .[, file.names := tstrsplit(path, '/', keep = 4)] %>% 
+  .[, group := gsub('_[0-9]{1}$', '', file.names)]
+
+fasta <-  paste0(path, '/Mock-10h_1/SARS-CoV-2.fasta')
+gtf <-  paste0(path, '/Mock-10h_1/SARS-CoV-2.gtf')
+
+gtf.anno <-  prepareAnnotations(gtf)
+
+# remove the mock samples
+subset.input <- input[!file.names %like% 'Mock']
+
+subset.input
+```
+following protocol developed here: 
+https://github.com/Balays/SARS-CoV2_ONT_data/blob/main/README.md
+
+import bams with matching sample metadata
+
+```{r}
+# load bam using Rsamtools
+# bamFile creates a pointer to each bam file
+bam.list <- apply(subset.input, 1, function(x){
+  b.file <- BamFile(x[[1]])
+})
+names(bam.list) <- subset.input$file.names
+
+## nothing returned....
+lapply(bam.list, seqinfo)
+
+## read all the reads in the bam file, w/o selecting/filtering
+bamInfo.list <- lapply(bam.list, scanBam)
+names(bamInfo.list) <-  names(bam.list)
+
+
+bamInfo.list
+# list of 1 as we only have one genomic region (one chr in the ref fasta)
+# so a list of list per chromosome/reference
+# this is how I would pull out 
+bamInfo.list <- lapply(bamInfo.list, function(x){
+  return(x[[1]])
+})
+
+
+```
+
+Important flags for the alignment output 
+qname: The name of the read.
+rname: The name of the chromosome / sequence / contig it was aligned to.
+strand: The strand of the alignment.
+pos: The coordinate of the left-most part of the alignment.
+qwidth: The length of the read.
+mapq: The mapping quality of the alignment.
+seq: The actual sequence of the alignment.
+qual: The quality string of the alignment.
+cigar: The CIGAR string (below).
+flag: The flag (below).
+
+
+```{r}
+# this is how we can  subset the alignments to a specific region
+# can just filter the reads for each sgRNA, or do we want 'fuzzy' alignments due to the variants?
+
+# matches sequence name and 
+gr <- GRanges(seqnames = "seq2",
+              ranges = IRanges(start = c(100, 1000), end = c(1500,2000)))
+
+params <- ScanBamParam(which = gr, what = scanBamWhat())
+
+# for now just take the fields we are interested in rather than the alignemtns (which params)
+params <- ScanBamParam(what = c("rname", "qname", "qwidth", "flag", "pos", "mapq", "cigar", "strand"))
+
+```
+
+Quick overview of alignments:
+Think this would be more relevant for combined alignment using human host and viral genome (like Jyoti project)
+
+```{r}
+lapply(seq_along(bamInfo.list), function(x,n,i){
+  print(n[[i]])
+  quickBamFlagSummary(x[[i]])
+},x=bamInfo.list, n=names(bamInfo.list))
+```
+
+look at histograms of the mapping quality
+```{r}
+# use these kind of tables to look at summaries of the data
+lapply(seq_along(bamInfo.list), function(x,n,i){
+  table(x[[i]]$strand) 
+  hist(x[[i]]$mapq, breaks=60, main=n[[i]])
+},x=bamInfo.list, n=names(bamInfo.list))
+
+#  ones with uniform scores cant plot distribution....
+summary(bamInfo.list[["S92_20A_EU1_24h_1"]]$mapq)
+summary(bamInfo.list[["S92_IC19_10h_2"]]$mapq)
+```
+filtering
+---
+mapQ of 30 and remove any alignments not on the pos strand
+just filter by mapq 30 to remove poor alignments (also drops any unaligned in files)
+```{r}
+bamInfo.list[["S92_20A_EU1_24h_1"]]$cigar
+
+lapply(seq_along(bamInfo.list), function(x,n,i){
+  
+  #writing out filtered files...
+  output <- sub('bam', 'filtered.bam', subset.input$path[i]) 
+
+  message('filtering sample ', n[[i]], '....')
+  # remove things not mapped to ref, with map q < 30, mapped to -ve strand
+  filters <- !is.na(x[[i]]$rname) & x[[i]]$mapq >= 30 & x[[i]]$strand == '+'
+  
+  message(sum(!filters), ' reads were filtered out in ', n[[i]], '!')
+   #message('Generating ', destination, ' ...')
+  filterBam(subset.input$path[i],  filter=filters, destination=output)
+  
+},x=bamInfo.list, n=names(bamInfo.list))
+```
+
+now read in these and convert to a data.table
+
+```{r}
+subset.input[, f.path := sub("bam","filtered.bam", path)]
+
+f.bamInput.list <- apply(subset.input,1, function(x){
+ dt <-  scanBam(x[[4]], param = params)
+ dt[[1]] # only one  element
+})
+
+names(f.bamInput.list) <-  names(bamInfo.list)
+```
+
+```{r}
+#as per the Rsamtools vignette
+# convert list of lists to concated vector or factor
+.unlist <- function (x){
+   ## do.call(c, ...) coerces factor to integer, which is undesired
+   x1 <- x[[1L]]
+   if (is.factor(x1)){
+      structure(unlist(x), class = "factor", levels = levels(x1))
+   } else {
+      do.call(c, x)
+   }
+}
+
+#store names of BAM fields
+bam_field <- names(f.bamInput.list[[1]])
+
+bam.dt <- lapply(f.bamInput.list, function(x){
+  # go through each bam field unlist 
+  dt <- do.call('data.table', x)
+  return(dt)
+}) %>%  rbindlist(idcol='sample')
+```
+
+
+
+mapped reads per sample
+# pretty variable but not much more thank 4k mapped reads..
+general trend of increased read mapping after 24hrs which is good...
+
+```{r}
+bam.dt[, group := sub("_[1-3]$", '', sample)]
+ba
+col.vec <- randomcoloR::distinctColorPalette(k=length(unique(bam.dt$group)))
+
+ggplot(bam.dt[,.N,by=.(sample,group)], aes(x=sample, y=bam.dt[,.N, by=sample][,N], fill=group)) + 
+  geom_bar(stat='Identity') + 
+  theme_classic() + 
+  scale_fill_manual(values=col.vec) +
+  theme(axis.text.x= element_text(angle=90))
+```
+What do our read length distributions look like?
+bimodal; peak around 3ish and also 7-8k..
+```{r}
+bam.dt[, group := sub("_[1-3]$", '', sample)]
+
+ggplot(bam.dt, aes(x=qwidth, fill=group)) +
+  geom_histogram() +
+  theme_bw() +
+  facet_wrap(~group) +
+  scale_fill_manual(values=col.vec)
+```
+ambiguous reads/multimapped?
+how many reads assigned to more than one position in the reference?
+
+Seems many reads present more than once.
+Extract these reads, look at alignments pos
+Drop the multimappers and select the site with teh best mapQ score??
+
+Seem to be supplementary alignments (judging by flag)
+
+```{r}
+# q: why do we have some samples with same transcripts mapped multiple times?
+bam.dt[,.N, by=.(qname, sample)]
+
+bam.dt[,.N, by=.(qname, sample)][N > 1,][,.N, by=sample]
+
+ggplot(bam.dt[flag == '2048',][,.N, by=.(sample,group)], aes(x=sample, fill=group,y=N)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.vec) +
+  theme_classic()+
+  ggtitle('supplementary mappings') +
+  theme(axis.text.x= element_text(angle=90))
+
+multimappers <- bam.dt[,.N, by=.(qname, sample)] %>% 
+  .[N > 1,] %>% 
+  .[,.(qname,sample)] %>% 
+  .[, mapping := paste0(qname, sample)]
+
+
+table(bam.dt$flag)
+```
+
+Definite variability in read counts between reps but look consistent
+```{r}
+bam.dt[, biorep := str_extract(mapping, "[1-3]$")]
+
+ggplot(bam.dt[,.N, by=.(pos, biorep,group)][N > 1,], aes(x=pos, fill=biorep) )+
+  geom_histogram() +
+  scale_fill_manual(values=col.vec) +
+  ggtitle('coordinates') +
+  xlab('left aligned position') +
+  facet_wrap(~group) +
+  theme_classic()
+```
+starting sites of interest:
+
+```{r}
+
+bamToTable <- function(bamFile){
+  bam <- Rsamtools::scanBam(bamFile)
+  stopifnot (length(bam) == 1)
+  bam <- bam[[1]]
+  
+  #store names of BAM fields
+  bam_field <- names(bam)
+  
+  bam$seq <-  as.character(bam$seq)
+  bam$qual <-  as.character(bam$qual)
+  
+  # make flags more human readable
+  flags <- as.data.table (Rsamtools::bamFlagAsBitMatrix(bam$flag))
+  
+  
+  #store as data table
+  bam_df <- do.call("data.table", bam)
+  setnames(bam_df, bam_field)
+  bam_df <- cbind(bam_df, flags)
+  
+  return (bam_df)
+}
+
+bamToTable('output/020124_refSARS_run/variants_alignments/S92_20A_EU1_24h_1/S92_20A_EU1_24h_1.align.bam')
+```
+More straight forward using ref for alignment, just extract sites within a window (5 default) of the reference site
+```{r}
+
+spliceSites.ref <- c(genomic = 67,
+                     S = 21553,
+                     orf3 = 25382,
+                     E  = 26237,
+                     M = 26470,
+                     orf6 = 27041,
+                     orf7 = 27385,
+                     orf8 = 27885,
+                     N = 28257,
+                     nonc_9b = 28280,
+                     Nstar = 28878)
+
+
+# counts per site per sample
+counts.tab <- bam.dt[, .N, by=.(pos,sample)]
+
+
+# above data in table form and create windows:
+splices <- rbindlist(list(SARS2  = data.table (splice.name = names(spliceSites.ref),
+                                               splice.center = spliceSites.ref)),idcol = "refDB")
+
+# fuzzy matching; allow 5 bp either side
+# why 5 bp? look at the 
+splices[, windowRight := splice.center + 5]
+splices[, windowLeft := splice.center -5 ]
+
+#If windowLeft/windowRight straddle the reference base, then it is a match.
+startPos.labeled <- splices[counts.tab,
+                            on = .( windowLeft < pos, windowRight > pos)]
+
+filtered.startPos <- startPos.labeled[!is.na(refDB),]
+
+# collapse counts to 
+filtered.startPos[, N := sum(N), by=.(sample,splice.name)] 
+# rm duplicates
+clean.startPos <- filtered.startPos[!duplicated(filtered.startPos, by=c('sample', 'splice.name')),]
+```
+
+# first, a check that all sites were mapped to 
+```{r}
+clean.startPos[, group := sub('_[1-3]$', '', sample)]
+
+ggplot(clean.startPos, aes(x=log2(N), y=sample, fill=group)) +
+  geom_bar(stat='Identity') +
+  coord_flip() +
+  facet_wrap(~splice.name) + 
+  theme_classic() +
+  scale_fill_manual(values=col.vec) +
+  theme(axis.text.x = element_text(angle=90,size=4))
+```
+
+
+```{r}
+ggplot(clean.startPos, aes(x=log2(N), y=sample, fill=group)) +
+  geom_bar(stat='Identity') +
+  coord_flip() +
+  facet_wrap(~splice.name) + 
+  theme_classic() +
+  scale_fill_manual(values=col.vec) +
+  theme(axis.text.x = element_text(angle=90,size=4))
+```
+look at boxplot of values.. normalise for comparisons..
+
+```{r}
+ggplot(clean.startPos, aes(x=sample, y=log2(N), fill=group)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.vec) +
+  theme(axis.text.x = element_text(angle=90,size=4))
+```
+
+# convert to count matrix, use TMM to normalise library size, then sgRNA/gRNA to normalise by 
+
+
+
+
+not needed
+-----
+
+# filter bams
+bam.param.list <- lapply(bam.list, function(x){
+  params  <- ScanBamParam(what = c("rname", "qname", "qwidth", "flag", "pos", "mapq", "cigar", "strand"))
+  bam.ori <- as.data.table(scanBam(x, param = params))
+})
+
+lapply(bam.list, scanBam)
+
+
+help(scanBam)
+
+View(bam.param.list)
+   ## Filter alignments and write out filtered alignments
+    if(write.filtered) {
+      destination <- paste0(stringi::stri_replace_last_regex(bamfile, '.bam', ''), '.filtered.bam')
+      if(any(!file.exists(destination), force.create)) {
+        params  <- ScanBamParam(what = c("rname", "qname", "qwidth", "flag", "pos", "mapq", "cigar", "strand"))
+        bam.ori <- as.data.frame(scanBam(bamfile, param = params))
+        if(filtering == 'all.reads.w.supp.ali') {
+          message('This filters out every read that has (a) supplementary alignment(s), since these are most likely chimeric reads.')
+          tokeep <- 
+            !is.na(bam.ori$rname) &
+            bam.ori$rname == seqnames.tofilt &
+            bam.ori$mapq >= mapq.filt &
+            !is.element(bam.ori$qname, dup(bam.ori$qname))
+
+```
+
+
+
+
+
+
+
+## not used...
+
+below are collapsed and transcripts are combined..
+transcript discovery and quantification
+
+
+
+
+```{r}
+# generate all possible unique pairs for pw comparisons
+# cant process all together; dont know why...
+
+#process pw;
+last.tp
+last.tp <- subset.input[grep("^S92_", file.names, invert=T),] %>% 
+  .[grepl("-24*", file.names)]
+
+se.multiSample <- bambu(reads = last.tp[,path], annotations = gtf.anno, genome = fasta)
+
+colData(se.multiSample)$condition <- as.factor(last.tp[-1,file.names])
+```
+
+assign reads to gene estimates
+
+```{r}
+seGene.multiSample <- transcrptToGeneExpression(se.multiSample)
+rownames(seGene.multiSample)
+
+assays(seGene.multiSample)$counts
+fread(gtf) %>%  View()
+```
+
+BAM inspection
+-----
+clear issues with the alignments... reads have been collapsed to two transcripts...
+Read alignments only returned for two transcripts.. look at the raw alignment files 
+
+```{r}
+
+subset.input
+for (i in seq_along(subset.input$path)){
+  
+  b.file <- BamFile(i)
+  
+  
+  print(i)
+}
+
+bam.list <- apply(subset.input, 1, function(x){
+  b.file <- BamFile(x[[1]])
+})
+
+names(bam.list) <- subset.input$file.names
+```
+
+look at the coverage of this list of bam files
+```{r}
+lapply(bam.list, seqinfo)
+
+
+lapply(bam.list, countBam)
+
+lapply(bam.list, print)
+```
+
+
+
+
+
+
+
+

@@ -1,0 +1,441 @@
+---
+title: "01-12-23.share.Run1.results"
+author: "Martin Gordon"
+date: "2023-12-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Share results from the first DEG analysis
+
+share the output from the first DGE analysis
+
+
+what to share
+: allTimepoints.wide.csv ~6pm
+
+
+```{r}
+library(magrittr)
+library(data.table)
+library(stringr)
+library(ggplot2)
+library(tximport)
+library(ggrepel)
+library(DESeq2)
+# visualisation
+library(ComplexHeatmap)
+library(EnhancedVolcano)
+# annotation & filtering 
+library(AnnotationHub)
+library(genefilter) # not available 
+
+#Ben utils
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source("../../utils/mg_utils/HelperFunctions.R")
+```
+
+First pass just share the results from the analysis
+```{r}
+path <- 'output/JyotiB_results/tables'
+
+# create dt
+input <- dir(path=path, pattern = "*_(genes|output)\\.csv$", recursive = T, full.names = TRUE) %>% 
+  as.data.table() %>% 
+  .[, fname := gsub("output/JyotiB_results/tables/|_(genes|output)\\.csv", '', .)] %>% 
+  setnames(new=c('path', 'fname'))
+  
+in.list <- apply(input[,1],1, fread)
+names(in.list) <- input$fname
+```
+# quick look at the results
+```{r}
+lapply(in.list, head)
+```
+
+
+need to rerun the filtering and extract everyhting that is significant
+filtered out pval = 0, keep these as just means the number is so small it isnt included..
+
+get the full list of significant things
+```{r}
+full.list <- in.list[grep('_dds', names(in.list))]
+
+full.df <-  rbindlist(full.list, idcol = 'group')
+full.df %>%  head()
+
+# filter by geommetric mean of pval and log2FC to get most significant hits
+full.df[, sigScore := magSigScore(log2FoldChange, pvalue)]
+
+full.df[, `:=`(timepoint=str_extract(group, '[0-9]{1,2}'),
+               comparison=gsub("_[0-9]{1,2}|_[0-9]{1,2}_dds", "", group)
+               )]
+
+full.df %>%  dim()
+
+full.list <- split(full.df, full.df$comparison)
+
+full.df[comparison == 'Mock-Brisbane' & symbol == 'TMSB15B']
+```
+share the complete list of files
+identify the duplicate genes, take the largest value and share
+
+```{r}
+# recalcualte geom_mean and use use for filtering
+
+lapply(full.list, function(x){
+
+
+  rm.dups <- x[, .N, by=.(symbol, group)] %>% 
+    .[N > 1,]
+  
+  rm.rows <- x[symbol %in% rm.dups$symbol, .SD[which.min(sigScore)], by=.(symbol, group)]
+  rm.rows[, filter.col := paste0(symbol,'.',group,'.', gm.pval.log2fc)]
+
+  x[, filter.col := paste0(symbol,'.',group,'.', gm.pval.log2fc)]
+  filtered.x <- x[!filter.col %in% rm.rows$filter.col, ]
+  filtered.x <- filtered.x[, filter.col := NULL]
+
+  # now convert to wide format
+  wide.dt <- dcast(filtered.x, symbol+entrez+comparison~timepoint, value.var=c('log2FoldChange', 'pvalue', 'padj'))
+  
+  col.order <- c('symbol', 'entrez', 'comparison',  
+                 "log2FoldChange_0",  "log2FoldChange_3",  "log2FoldChange_6",  "log2FoldChange_12",  "log2FoldChange_24",
+                 "pvalue_0", "pvalue_3" ,"pvalue_6","pvalue_12",  "pvalue_24",
+                 "padj_0","padj_3", "padj_6","padj_12","padj_24" )
+  
+  
+  setcolorder(wide.dt, col.order)
+
+  fname <-  unique(x$comparison)
+
+ fwrite(wide.dt, ScriptAndDatedFileName(paste0(fname, '.allDESeqresults.wide.csv')))
+})
+```
+
+```{r}
+
+# sanity check 
+full.df[comparison == 'Mock-Brisbane' & symbol =='A1BG']
+```
+
+
+
+go through the significant list of things
+create the full list of sig sites
+
+```{r}
+sig.list <- lapply(full.list, function(x){
+  sig.hits <- x[sig != 'Not',]
+  return(sig.hits)
+})
+
+lapply(sig.list, function(x){
+  
+  x[symbol == 'CACNA1S']
+})
+```
+
+summarise the list of sites and take the max pval
+
+```{r}
+# load in functions 
+source("../../utils/mg_utils/HelperFunctions.R")
+
+comb.dt <- rbindlist(sig.list)[, sigScore := magSigScore(log2FoldChange,pvalue)]# 
+
+comb.dt[, .N, by=.(symbol, comparison)] %>% 
+  .[order(-N)]
+
+```
+
+write out the unfiltered results; will need these for plotting 
+
+```{r}
+unfiltered.list <-split(comb.dt, comb.dt$comparison)
+
+lapply(seq_along(unfiltered.list), function(x,n,i){
+  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'sig.genes.unfiltered.csv')))
+},x=unfiltered.list, n=names(unfiltered.list))
+```
+
+
+```{r}
+filter.dt <- comb.dt[, .SD[which.max(sigScore)], by=.(symbol,comparison)]
+
+# sanity check 
+#CACNA1S	Mock-Brisbane	5
+comb.dt[symbol == 'CACNA1S' & comparison == 'Mock-Brisbane', ]
+filter.dt[symbol == 'CACNA1S' & comparison == 'Mock-Brisbane', ]
+
+# also want to add a column of n sig timepoints
+# create a dt of N sig for each gene/contrast, and add this col to the dt
+sig.counts <- comb.dt[, .N, by=.(symbol, comparison)]
+setnames(sig.counts, new=c('symbol', 'comparison', 'N.SigTimePoints'))
+
+# combine the datatables; does the DT 
+# sanity check
+merge.dt <- merge(x=filter.dt, y=sig.counts, all.x=T, all.y=T, by=c('symbol', 'comparison'))
+
+# filter the dt, split and merge
+filtered.list <- merge.dt[, .(symbol,entrez, comparison,timepoint,log2FoldChange, padj, pvalue, N.SigTimePoints)] %>% 
+  split(., .$comparison)
+
+# sanity check 
+lapply(filtered.list, function(x){
+  
+  x[symbol ==  'CACNA1S']
+})
+```
+
+write out this filtered dt in long format
+
+```{r}
+lapply(seq_along(filtered.list), function(x,n,i){
+  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'sig.genes.filtered.csv')))
+},x=filtered.list, n=names(filtered.list))
+```
+
+convert to wide and share
+```{r}
+wide.filtered <- dcast(rbindlist(filtered.list), symbol+entrez~comparison, value.var = c('timepoint', 'log2FoldChange', 'padj', 'pvalue', 'N.SigTimePoints'))
+
+fwrite(wide.filtered, ScriptAndDatedFileName('combined.filtered.sig.results.wide.csv'))
+
+
+wide.list <-  lapply(seq_along(filtered.list), function(x,n,i){
+  wide.x <- dcast(x[[i]], symbol+entrez+timepoint+N.SigTimePoints~comparison, value.var = c('log2FoldChange', 'padj', 'pvalue'))
+  
+  return(wide.x)
+ fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'sig.genes.filtered.wide.csv')))
+},x=filtered.list, n=names(filtered.list))
+
+
+#fread(ScriptAndDatedFileName('Mock-Victoriasig.genes.filtered.wide.csv'))
+
+fread(ScriptAndDatedFileName('sig.genes.allTimepoints.csv'))
+```
+use the list of sig genes to filter to the full list
+
+```{r}
+
+full.sig.dt <- lapply(seq_along(full.list), function(x,y,n,i){
+  
+  compar.oi <- n[[i]]
+  
+  sig.genes <- y[[compar.oi]][, unique(symbol)]
+
+  return(x[[i]][symbol %in% sig.genes,])
+  
+},x=full.list, n=names(full.list), y=sig.list) %>% 
+  rbindlist()
+
+fwrite(full.sig.dt, ScriptAndDatedFileName('sig.genes.allTimepoints.csv'))
+
+full.sig.dt[, .N, by=.(symbol, comparison, timepoint)] %>% 
+  .[order(-N)]
+
+
+full.sig.dt[symbol =='PDE11A' & comparison == 'Mock-Brisbane',]
+
+
+full.df[symbol =='PDE11A' & comparison == 'Mock-Brisbane',]
+
+
+full.list <- in.list[grep('_dds', names(in.list))]
+full.df <-  rbindlist(full.list, idcol = 'group')
+
+full.df$group %>%  unique(0)
+full.df[symbol =='PDE11A' & group == 'Mock_0-Brisbane_0_dds',]
+
+sig.df[symbol =='PDE11A' & group == 'Mock_0-Brisbane_0_dds',]
+```
+
+now, split to list and convert to wide format before sharing
+a couple of gene IDs  multimapped to same gene symbol rm these
+```{r}
+# case here of mapping a couple of genes symbols to same gene; just take the max score
+full.sig.dt[, .SD[which.min(gm.pval.log2fc)], by=.(symbol,group)]
+
+rm.dups <- full.sig.dt[, .N, by=.(symbol, group)] %>% 
+  .[N > 1,]
+rm.dups
+
+rm.rows <- full.sig.dt[symbol %in% rm.dups$symbol & group %in% rm.dups$group, .SD[which.min(gm.pval.log2fc)], by=.(symbol,group)]
+rm.rows[, filter.col := paste0(symbol,'.', group,'.', gm.pval.log2fc)]
+full.sig.dt[, filter.col := paste0(symbol,'.', group,'.', gm.pval.log2fc)]
+
+full.sig.dt <- full.sig.dt[!filter.col %in% rm.rows$filter.col, ]
+full.sig.dt[, filter.col := NULL]
+
+
+sig.genes.all <- split(full.sig.dt, full.sig.dt$comparison)
+```
+
+```{r}
+col.order <- c("symbol","entrez","log2FoldChange_0","log2FoldChange_3","log2FoldChange_6","log2FoldChange_12","log2FoldChange_24",
+               "pvalue_0","pvalue_3","pvalue_6","pvalue_12","pvalue_24",
+               "padj_0", "padj_3","padj_6","padj_12","padj_24",
+               "sig_0", "sig_3", "sig_6", "sig_12", "sig_24")
+
+
+new.wide.list <- lapply(wide.list, function(x){
+  colnames(x) <- gsub("_(Mock|Brisbane|Victoria)-(Mock|Brisbane|Victoria)", "", colnames(x))
+  setcolorder(x, col.order)
+  return(x)
+})
+
+# convert to wide and share
+lapply(seq_along(sig.genes.all), function(x,n,i){
+ x.wide <-  dcast(x[[i]], symbol+entrez~comparison+timepoint, value.var=c('log2FoldChange', 'sig', 'pvalue', 'padj'))
+ print(colnames(x.wide))
+ colnames(x.wide) <- gsub("_(Mock|Brisbane|Victoria)-(Mock|Brisbane|Victoria)", "", colnames(x.wide))
+ setcolorder(x.wide, col.order)
+ 
+
+ fwrite(x.wide, ScriptAndDatedFileName(paste0(n[[i]], '.sigGenes.allTimepoints.wide.csv')))
+},x=sig.genes.all, n=names(sig.genes.all))
+```
+
+
+Not used
+-----
+
+
+
+how can we tidy this further? 
+Look for repeated genes that are sig across many time points, find the gene with the largest, magSig score (or just log2FC?) and keep this
+
+
+many hits significant across timepoints
+filter out to per gene score taking the max sig hit
+```{r}
+lapply(sig.list, function(x){
+  x[, .N, by=symbol] %>% 
+    .[order(-N)]
+})
+```
+
+calculate magsig score and use this to select top hit
+add a col indicating number of other timepoints the gene was significant in 
+
+```{r}
+# load in functions 
+source("../../utils/mg_utils/HelperFunctions.R")
+
+comb.dt <- rbindlist(sig.list)[, sigScore := magSigScore(log2FoldChange,pvalue)]# 
+filter.dt <- comb.dt[, .SD[which.max(sigScore)], by=.(symbol,comparison)]
+
+comb.dt[, .N, by=.(symbol, comparison)] %>% 
+  .[order(-N)]
+
+# sanity check 
+#CACNA1S	Mock-Brisbane	5
+comb.dt[symbol == 'CACNA1S' & comparison == 'Mock-Brisbane', ]
+filter.dt[symbol == 'CACNA1S' & comparison == 'Mock-Brisbane', ]
+
+
+
+
+# also want to add a column of n sig timepoints
+# create a dt of N sig for each gene/contrast, and add this col to the dt
+sig.counts <- comb.dt[, .N, by=.(symbol, comparison)]
+setnames(sig.counts, new=c('symbol', 'comparison', 'N.SigTimePoints'))
+
+
+# combine the datatables; does the DT 
+# sanity check
+merge.dt <- merge(x=filter.dt, y=sig.counts, all.x=T, all.y=T, by=c('symbol', 'comparison'))
+
+# filter the dt, split and merge
+filtered.list <- merge.dt[, .(symbol,entrez, comparison,timepoint,log2FoldChange, padj, pvalue, N.SigTimePoints)] %>% 
+  split(., .$comparison)
+```
+
+
+```{r}
+lapply(seq_along(filtered.list), function(x,n,i){
+  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'sig.genes.filtered.csv')))
+},x=filtered.list, n=names(filtered.list))
+```
+# collapse list and then share
+
+```{r}
+wide.filtered <- dcast(rbindlist(filtered.list), symbol+entrez~comparison, value.var = c('timepoint', 'log2FoldChange', 'padj', 'pvalue', 'N.SigTimePoints'))
+
+fwrite(wide.filtered, ScriptAndDatedFileName('combined.filtered.sig.results.wide.csv'))
+
+
+wide.list <-  lapply(seq_along(filtered.list), function(x,n,i){
+  wide.x <- dcast(x[[i]], symbol+entrez+timepoint+N.SigTimePoints~comparison, value.var = c('log2FoldChange', 'padj', 'pvalue'))
+  
+  return(wide.x)
+ fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'sig.genes.filtered.wide.csv')))
+},x=filtered.list, n=names(filtered.list))
+
+
+colnames(wide.filtered)
+```
+
+# first things first, extract the sig list of genes
+```{r}
+sig.list <- in.list[grep('_sig', names(in.list))]
+
+sig.df <-  rbindlist(sig.list, idcol = 'group')
+sig.df %>%  head()
+
+sig.df[, `:=`(timepoint=str_extract(group, '[0-9]{1,2}'),
+               comparison=gsub("_[0-9]{1,2}|_[0-9]{1,2}_sig", "", group)
+               )]
+
+sig.list <- split(sig.df, sig.df$comparison)
+
+# many more hits comparing Mock-virus vs virus-virus
+lapply(sig.list, dim)
+
+
+# this is now the list of sig genes for each comparison
+lapply(seq_along(sig.list), function(x,n,i){
+  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'sig.genes.unfiltered.csv')))
+},x=sig.list, n=names(sig.list))
+
+
+# write out the sig list in wide 
+wide.list <- lapply(seq_along(sig.list), function(x,n,i){
+  # conver to wide for each tp
+  dt <- x[[i]]
+ wide.dt <- dcast(dt, symbol+entrez~comparison+timepoint, value.var = c('log2FoldChange','pvalue', 'padj'))
+ #fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'sig.genes.unfiltered.csv')))
+},x=sig.list, n=names(sig.list))
+
+lapply(wide.list, colnames)
+
+
+# reorder col names
+col.order <- c("symbol","entrez","log2FoldChange_0","log2FoldChange_3","log2FoldChange_6","log2FoldChange_12","log2FoldChange_24",
+               "pvalue_0","pvalue_3","pvalue_6","pvalue_12","pvalue_24",
+               "padj_0", "padj_3","padj_6","padj_12","padj_24")
+
+
+new.wide.list <- lapply(wide.list, function(x){
+  colnames(x) <- gsub("_(Mock|Brisbane|Victoria)-(Mock|Brisbane|Victoria)", "", colnames(x))
+  setcolorder(x, col.order)
+  return(x)
+})
+
+names(new.wide.list) <- c("Mock-Brisbane", "Mock-Victoria", "Victoria-Brisbane")
+
+
+lapply(seq_along(new.wide.list), function(x,n,i){
+  
+  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], '.siggenes.wide.csv')))
+  
+},x=new.wide.list, n=names(new.wide.list))
+```
+
+

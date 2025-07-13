@@ -1,0 +1,203 @@
+---
+title: "022025_prepPPIProphetMatrices"
+author: "Martin Gordon"
+date: "2025-02-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## intro 
+
+Preparing the PPIprophet input matrices 
+Take the raw data provided by Andrea (mising standards, so invent) and input
+
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(ComplexHeatmap)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+```
+
+read in the DIA-NN matrices and check for the 
+```{r}
+secms <- dir('./data/MASSIVE_data', pattern='*tsv', full.names = T) %>% 
+  grep('_psm', ., invert = T, value=T)
+
+secms.list <- lapply(secms, fread)
+names(secms.list) <- gsub('\\.\\/data\\/MASSIVE\\_data\\/|\\.tsv', '', secms)
+
+lapply(secms.list, colnames)
+```
+
+Conditions in libraries 1-3 not clear; just take the PhiPA3 example and lets see if we can generate a matrix and run the pipeline
+If this works and looks similar scores to the original, then create a conda/docker environment
+```{r}
+lapply(secms.list, head)
+phiPA3.dt <- secms.list[[4]]
+```
+
+Alright, lets conver thtis to a PCP matrix
+Need to look up the DIANN colnames
+
+data already filtered for Q value <= 0.01
+Looks like things are already summarised to the protein level, so 
+
+The key columns in DIA-NN are:
+ matched proteins ('Protein.Group' column) and quantities for both precursor and proteins ('Precursor.Normalised' and 'PG.MaxLFQ', respectively), for each run in the experiment
+
+```{r}
+phiPA3.dt[Q.Value <= 0.01,]
+phiPA3.dt[, .(Precursor.Id, Precursor.Charge,Modified.Sequence, Stripped.Sequence, Proteotypic, Protein.Group)]
+
+phiPA3.dt[Run == 'PA01_PhiPA3_DIA_R2_F57_redo_BE9_1_11973' & Protein.Group == 'Q9I1H1']
+```
+
+Is this protein level intensity or peptide? Protein level intensity, but the peptides are returned
+
+```{r}
+colnames(phiPA3.dt)
+# no multi-elute peptides; now want to try a summarisation method..
+# I guess as a first pass, we just need to check if this actually works and we pull out any similar complexes;
+# for now just use TMP normalization by MSstats
+unique(phiPA3.dt[,.N, by=.(Protein.Group, Modified.Sequence, Precursor.Charge, Run)]$N )
+
+# maxLFQ is unique to each protein so easy to save as a matrix and scale before inputting to the algorithm
+any(duplicated(phiPA3.dt[,.N, by=.(Protein.Group, PG.MaxLFQ, Run)][,.(Protein.Group, Run)]))
+```
+Lets tidy the columns and summarise with msstats
+```{r}
+# same nromalization is turned off
+phiPA3.dt[Precursor.Normalised != Precursor.Quantity]
+```
+
+Tidy for MSS input
+```{r}
+phiPA3.dt <- phiPA3.dt[,.(Run, Condition='phiPA3', ProteinName = Protein.Group, gene=Genes, 
+                          PeptideSequence=Modified.Sequence, PrecursorCharge=Precursor.Charge,  
+                          BioReplicate = factor(gsub('_DIA_R', '', str_extract(Run, '_DIA_R[0-9]')), levels=c('1','2')),
+                          fraction = str_extract(Run, '(?<=_F)[0-9]{1,2}(?=_)'),
+                          FragmentIon = NA, IsotopeLabelType='L', PG.MaxLFQ, Intensity=Precursor.Quantity)]
+```
+Summarise at the level of each fraction
+```{r}
+phiPA3.dt[, Condition := paste0(Condition, '.', fraction)]
+
+phiPA3.dt[Run =='PA01_PhiPA3_DIA_R2_F57_redo_BE9_1_11973' & gene == 'ambC']
+
+phiPA3.dt[,.(Run, fraction, BioReplicate)] %>% 
+  unique()
+```
+
+```{r}
+#fwrite(phiPA3.dt, ScriptAndDatedFileName('phiPA3.clean.long.csv'))
+phiPA3.dt <-  fread('~/Documents/projects/022025_IJKim_PPIProphetPilotStudy/022025_preparePPIprophetMats_data/2025_02_21_phiPA3.clean.long.csv')
+phiPA3.dt[, ProductCharge := NA]
+
+
+dp.out <- MSstats::dataProcess(phiPA3.dt, 
+                               MBimpute =  FALSE, 
+                               normalization = FALSE, # turn off for SECMS
+                               summaryMethod = "TMP",
+                               featureSubset = 'highQuality',
+                               remove_uninformative_feature_outlier=T)
+
+
+#saveRDS(dp.out, ScriptAndDatedFileName('phiPA3.rds'))
+```
+
+```{r}
+dp.out <- readRDS('~/Documents/projects/022025_IJKim_PPIProphetPilotStudy/022025_preparePPIprophetMats_data/2025_02_21_phiPA3.rds')
+p.quant <- setDT(dp.out$ProteinLevelData)
+```
+
+In general the profiles look quite similiar.. I wonder about the papers normalization method
+```{r}
+g <- ggplot(dp.out$ProteinLevelData, aes(x=GROUP, y=LogIntensities)) +
+  geom_boxplot() +
+  facet_wrap(~SUBJECT) +
+  theme(axis.text.x = element_text(angle=90, size=6))
+
+BackupAsPDF(g, 'phiPA3.tmp.boxplot')
+
+g <- ggplot(phiPA3.dt, aes(x=Condition, y=log2(PG.MaxLFQ))) +
+  geom_boxplot() +
+  facet_wrap(~BioReplicate) +
+  theme(axis.text.x = element_text(angle=90, size=6))
+
+BackupAsPDF(g, 'phiPA3.maxLFQ.boxplot')
+
+# set the column order for the data
+col.order <- paste0('phiPA3.', seq(1,72,1))
+```
+
+create matrix, populate and upload
+
+```{r}
+
+mat.1 <- dcast(p.quant[SUBJECT == 1, ], Protein~GROUP, value.var='LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+
+mat.2 <- dcast(p.quant[SUBJECT == 2, ], Protein~GROUP, value.var='LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+
+
+mat.2
+  
+colnames(mat.1) <- gsub('[A-Za-z0-9]+[.]', '', colnames(mat.1))
+colnames(mat.2) <- gsub('[A-Za-z0-9]+[.]', '', colnames(mat.2))
+
+colorder <- as.character(seq(1,72,1))
+  
+message('reordering matrix columns and filling in missing fractions...') 
+  # fills in missing fractions with NA so easy to populate
+mat.1 <- mat.1[,  match(colorder, colnames(mat.1))]
+mat.2 <- mat.2[,  match(colorder, colnames(mat.2))]
+
+colnames(mat.1) <- colorder
+colnames(mat.2) <- colorder
+  
+message('converting intensities to linear scale...') 
+mat.1 <- 2^mat.1
+mat.2 <- 2^mat.2
+  
+  # convert to 0
+mat.1[is.na(mat.1)] <- 0
+mat.2[is.na(mat.2)] <- 0
+  
+mat.list <- list(biorep1=mat.1, biorep2=mat.2)
+```
+
+write out the list of intensities to file
+```{r}
+
+mat.list
+lapply(names(mat.list), function(x,i){
+
+  p.mat <- data.table(x[[i]], keep.rownames = T)
+  setnames(p.mat, old='rn', new='GN')
+  #p.mat[, GN := multiUniprots2multiGenes(ID, species='HUMAN')]
+  
+  #col.order <- c('GN', 'ID', as.character(seq(1,72,1)))
+  col.order <- c('GN', as.character(seq(1,72,1)))
+  p.mat <-  p.mat[, ..col.order]
+  
+  fwrite(p.mat, sep='\t', ScriptAndDatedFileName(paste0(i, '.phiPA3.ppiProphet.txt')))
+  
+},x=mat.list)
+```
+Take the already prepared matrix and use that as input 
+
+```{r}
+testmat <- fread('data/MASSIVE_data/PA01_C3_KZ_directDIA.pr_matrix.tsv')
+testmat <- fread('data/MASSIVE_data/PA01_KZ_library_SEC.tsv')
+testmat
+```
+
+

@@ -1,0 +1,489 @@
+---
+title: "071924_EditQC"
+author: "Martin Gordon"
+date: "2024-07-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Edit set QC
+
+Run some basic QC of the edit set produced by reditools.
+
+i) What does a high quality variant look like? Use the features of output to run PCA and highlight good variants clustering.
+ii) Identify characteristics of this cluster/group
+iii) Use our high qual set to define threholds for filtering.
+iii) FDR assessment. Use CT/GA edits as a indicator of FP rate (unlikely to detect). Assess this both before and after filtering
+
+Maybe can use a supervised clustering approach if we can ID a TP set...
+
+Tips:
+
+Hi Jack, 
+The first thing to do when one obtains an output of putative editing sites is to look at the distribution of MM types. In your case, the numbers of AG,GA,TC, and CT MMs are roughly the same, which means we got mostly noise (SNPs, alignment errors, etc). CT editing can be ignored at this point. Additional filters are required to improve SNR.
+
+I do see some signs for a signal buried in the list though. For example, I looked for sites that (a) have at least 20 supporting DNA reads, all agreeing with the reference (b) RNA MM is seen in at least five samples. I got the following stats:
+
+AG (strand 0)+TC(strand 1) -- these should be AG on the expressed strand, if I got the strand annotation correctly   -   18 sites
+AG (strand 1)+TC(strand 0)  -- should be TC on the expressed strand                                                                         -    6 sites
+CT (strand 0)+GA(strand 1)  -- CT                                                                                                                                  -   7 sites
+CT (strand 1)+GA(strand 1)  -- GA                                                                                                                                  -   8 sites
+
+So we have a PFR of about 1/3 which is not that bad for a start. More importantly, the 18 sites found this way include several conserved sites (at least based on the gene names, you should verify that the positions are homologous to the known mammalian sites): FLNA, FLNB, COPA.
+
+I also tried to release the samples filter a bit, and ask for only four samples. This results in 
+
+AG (strand 0)+TC(strand 1) -- these should be AG on the expressed strand, if I got the strand annotation correctly   -   27 sites
+AG (strand 1)+TC(strand 0)  -- should be TC on the expressed strand                                                                         -    10 sites
+CT (strand 0)+GA(strand 1)  -- CT                                                                                                                                  -   13 sites
+CT (strand 1)+GA(strand 1)  -- GA                                                                                                                                  -   14 sites
+
+So the FPR is worse (roughly 1/2), and the marginal change is only nine AG sites vs. ~6 noise sites, but we found among these additional nine candidates COG3 (another known edited target).
+
+This is just a first quick-and-dirty try, and I expect we can do better with more careful analysis. Here are some ideas for things to look at as a start:
+
+1. Make sure I got the strand annotation correctly. I assumed strand 0 means that the read aligns to the reference strand, and if we have, for example, AG MM with strand=0 it means that the RNA shows G at this position, while AG with strand=1 means the RNA aligned to the reverse strand and shows T (so we see TC mismatch, which is not due to ADAR editing).  
+
+
+
+
+2. Look for carefully at the known conserved mammalian sites to see if you picked them up. For the ones I mentioned above, make sure the MM you see is at the same position; for all others, try to locate the homologous sites and see if there is any evidence for editing. You can follow the procedure described in https://link.springer.com/article/10.1186/s12915-023-01756-2 (section: Conservation of editing between Xenopus and mammals). I would expect at least a dozen of these sites to reappear in Alligator.
+
+3. Try to look at the top noise sites (TC/CT/GA sites that reoccur in multiple samples) and see if you can filter them out by excluding MMs in reads' ends or alignments' ends (say 5bp to each side). Also, consider removing MMs near splicing junctions (at least 2bp on each side).
+
+
+Other considerations; site level filtering? What coverage/Frequency threshold should we enforce?
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(ggrepel)
+library(viridis)
+source("../../utils/bp_utils/ManageScriptData.R")
+```
+Read in our edit set
+```{r}
+path <- dir('./data/anno_0603',full.names = T)
+
+edits.list <- lapply(path, fread, header=T)
+names(edits.list) <- gsub('.\\/data\\/anno_0603\\/|_outTable_anno_[0-9]+[.]txt$','', path)
+
+edits.dt <- rbindlist(edits.list,idcol='Sample')
+```
+
+Some of these cols are characters.. convert to numeric 
+Converts '-' to NA
+
+```{r}
+edits.dt %>%str()
+edits.dt[, c('gCoverage-q20', 'gMeanQ', 'gFrequency') := lapply(.SD, as.numeric), .SDcols=c('gCoverage-q20', 'gMeanQ', 'gFrequency')]
+```
+
+Strand indicator; 1 for + strand, 0 for - strand and 2 unknown;
+For now filter out the unknown strand info,  reads with mismatches to the DNA above (> 5% mutant rate in DNA removed) and sites with < 20 reads coverage
+
+Also create a flag for putative ADAR edit, and define a FPR based on this
+```{r}
+f.edits.dt <- edits.dt[Strand != 2 & gFrequency < 0.05 & `gCoverage-q20` >= 20,]
+
+f.edits.dt[, putativeADARedit :=  ifelse((AllSubs == 'AG' & Strand == 0) | (AllSubs == 'TC' & Strand == 1), 'yes', 'no')]
+
+f.edits.dt[,.N, by=.(AllSubs,Strand)][order(-N)]
+
+# add a sample group flag
+f.edits.dt[,Group := str_extract(Sample, 'GF[CV]')]
+
+# extract the transcript IDs for this
+f.edits.dt[, transcriptID := paste0(unlist(lapply(strsplit(anno_tid, ',', fixed=T), function(x) grep('[-]transcript', x, value = T))), collapse = ';'), by=.I]
+f.edits.dt[, transcriptID := gsub('[-]transcript', '', transcriptID)]
+
+
+# add another identifier for the specific edit
+# apply function is close but not the same... some gaps in the collapse elements? a type issue?
+#f.edits.dt[, editID := apply(.SD, 1, function(x) paste(x, collapse='_')), .SDcols=c('Region','Position', 'Strand', 'AllSubs')]
+f.edits.dt[, editID := do.call(paste, c(.SD, sep='_')), .SDcols=c('Region','Position', 'Strand', 'AllSubs')]
+```
+
+Write out the list of possible ADAR edits and also the coverage and frequency
+```{r}
+edits.wide <- dcast(f.edits.dt[putativeADARedit == 'yes',], formula=paste0(editID,'__',anno_gid)~Sample, value.var = c('Frequency')) %>% 
+  as.matrix(rownames=1)
+edits.wide[is.na(edits.wide)] <- 0
+
+# write out the  counts
+edits.wide <- dcast(f.edits.dt[putativeADARedit == 'yes',], formula=paste0(editID,'__',anno_gid)~Sample, value.var = c('Coverage-q20', 'Frequency')) %>% 
+  as.matrix(rownames=1)
+edits.wide[is.na(edits.wide)] <- 0
+
+fwrite(data.table(edits.wide, keep.rownames = T)[, c(1,2,8,3,9,4,10,5,11,6,12,7,13)],  ScriptAndDatedFileName('putativeADARedits.freqCoverageMat.csv'))
+fwrite(f.edits.dt, ScriptAndDatedFileName('minialFilter.edits.csv'))
+```
+```{r}
+edits.wide <- edits.wide[apply(edits.wide, 1, function(x) sum(x != 0) >= 3),]
+
+hm <- Heatmap(edits.wide, 
+        row_title=sprintf('%s potential ADAR edit sites', nrow(edits.wide)),
+        name='% reads edited', 
+        show_row_names = F, 
+        column_split=gsub('[1-3]$','', colnames(edits.wide)),
+        col=viridis(100))
+
+hm
+BackupAsPDF(hm, 'editSites.heatmap', dimensions=c(8,8))
+```
+get list of edited genes
+These are sites using the filtering criteria above to filter to likely ADAR edits
+```{r}
+summary.dt <- f.edits.dt[putativeADARedit == 'yes', .(NRepDetected = .N), by=.(editID, anno_gid, transcriptID, Group)]
+
+
+f.edits.dt[putativeADARedit == 'yes', .(NRepDetected = .N), by=.(editID, anno_gid, transcriptID, Group)]
+
+# ideentify the shared sites in both groups
+shared.sites <- intersect(summary.dt[Group == 'GFV', unique(editID)], summary.dt[Group == 'GFC', unique(editID)])
+
+summary.dt[, uniqueToGroup := 'yes']
+summary.dt[editID %in% shared.sites , uniqueToGroup := 'no']
+
+#edit ID is chr_pos_strand_refBasEditBase
+fwrite(summary.dt[, .(editID, geneID=anno_gid, transcriptID, Group, NRepDetected, uniqueToGroup)], ScriptAndDatedFileName('editSites.breakdownByGroup.csv'))
+```
+Can we do a differential editing proportion? A manhattan plot or some kind of linear chr structre on X with pval adj on Y possibly?
+
+
+Ok, just write out things that belong to the different groups
+
+```{r}
+
+```
+
+
+
+Write out a list of transcripts we found in our edit data
+
+```{r}
+id.dt <- f.edits.dt[,.(anno_gid,anno_tid)]
+
+id.dt <- id.dt[, .(gene = anno_gid,
+              transcriptID = paste0(unlist(lapply(strsplit(anno_tid, ',', fixed=T), function(x) grep('[-]transcript', x, value = T))), collapse = ';') ), by=.I]
+
+
+id.dt <- id.dt[, .(gene, transcriptID = gsub('[-]transcript', '', transcriptID))]
+
+fwrite(unique(id.dt), ScriptAndDatedFileName('alliIDs.minFiltering.txt'))
+
+
+fread('~/Documents/projects/051524_JMoen_AlligatorEditSites/071824_EditSet_QC_data/2024_07_19_alliIDs.minFiltering.txt')
+
+```
+Write out list of unique IDs found in one condition or the other
+Get three vectors; unique and overlapping
+
+```{r}
+
+
+nEdits.dt <- f.edits.dt[putativeADARedit == 'yes' & `Coverage-q20` > 20 & Strand != 2 & gFrequency < 0.05, 
+
+
+# add a flag for sample its identified in 
+nEdits.dt[, ExclusiveInGroup := ifelse() ]
+```
+Some heatmaps
+----
+
+For here extracted any gene with potential ADAR editing (A-G, T-C on correct strand), at least one RNA edit with > 20 good qual (Q20) reads coverage & > 20 good qual DNA with no snps detected
+We are looking at N good qual edits per genes; is this interesting?
+```{r}
+# our heatmap is N edited sites per gene
+edit.mat <- f.edits.dt[putativeADARedit == 'yes'  & `Coverage-q20` > 20, .N, by=.(anno_gid, Sample)] %>% 
+  dcast(., formula='anno_gid~Sample', value.var='N') %>% 
+  as.matrix(rownames = 'anno_gid')
+
+edit.mat[is.na(edit.mat)] <- 0
+
+# want edits to be detected in at least 2 samples
+edit.mat <- edit.mat[apply(edit.mat, 1, function(x) sum(x != 0) >= 2),]
+
+submat <- sweep(edit.mat, 1, apply(edit.mat, 1, max, na.rm=T), '/')
+
+hm <- Heatmap(submat,
+        #col=colorRamp2(c(0,1), c('lightgrey', 'firebrick4')),
+        col=viridis(100),
+        row_names_gp = gpar(fontsize=2),
+        show_row_names = T,
+        name='nEdits/rowMax',
+        row_title = sprintf('%s potential ADAR-edited genes', nrow(submat)),
+        column_split =  gsub('[123]$', '', colnames(submat)))
+hm
+BackupAsPDF(hm, 'minimalF.edits.heatmap', dimensions=c(9,14))
+
+
+View(edit.mat)
+```
+
+```{r}
+
+```
+
+
+
+```{r}
+#Maybe makes sense to work in log space?
+#Do we really want to include rows with one edit across all samples? Dont think so
+# logtransfrmo will convert to 0 and can remove
+
+
+edit.mat <- f.edits.dt[putativeADARedit == 'yes', .N, by=.(anno_gid, Sample)] %>% 
+  dcast(., formula='anno_gid~Sample', value.var='N') %>% 
+  as.matrix(rownames = 'anno_gid')
+
+# filter these out we dont trust them 
+edit.mat[rowSums(edit.mat, na.rm=T) == 1] %>% sum(na.rm=T)
+
+
+
+# what does the median sclaed look like
+edit.mat <- f.edits.dt[putativeADARedit == 'yes', .N, by=.(anno_gid, Sample)] %>% 
+  dcast(., formula='anno_gid~Sample', value.var='N') %>% 
+  as.matrix(rownames = 'anno_gid')
+
+edit.mat <- sweep(edit.mat, 1, apply(edit.mat, 1, median, na.rm=T), '-')
+edit.mat[is.na(edit.mat)] <- 0
+
+hm <- Heatmap(edit.mat,
+        #col=colorRamp2(c(0,1), c('lightgrey', 'firebrick4')),
+        row_names_gp = gpar(fontsize=2),
+        show_row_names = F,
+        name='nEdits/rowMax',
+        row_title = sprintf('%s potential ADAR-edited genes', nrow(edit.mat)),
+        column_split =  gsub('[123]$', '', colnames(edit.mat)))
+hm
+```
+try pam clustering on the input and see what 
+
+```{r}
+
+```
+
+
+After minimal filtering, plot the breakdown of AG/TC edits vs incorrect strand vs other strand
+```{r}
+g <- ggplot(f.edits.dt[,.N, by=.(Sample, putativeADARedit)], aes(x=Sample, y=N, fill=putativeADARedit)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Number of detected edits with minimal filtering') +
+  xlab('N edits') +
+  ylab('Sample') +
+  scale_fill_brewer(type='qual',palette = 3) +
+  theme_bw()
+g
+BackupAsPDF(g, 'nHits.ADARcol.barplot')
+```
+Define an FDR rate for our testing; for now it will be ADAR/AllEdits per sample
+
+```{r}
+#define a FDR rate per sample
+summary.dt <- f.edits.dt[, .N, by=.(Sample, putativeADARedit)]
+
+g <- ggplot(summary.dt[, .(FDR = sum(N[putativeADARedit != 'yes'])/sum(N),
+                      Status = ifelse(grepl('GFC', Sample), 'GFC', 'GFV')), by=Sample], 
+       aes(x=Sample, y=FDR, fill=Status)) +
+  ggtitle('FDR minimal filtering') +
+  scale_fill_brewer(type='qual',palette = 1) +
+  geom_bar(stat='Identity')
+
+BackupAsPDF(g, 'FDR.minFilter.barplot')
+```
+
+Need to further filter our input; what about removing low freq edits
+
+ 
+ edit frequency of at least 10%; seems to greatly improve our FP rate
+```{r}
+f.edits.dt$Frequency %>% max()
+
+g <- ggplot(f.edits.dt[,.N, by=.(Sample, putativeADARedit)], aes(x=Sample, y=N, fill=putativeADARedit)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Number of detected edits with minimal filtering') +
+  xlab('N edits') +
+  ylab('Sample') +
+  scale_fill_brewer(type='qual',palette = 3) +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'nHits.ADARcol.barplot')
+```
+What are the features that best distinguish TP vs FP from othr
+
+Create a couple of plots; like coverage vs FPR and frequency RNA vs FDR
+
+Wonder if this is a function of low coverage at high edit frequency? Or maybe we just dont expect ADAR to edit sites at such high frequency? Even still, looking at ~10% threshold for edit frequency (or at least 5) might be a good start
+Also possibly these are true SNPs (not edits) that were missed by DNAseq? Look at the coverage distribution for both the Freq < 0.8 and > 0.8
+
+```{r}
+f.edits.dt[,AllSubs] %>%  unique()
+
+
+f.edits.dt[, .N, by=.(Strand, AllSubs)][order(-N)]
+freq.thresh <- seq(0,1,by=0.1)
+
+cov.Summary <- lapply(freq.thresh, function(x){
+  
+  message(paste0('calculating summay statistics at coverage ', x))
+  
+  dt <- f.edits.dt[Frequency >= x, .N, by=.(Sample, putativeADARedit)] %>% 
+    .[, `:=`(Frequency = x,
+             Status = str_extract(Sample, 'GF[CV]{1}'),
+             FDR = sum(N[putativeADARedit != 'yes'])/sum(N)), by=Sample]
+  
+  return(dt)
+}) %>% rbindlist(idcol=F)
+
+g <- ggplot(cov.Summary, aes(x=Frequency, y=FDR, color=Status)) +
+  geom_point() +
+  geom_line(aes(group=Sample, linetype = Sample), show.legend = F) + 
+  geom_text_repel(
+    aes(label = Sample), data = unique(cov.Summary[Frequency ==1,.(Sample,Status,Frequency,FDR)]), size = 3) +
+  scale_color_brewer(type = 'qual', palette = 2) +
+  ggtitle('FPR vs Edit site frequency') +
+  theme_bw() +
+  theme()
+g
+BackupAsPDF(g, 'FPRvsEditFrequency.linechart')
+```
+Also possibly these are true SNPs (not edits) that were missed by DNAseq? 
+Look at the coverage distribution for both the Freq < 0.75 and > 0.75; looks like the high frequency stuff tends to have low genomic coverage, perhaps missed by DNAseq? (no as still recovered...)
+
+incompelte view.. look at putADAR distribution vs others
+
+```{r}
+f.edits.dt[Frequency > 0.8 & `gCoverage-q20` < 30,]
+
+# fix non numeric cols
+f.edits.dt[,  c('gCoverage-q20', 'gMeanQ', 'gFrequency') := lapply(.SD, function(x) as.numeric(x)), .SDcols = c('gCoverage-q20', 'gMeanQ', 'gFrequency')]
+
+g <- ggplot(f.edits.dt[,.(Sample, `Coverage-q20`, Frequency, putativeADARedit, `> 0.75 EditFrequency` = ifelse(Frequency > 0.75, 'yes', 'no'))], 
+       aes(x=`Coverage-q20`, fill=`> 0.75 EditFrequency`)) +
+  geom_density(alpha=0.5) +
+  scale_x_continuous(limits = c(0,150)) +
+  scale_fill_brewer(type='qual') +
+  theme_bw() 
+g
+BackupAsPDF(g, 'rnaCoverage.density')
+
+# what about genome coverage?
+g <- ggplot(f.edits.dt[,.(Sample, `gCoverage-q20`, Frequency, putativeADARedit, `> 0.75 EditFrequency` = ifelse(Frequency > 0.75, 'yes', 'no'))], 
+       aes(x=`gCoverage-q20`, fill=`> 0.75 EditFrequency`)) +
+  geom_density(alpha=0.5) +
+  scale_x_continuous(limits = c(15,75)) +
+  scale_fill_brewer(type='qual') +
+  theme_bw() 
+g
+BackupAsPDF(g, 'genomicCoverage.density')
+
+
+f.edits.dt[`gCoverage-q20` < 20, .N, .(Sample, putativeADARedit)][order(-N)]
+```
+
+
+Look at base quality vs FPR
+No relationship which is good; want all our input reads to be high quality. Looks like a slight drop in BQ 50 but otherwise v similar
+
+```{r}
+
+cov.Summary <- lapply(q.thresh, function(x){
+  
+  message(paste0('calculating summay statistics at quality thresholds ', x))
+  
+  dt <- f.edits.dt[MeanQ >= x, .N, by=.(Sample, putativeADARedit)] %>% 
+    .[, `:=`(BaseMeanQ = x,
+             FDR = sum(N[putativeADARedit != 'yes'])/sum(N)), by=Sample]
+  
+  return(dt)
+}) %>% rbindlist(idcol=F)
+
+
+g <- ggplot(cov.Summary, aes(x=BaseMeanQ, y=FDR, color=Sample)) +
+  geom_point() +
+  geom_line(aes(group=Sample)) + 
+  geom_text_repel(
+    aes(label = Sample), data = unique(cov.Summary[Frequency ==1,.(Sample,Frequency,FDR)]), size = 3) +
+  ggtitle('FPR vs Edit site frequency') +
+  theme_bw()
+g
+BackupAsPDF(g, 'FPRvsmeanQ.linechart')
+```
+
+
+```{r}
+#define a FDR rate per sample
+summary.dt <- f.edits.dt[Frequency >= 0.5, .N, by=.(Sample, putativeADARedit)]
+
+
+# calculate & plot FDR stat
+g <- ggplot(summary.dt[, .(FDR = sum(N[putativeADARedit != 'yes'])/sum(N),
+                      Status = ifelse(grepl('GFC', Sample), 'GFC', 'GFV')), by=Sample], 
+       aes(x=Sample, y=FDR, fill=Status)) +
+  ggtitle('FDR minimal filtering') +
+  scale_fill_brewer(type='qual',palette = 1) +
+  geom_bar(stat='Identity')
+
+g
+
+
+
+summary.dt <- f.edits.dt[Frequency == 1.0, .N, by=.(Sample, putativeADARedit)]
+
+# calculate & plot FDR stat
+g <- ggplot(summary.dt[, .(FDR = sum(N[putativeADARedit != 'yes'])/sum(N),
+                      Status = ifelse(grepl('GFC', Sample), 'GFC', 'GFV')), by=Sample], 
+       aes(x=Sample, y=FDR, fill=Status)) +
+  ggtitle('FDR minimal filtering') +
+  scale_fill_brewer(type='qual',palette = 1) +
+  geom_bar(stat='Identity')
+
+g
+
+
+```
+
+
+plot of FDR based on non-ADAR edits (possibly some APOEBEC??)
+Why does the virus have higher FDR? more variants due to infection or something?
+```{r}
+# weird a lot of these columns have a chr string for numeric. Lets convert these
+edits.dt %>% str()
+edits.dt[, c('gCoverage-q20', 'gFrequency') := lapply(.SD, as.numeric), .SDcols=c('gCoverage-q20', 'gFrequency')]
+
+
+# cols.oi for PCA, meanQ, gMeanQ 
+# RNAseq MeanQ
+edits.dt[, gMeanQ := as.numeric(gMeanQ)]
+
+ggplot(edits.dt, aes(x=`gCoverage-q20`, y=`Coverage-q20`)) +
+  geom_point()
+```
+
+```{r}
+
+```
+
+Not used...
+----
+
+Create a col identifying the SNV
+Also need to handle multi variant sites... I think we need some kind of odds ratio A/all/gA/aall
+```{r}
+# first create mutant col
+edits.dt[, SNP := paste0(unlist(strsplit(AllSubs, '[ ]')), collapse=';'), by=.I]
+# now edit to remove the refbase
+edits.dt[, SNP := gsub('^[A-Z]{1}|(?<=;)[A-Z]{1}', '', SNP, perl = T)]
+
+edits.dt[grep('[;]', SNP),.(`BaseCount[A,C,G,T]`,`gBaseCount[A,C,G,T]`)]
+```

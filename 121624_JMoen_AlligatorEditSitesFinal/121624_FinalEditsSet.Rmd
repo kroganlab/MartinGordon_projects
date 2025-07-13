@@ -1,0 +1,259 @@
+---
+title: "121624_FinalEditsSet"
+author: "Martin Gordon"
+date: "2024-12-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(ggrepel)
+library(viridis)
+library(GGally)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+
+
+clusterWithNA <- function(mat, na.val=0){
+  
+  mat[is.na(mat)] <- na.val
+  return(hclust(dist(mat)))
+} 
+
+source("../../utils/bp_utils/ManageScriptData.R")
+```
+
+Have rerun the analysis and correctly applied the strand correction 
+Goal is to just get Jack back his edited set
+
+Create three tables; one with WT edits, one with Inf edits maybe one with both?
+
+## Edit set QC
+
+Run some basic QC of the edit set produced by reditools.
+Reduced filtering from previous analysis to avoid thresholding variants not called in the viral set (issue w viral set is ~25% of reads mapping to virus!)
+
+i) What does a high quality variant look like? Use the features of output to run PCA and highlight good variants clustering.
+ii) Identify characteristics of this cluster/group
+iii) Use our high qual set to define threholds for filtering.
+iii) FDR assessment. Use CT/GA edits as a indicator of FP rate (unlikely to detect). Assess this both before and after filtering
+
+Maybe can use a supervised clustering approach if we can ID a TP set...
+
+
+Eli Email:::
+
+Hi Jack, 
+The first thing to do when one obtains an output of putative editing sites is to look at the distribution of MM types. In your case, the numbers of AG,GA,TC, and CT MMs are roughly the same, which means we got mostly noise (SNPs, alignment errors, etc). CT editing can be ignored at this point. Additional filters are required to improve SNR.
+
+I do see some signs for a signal buried in the list though. For example, I looked for sites that (a) have at least 20 supporting DNA reads, all agreeing with the reference (b) RNA MM is seen in at least five samples. I got the following stats:
+
+AG (strand 0)+TC(strand 1) -- these should be AG on the expressed strand, if I got the strand annotation correctly   -   18 sites
+AG (strand 1)+TC(strand 0)  -- should be TC on the expressed strand                                                                         -    6 sites
+CT (strand 0)+GA(strand 1)  -- CT                                                                                                                                  -   7 sites
+CT (strand 1)+GA(strand 1)  -- GA                                                                                                                                  -   8 sites
+
+So we have a PFR of about 1/3 which is not that bad for a start. More importantly, the 18 sites found this way include several conserved sites (at least based on the gene names, you should verify that the positions are homologous to the known mammalian sites): FLNA, FLNB, COPA.
+
+I also tried to release the samples filter a bit, and ask for only four samples. This results in 
+
+AG (strand 0)+TC(strand 1) -- these should be AG on the expressed strand, if I got the strand annotation correctly   -   27 sites
+AG (strand 1)+TC(strand 0)  -- should be TC on the expressed strand                                                                         -    10 sites
+CT (strand 0)+GA(strand 1)  -- CT                                                                                                                                  -   13 sites
+CT (strand 1)+GA(strand 1)  -- GA                                                                                                                                  -   14 sites
+
+So the FPR is worse (roughly 1/2), and the marginal change is only nine AG sites vs. ~6 noise sites, but we found among these additional nine candidates COG3 (another known edited target).
+
+This is just a first quick-and-dirty try, and I expect we can do better with more careful analysis. Here are some ideas for things to look at as a start:
+
+1. Make sure I got the strand annotation correctly. I assumed strand 0 means that the read aligns to the reference strand, and if we have, for example, AG MM with strand=0 it means that the RNA shows G at this position, while AG with strand=1 means the RNA aligned to the reverse strand and shows T (so we see TC mismatch, which is not due to ADAR editing).  
+
+1 is + strand, 0 is - strand in Reditools output
+
+2. Look for carefully at the known conserved mammalian sites to see if you picked them up. For the ones I mentioned above, make sure the MM you see is at the same position; for all others, try to locate the homologous sites and see if there is any evidence for editing. You can follow the procedure described in https://link.springer.com/article/10.1186/s12915-023-01756-2 (section: Conservation of editing between Xenopus and mammals). I would expect at least a dozen of these sites to reappear in Alligator.
+
+3. Try to look at the top noise sites (TC/CT/GA sites that reoccur in multiple samples) and see if you can filter them out by excluding MMs in reads' ends or alignments' ends (say 5bp to each side). Also, consider removing MMs near splicing junctions (at least 2bp on each side).
+
+Other considerations; site level filtering? What coverage/Frequency threshold should we enforce?
+
+Can look at using samtools/bedtools to filter out variants at exon boundaries etc.
+
+
+
+Strand output: 1 for + strand, 0 for - strand a
+
+```{r}
+path <- dir('./data', pattern='*_outTable_anno.txt',full.names = T, recursive = F)
+
+edits.list <- lapply(path, fread, header=F)
+names(edits.list) <- gsub('./data/|_outTable_anno.txt$','', path)
+
+edits.dt <- rbindlist(edits.list,idcol='sample')
+
+# large obj so delete
+rm(edits.list)
+```
+
+Tidy the names of the sites 
+```{r}
+setnames(edits.dt, 
+         old=c('V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'V7', 'V8', 'V9', 'V10','V11','V12','V13','V14', 'V15', 'V16', 'V17'),
+         new=c('chr', 'pos', 'ref', 'strand', 'rnaCoverageq25', 'rnaMeanQ', 'rnaBaseCount[A,C,G,T]', 'rnaAllSubs', 'rnaEditFrequency', 
+               'dnaCoverageq25', 'dnaMeanQ', 'dnaBaseCount[A,C,G,T]', 'dnaAllSubs', 'dnaEditFrequency', 'biotype', 'gene', 'transcriptID'))
+
+
+# now, lets see 
+edits.dt[, status := ifelse(grepl('GFC', sample), 'Control', 'Infected')]
+```
+
+Want to quickly check the strandedness of our output; lets see if we can identify the breakdown of edits
+Simple first pass; first take the edited sites with at least 20 reads matching dna with no edits and 20 reads matching rna with at least two edited sites
+
+
+I cant get a good answer on ADAR editing on why both strands 0 and 1 AG is the most edited site?
+Strand output: 1 for + strand, 0 for - strand a; Dont think this has anything to do with strandedness of the output.. match to the bed file and see if we can find edits where the strand the gene strand agree
+This has no gene information, it just tells us that the edits are annotated to the + or - strand
+```{r}
+# take the filtered set of edits
+filtered.dt <- edits.dt[dnaCoverageq25 >= 20 & dnaEditFrequency == 0 & rnaEditFrequency > 0.01 & rnaCoverageq25 >= 20 & strand != 2,]
+
+edits.dt[dnaCoverageq25 >= 20 & dnaEditFrequency == 0 & rnaEditFrequency > 0.01 & rnaCoverageq25 >= 20 & strand == 2,]
+
+g <- ggplot(filtered.dt[,.N, by=.(rnaAllSubs, strand)][N>10 & strand != 2,], aes(x=rnaAllSubs, y=N)) +
+  geom_bar(stat='Identity', fill='deepskyblue1') +
+  ggtitle('Edit profile breakdown') +
+  ylab('N edits (frequency >= 0.01 & Coverage >= 20reads)') +
+  facet_wrap(~strand) +
+  theme_bw() +
+  theme(text=element_text(family='mono'))
+g
+BackupAsPDF(g, 'editBreakdown.barplot', dimensions=c(10,5))
+
+
+# gene hits only
+g <- ggplot(filtered.dt[gene != '-',.N, by=.(rnaAllSubs, strand)][N>10 & strand != 2,], aes(x=rnaAllSubs, y=N)) +
+  geom_bar(stat='Identity', fill='deepskyblue1') +
+  ggtitle('Edit profile breakdown') +
+  ylab('N edits (frequency >= 0.01 & Coverage >= 20reads)') +
+  facet_wrap(~strand) +
+  theme_bw() +
+  theme(text=element_text(family='mono'))
+g
+BackupAsPDF(g, 'editBreakdown.barplot', dimensions=c(10,5))
+```
+
+```{r}
+bed.dt <- fread('/Users/martingordon/Documents/projects/051524_JMoen_AlligatorEditSites/073124_EditQCFinalSet_data/2024_08_01_edits.anno.bed', sep='\t')
+
+# filter to just the coding seqence
+bed.dt <- bed.dt[V3 == 'CDS', .(V1, V3, V4, V7, V9)]
+bed.dt[, c('gene') :=  tstrsplit(V9,';', keep=c(6))]
+bed.dt[ , gene := gsub('gene=', '', gene)]
+
+#gene.dt <- bed.dt[, .(Region, gene, featureStrand)] %>% 
+bed.dt <- bed.dt[,.(V1, V4, V7, gene)]
+setnames(bed.dt, new=c('Region', 'Position', 'featureStrand', 'gene'))
+```
+Just keep AG; interesting a spike in TC edits also,but ~50% greater than baseline
+```{r}
+# still signal here in the non-annotated regions... leave out for now though
+filtered.dt <- filtered.dt[gene != '-' & !grepl(' ', rnaAllSubs) & rnaAllSubs == 'AG',] # just look at AG; want to stick to edits  coding edits
+
+
+# get the number of edits for control set and the infected seperately, then combine
+nControlEdits <- filtered.dt[status =='Control', .N, by=.(chr, pos, gene)][, .(chr, pos, gene, NSamplesEditIdentified_Control=N)]
+nInfectedEdits <- filtered.dt[status =='Infected', .N, by=.(chr, pos, gene)][, .(chr, pos, gene, NSamplesEditIdentified_Infected=N)]
+nAllEdits <- filtered.dt[, .N, by=.(chr, pos, gene)][, .(chr, pos, gene, NSamplesEditIdentified_All=N)]
+
+
+filtered.dt <- merge(filtered.dt, nControlEdits, by=c('chr', 'pos', 'gene'), all.x=T)
+filtered.dt <- merge(filtered.dt, nInfectedEdits, by=c('chr', 'pos', 'gene'), all.x=T)
+filtered.dt <- merge(filtered.dt, nAllEdits, by=c('chr', 'pos', 'gene'), all.x=T)
+
+
+tidy.dt <- filtered.dt[,.(sample, status, chr, pos, gene, strand, ref, rnaAllSubs, rnaCoverageq25, rnaMeanQ, rnaEditFrequency, `rnaBaseCount[A,C,G,T]`,  dnaCoverageq25, dnaMeanQ, `dnaBaseCount[A,C,G,T]`, NSamplesEditIdentified_Control, NSamplesEditIdentified_Infected, NSamplesEditIdentified_All)]
+
+fwrite(tidy.dt[NSamplesEditIdentified_Infected == 3 | NSamplesEditIdentified_Control == 3,], ScriptAndDatedFileName('ADAR.edits.presentInAllSamples.csv'))
+
+
+
+g <- ggplot(tidy.dt[NSamplesEditIdentified_Infected == 3 | NSamplesEditIdentified_Control == 3,.N, NSamplesEditIdentified_All], aes(x=NSamplesEditIdentified_All, y=N)) +
+  geom_bar(stat='Identity', fill='deepskyblue1') +
+  ggtitle('N') +
+  ylab('Edited sites identified in all group members') +
+  theme_bw() +
+  theme(text=element_text(family='mono'))
+
+
+BackupAsPDF(g, 'editsIndentifedMultipleSamples.barplot')
+
+
+nhits.dt <- tidy.dt[NSamplesEditIdentified_Infected == 3 | NSamplesEditIdentified_Control == 3,.(chr, pos, gene, ref,rnaAllSubs, status, 
+                                                                                                 NSamplesEditIdentified_All, NSamplesEditIdentified_Control, NSamplesEditIdentified_Infected)] %>% 
+  unique()
+
+
+fwrite(nhits.dt, ScriptAndDatedFileName('edits.summary.csv'))
+
+ggplot(nhits.dt[,.N,by=NSamplesEditIdentified_All], aes(x=NSamplesEditIdentified_All, y=N)) +
+  geom_bar(stat='Identity', fill='skyblue')
+```
+
+
+
+merge with the edits datatable so we can see if the genes match the feature strands
+Not needed... already annotated to overlaping gene
+
+```{r}
+filtered.dt[,.N, by=gene]
+test <- merge(x=filtered.dt, y=bed.dt, by.x=c('chr', 'pos'), by.y=c('Region', 'Position'), all.x=T)
+
+# lets take the set annotated to gene
+filtered.dt[gene != '-',][,.N, by=.(rn),strand)]
+
+# question; is any gene assigned to more than one strand?
+# no, the strand info is related to if it maps to the + of the reference, or the - reference
+filtered.dt[gene != '-',][,.N, by=.(gene,strand, sample)][,.(gene,strand,sample)][,.N, by=.(gene,sample)][N == 1]
+
+
+# lets be even more stringent; remove sites with more than one type of mutation
+
+
+filtered.dt[gene != '-', .N, by=allSubs]
+
+
+filtered.dt[gene != '-',.N, by=rnaAllSubs]
+
+test[!is.na(gene.x) & !is.na(gene.y)]
+
+test.dt <- merge(x=filtered.dt, y=bed.dt, by.x=c('chr', 'pos', 'gene', 'strand'), by.y=c('Region', 'Position', 'gene', 'featureStrand'), all.x=T)
+edits.dt
+
+filtered.dt
+
+edits.dt[gene %like% 'FLN']
+
+
+bed.dt[gene %in% c('FLNA')]
+
+
+# 1 is + strand, 0 is - strand
+filtered.dt[gene %in% c('FLNB', 'FLNA'),]
+
+
+# so shows our strandedness is wrong.. as strand 0 refers to neg strand and when we look at the data, can see the reference T is on the positive strand
+edits.dt[Position == 28972564 & Region == 'NC_081831.1']
+
+gsub('L', '[IL]', 'LIDHDH')
+
+grepl("[IL]ID", "IIDHHDXXXX")
+```

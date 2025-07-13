@@ -1,0 +1,1169 @@
+---
+title: "101524_MAGECKContrasts_firstPass"
+author: "Martin Gordon"
+date: "2024-10-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(viridis)
+library(dendextend) # for dendogram modifications
+library(DESeq2)
+library(patchwork)
+library(ggrepel)
+library(tidymodels)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+
+```
+MAGECK differential results explaination: variance is estimated within the control samples, and we tend to find things upreg in the test group
+Why is the FC not reciprocial if test/cotnrol labels swapped? Becuase variance is estimated using the control samples, so for downregulated things (means higher in controls), variance tends to be higher, because these are big counts, so 
+To me, the issue we seem to have with the data heteroskedacity, when we have high counts we have high variance (and there is quite a bit of differences in our bioreps), we are biasing findings towards things that are low count in control group (low count = low variance)
+Running it on full table vs reduced doesnt matter; get the same output..
+
+My thinking at moment is just to proceed as is; take the FC values and try map these to the genes
+
+I think best approach is to aggressively filter low count sgRNA and run the analysis using DESeq2, seperately for BEMax/ABe8e. Estimate variances across samples 
+
+```{r}
+
+```
+
+
+Sample overview: have d7 and d21 treatments
+What will we use for the baseline for our comparisons? Dont want to compare directly across treatments instead I think we want to find. treatment specific effect and a timepoint dependent effect
+
+We have: 2 bio replicates, 2 treatments (plus a control), two timepoint (d7 and d21); do we have a d0? What is library rep? Ask Ronald for more info on the exp set-up
+
+
+Todo:
+Check the anno info for the guides and use this to map to genome coordinate and produce tiling plots and ridgeplots
+Collapse the volcanoplots to just one 
+
+
+Create some QC plots and rename the labels in the count matrix
+Just realised with the sgRNA normalized set; we dont want to use the undetermined in the normalization step; 
+take the unnormalized count matrix and nomralize at the testing step
+```{r}
+summary.dt <- fread('./output/141024_noNormalization.countsummary.txt')
+
+# drop the undetermined file.. may need to dig into this set later; see if we can recover some barcodes from here
+# remove this undetermined file
+summary.dt <- summary.dt[!grepl('Undetermined', File)]
+
+
+summary.dt[, newLabel := gsub('/wd/data/fastq/bclconvert_defaults/|_R1_001.fastq.gz', '', File)]
+
+summary.dt[, editor := ifelse(grepl('^ABE8[Ee]', newLabel), 'abe8e', 
+                              ifelse(grepl('^BE4Max', newLabel), 'bemax', 'plasmid'))]
+
+
+summary.dt[, treatment := stringr::str_extract(newLabel, 'Alpelisib|CTRL|Paxalisib|Librep|Lib-rep|librep')]
+
+# lets tidy the treatment names
+summary.dt[, treatment ] %>%  unique()
+summary.dt[treatment == 'CTRL', treatment := 'control']
+summary.dt[treatment %in% c("Librep","Lib-rep","librep"), treatment := 'librep']
+
+# add a timepoint marke r
+summary.dt[, timepoint := gsub('day', '', stringr::str_extract(newLabel, 'day[0-9]{1,2}'))]
+summary.dt[is.na(timepoint), timepoint := '0']
+summary.dt[, timepoint := factor(timepoint, levels=c('0', '7', '22'))]
+
+
+summary.dt[, .(timepoint, newLabel)]
+```
+
+Gini index looks good indicating sgRNA guide even richness in majority of samples
+```{r}
+g <- ggplot(summary.dt, aes(x=reorder(newLabel, as.numeric(timepoint)), y=GiniIndex, fill=treatment)) +
+  geom_bar(stat='Identity') +
+  geom_hline(yintercept=0.1, alpha=0.6, linetype=2) +
+  scale_fill_brewer(type='qual') +
+  ggtitle('Gini index (sgRNA evenness)') +
+  xlab('Sample') +
+  facet_wrap(~editor, scales='free')  +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=6)) 
+g
+BackupAsPDF(g, 'gini.idx.barplot', dimensions=c(8,5))
+```
+plot the number of zero counts in each 
+V low numbers it seems; looks good!
+```{r}
+g <- ggplot(summary.dt, aes(x=reorder(newLabel, as.numeric(timepoint)), y=Zerocounts, fill=treatment)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~editor, scales='free') +
+  scale_fill_brewer(type='qual') +
+  ggtitle('Number of sgRNA with 0 counts') +
+  xlab('Sample') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=6))
+
+
+BackupAsPDF(g, 'N.0.counts.barplot',  dimensions=c(8,5))
+```
+Proportion of reads mapped
+
+```{r}
+
+summary.long <- melt(summary.dt[,.(newLabel,editor, treatment, timepoint, Reads, Mapped)], id.vars = c('newLabel', 'editor', 'treatment', 'timepoint'))
+setnames(summary.long, old=c('variable', 'value'), new=c('status', 'count'))
+
+
+summary.long[status == 'Reads', status := 'total reads']
+summary.long[status == 'Mapped', status := 'reads mapped to sgRNA']
+
+g <- ggplot(summary.long, aes(x=reorder(newLabel, as.numeric(timepoint)), y=count, fill=status)) +
+  geom_bar(position='fill',stat='Identity') +
+  facet_wrap(~editor, scales='free') +
+  scale_fill_manual(values=c('total reads' = 'skyblue3', 'reads mapped to sgRNA'='lightcoral')) +
+  ggtitle('Sample mapping statistcs') +
+  xlab('Sample') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=6))
+
+g
+BackupAsPDF(g, 'mappingStats.barplot',  dimensions=c(8,5))
+```
+plot the number of reads mapped in each sample
+Looks like 1M to 4-5M per sample
+```{r}
+g <- ggplot(summary.long[status ==  'reads mapped to sgRNA',], aes(x=reorder(newLabel, as.numeric(timepoint)), y=count, fill=status)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~editor, scales='free') +
+  scale_fill_manual(values=c('skyblue3')) +
+  ggtitle('Number of reads mapped to sgRNA') +
+  xlab('Sample') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=6))
+
+g
+BackupAsPDF(g, 'nReadsmapped.barplot',  dimensions=c(8,5))
+
+```
+we should still be getting 100x coverage of each sgRNA in each sample
+```{r}
+#summary.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgCount.summary.csv')
+
+# add a replicate ID
+summary.dt[, rep := stringr::str_extract(stringr::str_extract(newLabel, 'Alpelisib[0-9]|CTRL[0-9]|axalisib[0-9]|Librep[0-9]|Lib-rep[0-9]|librep[0-9]'), '[0-9]$')]
+summary.dt[is.na(rep), rep := '1']
+
+#fwrite(summary.dt, ScriptAndDatedFileName('sgCount.summary.csv'))
+summary.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgCount.summary.csv')
+```
+
+Read in the (unnormalized) count matrix; produce pairwise corrrelation matirx
+
+```{r}
+counts.dt <- fread('./output/141024_noNormalization.count.txt') 
+# convert to long, merge with other dt so we can get the sample info 
+counts.dt <- reshape2::melt(counts.dt, id.vars = c('sgRNA', 'Gene')) %>% 
+  as.data.table()
+setnames(counts.dt, old=c('variable', 'value'), new=c('Label', 'rawCounts'))
+
+#drop the undetermined
+counts.long <- merge(counts.dt[Label != 'sample30',], summary.dt[, .(Label, newLabel, editor, treatment, timepoint, rep)], by='Label', all.x=T)
+```
+
+plot log2 distribution
+
+```{r}
+g <- ggplot(counts.long, aes(x=reorder(newLabel, as.numeric(timepoint)), y=log2(rawCounts+1), fill=treatment)) +
+  geom_boxplot() +
+  ggtitle('raw log2-trasnformed counts distirbution') +
+  xlab('Sample') +
+  geom_hline(yintercept=log2(100), alpha=0.7, linetype=1) +
+  scale_fill_brewer(type='qual') +
+  facet_grid(~editor, scales='free') +
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'rawCounts.boxplots')
+```
+Looking at this, we clearly need to normalize our samples before further processing 
+I think best approach is to base the normalization on the sgRNA guides
+
+Use DEseq2 and normalize using a subset of samples
+
+Identify the control genes in each sample
+```{r}
+sgControls <- read_xlsx('./docs/PIK3CA pathway base editing.xlsx', sheet=1) %>%  
+  as.data.table() %>% 
+  .[Gene == 'non-targeting', `Sl No`] %>% 
+  unique()
+```
+
+Use both normalization methods and merge to original data.table
+```{r}
+rawMat <- dcast(counts.long, sgRNA~editor+treatment+timepoint+rep, value.var='rawCounts') %>% 
+  as.matrix(rownames='sgRNA')
+
+metadata <- summary.dt[, .(sample=paste(editor,treatment,timepoint,rep, sep='_'), group=paste(editor,treatment,timepoint, sep='_'), editor, treatment, timepoint, rep)] %>% 
+  as.data.frame(row.names = .$sample)
+
+rawMat <- rawMat[, rownames(metadata)]
+
+# all TRUE
+rownames(metadata) == colnames(rawMat)
+
+
+dds <- DESeqDataSetFromMatrix(countData = rawMat,
+                              colData = metadata,
+                              design = ~group)
+
+# logical vec indicating which sdamples are controls
+isControl <- rownames(dds) %in% sgControls
+
+
+dds <- estimateSizeFactors(dds, 
+                    controlGenes = isControl)
+
+norm.sgRNA.counts <- counts(dds, normalized=T)
+
+norm.sgRNA.counts <- norm.sgRNA.counts %>% 
+  reshape2::melt(., idvar=rownames(.))
+
+dds <- DESeqDataSetFromMatrix(countData = rawMat,
+                              colData = metadata,
+                              design = ~group)
+
+dds <- estimateSizeFactors(dds)
+
+norm.counts <- counts(dds, normalized=T)
+
+norm.counts <- norm.counts %>% 
+  reshape2::melt(., idvar=rownames(.))
+
+# looks like little difference in the counts..
+norm.sgRNA.counts %>%  head()
+norm.counts %>%  head()
+```
+
+No difference in the normalization methods really. My take away is that median scaling is fine; not expecting most things to move between conditiions
+
+```{r}
+setnames(norm.sgRNA.counts, old=c('Var1', 'Var2', 'value'), new=c('sgRNA', 'sample', 'sgRNAnormCounts'))
+setnames(norm.counts, old=c('Var1', 'Var2', 'value'), new=c('sgRNA', 'sample', 'normCounts'))
+
+norm.counts <- merge(norm.counts, norm.sgRNA.counts, by=c('sgRNA', 'sample'))
+
+g <- ggplot(norm.counts, aes(x=normCounts, y=sgRNAnormCounts)) +
+  geom_point() +
+  geom_density_2d() +
+  ggtitle('Normalization methods comparison') +
+  geom_abline(slope=1, intercept=0) +
+  theme_bw()
+g
+BackupAsPDF(g, 'normMethods.comparison.scatterplot')
+
+
+# log trasnform the values
+g <- ggplot(norm.counts, aes(x=log2(normCounts+1), y=log2(sgRNAnormCounts+1))) +
+  geom_point() +
+  geom_density_2d() +
+  ggtitle('Normalization methods comparison') +
+  geom_abline(slope=1, intercept=0) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'normMethods.comparison.logScaled.scatterplot')
+```
+merge both these normalization methods to the original data and pplot the raw vs normalized
+```{r}
+counts.long[, sample := paste(editor, treatment, timepoint, rep, sep='_')]
+counts.long <- merge(counts.long, norm.counts, by=c('sample','sgRNA'))
+
+g <- ggplot(counts.long[sgRNA %in% sgControls,], aes(x=reorder(sample, as.numeric(timepoint)), y=log2(sgRNAnormCounts+1), fill=treatment)) +
+  geom_boxplot() +
+  scale_fill_brewer(type='qual') +
+  ggtitle('sgRNA non-targeting controls (Normalized)') +
+  facet_wrap(~editor, scales='free') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5),
+        axis.title.x = element_blank())
+g
+
+p <- ggplot(counts.long[sgRNA %in% sgControls,], aes(x=reorder(sample, as.numeric(timepoint)), y=log2(rawCounts+1), fill=treatment)) +
+  geom_boxplot() +
+  scale_fill_brewer(type='qual') +
+  ggtitle('sgRNA non-targeting controls (Raw)') +
+  facet_wrap(~editor, scales='free') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5),
+        axis.title.x = element_blank())
+
+
+BackupAsPDF(p/g, 'sgRNA.NTC.RawvsNorm.boxplots', dimensions=c(10,8))
+
+
+#fwrite(counts.long[, .(sgRNA,Gene, Label, sample, editor, treatment, timepoint, rep, rawCounts, normCounts, sgRNAnormCounts)], ScriptAndDatedFileName('sgRNAcounts.normalized.txt'))
+
+counts.long <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgRNAcounts.normalized.txt')
+```
+
+plot the raw vs normalized counts for all genes
+
+```{r}
+g <- ggplot(counts.long, aes(x=reorder(sample, as.numeric(timepoint)), y=log2(sgRNAnormCounts+1), fill=treatment)) +
+  geom_boxplot() +
+  scale_fill_brewer(type='qual') +
+  ggtitle('sgRNA log-transformed counts (Normalized)') +
+  facet_wrap(~editor, scales='free') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5),
+        axis.title.x = element_blank())
+
+
+p <- ggplot(counts.long, aes(x=reorder(sample, as.numeric(timepoint)), y=log2(rawCounts+1), fill=treatment)) +
+  geom_boxplot() +
+  scale_fill_brewer(type='qual') +
+  ggtitle('sgRNA log-transformed counts (Raw)') +
+  facet_wrap(~editor, scales='free') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5),
+        axis.title.x = element_blank())
+
+BackupAsPDF(p/g, 'sgRNA.allSgRNA.RawvsNorm.boxplots', dimensions=c(10,8))
+```
+Now we want to perform the PWcomparisons; best way to do this is to run the comparisons individually first with the RRA algorithmm try MLE tomorrow
+```{r}
+#function to make a mageck matrix
+
+counts.long$sample %>% unique()
+
+sgNorm.mat <- dcast(counts.long, sgRNA+Gene~sample, value.var = 'sgRNAnormCounts')
+fwrite(sgNorm.mat, ScriptAndDatedFileName('sgNorm.countMat.txt'))
+```
+
+# given a matrix and treatment and sample IDs, run mageck test
+```{r}
+runMageckRRA <- function(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt', 
+                         ctrlSamplesRegx='',
+                         testSamplesRegx='',
+                         otherParams='',
+                         outDir=NA){
+  
+  count.mat <- fread(mat)
+  head(count.mat)
+  
+  message(paste('Extracting indices for control & test samples...'))
+  
+  ctrlSamples <- grep(ctrlSamplesRegx, colnames(count.mat), value=T)
+  testSamples <- grep(testSamplesRegx, colnames(count.mat), value=T)
+  
+  
+  cols.oi <- c('sgRNA', 'Gene', ctrlSamples, testSamples)
+  
+  message(paste0('Control samples: ', paste(ctrlSamples, collapse=';')))
+  message(paste0('Test samples: ', paste(testSamples, collapse=';')))
+ 
+  #print(colnames(count.mat))
+  submat <- count.mat[, ..cols.oi]
+  
+  stopifnot(length(colnames(submat)) >= 4) 
+  
+  # name for the output; just subt the grep pattern matching the replicate information
+  mat.name <- paste(gsub('[+.]', '', testSamplesRegx), gsub('[+.]', '', ctrlSamplesRegx), sep='-vs-')
+  message(paste0('comparison name: ', mat.name))
+  
+  
+  # write output to file 
+  if (!is.na(outDir)){
+    
+    message('Saving output to file:')
+    message(paste0(outDir,'/', mat.name, '.sgRNAnorm.mat.txt'))
+    fwrite(submat, sep='\t', paste0(outDir,'/', mat.name, '.sgRNAnorm.mat.txt'))
+    
+    message('Writing MAGECK test command to file:')
+    cmd <- paste("mageck test -k ", paste0(outDir,'/', mat.name, '.sgRNAnorm.mat.txt'), " -t ", paste(testSamples, collapse=','), " -c ",  paste(ctrlSamples, collapse=','), " -n ", mat.name, paste0(otherParams, collapse=' '))
+    message(cmd)
+    fwrite(as.data.table(cmd), col.names = F, paste0(outDir,'/', mat.name, '.mageckCmd.txt'), quote = F)
+    
+  } else {
+    
+    message('Returning output matrix and MAGECK cmd:')
+    cmd <- paste("mageck test -k ", paste0('./', mat.name, '.sgRNAnorm.mat.txt'), " -t ", paste(testSamples, collapse=','), " -c ",  paste(ctrlSamples, collapse=','), " -n ", mat.name, paste0(otherParams, collapse=' '))
+    
+    list(mageckMatrix=submat,
+         mageckCmd=cmd)
+    
+    #now need to find a way to dockerize this command...
+  }
+}
+
+
+
+# testing looks good....
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='abe8e_librep_0.+',
+             testSamplesRegx='abe8e_control_7.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+```
+Ok, now need to run each individually..
+
+These are the Abe8e comparisons
+```{r}
+colnames(sgNorm.mat)
+
+
+# testing looks good....
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='abe8e_librep_0.+',
+             testSamplesRegx='abe8e_control_7.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+
+# run for each of the samples to generate a matrix of plots
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='abe8e_librep_0.+',
+             testSamplesRegx='abe8e_control_22.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+
+# testing looks good....
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='abe8e_librep_0.+',
+             testSamplesRegx='abe8e_Alpelisib_7.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+
+# run for each of the samples to generate a matrix of plots
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='abe8e_librep_0.+',
+             testSamplesRegx='abe8e_Alpelisib_22.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='abe8e_librep_0.+',
+             testSamplesRegx='abe8e_Paxalisib_7.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+
+# run for each of the samples to generate a matrix of plots
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='abe8e_librep_0.+',
+             testSamplesRegx='abe8e_Paxalisib_22.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+```
+
+Now do the Pax treatment
+
+```{r}
+# testing looks good....
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='bemax_librep_0.+',
+             testSamplesRegx='bemax_control_7.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+
+# run for each of the samples to generate a matrix of plots
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='bemax_librep_0.+',
+             testSamplesRegx='bemax_control_22.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='bemax_librep_0.+',
+             testSamplesRegx='bemax_Alpelisib_7.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+
+# run for each of the samples to generate a matrix of plots
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='bemax_librep_0.+',
+             testSamplesRegx='bemax_Alpelisib_22.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='bemax_librep_0.+',
+             testSamplesRegx='bemax_Paxalisib_7.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+
+
+# run for each of the samples to generate a matrix of plots
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             ctrlSamplesRegx='bemax_librep_0.+',
+             testSamplesRegx='bemax_Paxalisib_22.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+```
+Generate a heatmap of the sample correlations of the normalized samples
+```{r}
+
+normMat <- dcast(counts.long, sgRNA~sample, value.var='sgRNAnormCounts') %>% 
+  as.matrix(rownames=1)
+
+# log2 transform for normal distirbution
+corMat <- cor(log2(normMat+1), method='pearson', use = 'pairwise.complete.obs')
+
+# dendo ordereding
+od =  hclust(dist(corMat))$order
+corMat = corMat[od, od]
+
+
+hm <- Heatmap(corMat,
+        col=viridis(10),
+        name='Pearsons r',
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        column_dend_side = 'bottom',
+        rect_gp = gpar(type = "none"),
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=6),
+	      cell_fun = function(j, i, x, y, w, h, fill) {
+		      if(i >= j) {
+			      grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		        grid.text(sprintf("%.2f", corMat[i, j]), x, y, gp = gpar(col='white', fontsize = 7))
+		      }
+	  })
+hm
+BackupAsPDF(hm, 'sgRNAnorm.PWCorrelations.heatmap',dimensions=c(9,7))
+```
+PCA of the normalized log trasnformed counts 
+
+```{r}
+pcaOut <- prcomp(t(log2(normMat+1)))
+
+colInfo <- data.table(sample = colnames(normMat))
+colInfo <- merge(colInfo, summary.dt[,.(sample=paste(editor,treatment,timepoint,rep, sep='_'), editor,treatment,timepoint,rep)], by='sample')
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "sample", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = as.character(timepoint), shape = editor)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_brewer(type='qual') +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "normalizedCounts.timepointCol.pca")
+```
+10-16-24
+--
+Now lets read in the differential results and 
+
+```{r}
+de.files <- dir(path='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/DETesting_res', pattern='*sgrna_summary.txt', full.names = T)
+de.list <- lapply(de.files, fread)
+
+names(de.list) <- gsub('/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/DETesting_res/|.sgrna_summary.txt','', de.files)
+```
+
+# collapse all to the single data
+```{r}
+de.dt <- rbindlist(de.list, idcol='contrast')
+```
+
+```{r}
+# do the padj on the ptwosided
+de.dt[, adj.pval := p.adjust(p.twosided, method='BH'), by=.(contrast)]
+
+de.dt[, sig := 'not']
+de.dt[abs(LFC) >= 1 & FDR < 0.05, sig := ifelse(LFC > 0, 'up', 'down')]
+# this is actually the same as the FDR calculation..
+de.dt[abs(LFC) >= 1 & adj.pval < 0.05, sig := ifelse(LFC > 0, 'up', 'down')]
+
+```
+
+add some other metadata info to the cols
+
+```{r}
+de.dt[, newLabel := gsub('abe8e_|bemax_','', contrast)]
+de.dt[, editor := ifelse(grepl('abe8e', contrast), 'abe8e', 'bemax')]
+de.dt[Gene %like% "sgINTERGENIC", Gene := 'Intergenic']
+de.dt[, comparison := gsub('bemax_|abe8e_', '', contrast)]
+# numberator timepoint
+de.dt[, numeratorTimepoint := factor(gsub('-','', stringr::str_extract(contrast, '[0-9]{1,2}-')), levels=c('0','7','22'))]
+
+#fwrite(de.dt, ScriptAndDatedFileName('PWcomparisonsVsLibDay0.firstpass.csv'))
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_16_PWcomparisonsVsLibDay0.firstpass.csv')
+```
+
+
+```{r}
+# breakdown by contrast
+g <- ggplot(de.dt[,.N, by=.(sig, contrast, editor, numeratorTimepoint, newLabel)][sig != 'not',], aes(x=reorder(newLabel, as.numeric(numeratorTimepoint)), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~editor, scales='free') +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & p.adjust < 0.05)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=7))
+g
+BackupAsPDF(g, 'NsigHits.barchart')
+
+```
+```{r}
+# breakdown by contrast and gene
+g <- ggplot(de.dt[,.N, by=.(sig, Gene, comparison, editor, numeratorTimepoint, newLabel)][sig != 'not',], aes(x=editor, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_grid(Gene~comparison) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & p.adjust < 0.05)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        strip.text.x = element_text(size=7))
+g
+
+BackupAsPDF(g, 'sgRNA.sigHits.breakdownbyGeneandContrast', dimensions=c(11,14))
+```
+Lets look at heatmaps and volcanoplots of hte genes
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+
+  subdt <- de.dt[contrast == x,]
+    
+  g <- ggplot(data=subdt, aes(x=reorder(sgrna,LFC), y=LFC, label=sgrna, col=sig)) +
+    geom_point(size=1, aes(col=ifelse(LFC > 1, 'up', 
+                                      ifelse(LFC< -1,'down', 'not')))) +
+    #geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+    ggrepel::geom_text_repel(data=subdt[sig != 'not',], aes(label=sgrna),  segment.linetype=3, max.overlaps = 30,size=1.5) +
+    ggtitle(paste0(x, ' rank plot')) +
+    theme_classic() +
+    xlab('Rank') +
+    # here we add numeric vals to expand the scales
+    scale_x_discrete(expand = expansion(add=500)) +
+    scale_y_discrete(expand = expansion(add=1)) +
+    scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          legend.position = 'none'
+        )
+  
+ BackupAsPDF(g, paste0('rankplots/', x, '.LFC.rankplot'), dimensions = c(6.5,10))
+})
+```
+Volcanoplots, heatmaps, then scatterplots
+
+Volcanoplot of the sig hits
+
+Facet by genomic location
+```{r}
+
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[contrast == x,]
+  
+  g <- ggplot(subdt, aes(x=LFC, y=-log10(adj.pval), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not'], show.legend = F, size=2, max.overlaps = 20) +
+  facet_wrap(~Gene, ncol=3, scales='free_y') +
+  ggtitle(x) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+  g
+  
+  BackupAsPDF(g, paste0('volcanoplots_individual/genomic_location/',x ,'.volcanoplots'), dimensions=c(9,8))
+})
+
+
+lapply(unique(sgRNA.dt$contrast), function(x){
+  
+  subdt <- sgRNA.dt[contrast == x,]
+  subdt[, adj.pval := -log10(FDR)]
+  subdt[ adj.pval > 20, adj.pval := 20 ]
+  
+  g <- ggplot(subdt, aes(x=LFC, y=adj.pval, color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not'], show.legend = F, size=2, max.overlaps = 20) +
+  facet_wrap(~Gene, ncol=3) +
+  ggtitle(x) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+  BackupAsPDF(g, paste0('volcanoplots_individual/genomic_location_fixedYaxis/',x ,'.volcanoplots'), dimensions=c(9,7))
+})
+```
+
+
+Collapse the volcanoplots to one per contrast and color sig by most significant mutant
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[contrast == x,]
+  #subdt[, adj.pval := -log10(FDR)]
+  subdt[ adj.pval > 40, adj.pval := 40 ]
+  
+  g <- ggplot(subdt, aes(x=LFC, y=-log10(adj.pval), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not'], show.legend = F, size=2, max.overlaps = 20, segment.alpha=0.6) +
+  ggtitle(x) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+  g
+ BackupAsPDF(g, paste0('volcanoplots_individual/collapsed/',x ,'.volcanoplots'), dimensions=c(7,5))
+})
+```
+
+Collapse volcanoplots to the gene level
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[contrast == x,]
+  subdt[, adj.pval := -log10(adj.pval)]
+  #subdt[, adj.pval := -log10(FDR)]
+  subdt[ adj.pval > 40, adj.pval := 40 ]
+  
+  g <- ggplot(subdt, aes(x=LFC, y=adj.pval, color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not'], show.legend = F, size=2, max.overlaps = 20, segment.alpha=0.6) +
+  ggtitle(x) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+  g
+ BackupAsPDF(g, paste0('volcanoplots_individual/collapsed_pvalThresholded/',x ,'.volcanoplots'), dimensions=c(7,5))
+})
+```
+
+
+Now generate some heatmaps of the de genes
+I think best approach is to take the subsets of the 3 contrasts vs library (D0) and trace how these look across the different groups
+
+```{r}
+sgNorm.mat <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt')
+
+bemax.sig.list <- list(dmso      =  de.dt[editor == 'bemax' & sig != 'not' & grepl('control', contrast), unique(sgrna)],
+                       Alpelisib =  de.dt[editor == 'bemax' & sig != 'not' & grepl('Alpelisib', contrast), unique(sgrna)],
+                       Paxalisib =  de.dt[editor == 'bemax' & sig != 'not' & grepl('Alpelisib', contrast), unique(sgrna)])
+                       
+abe8e.sig.list <- list(dmso      =  de.dt[editor == 'abe8e' & sig != 'not' & grepl('control', contrast), unique(sgrna)],
+                       Alpelisib =  de.dt[editor == 'abe8e' & sig != 'not' & grepl('Alpelisib', contrast), unique(sgrna)],
+                       Paxalisib =  de.dt[editor == 'abe8e' & sig != 'not' & grepl('Alpelisib', contrast), unique(sgrna)])
+
+
+sig.list <- list(dmso =  de.dt[sig != 'not' & grepl('control', contrast), unique(sgrna)],
+                 Alpelisib =  de.dt[sig != 'not' & grepl('Alpelisib', contrast), unique(sgrna)],
+                 Paxalisib =  de.dt[sig != 'not' & grepl('Alpelisib', contrast), unique(sgrna)])
+```
+subset the matrix to the bemax and the abe8e norm set
+
+```{r}
+gene.anno <- sgNorm.mat$Gene
+
+countMat <- sgNorm.mat[, -c('Gene')] %>% 
+  as.matrix(rownames='sgRNA')
+
+submat <- countMat[rownames(countMat) %in% sig.list$dmso,]
+
+#log transform
+submat <- log2(submat +1)
+
+# lets sweep out the row medians
+submat <- sweep(submat, 1, apply(submat,1, median, na.rm=T))
+
+Heatmap(submat, 
+        cluster_rows = clusterWNA(submat))
+
+
+sig.list$dmso
+```
+
+```{r}
+library(ggpubr) # could also use geom_annotate..
+library(tidymodels)
+
+source('~/Documents/utils/mg_utils/r_utils/plottingHelperFunctions.R')
+
+# do a all by all scatterplot comparison
+#contrast.pairs <-  UniqueFactorCombos(de.dt$contrast, allow.dups = F, sep=',')
+
+
+# write our custom contrast apirs
+contrast.pairs <- contrast.pairs[(grepl('bemax', Var1) & grepl('bemax', Var2))| (grepl('abe8e',Var1) & grepl('abe8e',Var2)),]
+
+
+contrast.pairs <-  data.table(Var1 = c("abe8e_Alpelisib_22-vs-abe8e_librep_0", "abe8e_Alpelisib_22-vs-abe8e_librep_0", "abe8e_Alpelisib_22-vs-abe8e_librep_0", "abe8e_Paxalisib_22-vs-abe8e_librep_0",
+                                      "bemax_Alpelisib_22-vs-bemax_librep_0", "bemax_Alpelisib_22-vs-bemax_librep_0", "bemax_Alpelisib_22-vs-bemax_librep_0",  "bemax_Paxalisib_22-vs-bemax_librep_0"),
+                             Var2 = c("abe8e_Alpelisib_7-vs-abe8e_librep_0",  "abe8e_control_22-vs-abe8e_librep_0", "abe8e_Paxalisib_22-vs-abe8e_librep_0", "abe8e_control_22-vs-abe8e_librep_0",
+                                      "bemax_Alpelisib_7-vs-bemax_librep_0", "bemax_control_22-vs-bemax_librep_0" , "bemax_Paxalisib_22-vs-bemax_librep_0", "bemax_control_22-vs-bemax_librep_0"))
+
+
+apply(contrast.pairs,1,  function(x){
+  
+  print(x)
+  dt <- dcast(de.dt[contrast %in% x,], sgrna+Gene~contrast, value.var = c('LFC','sig'))
+  # print
+  setnames(dt, new=c('sgRNA', 'gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+
+  
+  # could try nested if else but not working v well....
+  #dt[, label := 'not sig']
+  #dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  #dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  #dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'both sig']
+  
+    # create a col factor for 
+  dt[, label := ifelse(sig.x != 'not' & sig.y != 'not', 'both sig',
+                            ifelse(sig.x != 'not' & sig.y == 'not', 'x-axis sig',
+                                   ifelse(sig.x == 'not' & sig.y != 'not', 'y-axis sig',
+                                          'not sig')))]
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=sgRNA)) +
+    geom_point() +
+    geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-1,1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('x-axis sig'='#35B779FF', 'y-axis sig'="#FDE725FF", 'not sig'='grey', 'both sig'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not sig',],size = 2, max.overlaps = 20, segment.alpha=0.5, segment.linetype=2, show.legend = F) +
+    xlab(paste(x[1], 'log2 fold change',sep=' ')) +
+    ylab(paste(x[2], 'log2 fold change',sep=' ')) +
+    ggtitle(paste('Fold Change Comparisons')) + 
+    theme_bw()
+  
+  #add cor score
+  g <- g + stat_cor(data=dt, aes(x=log2FC.x, y=log2FC.y, label=..r.label..), method='pearson', inherit.aes = F)
+  
+  g
+  BackupAsPDF(g, paste0('scatterplots/',x[1], '__', x[2],'.log2FC.scatterplots.'))
+})
+
+```
+
+First investigate differential testing
+Reverse the ctrl/treatment label to investigate if this is due to a normalization procedure
+```{r}
+test.dt <- fread('101524_MAGECKContrasts_firstPass_data/Test_abe8e_librep_0-vs-abe8e_Paxalisib_22.sgrna_summary.txt')
+
+test.dt[, sig := 'not']
+test.dt[abs(LFC) >= 1 & FDR < 0.05, sig := ifelse(LFC > 0 ,'up', 'down')]
+test.dt[, adj.pval := -log10(FDR)]
+
+sgRNA.oi <- c('BE_5719BE_1511',)
+
+test.dt[adj.pval > 40, adj.pval := 40 ]
+
+g <- ggplot(test.dt, aes(x=LFC, y=(adj.pval), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=test.dt[sig !='not'], show.legend = F, size=2, max.overlaps = 20, segment.alpha=0.6) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+g
+BackupAsPDF(g, 'testvolcano')
+```
+```{r}
+test2.dt <- fread('101524_MAGECKContrasts_firstPass_data/Test_abe8e_librep_0-vs-abe8e_Paxalisib_22_retry.sgrna_summary.txt')
+
+test2.dt[, sig := 'not']
+test2.dt[abs(LFC) >= 1 & FDR < 0.05, sig := ifelse(LFC > 0 ,'up', 'down')]
+test2.dt[, adj.pval := -log10(FDR)]
+
+test2.dt[adj.pval > 40, adj.pval := 40 ]
+
+g <- ggplot(test2.dt, aes(x=LFC, y=(adj.pval), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=test2.dt[sig !='not'], show.legend = F, size=2, max.overlaps = 20, segment.alpha=0.6) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+g
+BackupAsPDF(g, 'testvolcano')
+```
+One other test to run; feed the full matrix
+and run with i) both replicates and ii)one replicate in each for bemax_Paxalisib_22 vs bemax_librep_0
+
+Read in both and lets inspect the output
+
+```{r}
+test.1rep <- fread('101524_MAGECKContrasts_firstPass_data/fullMat_Rep1_abe8e_Paxalisib_22__abe8e_librep_0.sgrna_summary.txt')
+test.allReps <- fread('101524_MAGECKContrasts_firstPass_data/fullMat_allReps_abe8e_Paxalisib_22__abe8e_librep_0.sgrna_summary.txt')
+
+test.1rep[, sig := 'not']
+test.1rep[abs(LFC) >=1 & FDR < 0.05, sig := ifelse(LFC > 0, 'up', 'down')]
+test.allReps[, sig := 'not']
+test.allReps[abs(LFC) >=1 & FDR < 0.05, sig := ifelse(LFC > 0, 'up', 'down')]
+```
+
+
+```{r}
+g <- ggplot(test.1rep, aes(x=LFC, y=-log10(FDR), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=test.1rep[sig !='not'], show.legend = F, size=2, max.overlaps = 20, segment.alpha=0.6) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+g
+
+
+g <- ggplot(test.allReps, aes(x=LFC, y=-log10(FDR), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=test.allReps[sig !='not'], show.legend = F, size=2, max.overlaps = 20, segment.alpha=0.6) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+g
+
+```
+
+```{r}
+g <- ggplot(de.dt[contrast == "abe8e_Paxalisib_22-vs-abe8e_librep_0",], aes(x=LFC, y=-log10(FDR), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=de.dt[contrast == "bemax_Paxalisib_22-vs-bemax_librep_0",][sig !='not'], show.legend = F, size=2, max.overlaps = 20, segment.alpha=0.6) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+g
+
+```
+Heatmaps of the sgRNA; first need to annotate the locations of the edits, then we can plot the 
+```{r}
+
+```
+
+
+
+
+```{r}
+mageck.test.mat <- fread('/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_16_sgNorm.countMat.txt')
+#fwrite(mageck.test.mat, sep='\t', ScriptAndDatedFileName('sgNorm.countMat.txt'))
+mageck.test.mat
+colnames(mageck.test.mat)
+
+which(colnames(mageck.test.mat) == "bemax_Paxalisib_22_2")
+
+```
+
+
+```{r}
+print(de.dt[contrast == "abe8e_Paxalisib_22-vs-abe8e_librep_0" & sgrna == 'BE_622',.(contrast, sgrna,control_count, treatment_count, LFC, p.twosided, FDR)])
+de.dt[contrast == "abe8e_Paxalisib_22-vs-abe8e_librep_0" & sgrna == 'BE_622',]
+```
+
+
+```{r}
+
+test.dt[sgrna == 'BE_622', .(contrast="abe8e_librep_0-vs-abe8e_Paxalisib_22", sgrna,control_count, treatment_count, LFC, p.twosided, FDR)]
+test.dt[sgrna == 'BE_622', ]
+```
+```{r}
+test2.dt[sgrna == 'BE_622', ]
+```
+
+
+
+**DEseq**
+Plot the heatmaps for the sgRNA
+
+```{r}
+# run for each of the samples to generate a matrix of plots
+runMageckRRA(mat='~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_15_sgNorm.countMat.txt',
+             #ctrlSamplesRegx='abe8e_librep_0.+',
+             #testSamplesRegx='abe8e_Paxalisib_22.+',
+             testSamplesRegx='abe8e_librep_0.+',
+             ctrlSamplesRegx='abe8e_Paxalisib_22.+',
+             otherParams = c('--norm-method none', '--remove-zero both', '--remove-zero-threshold 0'),
+             outDir='/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/RRA_PWComparisons_mats')
+```
+
+```{r}
+de.dt[,.N, by=.(sig,contrast)] %>% 
+  .[contrast %in% c('abe8e_Alpelisib_22-vs-abe8e_librep_0', 'abe8e_Alpelisib_7-vs-abe8e_librep_0')]
+```
+
+```{r}
+de.dt[sgrna == 'BE_5174',]
+```
+
+
+Alright; lets look at volcanoplots of the differences in the two groups
+
+```{r}
+
+```
+
+
+
+
+Try DESeq2 method and split the datasets into the two editors
+```{r}
+colnames(sgNorm.mat)
+```
+
+```{r}
+sgNorm.mat[sgRNA == 'BE_1',]
+```
+
+
+```{r}
+# log trasnform the values
+g <- ggplot(counts.long, aes(x=log2(rawCounts+1), y=log2(sgRNAnormCounts+1))) +
+  geom_point() +
+  ggtitle('Normalization methods comparison') +
+  geom_abline(slope=1, intercept=0) +
+  facet_wrap(~sample) +
+  theme_bw()
+
+g
+
+
+counts.long$treatment %>%  unique()
+```
+
+
+I'm thinking best approach is to normalize and test seperately; these editors are quite different in bases they modify, so probably best to consider as two different experiments
+Maybe normalization is fine, but definitely test seperately
+
+
+```{r}
+norm.counts.dt <- fread('./output/141024_sgCtrlNorm.count_normalized.txt') %>% 
+  .[, -c('Gene')] %>% 
+  as.matrix(rownames='sgRNA')
+
+
+
+log(norm.counts.dt)
+
+corMat <- cor(log2(norm.counts.dt+1), method='pearson', use = 'pairwise.complete.obs')
+
+# dendo ordereding
+od =  hclust(dist(corMat))$order
+corMat = corMat[od, od]
+
+
+hm <- Heatmap(corMat,
+        col=viridis(10),
+        name='Pearsons r',
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        column_dend_side = 'bottom',
+        rect_gp = gpar(type = "none"),
+	      cell_fun = function(j, i, x, y, w, h, fill) {
+		      if(i >= j) {
+			      grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		        grid.text(sprintf("%.2f", corMat[i, j]), x, y, gp = gpar(fontsize = 10))
+		      }
+	  })
+
+hm
+```
+
+
+
+Look at correlations between samples
+Do an all by all matrix with complexHeatmap
+
+
+
+
+
+```{r}
+counts.long$treatment %>% unique()
+
+rawMat <- dcast(counts.long, sgRNA~newLabel, value.var = 'rawCounts') %>% 
+  as.matrix(rownames='sgRNA')
+
+
+#rawMat <- log2(rawMat+1)
+
+corMat <- cor(rawMat, method='spearman', use = 'pairwise.complete.obs')
+
+# dendo ordereding
+od =  hclust(dist(corMat))$order
+corMat = corMat[od, od]
+
+
+hm <- Heatmap(corMat,
+        col=viridis(10),
+        name='Pearsons r',
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        column_dend_side = 'bottom',
+        rect_gp = gpar(type = "none"),
+	      cell_fun = function(j, i, x, y, w, h, fill) {
+		      if(i >= j) {
+			      grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		        grid.text(sprintf("%.2f", corMat[i, j]), x, y, gp = gpar(fontsize = 10))
+		      }
+	  })
+hm
+#BackupAsPDF(hm, 'sampleCorrelations.rawCounts)
+```
+

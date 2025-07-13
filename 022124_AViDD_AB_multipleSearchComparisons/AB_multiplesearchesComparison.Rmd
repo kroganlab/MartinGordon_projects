@@ -1,0 +1,1119 @@
+---
+title: "210224_MultipleSearchesComparison"
+author: "Martin Gordon"
+date: "2024-02-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Multiple Searches Comparison for the AViDD AB data
+To identify issues with previous search, we will look at the four searches together, plot and share the QC results
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(nichenetr)
+library(patchwork) # combine plots
+library(viridis)
+library(ggvenn)
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+metadata on mice available in the docs column; would be nice to use mouse weight or viral load in the analysis
+Most simple approach would be to include in the PCA
+
+For now reach out to Jack and proceed with the analysis
+
+```{r}
+spec.list <-  list(dda_bg = fread('./data/DDA Lib.tsv'),
+                   dda_noBg = fread('./data/DDA Lib No Background.tsv'),
+                   dual_bg = fread('./data/Dual Lib .tsv'),
+                   dual_noBg = fread('./data/2024.02.21 - Mac1 AB - Dual No Bg_Report_MSStats Format (Normal).tsv'),
+                   allSamples = fread('../020524_AVIDD_ABproteomics/data/AB_Report_MSstats_Format.tsv'))
+
+# sample ids 
+keys <- fread('./data/keys.txt')
+keys
+keys[,.N, .(Condition,RawFile)]
+# contrasts
+contrasts.txt <- fread('./data/contrasts.txt', sep='-', header=F)
+```
+
+```{r}
+# the dual DIA and DDA is a much bigger library; more things detected, but perhaps also an issue
+lapply(spec.list, dim)
+lapply(spec.list, str)
+```
+
+combine with sample metadata
+```{r}
+keys$RawFile %>%  unique()
+lapply(spec.dt.list, function(x){
+  x$Run %>%  unique()
+})
+
+spec.dt.list <- lapply(spec.list, function(X){
+  
+  spec.dt <- merge(x=X[,!c("Condition", "BioReplicate")], y=keys[,.(Condition, BioReplicate, RawFile, Fraction,IsotopeLabelType)], by.x='Run', by.y='RawFile')
+  return(spec.dt)
+})
+```
+
+Read in the MOUSE ID mapping file 
+
+```{r}
+# lets map the homologs to the mss output and write the complete and tidied data to file 
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+# gene sets OI
+piGenes <- read_xlsx('./docs/1-s2.0-S0092867423009157-mmc4.xlsx', col_names = T, sheet=7) %>% 
+  setDT(.) %>% 
+  .[category == 'Proinflammatory'] %>% 
+  .[,unique(gene)]
+
+isGenes <- fread('./docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+```
+
+
+For the searches, fix the SARS-CoV2 protein names
+
+
+
+need to check out what is in each of these runs... 
+Seems the other treatment conditions are dropped in this; only interested in comparison to mock,WT and vehicle
+
+```{r}
+spec.list[[3]][!Run %in% spec.list[[4]]$Run,unique(Run)]
+#"ex014889.raw"
+spec.list[[4]][Run == 'ex014889.raw',]
+
+#mock biorep 5
+keys[RawFile == 'ex014889.raw',]
+
+# sanity test 
+tidy.keys <- keys[,.N, by=.(RawFile,Condition,BioReplicate)][,.(RawFile,Condition, BioReplicate)][!Condition %in% c('x3769_7D','x3769_4D', 'x4052_4D','x4052_7D'),][order(RawFile),]
+
+# check the merging 
+lapply(spec.dt.list, function(x){
+  
+  print(x[,.N, by=.(Run,Condition, BioReplicate)][, .(Run,Condition,BioReplicate)][order(Run),])
+  tidy.keys
+})
+```
+These are only the samples
+
+```{r}
+spec.dt.list <- lapply(spec.dt.list, function(x){
+  hist(log2(x$Intensity))
+  spec.dt <-  x[Intensity > 2^5, ]
+  hist(log2(spec.dt$Intensity))
+  return(spec.dt)
+})
+```
+For now drop the sample with the missing rep and process
+
+```{r}
+spec.dt.list[[4]] <-  NULL
+
+```
+
+quick qc
+----
+
+multi-feature peptide ions?
+Seems all the featues are unique
+
+```{r}
+# no multiple feature peptide ions detected
+spec.dt[,.N, by=.(PeptideSequence,PrecursorCharge,Run)][N >1]
+
+
+lapply(spec.dt.list, function(x){
+  
+  x[, .N, by=.(PeptideSequence,PrecursorCharge, Run)][N > 1]
+})
+```
+
+
+boxplots of intensities
+
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(length(unique(spec.dt.list[[3]]$Condition)))
+
+lapply(seq_along(spec.dt.list), function(x,n,i){
+  
+  
+  g <- ggplot(x[[i]], aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition)) +
+    geom_boxplot() +
+    theme_classic() +
+    labs(title = n[[i]]) +
+    scale_fill_manual(values=col.pal) +
+    theme(axis.text.x = element_text(angle=90))
+
+  g
+  BackupAsPDF(g, paste0(n[[i]],'.raw.intensities.boxplot'))
+  
+},x=spec.dt.list, n=names(spec.dt.list))
+
+```
+n features
+---
+This bg imputation doesnt seem to make a big difference in the samples
+
+```{r}
+
+lapply(seq_along(spec.dt.list), function(x,n,i){
+  
+  
+  g <- ggplot(x[[i]][,.N, by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+    geom_bar(stat='Identity') +
+    labs(title = n[[i]]) +
+    scale_fill_manual(values=col.pal) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+
+  g
+  BackupAsPDF(g, paste0(n[[i]],'.Nfeatures.barplot'))
+  
+},x=spec.dt.list, n=names(spec.dt.list))
+
+```
+PCA of the features 
+
+```{r}
+lapply(seq_along(spec.dt.list), function(x,n,i){
+  
+  
+  featureMat <-  dcast(x[[i]], 
+                  paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") %>% as.matrix(rownames = 'PeptideSequence')
+  featureMat <- featureMat[complete.cases(featureMat), ]
+  
+  # 
+  pcaOut <- prcomp(t(log2(featureMat)))
+  colInfo <- data.table(colname = colnames(featureMat))
+  colInfo[,c("status","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+
+  #PCA
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    theme_bw() + 
+    labs(title = n[[i]]) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+    scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = 21:25) +
+    #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+  p
+  BackupAsPDF(p, paste0(n[[i]],'.completeFeatures.pca.'))
+
+  
+},x=spec.dt.list, n=names(spec.dt.list))
+
+```
+feature matrix 
+
+```{r}
+lapply(seq_along(spec.dt.list), function(x,n,i){
+  
+  featureMat <-  dcast(x[[i]], 
+                  paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") %>% as.matrix(rownames = 'PeptideSequence')
+  
+  print(featureMat)
+  featureMat <-  log2(featureMat)
+
+  dim(featureMat)
+  dim(featureMat[complete.cases(featureMat),])
+
+  # create annotation
+  ann <- data.table(replicate=str_extract(colnames(featureMat),'[1-5]$'),
+                  treatment=sub("[_.].+", "", colnames(featureMat)),
+                  timepoint=ifelse(grepl("[47]D", colnames(featureMat)), str_extract(colnames(featureMat), "[47]D"), 'na'))
+
+
+  colours <- list('timepoint' = c('na' = '#4477AA', '4D'="#228833", '7D'="#CCBB44"),
+                'replicate' = c('1' = '#4477AA', '2'='#66CCEE', '3'="#228833", '4'="#CCBB44", '5'='#EE6677'),
+                'treatment' =c('Mock' = col.pal[1], 'Vehicle'=col.pal[2], 'N1062D'=col.pal[3], 'x3769'=col.pal[4], 'x4052'=col.pal[5], 'x4206'=col.pal[6])
+                )
+
+  colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+  # subset the data
+  submat <- featureMat[sample(rownames(featureMat), 2000), ]
+  
+
+
+  hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities', column_names_gp = gpar(fontsize=6))
+  hm
+  BackupAsPDF(hm, paste0(n[[i]],'.features.clustered.heatmap'))
+
+  submat <- sweep(submat,1, STATS=apply(submat, 1, median, na.rm=T))
+  hm <- Heatmap(submat, cluster_rows=clusterWNA(submat), show_row_names = F, cluster_columns = T, top_annotation = colAnn, name='LogIntensities/Median',  column_names_gp = gpar(fontsize=6))
+  hm
+  BackupAsPDF(hm, paste0(n[[i]],'.features.clustered.medianScaled.heatmap'))
+  
+}, x=spec.dt.list, n=names(spec.dt.list))
+```
+Protein Summarisation
+
+convert to msstats format
+```{r}
+mssInput.list <-  lapply(spec.dt.list,  function(x){
+  
+  mss.dt <- specFileToCompleteMSstats(x)
+  mss.dt[,  IsotopeLabelType := 'L']
+  
+  return(mss.dt)
+})
+
+names(mssInput.list) <- names(spec.dt.list)
+```
+summarise to protein level
+-----
+- NB dont use the specFiletoCompleteMSstats as it doesnt seem to handle the fractionation in these files (perhaps its a result of the )
+```{r}
+dp.out.list <-  lapply(spec.dt.list,  function(x){
+  
+ dp.out <- MSstats::dataProcess(x, 
+                              MBimpute =  FALSE, 
+                              featureSubset = "highQuality", 
+                              remove_uninformative_feature_outlier = TRUE)
+ 
+ return(dp.out)
+})
+
+names(dp.out.list) <- names(mssInput.list)
+
+```
+
+Write out the RDS files
+
+```{r}
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  saveRDS(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], ".rds")))
+},x=dp.out.list, n=names(dp.out.list))
+```
+
+Save the individual files
+
+```{r}
+lapply(seq_along(dp.out.list), function(x,n,i){
+  fwrite (x[[i]]$ProteinLevelData, ScriptAndDatedFileName(paste0(n[[i]], ".ProteinLevelData.csv")))
+  fwrite (x[[i]]$FeatureLevelData,  ScriptAndDatedFileName(paste0(n[[i]], ".FeatureLevelData.csv")))
+},x=dp.out.list, n=names(dp.out.list))
+```
+
+Now read in the protein quant, look at the sample clustering and look at the ISG profiles
+
+```{r}
+p.quant.list <-  list(dda_bg = fread('./AB_multiplesearchesComparison_data/2024_02_21_dda_bg.ProteinLevelData.csv'),
+                   dda_noBg = fread('./AB_multiplesearchesComparison_data/2024_02_21_dda_noBg.ProteinLevelData.csv'),
+                   dual_bg = fread('./AB_multiplesearchesComparison_data/2024_02_21_dual_bg.ProteinLevelData.csv'))
+
+
+lapply(p.quant.list, head)
+
+names(dp.out.list)
+```
+QC plots
+
+boxplots of normalised intensities
+
+```{r}
+
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  g <- ggplot(x[[i]], aes (x= interaction(SUBJECT, GROUP), y = LogIntensities, fill = GROUP)) +
+  geom_boxplot() +
+  labs(title=n[[i]]) +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+  g
+  BackupAsPDF(g, paste0(n[[i]],'protein.intensities.boxplot'))
+  
+}, x=p.quant.list, n=names(p.quant.list))
+
+```
+
+Protein Counts per sample
+Weird.. we found a lot more peptides/fragments, but N proteins relatively consistent across samples
+
+```{r}
+
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  g <- ggplot(x[[i]][,.N,by=.(GROUP,SUBJECT)], aes(x=reorder(interaction(GROUP,SUBJECT)), y = N, fill = GROUP)) +
+  geom_bar(stat='Identity') +
+  labs(title=n[[i]]) +
+  theme_classic() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90))
+  g
+  BackupAsPDF(g, paste0(n[[i]],'nProteins.barplot'))
+  
+}, x=p.quant.list, n=names(p.quant.list))
+
+```
+pca and sample clustering 
+```{r}
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  prot.mat <- dcast (x[[i]], Protein~interaction(GROUP,SUBJECT), value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+  prot.mat <- prot.mat[complete.cases(prot.mat),]
+  
+  # run pc
+  pcaOut <- prcomp(t(prot.mat))
+  
+  
+  colInfo <- data.table(colname = colnames(prot.mat))
+  colInfo[,c("status", "rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+  
+  
+
+  #PCA
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  pcaDT[, `:=`(timepoint = ifelse(grepl("[47]D", rn), str_extract(rn, "[47]D"), 'na'),
+             treat = gsub("[_.].+", "", rn)
+             )]
+  
+  
+  # scree plot of the PC var explained
+  q <- qplot(1:10,  pcaPercentVar[1:10]) +
+  geom_line() +
+  xlab('Princpal Component 1:10') +
+  ylab(('% Variance explained')) +
+  ggtitle(paste0(n[[i]],' scree plot'))
+
+  BackupAsPDF(q, paste0(n[[i]],'pc.screeplot.'))
+  
+
+  #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    theme_bw() + 
+    ggtitle(n[[i]]) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+    scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = 21:25) +
+    #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ))
+
+  BackupAsPDF(p, paste0(n[[i]], 'completeProteins.pc1pc2.pca.'))
+  
+  
+  # plot pc2 and pc3
+  p <- ggplot (pcaDT, aes(x=PC2, y=PC3,  fill = status, shape = rep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    theme_bw() + 
+    ggtitle(n[[i]]) +
+    xlab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    ylab (sprintf ("PC3, %.1f%%", pcaPercentVar[3])) + 
+    #ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+    scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = 21:25) +
+    #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ))
+
+  BackupAsPDF(p, paste0(n[[i]], 'completeProteins.pc2pc3.pca.'))
+  
+}, x=p.quant.list, n=names(p.quant.list))
+```
+
+Out of curiosity, based solely on ISGs how do the samples cluster?
+Look v different with bg turned off compared to others...
+
+```{r}
+lapply(seq_along(p.quant.list), function(x,n,i){
+  x[[i]][, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+},x=p.quant.list, n=names.quant.list)
+```
+
+
+```{r}
+isGenes
+mh_mappings
+# map to MOUSE IDs and subset
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  prot.mat <- dcast (x[[i]], Protein~interaction(GROUP,SUBJECT), value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+  prot.mat <- prot.mat[complete.cases(prot.mat),]
+  
+  # subset to ISG set based on mouse mapping
+  # less features detected in the second set... w/o imputation, less complete.cases possibly?
+  prot.mat <- prot.mat[rownames(prot.mat) %in% mh_mappings[Symbol.human %in% isGenes, SWISS_PROT_IDs.mouse],]
+  
+  # run pc
+  pcaOut <- prcomp(t(prot.mat))
+  
+  colInfo <- data.table(colname = colnames(prot.mat))
+  colInfo[,c("status", "rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+  
+  #PCA
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  pcaDT[, `:=`(timepoint = ifelse(grepl("[47]D", rn), str_extract(rn, "[47]D"), 'na'),
+             treat = gsub("[_.].+", "", rn)
+             )]
+  
+  # scree plot of the PC var explained
+  q <- qplot(1:10,  pcaPercentVar[1:10]) +
+  geom_line() +
+  xlab('Princpal Component 1:10') +
+  ylab(('% Variance explained')) +
+  ggtitle(paste0(n[[i]],' scree plot'))
+  BackupAsPDF(q, paste0(n[[i]],'pc.ISGsubset.screeplot.'))
+  
+
+  #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = status, shape = rep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    theme_bw() + 
+    ggtitle(paste0(n[[i]], ' ISG subset')) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+    scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = 21:25) +
+    #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ))
+
+  BackupAsPDF(p, paste0(n[[i]], 'ISGsubset.pc1pc2.pca.'))
+  
+  
+},x=p.quant.list, n=names(p.quant.list))
+
+
+```
+
+look at sample ISG sample clustering and share with Jack, then do the DEA
+
+```{r}
+  
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  prot.mat <- dcast (x[[i]], Protein~interaction(GROUP,SUBJECT), value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+
+  # subset to ISG set based on mouse mapping
+  # less features detected in the second set... w/o imputation, less complete.cases possibly?
+  prot.mat <- prot.mat[rownames(prot.mat) %in% mh_mappings[Symbol.human %in% isGenes, SWISS_PROT_IDs.mouse],]
+  rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species='MOUSE')
+  
+  # create annotation
+  ann <- data.table(replicate=str_extract(colnames(prot.mat),'[1-5]$'),
+                  treatment=sub("[_.].+", "", colnames(prot.mat)),
+                  timepoint=ifelse(grepl("[47]D", colnames(prot.mat)), str_extract(colnames(prot.mat), "[47]D"), 'na'))
+
+  colours <- list('timepoint' = c('na' = '#4477AA', '4D'="#228833", '7D'="#CCBB44"),
+                'replicate' = c('1' = '#4477AA', '2'='#66CCEE', '3'="#228833", '4'="#CCBB44", '5'='#EE6677'),
+                'treatment' =c('Mock' = col.pal[1], 'Vehicle'=col.pal[2], 'N1062D'=col.pal[3], 'x3769'=col.pal[4], 'x4052'=col.pal[5], 'x4206'=col.pal[6])
+                )
+
+  colAnn <- HeatmapAnnotation(df = ann, col = colours)
+  
+
+  hm <- Heatmap(prot.mat, 
+                cluster_rows=clusterWNA(prot.mat), 
+                show_row_names = T, 
+                cluster_columns = T, 
+                top_annotation = colAnn,
+                name='LogIntensities',
+                column_names_gp = gpar(fontsize=6), 
+                row_names_gp = gpar(fontsize=6))
+  hm
+  #BackupAsPDF(hm, 'ISGproteins.clustered.heatmap')
+
+  subMat <- sweep(prot.mat,1, STATS=apply(prot.mat, 1, median, na.rm=T))
+
+  hm <- Heatmap(subMat, 
+                cluster_rows=clusterWNA(subMat), 
+               show_row_names = T, 
+               cluster_columns = F, 
+              #top_annotation = colAnn, 
+              name='LogIntensities/rowMedian',  
+              column_names_gp = gpar(fontsize=6), 
+              row_names_gp = gpar(fontsize=8), 
+              column_split=sub("[.][1-5]$", "", colnames(subMat)),
+              column_title_gp = gpar(fontsize=5))
+  draw(hm, column_title=n[[i]])
+  
+  BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' ISG subset')), paste0(n[[i]], '.isg.subset.medianScaled.heatmap'))
+  
+},x=p.quant.list, n=names(p.quant.list))
+#BackupAsPDF(hm, 'ISGproteins.medianscaled.heatmap')
+  
+```
+Take a random subset and view the clustering; do the same samples still stand out?
+
+```{r}
+  
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  prot.mat <- dcast (x[[i]], Protein~interaction(GROUP,SUBJECT), value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+  submat <-  scale(prot.mat, center=T, scale=T)
+  submat <- submat[sample(rownames(submat),2000), ]
+  
+  rownames(submat) <- multiUniprots2multiGenes(rownames(submat), species='MOUSE')
+  
+  # create annotation
+  ann <- data.table(replicate=str_extract(colnames(submat),'[1-5]$'),
+                  treatment=sub("[_.].+", "", colnames(submat)),
+                  timepoint=ifelse(grepl("[47]D", colnames(submat)), str_extract(colnames(submat), "[47]D"), 'na'))
+
+  colours <- list('timepoint' = c('na' = '#4477AA', '4D'="#228833", '7D'="#CCBB44"),
+                'replicate' = c('1' = '#4477AA', '2'='#66CCEE', '3'="#228833", '4'="#CCBB44", '5'='#EE6677'),
+                'treatment' =c('Mock' = col.pal[1], 'Vehicle'=col.pal[2], 'N1062D'=col.pal[3], 'x3769'=col.pal[4], 'x4052'=col.pal[5], 'x4206'=col.pal[6])
+                )
+
+  colAnn <- HeatmapAnnotation(df = ann, col = colours)
+  
+
+  hm <- Heatmap(submat, 
+                cluster_rows=clusterWNA(submat), 
+                show_row_names = F, 
+                cluster_columns = T, 
+                top_annotation = colAnn,
+                name='z-score(Ints.)',
+                column_names_gp = gpar(fontsize=6), 
+                row_names_gp = gpar(fontsize=6))
+  hm
+  #BackupAsPDF(hm, paste0(n[[i]],'.proteins.z-scores.clustered.heatmap'))
+
+  
+  submat <- prot.mat[sample(rownames(prot.mat),2000), ]
+  subMat <- sweep(prot.mat,1, STATS=apply(prot.mat, 1, median, na.rm=T))
+
+  hm <- Heatmap(subMat, 
+                cluster_rows=clusterWNA(subMat), 
+               show_row_names = F, 
+               cluster_columns = T, 
+              #top_annotation = colAnn, 
+              name='LogIntensities/rowMedian',  
+              column_names_gp = gpar(fontsize=6), 
+              row_names_gp = gpar(fontsize=8), 
+              cluster_column_slices = T,
+              column_split=sub("[.][1-5]$", "", colnames(subMat)),
+              column_title_gp = gpar(fontsize=5))
+  draw(hm, column_title=n[[i]])
+  
+  BackupAsPDF(draw(hm, column_title=n[[i]]), paste0(n[[i]], '.proteins.medianScaled.heatmap'))
+  
+},x=p.quant.list, n=names(p.quant.list))
+
+```
+```{r}
+lapply(seq_along(p.quant.list), function(x,n,i){
+  
+  prot.mat <- dcast (x[[i]], Protein~interaction(GROUP,SUBJECT), value.var = "LogIntensities") |> as.matrix (rownames = "Protein")
+
+  submat <- prot.mat[sample(rownames(prot.mat),2000), ]
+  subMat <- sweep(prot.mat,1, STATS=apply(prot.mat, 1, median, na.rm=T))
+  
+    # create annotation
+  ann <- data.table(replicate=str_extract(colnames(submat),'[1-5]$'),
+                  treatment=sub("[_.].+", "", colnames(submat)),
+                  timepoint=ifelse(grepl("[47]D", colnames(submat)), str_extract(colnames(submat), "[47]D"), 'na'))
+
+  colours <- list('timepoint' = c('na' = '#4477AA', '4D'="#228833", '7D'="#CCBB44"),
+                'replicate' = c('1' = '#4477AA', '2'='#66CCEE', '3'="#228833", '4'="#CCBB44", '5'='#EE6677'),
+                'treatment' =c('Mock' = col.pal[1], 'Vehicle'=col.pal[2], 'N1062D'=col.pal[3], 'x3769'=col.pal[4], 'x4052'=col.pal[5], 'x4206'=col.pal[6])
+                )
+
+  colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+  hm <- Heatmap(subMat, 
+                cluster_rows=clusterWNA(subMat), 
+               show_row_names = F, 
+               cluster_columns = T, 
+              top_annotation = colAnn, 
+              name='LogIntensities/rowMedian',  
+              column_names_gp = gpar(fontsize=6), 
+              row_names_gp = gpar(fontsize=8), 
+            #  cluster_column_slices = T,
+              #column_split=sub("[.][1-5]$", "", colnames(subMat)),
+              column_title_gp = gpar(fontsize=5))
+  draw(hm, column_title=n[[i]])
+  
+  #BackupAsPDF(draw(hm, column_title=n[[i]]), paste0(n[[i]], '.proteins.medianScaled.clusteering.heatmap'))
+  
+},x=p.quant.list, n=names(p.quant.list))
+```
+
+PW comparisons of each of the setups
+-----
+
+```{r}
+contrasts.list <- split(contrasts.txt, seq(nrow(contrasts.txt)))
+names(contrasts.list) <- apply(contrasts.txt, 1, function(x){ paste(x[1], x[2], sep='-') }) 
+
+dp.proc.list <- lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  f.quant <- setDT(x[[i]]$FeatureLevelData)
+  p.quant <- setDT(x[[i]]$ProteinLevelData)
+  
+  p.quant[, SUBJECT := interaction(GROUP,SUBJECT)]
+  f.quant[, SUBJECT := interaction(GROUP,SUBJECT)]
+  
+  x[[i]]$FeatureLevelData <- f.quant
+  x[[i]]$ProteinLevelData <- p.quant
+  
+  return(x[[i]])
+
+},x=dp.out.list, n=names(dp.out.list))
+
+
+names(dp.proc.list) <- names(dp.out.list)
+```
+run the pw comparisons
+```{r}
+contrasts.new.txt <-  fread('./data/contrasts_new.txt', sep='-', header=F)
+
+contrasts.list <- split(contrasts.new.txt, seq(nrow(contrasts.new.txt)))
+names(contrasts.list) <- apply(contrasts.new.txt, 1, function(x){ paste(x[1], x[2], sep='-') }) 
+
+ms.out.list <- lapply(seq_along(dp.proc.list), function(x,n,i){
+  
+  contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(x[[i]]$ProteinLevelData$GROUP),
+                               labels = names(contrasts.list))
+  
+  print(contrasts.mat)
+  # run msstats correcting for batch 
+  mss <- groupComparison(contrast.matrix=contrasts.mat, data=x[[i]])
+  mss.dt <- setDT(mss$ComparisonResult)
+
+  #fwrite(mss.dt, ScriptAndDatedFileName(paste0(n[[i]], 'mss.pwcontrasts.unfiltered.csv')))
+  
+},x=dp.proc.list, n=names(dp.proc.list))
+
+
+names(ms.out.list) <- names(dp.proc.list)
+```
+Write the output of the MSstats analysis
+
+```{r}
+mss.proc.list <- lapply(seq_along(ms.out.list), function(x,n,i){
+  
+  x[[i]][, gene := multiUniprots2multiGenes(as.character(Protein), species='MOUSE')]
+  fwrite(x[[i]], ScriptAndDatedFileName(paste0(n[[i]], 'mss.pwcontrasts.unfiltered.csv')))
+  
+  # now 
+  x.dt <- x[[i]][!is.infinite(abs(log2FC)) & !issue %in% c("oneConditionMissing","completeMissing"), ] %>% 
+  .[, sig := 'not'] %>% 
+  .[abs(log2FC) > 0.58 & adj.pvalue < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+  
+  fwrite(x.dt, ScriptAndDatedFileName(paste0(n[[i]], 'mss.pwcontrasts.processed.csv')))
+  return(x.dt)
+
+},x=ms.out.list, n=names(ms.out.list))
+
+names(mss.proc.list) <-  names(ms.out.list)
+```
+
+```{r}
+mss.comb <- rbindlist(mss.proc.list, idcol = T)
+
+g <- ggplot(data=mss.comb[sig != 'not', .N, by=.(sig,.id,Label)], aes(x=sig, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=c('up'='red', 'down'='blue')) +
+  facet_grid(.id~Label) +
+  theme_bw() +
+  theme(
+  strip.text = element_text(
+    size = 5))
+
+BackupAsPDF(g, 'Nsighits.contrastvsearch.barplot', dimensions = c(12,6))
+```
+
+plot summary of the sig hits per conditons
+
+```{r}
+g <- ggplot(data=mss.comb[sig != 'not', .N, by=.(sig,.id)], aes(x=sig, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=c('up'='red', 'down'='blue')) +
+  facet_grid(.~.id) +
+  theme_bw() +
+  theme(
+  strip.text = element_text(
+    size = 8))
+
+BackupAsPDF(g, 'Nsighits.search.barplot', dimensions = c(6,4))
+```
+MOUSE ID mappings 
+```{r}
+
+new.mss <- merge.data.table(x=mss.comb, y=mh_mappings[,.(Symbol.mouse, Symbol.human, SWISS_PROT_IDs.mouse, SWISS_PROT_IDs.human)], by.x='Protein', by.y='SWISS_PROT_IDs.mouse', all.x=T)
+mss <- unique(new.mss, by=c("Protein", "Label", ".id")) #drop dup records from 1:many mappings
+
+nrow(mss.comb)
+nrow(new.mss)
+nrow(mss)
+```
+
+Volcanoplot vs vehicle 
+```{r}
+contrasts.oi <-  grep('-Vehicle', unique(mss.comb$Label), value=T)
+contrasts.oi <- contrasts.oi[-1]
+
+
+g <-  ggplot(mss[Symbol.human %in% isGenes & Label %in% contrasts.oi, ], aes(x=log2FC, y=-log10(adj.pvalue), col=sig, label=Symbol.mouse)) +
+    geom_point() +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('up'='#990033', 'down'="#2A788EFF", 'not'='grey')) +
+    ggrepel::geom_text_repel(size = 2, max.overlaps = 20, segment.color = 'grey80') +
+    ggtitle(paste('ISG Fold Change Comparisons')) + 
+    theme_bw() +
+    facet_grid(.id~Label)
+
+g
+BackupAsPDF(g, 'isg.vsVeh.volcanoplots', dimensions=c(10,8))
+```
+
+Volcanoplots of the DEGs in each contrast, 1 row per search
+
+```{r}
+
+g <- ggplot(mss[Label %in% contrasts.oi,], aes(x=log2FC, y=-log10(adj.pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss[Label %in% contrasts.oi & sig != 'not',], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  # add the points for the SARS-CoV2 proteins
+  #geom_point(data=mss[Protein %in% virus.prots,], aes(x=log2FC, y=-log10(adj.pvalue)), col='#669966') +
+  #ggrepel::geom_text_repel(data=mss[Protein %in% virus.prots,],  size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "#669966") +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  facet_wrap(Label~.id, ncol=3) +
+  theme_bw()
+g
+BackupAsPDF(g, 'combined.volcano', dimensions=c(12,18))
+
+
+mss[Protein %like% "SARS",]
+
+dp.out.list[[1]][Protein %like% "Q9Z0G7",]
+spec.list[[1]][grep("P0DTC3", ProteinName),]
+
+
+grep()
+
+mss[gene == 'NaN',]
+
+
+spec.dt.list[[1]][ProteinName == 'NaN',]
+```
+Venn Diagrams of overlaps in protein sig hits 
+- compare this to the unfiltered list
+
+
+
+```{r}
+searches.venn <- list(dual_bg = mss[.id == 'dual_bg' & sig != 'not',  unique(gene)],
+                      dda_bg = mss[.id == 'dda_bg' & sig != 'not',  unique(gene)],
+                      dda_nobg = mss[.id == 'dda_noBg' & sig != 'not',  unique(gene)]
+                      )
+
+g <- ggvenn(searches.venn) +
+  labs(title='overlap in sig hits (log2FC +/ 50% & adj.pval < 0.05)')
+g
+
+searches.venn <- list(dual_bg = ms.out.list[['dual_bg']][sig != 'not',  unique(gene)],
+                      dda_bg = ms.out.list[['dda_bg']][sig != 'not',  unique(gene)],
+                      dda_nobg = ms.out.list[['dda_noBg']][ sig != 'not',  unique(gene)]
+                      )
+
+g <- ggvenn(searches.venn) +
+  labs(title='overlap in sig hits (log2FC +/ 50% & adj.pval < 0.05)')
+
+```
+Compare the N sig hits to the unfiltereed set, seems many of these will appear as condition missing
+
+```{r}
+mss.raw.comb <- rbindlist(ms.out.list, idcol = T)
+
+g <- ggplot(mss.raw.comb[abs(log2FC) > 0.58 & adj.pvalue < 0.05 & !is.na(issue),.N, by=.(issue,.id)], aes(x=.id, y=N, fill=issue)) +
+  geom_bar(stat='Identity') +
+  labs(title='N proteins with missing vals in comparisons') +
+  theme_bw()
+g
+BackupAsPDF(g, 'NcomparisonsWConditionsMissing.barplot')
+```
+Heatmaps of proteins with conditions missing 
+
+```{r}
+lapply(seq_along(p.quant.list), function(x,y,n,i){
+  
+  p.mat <-  dcast(x[[i]], Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  p.mat <-  p.mat[rownames(p.mat) %in% y[.id == n[[i]] & !is.na(issue), unique(Protein)],  ]
+  
+  rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat), species = 'MOUSE')
+
+  
+  hm <- Heatmap(p.mat, 
+                cluster_rows = clusterWNA(p.mat), 
+                cluster_columns=F, 
+                col=viridis(100),
+                column_title_gp = gpar(fontsize=6),
+                column_split = list(gsub("[.][1-5]$", "", colnames(p.mat)), 
+                                                                       str_extract(colnames(p.mat), "[47]D")
+                                                                       ))
+  BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' oneConditionMissingProteins')), paste0(n[[i]], 'missingProts.heatmap'), dimensions=c(12,8))
+  
+  
+},x=p.quant.list, y=mss.raw.comb, n=names(p.quant.list))
+
+```
+Lets look at the enrichment for each of the sets
+
+just run enrichment of the 3;
+
+```{r}
+
+contrasts.oi <- grep("-Mock", unique(mss$Label), invert = T, value=T)
+
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(dbName = 'org.Mm.eg.db', ontology = "ALL", keyType = "UNIPROT")
+
+## loop through the 
+lapply(seq_along(mss.ou.list), function(x,n,i){
+  
+  universe <- x[[i]][, unique(Protein)]
+  
+  x[[i]][,enrich.grp := interaction(Label,sig)]
+  
+  enrich.dt <- enricherOnGroups(x[[i]][Label %in% contrasts.oi & sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "Protein", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+  fwrite(enrich.dt, ScriptAndDatedFileName(paste0(n[[i]],'.GOenrichments.')))
+
+  simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+  fwrite(simp.enrich$simplified, ScriptAndDatedFileName(paste0(n[[i]],'GOenrichments.simplified.')))
+
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'enrich.grp', topN = 8, title=paste0(n[[i]],' GO term enrichment'), 
+                                  negCols=unique(simp.enrich$simplified$enrich.grp[grep('down', simp.enrich$simplified$enrich.grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 8)
+  ht
+  BackupAsPDF(ht, paste0(n[[i]],'go.heatmap.top8.'), dimensions=c(10,8))
+}, x=mss.proc.list, n=names(mss.proc.list))
+```
+These enrichments dont look great... what happened to all the sig hits from previous work?
+Why are the enrichments so different and where are the sig hits?
+
+```{r}
+mss.raw.comb[, sig := 'not']
+mss.raw.comb[abs(log2FC) > 0.58 & adj.pvalue < 0.05,  sig := ifelse(log2FC > 0, 'up', 'down')]
+# not a huge amt of sig hits here...
+mss.raw.comb[sig != 'not',.N, by=.(Label,sig,.id)][grep("Mock", Label, invert=T)][grep("4206_4D-", Label)][order(Label)]
+
+# look at the processed... far less hits when we remove missing signals in these groups...
+mss.comb[sig != 'not',.N, by=.(Label,sig,.id)][grep("Mock", Label, invert=T)][grep("4206_4D-", Label)][order(Label)]
+```
+What about our sig hits previously in this comparison? Read in the data, look at a heatmap of the sig hits in the first search
+Also, compare the run condition matching with what we have now...
+
+First look at the sig hit profiles from the old data
+
+```{r}
+# p.quant 
+old.p.quant <- fread("../020524_AVIDD_ABproteomics/output/AB.ProteinLevelData.csv")
+old.p.quant[, REP := SUBJECT]
+old.p.quant[, SUBJECT := interaction(GROUP,SUBJECT)]
+# for plotting group averages
+old.p.quant[, mean.LogIntensities := mean(LogIntensities, na.rm=T), by=.(Protein,GROUP)]
+
+#msstats output
+old.mss <- fread('../020524_AVIDD_ABproteomics/output/mss.contrasts.ab.csv')
+
+#clean the res
+old.mss <- old.mss[!is.infinite(abs(log2FC)) & !issue %in% c("oneConditionMissing","completeMissing"), ] %>% 
+  .[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')] %>% 
+  .[, sig := 'not'] %>% 
+  .[abs(log2FC) > 0.58 & adj.pvalue < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+```
+
+```{r}
+old.hits <- old.mss[Label == 'x4206_4D-Vehicle_4D' & sig != 'not',  unique(Protein)]
+
+
+# look at our  new data almost no significant hits detected? Whats going on lost the vast majority of sig hits...
+mss.raw.comb[Label == 'x4206_4D-Vehicle_4D' & Protein %in% old.hits & sig != 'not', .N, by=.(sig, .id)] 
+
+# fold changes still quite large, but our pvalues much lower.. why is this?
+g <- ggplot(mss.raw.comb[Label == 'x4206_4D-Vehicle_4D', ],
+       aes(x=log2FC, y=-log10(adj.pvalue), color=sig)) +
+   geom_point() +
+  scale_color_manual(values=c('up'='red','down' = 'blue','not'='grey')) +
+  geom_point(data=mss.raw.comb[Label == 'x4206_4D-Vehicle_4D' & Protein %in% old.hits, ],  aes(x=log2FC, y=-log10(adj.pvalue), color='green')) +
+  facet_wrap(~.id)
+
+BackupAsPDF(g, 'x4206-vsVehD4.comparisontoOlddata')
+```
+Need to figure out why these are so different... 
+- compare output of the ms models. 
+- compare number of cols in the p.quant data (were there samples missing in the first run?)
+- compare the contrast matrices
+```{r}
+# 51 rows
+old.p.quant[,.N, by=(SUBJECT)][grep('x3769|x4052', SUBJECT, invert=T)]
+
+
+# lets look at the other data 
+lapply(p.quant.list, function(x){
+  
+  x[, .N, by=.(GROUP,SUBJECT)]
+})
+```
+Look at scatterplots of the p.quant data conditions; make sure these dont vary. IF they are v similar it must be down to the modelling...
+combine the four matrices and check
+```{r}
+old.p.quant[, .id := 'oldSearch']
+old.p.quant[, SUBJECT := REP]
+p.quant.comb <- rbind(rbindlist(p.quant.list, idcol = T), old.p.quant, fill=T)
+
+# look at group mean scatterplots
+wide.dt <- dcast(p.quant.comb, Protein~interaction(GROUP,.id), value.var='LogIntensities', fun.aggregate = mean, na.rm=T)
+
+# create scatterplots of x4206 mean vs other group
+g <- ggplot(wide.dt, aes(x=x4206_4D.dual_bg, y=x4206_4D.oldSearch)) + geom_abline(intercept = 0, slope=1) + geom_point() + geom_density_2d()
+g
+g <- ggplot(wide.dt, aes(x=x4206_4D.dda_noBg, y=x4206_4D.oldSearch)) + geom_abline(intercept = 0, slope=1) + geom_point() + geom_density_2d()
+g
+g <- ggplot(wide.dt, aes(x=x4206_4D.dda_bg, y=x4206_4D.oldSearch)) + geom_abline(intercept = 0, slope=1) + geom_point() + geom_density_2d()
+g
+```
+
+compare the raw spectronaut files
+
+```{r}
+# from Box folder 060224_AVIDD_AB_DIA/20240206_115609_2024.02.06 - Mac1 Inhibitor Mouse Lung AB/2024.02.06 - Mac1 Inhibitor Mouse Lung AB_Report_MSStats Format (Normal).tsv
+old.spec <- fread('../020524_AVIDD_ABproteomics/data/AB_Report_MSstats_Format.tsv')
+old.spec[, .id := 'oldSearch']
+
+
+old.spec[, gene := multiUniprots2multiGenes(ProteinName, species='MOUSE')]
+
+spec.list <-  list(dda_bg = fread('./data/DDA Lib.tsv'),
+                   dda_noBg = fread('./data/DDA Lib No Background.tsv'),
+                   dual_bg = fread('./data/Dual Lib .tsv'),
+                   dual_noBg = fread('./data/240221.dual.lib.nobg.tsv'))
+
+# get shared raw files
+shared.runs <- unique(spec.list[[1]]$Run)
+
+lapply(spec.list, function(x){nrow(x)})
+nrow(old.spec[Run %in% shared.runs,])
+
+# 32
+shared.runs %>% length()
+
+# still 32
+old.spec[Run %in% shared.runs, .N, by=.(Run)]
+```
+
+Compare the counts in each of the datasets
+
+```{r}
+spec.comb <- rbind(rbindlist(spec.list, idcol=T), old.spec, fill=T)
+spec.comb[, gene := multiUniprots2multiGenes(ProteinName, species='MOUSE')] 
+spec.comb <- spec.comb[Intensity > 2^5,]
+
+spec.wide <- dcast(spec.comb, interaction(PeptideSequence,PrecursorCharge)~interaction(.id,Run), value.var = "Intensity") %>% 
+  as.matrix(rownames=1)
+
+# just get complete prots for count comparisons
+spec.wide <-  spec.wide[complete.cases(spec.wide),]
+
+# comvert to dt
+spec.wide <- data.table(spec.wide, keep.rownames = T)
+
+ggplot(spec.wide, aes(x=log2(dual_bg.ex014876.raw), y=log2(oldSearch.ex014876.raw))) +
+  geom_point() +
+  geom_density2d()
+
+
+spec.wide %>%  colnames()
+```
+
+
+
+
+Todo
+----
+
+how do we compare enrichments. Use all prots detected across runs as bg
+What about using only shared features instead?
+```{r}
+
+```
+
+
+enrichment of the set of dual library vs dda only grp
+
+What about the additonal dual lib hits? look at enrichment of proteins not in dual lib and enrich
+Also maybe scatterplot of log2FC values of any sig proteins for each of the groups?
+
+
+```{r}
+
+```
+
+
+
+Todo
+---
+Filter out proteins with low N peptides
+Heatmaps?
+Ask about the viral proteins.. why are they not recovered in the search?
+
+‚

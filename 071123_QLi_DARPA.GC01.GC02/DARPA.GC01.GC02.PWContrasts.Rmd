@@ -1,0 +1,993 @@
+---
+title: "DARPA.GC01.GC02.PWcontrats"
+author: "Martin Gordon"
+date: "2023-11-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## MSstats PW contrasts
+
+Two sets of data:
+ZC conditions: these are for the receptor MRX2.
+RF conditions: these are for the receptor QRFPR.
+
+Notes for conditions:
+ZCxx: means the time for Zinc compound treatment for MRX2. So ZC00 means 0 min (ctrl), and ZC10
+means 10 min of Zinc compound treatment.
+YM: means the cells were pretreated with YM compound for Gq signaling inhibition.
+PTX: means the cells were pretreated with pertussis toxin for Gi signaling inhibition.
+So for example, the condition of ZC05_YM means Zinc compound treatment for 5 min and with YM
+pretreatment for Gq inhibition.
+The conditions for QRFPR follows the same logic
+
+
+Packages
+```{r}
+library(data.table)
+library(ggplot2)
+library(MSstats)
+library(magrittr)
+library(stringr)
+library(ComplexHeatmap)
+library(randomcoloR)
+
+source ("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+Read in data and get overview
+```{r}
+spec <- fread('./data/GC01_GC02/20231102_155913_GC01_GC02_EXc_dirDIA_APEX_MSStatsReport.tsv')
+
+
+spec[,.N,.(Run,Condition,BioReplicate)]
+dim(spec)
+summary(spec)
+str(spec)
+```
+
+```{r}
+spec[,.N,by=.(BioReplicate,Condition)]
+spec %>%  colnames()
+```
+histogram of intensites
+
+```{r}
+ggplot(spec, aes(x=log2(Intensity))) + geom_histogram()
+
+
+filter <- 2^4
+spec <- spec[Intensity > filter]
+  
+ggplot(spec, aes(x=log2(Intensity))) + geom_histogram()
+```
+N peptides per run 
+Clearly samples ZC00_YM2 and ZC00_PTX2 biorep 2 have lower counts than other groups, biorep in general seems to have lower counts
+```{r}
+colnames(spec)
+head(spec)
+
+# sanity check; make sure each peptide has a unique elution profile
+any(spec[,.N,by=.(PeptideSequence,PrecursorCharge, Condition, BioReplicate)]$N > 1)
+
+
+col.pal <- randomcoloR::randomColor(count=length(unique(spec$Condition)))
+
+g <- ggplot(spec[,.N,by=.(Condition, BioReplicate,PrecursorCharge)], aes(x=reorder(interaction(Condition, BioReplicate)), y=N, fill=Condition)) + 
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal)  +
+  theme_classic() +
+  ggtitle('N peptides per run') +
+  theme(
+    axis.text.x = element_text(angle=90)
+  )
+g
+
+BackupAsPDF(g, 'NpeptidesPerRun.barplot.')
+```
+
+Counts in general seem lower for the second biorep
+
+```{r}
+g <- ggplot(spec[,.N,by=.(Condition, BioReplicate,PrecursorCharge)], aes(x=reorder(interaction(Condition, BioReplicate)), y=N, fill=as.factor(BioReplicate))) + 
+  geom_bar(stat='Identity') + 
+  scale_fill_manual(values=col.pal)  +
+  theme_classic() +
+  ggtitle('N peptides per run') +
+  theme(
+    axis.text.x = element_text(angle=90)
+  )
+g
+```
+boxplots of peptide intensities per sample
+samples  ZC00_YM2 and ZC00_PTX2 biorep 2 clear outliers; remove
+
+```{r}
+g <- ggplot(spec, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition))  +
+  geom_boxplot() +
+   scale_fill_manual(values=col.pal)  +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle=90)
+  )
+
+BackupAsPDF(g, 'raw.intensities.boxplotrmSamples.')
+```
+
+Looks to me the RF treated QRFPR samples are much more variable
+Split the dataset into two and process seperately to avoid over-correcting during normalisation
+```{r}
+# drop the problematic samples
+spec <- spec[!interaction(Condition,BioReplicate) %in% c('ZC00_YM.2', 'ZC00_PTX.2'), ] 
+
+ggplot(spec, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition))  +
+  geom_boxplot() +
+   scale_fill_manual(values=col.pal)  +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle=90)
+  )
+summary(spec)
+```
+```{r}
+spec[, receptor := ifelse(grepl('ZC', Condition), 'MRX2', 'QRFPR')]
+# clear batch effect to me in spec: renmae the bioreps 4-6
+spec[receptor == 'QRFPR', BioReplicate := BioReplicate +3]
+
+```
+
+Before splitting, view PCA of samples 
+```{r}
+clusterwNA <- function(x, na.val=0){
+  
+  x[is.na(x)] <- na.val
+  dist(x) %>%  hclust(method='complete')
+}
+
+
+f.mat <-dcast(spec, interaction(PeptideSequence,PrecursorCharge)~interaction(Condition,BioReplicate), value.var = 'Intensity') %>% 
+  as.matrix(rownames='PeptideSequence')
+
+f.mat <- log2(f.mat)
+
+f.mat <- f.mat[complete.cases(f.mat),]
+
+submat <- f.mat[sample(rownames(f.mat), 3000),]
+Heatmap(submat, cluster_rows = clusterwNA(submat), show_row_names = F)
+```
+PCA of the samples; two large global batches depending on receptor
+Also clear outlier in sample ZC10.2; drop this sample also
+
+```{r}
+pcaOut <- prcomp(t(f.mat))
+
+colInfo <- data.table(colname = colnames(f.mat))
+colInfo[,c("treat","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ] # v useful fucntion
+
+title <- "PCA"
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = treat, shape=rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values=c(19, 21:26)) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+
+BackupAsPDF(p, "PCA.Complete.Features")
+
+```
+
+Drop ZC10.2 intensites very different to other members of group and replot
+
+```{r}
+spec <- spec[!interaction(Condition,BioReplicate) %in% c('ZC10.2'), ] 
+spec.list <- split(spec, spec$receptor)
+
+
+f.mat <-dcast(spec, interaction(PeptideSequence,PrecursorCharge)~interaction(Condition,BioReplicate), value.var = 'Intensity') %>% 
+  as.matrix(rownames='PeptideSequence')
+
+f.mat <- log2(f.mat)
+
+f.mat <- f.mat[complete.cases(f.mat),]
+
+submat <- f.mat[sample(rownames(f.mat), 3000),]
+Heatmap(submat, cluster_rows = clusterwNA(submat), show_row_names = F)
+```
+
+
+Now process the two spec list elements seperately
+
+```{r}
+
+spec.list <- lapply(spec.list, function(x){
+  
+  spec.mss <- specFileToCompleteMSstats(x)
+  spec.mss[, IsotopeLabelType := 'L']
+  setDF(spec.mss)  # MSstats likes data.frame not data.table, so convert to class data.frame
+
+})
+
+names(spec.list)
+```
+Run MSstats preprocessing function
+
+```{r}
+dp.out.list <- lapply(spec.list, function(x){
+  
+           MSstats::dataProcess(x,
+                               featureSubset = "highQuality",
+                               remove_uninformative_feature_outlier = TRUE,
+                               MBimpute = FALSE ) 
+  
+})
+```
+save output
+```{r}
+#saveRDS(dp.out.list[['MRX2']], './output/MRX2.rds')
+#saveRDS(dp.out.list[['QRFPR']], './output/QRFPR.rds')
+
+MRX2.dp  <- readRDS('./output/MRX2.rds')
+QRFPR.dp <- readRDS('./output/QRFPR.rds')
+
+dp.out.list <- list(MRX2 = MRX2.dp,
+                    QRFPR = QRFPR.dp)
+
+```
+
+boxplots of normalised logIntensites, 
+
+```{r}
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  g <- ggplot(x[[i]]$ProteinLevelData, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) + 
+    geom_boxplot() +
+    scale_fill_manual(values=col.pal) +
+    ggtitle(paste0(n[[i]], ' protein intensities')) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+
+  BackupAsPDF(g, paste0(n[[i]], '.protein.intensity.tmpnormalised.boxplot.'))
+},x=dp.out.list, n=names(dp.out.list))
+```
+Protein counts per sample
+
+```{r}
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  dt <- data.table(x[[i]]$ProteinLevelData)
+  print(dt)
+  g <- ggplot(dt[, .N, by=.(Protein,GROUP,SUBJECT)], aes(x=reorder(interaction(GROUP,SUBJECT)), y=N, fill=GROUP)) + 
+    geom_bar(stat='Identity') +
+    scale_fill_manual(values=col.pal) +
+    ggtitle(paste0(n[[i]], ' Protein counts')) +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle=90))
+ g
+  BackupAsPDF(g, paste0(n[[i]], '.protein.counts.'))
+},x=dp.out.list, n=names(dp.out.list))
+```
+
+
+
+MRX2 data looks good, but issues with QRFPR.
+For the QRFPR, run a second round of normalisation
+
+```{r}
+dt <- data.table(dp.out.list$QRFPR$ProteinLevelData) 
+
+pmat <- data.table(dp.out.list$QRFPR$ProteinLevelData) %>% 
+  dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+# tukey median polish proceedure
+tmp <- medpolish(pmat, na.rm = T)
+
+tmp.dt <- data.table(sample = names(tmp$col),
+                     offset = tmp$col
+                     )
+
+dt[, sample := interaction(GROUP,SUBJECT)]
+
+dt[tmp.dt, offset := i.offset, on=c("sample")]
+dt[, new.LogIntensities := LogIntensities - offset,]
+
+# looks much better save this to the data
+ggplot(dt, aes(x=interaction(GROUP,SUBJECT), y=new.LogIntensities, fill=GROUP)) + geom_boxplot()
+
+
+dt[, LogIntensities := new.LogIntensities]
+
+# use this if rerunning
+#fwrite(dt, './output/QRFPR.ProteinlvlData.tmpNormalized.csv.gz')
+
+dp.out.list$QRFPR$ProteinLevelData <- dt
+```
+
+heatmaps of 3K subsample of proteins
+
+```{r}
+# renmae the variables to add a control flag
+dp.out.list$QRFPR$ProteinLevelData <- setDF(data.table(dp.out.list$QRFPR$ProteinLevelData)[!GROUP %like% ('YM|PTX'), GROUP := paste0(GROUP,'_CTRL')])
+dp.out.list$MRX2$ProteinLevelData <- setDF(data.table(dp.out.list$MRX2$ProteinLevelData)[!GROUP %like% ('YM|PTX'), GROUP := paste0(GROUP,'_CTRL')])
+```
+
+```{r}
+dp.out.list$QRFPR$ProteinLevelData$GROUP %>%  unique()
+
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  p.mat <-  data.table(x[[i]]$ProteinLevelData) %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  subMat <- p.mat[sample(rownames(p.mat),2000), ]
+
+  #heatmap annotation 
+  grp <- sub(".[1-6]$", "", colnames(subMat))
+  time <-  str_extract(colnames(subMat), "00|05|10")
+  treat <- str_extract(colnames(subMat), "CTRL|PTX|YM_PTX|YM")
+  batch <- sub(".","",str_extract(colnames(subMat), ".[1-6]$"))
+
+  
+  ha <- HeatmapAnnotation(group = grp, treatment=treat, time=time, batch=batch, col=list(time=c('00'='red', '05'='blue', '10'='green'),
+                                                                                         treatment=c('PTX'='orange', 'YM_PTX'='yellow','YM'='palegreen', 'CTRL'='grey'),
+                                                                                         batch=c('1'='pink','2'='cyan', '3'='palegreen', '4'='purple', '5'='orange', '6'='lightyellow')))
+  
+  hm <-  Heatmap(subMat, 
+          cluster_rows = clusterwNA(subMat),
+          show_row_names = F,
+          name = 'Log2 Intensities',
+          row_title = sprintf('%s sampled proteins', nrow(subMat)),
+          top_annotation = ha)
+  
+  BackupAsPDF(draw(hm, column_title=n[[i]]), paste0(n[[i]], '.intensity.heatmaps.'),  dimensions=c(8,8))
+  
+}, x=dp.out.list, n=names(dp.out.list))
+
+```
+heatmaps of median swept plots
+
+```{r}
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  p.mat <-  data.table(x[[i]]$ProteinLevelData) %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  # subtract median vals from rows
+  subMat <- sweep(p.mat, 1, FUN='-', STATS=apply(p.mat, 1, median, na.rm=T))
+  
+  subMat <- subMat[sample(rownames(subMat),2000), ]
+
+  #heatmap annotation 
+  grp <- sub(".[1-6]$", "", colnames(subMat))
+  time <-  str_extract(colnames(subMat), "00|05|10")
+  treat <- str_extract(colnames(subMat), "CTRL|PTX|YM_PTX|YM")
+  batch <- sub(".","",str_extract(colnames(subMat), ".[1-6]$"))
+
+  
+  ha <- HeatmapAnnotation(group = grp, treatment=treat, time=time, batch=batch, col=list(time=c('00'='red', '05'='blue', '10'='green'),
+                                                                                         treatment=c('PTX'='orange', 'YM_PTX'='yellow','YM'='palegreen', 'CTRL'='grey'),
+                                                                                         batch=c('1'='pink','2'='cyan', '3'='palegreen', '4'='purple', '5'='orange', '6'='lightyellow')))
+  
+  hm <-  Heatmap(subMat, 
+          cluster_rows = clusterwNA(subMat),
+          show_row_names = F,
+          name = 'Intensities vs. Median',
+          row_title = sprintf('%s sampled proteins', nrow(subMat)),
+          column_names_gp = gpar(fontsize=6),
+          top_annotation = ha,
+          heatmap_legend_param = list(
+            legend_direction='vertical',
+            legend_width = unit(2, "cm"))
+            
+          )
+  
+  #draw(hm, column_title=n[[i]], heatmap_legend_side="bottom")
+BackupAsPDF(draw(hm, column_title=n[[i]]), paste0(n[[i]], '.mediansweep.heatmaps.'), dimensions=c(8,8))
+  
+}, x=dp.out.list, n=names(dp.out.list))
+```
+
+Still not seeing a lot of group clustering in the samples
+PCAs of each of the normalised samples
+Clear issue with batch so want to include this in our model
+```{r}
+lapply(seq_along(dp.out.list), function(x,n,i){
+  
+  p.mat <-  data.table(x[[i]]$ProteinLevelData) %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  p.mat <- p.mat[complete.cases(p.mat),]
+  
+  pcaOut <- prcomp(t(p.mat))
+
+  colInfo <- data.table(colname = colnames(p.mat))
+  colInfo[,c("treat","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ] # v useful fucntion
+
+
+#PCA
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = treat, shape=rep)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    ggtitle(n[[i]]) +
+    theme_bw() + 
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+    scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values=c(21:26)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+ p
+  BackupAsPDF(p, paste0(n[[i]], '.pca.complete.proteins.'))
+
+  
+}, x=dp.out.list, n=names(dp.out.list))
+```
+APEX works by labeling neighboring/interacting proteins with biotin which is then used to purify labeled proteins. There are also proteins that are endogenously biotinylated which will co-purify with the APEX-labeled proteins.  Here we look at a subset of these endogenous biotin proteins, and we inspect their post-normalization background levels, which are inversely related to the labeling-efficiency of APEX.  More background after normalization implies there is less APEX-labeled signal.
+
+possible issue here; big differences in labeling efficiency for QRFPR rep 6 there is a drastic drop compared to the other groups
+```{r}
+biotin.carboxylases.up <- c("O00763","P05165","P11498","Q13085","Q96RQ3")
+
+lapply(seq_along(dp.out.list), function(x,n,i){
+  dt <- data.table(x[[i]]$ProteinLevelData)
+  
+  p <- ggplot(dt[Protein %in% biotin.carboxylases.up], aes (x = interaction(GROUP,SUBJECT), y = LogIntensities, color = Protein)) + 
+    geom_line(aes(group = Protein)) + 
+    geom_point(aes(shape = as.factor(SUBJECT))) +
+    theme_classic() +
+    ggtitle(n[[i]]) +
+    theme(axis.text.x= element_text(angle=90))
+ p
+ BackupAsPDF(p, paste0(n[[i]], '.endoBiotinylatedProts.linechart.'))
+  },x=dp.out.list,n=names(dp.out.list))
+```
+
+
+differential expression
+-----
+
+First things; create two seperate list of contrasts, one for each dataset and add to list
+Give lists same name as the dp.out objects and process
+
+```{r}
+# first MRX2 
+mat.dimnames <- list(rnames='ZC05-ZC00',
+                     cnames= as.character(dp.out.list$MRX2$ProteinLevelData$GROUP %>% unique()))
+
+
+mrx2.contrasts <- matrix(data= c(-1,0,0,1,0,0,0,0,0,0), nrow = 1, dimnames=mat.dimnames)
+mrx2.contrasts <- rbind(mrx2.contrasts, c(-1,0,0,0,0,0,1,0,0,0))
+rownames(mrx2.contrasts)[2] <- 'ZC10-ZC00' 
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,-1,0,0,1,0,0,0,0))
+rownames(mrx2.contrasts)[3] <- 'ZC05_YM-ZC00_YM'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,-1,0,0,0,0,0,1,0))
+rownames(mrx2.contrasts)[4] <- 'ZC10_YM-ZC00_YM'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0, -1,0,0,1,0,0,0,0,0))
+rownames(mrx2.contrasts)[5] <- 'ZC05_PTX-ZC00_PTX'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0, -1,0,0,0,0,0,1,0,0))
+rownames(mrx2.contrasts)[6] <- 'ZC10_PTX-ZC00_PTX'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(-1,0,1,0,0,0,0,0,0,0))
+rownames(mrx2.contrasts)[7] <- 'ZC00_YM-ZC00'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(-1,1,0,0,0,0,0,0,0,0))
+rownames(mrx2.contrasts)[8] <- 'ZC00_PTX-ZC00'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,0,-1,0,1,0,0,0,0))
+rownames(mrx2.contrasts)[9] <- 'ZC05_YM-ZC05'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,0,-1,1,0,0,0,0,0))
+rownames(mrx2.contrasts)[10] <- 'ZC05_PTX-ZC05' 
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,0,0,0,0,-1,0,1,0))
+rownames(mrx2.contrasts)[11] <- 'ZC10_YM-ZC10' 
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,0,0,0,0,-1,1,0,0))
+rownames(mrx2.contrasts)[12] <- 'ZC10_PTX-ZC10'
+mrx2.contrasts <- rbind(mrx2.contrasts, c(0,0,0,0,0,0,-1,0,0,1))
+rownames(mrx2.contrasts)[13] <- 'ZC10_YM_PTX-ZC10'
+
+mrx2.contrasts
+```
+Now do the NPFFR1 contrasts 
+
+```{r}
+# first MRX2 
+mat.dimnames <- list(rnames='RF05-RF00',
+                     cnames= as.character(dp.out.list$QRFPR$ProteinLevelData$GROUP %>% unique()))
+
+ 
+qrfpr.contrasts <- matrix(data= c(-1,0,0,1,0,0,0,0,0,0), nrow = 1, dimnames=mat.dimnames)
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(-1,0,0,0,0,0,1,0,0,0))
+rownames(qrfpr.contrasts)[2] <- 'RF10-RF00' 
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,-1,0,0,1,0,0,0,0))
+rownames(qrfpr.contrasts)[3] <- 'RF05_YM-RF00_YM'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,-1,0,0,0,0,0,1,0))
+rownames(qrfpr.contrasts)[4] <- 'RF10_YM-RF00_YM'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0, -1,0,0,1,0,0,0,0,0))
+rownames(qrfpr.contrasts)[5] <- 'RF05_PTX-RF00_PTX'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0, -1,0,0,0,0,0,1,0,0))
+rownames(qrfpr.contrasts)[6] <- 'RF10_PTX-RF00_PTX'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(-1,0,1,0,0,0,0,0,0,0))
+rownames(qrfpr.contrasts)[7] <- 'RF00_YM-RF00'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(-1,1,0,0,0,0,0,0,0,0))
+rownames(qrfpr.contrasts)[8] <- 'RF00_PTX-RF00'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,0,-1,0,1,0,0,0,0))
+rownames(qrfpr.contrasts)[9] <- 'RF05_YM-RF05'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,0,-1,1,0,0,0,0,0))
+rownames(qrfpr.contrasts)[10] <- 'RF05_PTX-RF05' 
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,0,0,0,0,-1,0,1,0))
+rownames(qrfpr.contrasts)[11] <- 'RF10_YM-RF10' 
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,0,0,0,0,-1,1,0,0))
+rownames(qrfpr.contrasts)[12] <- 'RF10_PTX-RF10'
+qrfpr.contrasts <- rbind(qrfpr.contrasts, c(0,0,0,0,0,0,-1,0,0,1))
+rownames(qrfpr.contrasts)[13] <- 'RF10_YM_PTX-RF10'
+
+qrfpr.contrasts
+```
+now combine the two contrast matrices as a list
+
+perform the pairwise comparisons for each; may need to control for correcting so many at once
+
+
+Not recovering anything in the comparisons of interest
+Read back in the dp.processed data 
+
+```{r}
+MRX2.dp  <- readRDS('./output/MRX2.rds')
+QRFPR.dp <- readRDS('./output/QRFPR.rds')
+
+dp.out.list <- list(MRX2 = MRX2.dp,
+                    QRFPR = QRFPR.dp)
+```
+
+check out the MRX2 data first. Looks fine when adjusting names so run for both datasets
+
+```{r}
+colnames(mrx2.contrasts) <-  gsub("_CTRL","", colnames(mrx2.contrasts))
+colnames(qrfpr.contrasts) <-  gsub("_CTRL","", colnames(qrfpr.contrasts))
+
+contrast.list <- list(MRX2=mrx2.contrasts,
+                      QRFPR=qrfpr.contrasts)
+
+
+```
+
+
+
+```{r}
+# add batch term for linear modelling and correct the feature levle data grp names
+mss.in.list  <- lapply(dp.out.list, function(x){
+  x$ProteinLevelData$SUBJECT <- paste0('batch.', x$ProteinLevelData$SUBJECT)
+  x$FeatureLevelData$SUBJECT <- paste0('batch.', x$FeatureLevelData$SUBJECT)
+  return(x)
+  })
+
+
+# run the contrasts
+
+mss.out.list <- lapply(seq_along(mss.in.list), function(x,n,i){
+  
+  recpt <- n[[i]]
+  print(paste0('running comparison on ', recpt))
+  
+  # run msstats correcting for batch 
+  mss <- groupComparison(contrast.matrix=contrast.list[[recpt]], data=x[[recpt]])
+  mss.dt <- setDT(mss$ComparisonResult)
+  
+  return(mss.dt)
+  
+},x=mss.in.list, n=names(mss.in.list))
+
+
+names(mss.out.list) <- names(mss.in.list)
+```
+
+Identify the number of degs in each condition
+
+```{r eval=FALSE}
+lapply(seq_along(mss.out.list), function(x,n,i){
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.mss.pwcomparisons.raw.csv'))
+  
+},x=mss.out.list,n=names(mss.out.list))
+
+lapply(mss.out.list, head)
+```
+
+count number of DEGs
+More DEGs seem to be found in the QRFPR samples
+```{r}
+lapply(seq_along(mss.out.list), function(x,n,i){
+  dt <- x[[i]]
+  
+  dt[,gene := multiUniprots2multiGenes(as.character(Protein))] %>% #needed as in factor format
+  .[, sig := 'not'] %>% 
+  .[!issue %in% c('completeMissing','oneConditionMissing') & abs(log2FC) > 0.58 & adj.pvalue < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+  
+   fwrite(dt, paste0('./output/', n[[i]], '.mss.pwcomparisons.proc.csv'))
+  }, x=mss.out.list, n=names(mss.out.list))
+```
+
+Volcano plots of all the comparisons
+
+```{r}
+lapply(seq_along(mss.out.list), function(x,n,i){
+  dt <- x[[i]]
+  
+  # vecotr to iterate through
+  contrasts.oi <- dt$Label %>%  unique()
+  
+  # nested loop w 
+  lapply(contrasts.oi, function(cont){
+    
+      g <- ggplot(dt[Label == cont,], aes(x=log2FC, y=-log10(adj.pvalue), color=sig, label=gene)) + 
+      geom_point() +
+      geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+      geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+      ggrepel::geom_text_repel(data=dt[Label == cont & sig != 'not',],  size = 2, max.overlaps = 20) +
+      scale_color_manual(values=c('up'='red', 'down'='blue', 'not'='grey')) +
+      ggtitle(paste0(n[[i]], ' ', cont, ' (FC +/ 50% & p.adj < 0.05)')) +
+      # facet_wrap(~Label, scales = 'free') +
+      theme_bw() +
+      theme(strip.text.x = element_text(size = 5))
+      
+      BackupAsPDF(g, paste0(n[[i]],'.',cont,'.volcanoplot.'))
+    
+  })
+  
+  }, x=mss.out.list, n=names(mss.out.list))
+```
+
+Generate heat maps of sig genes in each comparison
+Looks like a very fast interaction; already less sig hits by 10 mins
+
+```{r}
+lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  mss <- x[[i]]
+  dt <- data.table(y[[i]]$ProteinLevelData)
+  
+  # get the receptor expres matrix
+  p.mat <-  dt %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+
+  # vecotor to iterate through
+  contrasts.oi <- mss[,unique(Label)]
+
+  # nested loop w 
+  lapply(contrasts.oi, function(cont){
+    
+    # extract the sig genes for each contrast
+    sig.prots <- mss[sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing") & Label == cont, unique(Protein)]
+    
+    if (length(sig.prots) > 2) {
+
+      # extract the submat of sig prots
+      subMat <- p.mat[rownames(p.mat) %in% sig.prots, ]
+
+      #heatmap annotation 
+      grp <- sub(".[1-6]$", "", colnames(subMat))
+      time <-  str_extract(colnames(subMat), "00|05|10")
+      treat <- str_extract(colnames(subMat), "CTRL|PTX|YM_PTX|YM")
+      batch <- sub(".","",str_extract(colnames(subMat), ".[1-6]$"))
+
+  
+      ha <- HeatmapAnnotation(group = grp, treatment=treat, time=time, batch=batch, col=list(time=c('00'='red', '05'='blue', '10'='green'),
+                                                                                         treatment=c('PTX'='orange', 'YM_PTX'='yellow','YM'='palegreen', 'CTRL'='grey'),
+                                                                                     batch=c('1'='pink','2'='cyan', '3'='palegreen', '4'='purple', '5'='orange', '6'='lightyellow')))
+      hm <-  Heatmap(subMat, 
+                     cluster_rows = clusterwNA(subMat), 
+                     top_annotation = ha, 
+                     name='Log2 Intensities', 
+                     row_names_gp = gpar(fontsize=3), 
+                     column_names_gp = gpar(fontsize=6),
+                     row_title = sprintf("%s sig proteins", nrow(subMat)) )
+    
+    
+    BackupAsPDF(draw(hm, column_title=cont), paste0(n[[i]],'.', cont, '.sig.prots.heatmap.'), dimensions=c(8,8))
+    #draw(hm, column_title=cont)
+    }
+  })
+  
+  }, x=mss.out.list, y=dp.out.list, n=names(mss.out.list))
+```
+median scaled heatmap
+
+```{r}
+lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  mss <- x[[i]]
+  dt <- data.table(y[[i]]$ProteinLevelData)
+  
+  # get the receptor expres matrix
+  p.mat <-  dt %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  subMat <- sweep(p.mat, MARGIN = 1, FUN = '-', STAT=apply(p.mat, 1, median, na.rm=T))
+
+  # vecotor to iterate through
+  contrasts.oi <- mss[,unique(Label)]
+
+  # nested loop w 
+  lapply(contrasts.oi, function(cont){
+    
+    # extract the sig genes for each contrast
+    sig.prots <- mss[sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing") & Label == cont, unique(Protein)]
+    
+    if (length(sig.prots) > 2) {
+
+      # extract the submat of sig prots
+      subMat <- subMat[rownames(subMat) %in% sig.prots, ]
+
+      #heatmap annotation 
+      grp <- sub(".[1-6]$", "", colnames(subMat))
+      time <-  str_extract(colnames(subMat), "00|05|10")
+      treat <- str_extract(colnames(subMat), "CTRL|PTX|YM_PTX|YM")
+      batch <- sub(".","",str_extract(colnames(subMat), ".[1-6]$"))
+
+  
+      ha <- HeatmapAnnotation(group = grp, treatment=treat, time=time, batch=batch, col=list(time=c('00'='red', '05'='blue', '10'='green'),
+                                                                                         treatment=c('PTX'='orange', 'YM_PTX'='yellow','YM'='palegreen', 'CTRL'='grey'),
+                                                                                     batch=c('1'='pink','2'='cyan', '3'='palegreen', '4'='purple', '5'='orange', '6'='lightyellow')))
+      hm <-  Heatmap(subMat, 
+                     cluster_rows = clusterwNA(subMat), 
+                     top_annotation = ha, 
+                     name='Log2 Intensities - Median', 
+                     row_names_gp = gpar(fontsize=3), 
+                     column_names_gp = gpar(fontsize=6),
+                     row_title = sprintf("%s sig proteins", nrow(subMat)) )
+    
+    
+    BackupAsPDF(draw(hm, column_title=cont), paste0(n[[i]],'.', cont, '.sig.prots.medianScaled.heatmap.'), dimensions=c(8,8))
+    #draw(hm, column_title=cont)
+    }
+  })
+  
+  }, x=mss.out.list, y=dp.out.list, n=names(mss.out.list))
+```
+
+
+
+generate heatmap of detected sig proteins in the data
+Only plotting all proteins not missing in one of the comparisons
+
+```{r}
+lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  mss <- x[[i]]
+  #get sig proteins across all comparisons
+  sig.prots <- mss[sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing") , unique(Protein)]
+
+  
+  dt <- data.table(y[[i]]$ProteinLevelData)
+  
+  # get the receptor expres matrix
+  p.mat <-  dt %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+
+    # extract the submat of sig prots
+    subMat <- p.mat[rownames(p.mat) %in% sig.prots, ]
+    
+    rownames(subMat) <- multiUniprots2multiGenes(rownames(subMat))
+
+    #heatmap annotation 
+    grp <- sub(".[1-6]$", "", colnames(subMat))
+    time <-  str_extract(colnames(subMat), "00|05|10")
+    treat <- str_extract(colnames(subMat), "CTRL|PTX|YM_PTX|YM")
+    batch <- sub(".","",str_extract(colnames(subMat), ".[1-6]$"))
+
+  
+    ha <- HeatmapAnnotation(group = grp, treatment=treat, time=time, batch=batch, col=list(time=c('00'='red', '05'='blue', '10'='green'),
+                                                                                         treatment=c('PTX'='orange', 'YM_PTX'='yellow','YM'='palegreen', 'CTRL'='grey'),
+                                                                                        batch=c('1'='pink','2'='cyan', '3'='palegreen', '4'='purple', '5'='orange', '6'='lightyellow')))
+  
+    hm <-  Heatmap(subMat, 
+                   cluster_rows = clusterwNA(subMat), 
+                   top_annotation = ha,
+                   row_names_gp = gpar(fontsize=2),
+                   column_names_gp = gpar(fontsize=6),
+                   name = 'Log2 Intensities',
+                   row_title = paste0(sprintf('%s sig proteins', nrow(subMat)), ' ', n[[i]]) )
+
+    BackupAsPDF(hm, paste0(n[[i]], '.sigProteins.noCondMissing.heatmap.'), dimensions=c(8,12))
+  
+  }, x=mss.out.list, y=dp.out.list, n=names(mss.out.list))
+
+```
+median sweep plot on the data 
+```{r}
+lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  mss <- x[[i]]
+  #get sig proteins across all comparisons
+  sig.prots <- mss[sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing") , unique(Protein)]
+  
+  print(length(sig.prots))
+  
+  dt <- data.table(y[[i]]$ProteinLevelData)
+  
+  # get the receptor expres matrix
+  p.mat <-  dt %>% 
+    dcast(., Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+   subMat <- sweep(p.mat, MARGIN = 1, FUN = '-', STATS=apply(p.mat, 1, median, na.rm=T))
+
+    # extract the submat of sig prots
+    subMat <- subMat[rownames(subMat) %in% sig.prots, ]
+    
+    rownames(subMat) <- multiUniprots2multiGenes(rownames(subMat))
+
+    #heatmap annotation 
+    grp <- sub(".[1-6]$", "", colnames(subMat))
+    time <-  str_extract(colnames(subMat), "00|05|10")
+    treat <- str_extract(colnames(subMat), "CTRL|PTX|YM_PTX|YM")
+    batch <- sub(".","",str_extract(colnames(subMat), ".[1-6]$"))
+
+  
+    ha <- HeatmapAnnotation(group = grp, treatment=treat, time=time, batch=batch, col=list(time=c('00'='red', '05'='blue', '10'='green'),
+                                                                                         treatment=c('PTX'='orange', 'YM_PTX'='yellow','YM'='palegreen', 'CTRL'='grey'),
+                                                                                        batch=c('1'='pink','2'='cyan', '3'='palegreen', '4'='purple', '5'='orange', '6'='lightyellow')))
+  
+    hm <-  Heatmap(subMat, 
+                   cluster_rows = clusterwNA(subMat), 
+                   top_annotation = ha,
+                   row_names_gp = gpar(fontsize=2),
+                   column_names_gp = gpar(fontsize=6),
+                   name = 'Log2 Intensities',
+                   row_title = paste0(sprintf('%s sig proteins', nrow(subMat)), ' ', n[[i]]) )
+
+    BackupAsPDF(hm, paste0(n[[i]], '.sigProteins.noCondMissing.medianSweep.heatmap.'), dimensions=c(8,12))
+  
+  }, x=mss.out.list, y=dp.out.list, n=names(mss.out.list))
+
+```
+Go enrichment for each of the differentially expressed gene groups across comparisons
+Not very strong enrichment across groups; could 
+
+```{r}
+
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "UNIPROT")
+
+#universe: all proteins detected in exp
+universe <- sapply(dp.out.list, function(x){
+  
+ as.character(x$ProteinLevelData$Protein)
+  #x$ProteinLevelData[,unique(Protein)]
+}) %>%  unlist() %>%  unique()
+
+
+lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  mss <- x[[i]]
+  mss[,enrich_grp := interaction(Label,sig)]
+  
+  enrich.dt <- enricherOnGroups(mss[sig != 'not',], groupColumns = 'enrich_grp', geneColumn = "Protein", term2gene.gmt = gmt.go, universe = universe)
+  
+  simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+  
+  hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 8,
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 5), upperThreshold = 8) 
+  
+  BackupAsPDF(hm, paste0(n[[i]], '.GOenrichment.heatmap.'), dimensions=c(8,8))
+
+  }, x=mss.out.list, y=dp.out.list, n=names(mss.out.list))
+
+
+# run enrichment on non-missing hits
+
+lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  mss <- x[[i]]
+  mss[,enrich_grp := interaction(Label,sig)]
+  
+  enrich.dt <- enricherOnGroups(mss[sig != 'not' & !issue %in% c('completeMissing','oneConditionMissing'),], groupColumns = 'enrich_grp', geneColumn = "Protein", term2gene.gmt = gmt.go, universe = universe)
+  
+  simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+  
+  hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 8,
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 5), upperThreshold = 8) 
+  
+  BackupAsPDF(hm, paste0(n[[i]], '.GOenrichment.noNAConditions.heatmap.'), dimensions=c(8,8))
+
+  }, x=mss.out.list, y=dp.out.list, n=names(mss.out.list))
+
+
+```
+
+TODO 
+----
+Check heatmaps & volcano pmatch
+Question: these are only for prots w/o missing conditions. What are the proportion of sig genes in each that are infinite?
+Is the proportion of NA increasing? all RF10 treatments have more missing values, same with ZC10
+
+Maybe isolate the 
+
+```{r}
+lapply(seq_along(mss.out.list), function(x,n,i){
+  
+  x[[i]][!issue %in% c('completeMissing','oneConditionMissing'), issue := 'noConditionsMissing']
+  dt <- x[[i]][sig != 'not' & issue != 'completeMissing',.N, by=.(sig,Label,issue)]
+
+  
+ g <-  ggplot(dt, aes(x=Label, y=N, fill=issue)) + 
+    geom_bar(stat = 'Identity') + 
+    scale_fill_manual(values=c('noConditionsMissing'='orange','oneConditionMissing'='grey')) + 
+    ggtitle(paste0('Breakdown of sig hits ', n[[i]])) +
+    theme_classic() + 
+    theme(axis.text.x=element_text(angle=90))
+ 
+ 
+ #BackupAsPDF(g, 'sig.hits.breakdown.NAvals.barchart')
+ 
+  g <-  ggplot(dt[issue == 'noConditionsMissing',], aes(x=Label, y=N, fill=sig)) + 
+    geom_bar(stat = 'Identity') + 
+    scale_fill_manual(values=c('up'='red','down'='blue')) + 
+    ggtitle(paste0('Breakdown of sig hits ', n[[i]])) +
+    theme_classic() + 
+    theme(axis.text.x=element_text(angle=90))
+  
+  BackupAsPDF(g, 'sig.hits.breakdown.up.vs.down.barchart')
+  
+},x=mss.out.list, n=names(mss.out.list))
+```
+
+Lots of missing values in the dataset. Rerun the enrichment using only the sig hits detected in both conditions compared
+
+```{r}
+MRX2.mss <-  fread('./output/MRX2.mss.pwcomparisons.proc.csv')
+QRFPR.mss <- fread('./output/QRFPR.mss.pwcomparisons.proc.csv')
+
+mss.out.list <- list(MRX2 = MRX2.mss,
+                     QRFPR = QRFPR.mss)
+
+
+# run enrichment on non-missing hits
+lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  mss <- x[[i]]
+  mss[,enrich_grp := interaction(Label,sig)]
+  
+  enrich.dt <- enricherOnGroups(mss[sig != 'not' & !issue %in% c('completeMissing','oneConditionMissing'),], groupColumns = 'enrich_grp', geneColumn = "Protein", term2gene.gmt = gmt.go, universe = universe)
+  
+  simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+  
+  hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 8,
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 5), upperThreshold = 8) 
+  
+  BackupAsPDF(hm, paste0(n[[i]], '.GOenrichment.noNAConditions.heatmap.'), dimensions=c(8,8))
+
+  }, x=mss.out.list, y=dp.out.list, n=names(mss.out.list))
+
+```
+TODO
+--
+Maybe try renormalise the QRFPR data,  but results look good
+

@@ -1,0 +1,345 @@
+---
+title: "100424.FormatPCPDatabase"
+author: "Martin Gordon"
+date: "2024-10-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Steps to produce clustering
+i) Took pearson correlation matrix of CRISPR knockouts
+ii) Created a distance matrix
+iii) Performed hierarchical clustering with complete linkage (largest distanc/dissimilarity between cluster1 & cluster2 is the distance between the clusters) 
+  (goal here is to find small, tight clusters as we are looking at complexes
+iv) Then we step through the dendogram, find any merges within a certain distance threshold (0.4 quantile) and extract all members of this cluster. This finds redundant clusters (for example, if  A-B-C are a cluster that meet the threshold, A-B, A-C and C-A will also be recovered)
+v) as a control randomized labels on the clusters and found ~50% less clusters, so some distinguishing but poor FP recovery. (rerun with more stringent threshold?)
+
+v) Because these are transcriptome responses to CRISPR editing, in most cases pearson similiarity was quite low. 
+
+Format a database in perturbSeq structure so we can use it with PCProphet to detect clusters
+
+```{r library}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(viridis)
+library(dendextend) # working with dendrogram
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+```
+Read in the CORUMDB and compare with the cluster set
+```{r}
+corum.dt <- fread('./data/humanComplexes.txt')
+clusters.dt <-  fread('./data/KOLF2-SrongPerturbation-Clusters.csv')
+
+# 50 clusters in total, ranging in size from 64 to 9 (ranked by size)
+clusters.dt[,.N, by=cluster]
+```
+
+```{r}
+corum.dt %>%  head()
+corum.dt %>%  colnames()
+
+
+  getwd()
+```
+Create a minimal corum DB format; just complex Name, ID, Gene names, uniproit and entrez
+```{r}
+clusters.dt[,ComplexID := cluster+1]
+clusters.dt[, ComplexName := paste('Cluster', ComplexID, sep='_')]
+
+
+# get uniprot and geneIDs
+clusters.dt[, Entrez := translateGeneName2Entrez(gene_target, species='HUMAN')]
+clusters.dt[, Uniprot := translateGeneName2Uniprot(gene_target, species='HUMAN')]
+
+
+clusters.corum.dt <- clusters.dt[, .(`subunits(Gene name)`=paste(gene_target, collapse=';'), "subunits(UniProt IDs)"=paste(Uniprot, collapse = ';'), "subunits(Entrez IDs)"= paste(Entrez, collapse = ';'), 'Organism'='Human'), by=.(ComplexID, ComplexName)]
+
+
+clusters.dt[,.N, by=cluster]$N
+clusters.corum.dt[, .SD[,length(unlist(strsplit(`subunits(Gene name)`, ';')))]]
+
+# looks good
+clusters.corum.dt[, .SD[,length(unlist(strsplit(`subunits(Gene name)`, ';')))], by=ComplexID]$V1 == clusters.dt[,.N, by=cluster]$N
+
+
+# check colnames 
+colnames(clusters.corum.dt) %in% colnames(corum.dt)
+
+
+head(corum.dt)
+head(clusters.corum.dt)
+
+
+# write out and test if works
+fwrite(clusters.corum.dt[,.(ComplexID, ComplexName, Organism, `subunits(Gene name)`, `subunits(UniProt IDs)`, `subunits(Entrez IDs)`)], sep='\t', ScriptAndDatedFileName('peturbSeq.clusters.db.txt'))
+
+fread('~/Documents/projects/100324_AForget_PCProphetPipeline/100724.makePCPDB_data/2024_10_07_peturbSeq.clusters.db.csv')
+```
+
+Inspect the cluster matrix that was produced
+This is a similarity matrix; convert to a distance matrix
+```{r}
+cluster.mat <- fread('./data/KOLF2-SrongPerturbation-PearsonCorr.csv')  %>% 
+  as.matrix(rownames='V1')
+
+#-1 to 1; dont rescale yet; just leave as is
+# most distant possible score of 2, most similar is 1
+range(cluster.mat)
+
+# convert to. a distance matrix and perform hierarchical clusterin
+dist.mat <- 1 - cluster.mat 
+
+# perform hierarichcial clustering of the distance matr
+# coerce to a distance matrix (no calculatons performed)
+
+# I think we want complete linkage as we want all the things in hte same cluster to be very similar as considering as part of same complex
+hc <- hclust(as.dist(dist.mat), method='complete')
+
+quantile(hc$height, probs=c(.05,.10,.15,.25))
+
+# ok error is my threshold to pull out the complexes I based on the pw distances rather than the 
+hist(hc$height)
+abline(v=0.65)
+
+Heatmap(dist.mat, 
+        cluster_rows = hc,
+        name='1 - Pearsons R',
+        col = viridis(3),
+        cluster_columns = hc, 
+        show_row_names = F,
+        show_column_names = F)
+```
+Create function to detect subclusters in the hierarchical clustering 
+
+```{r}
+# give a node id; pull out the genes that are members of this cluster
+extractLabelsfromClusters <- function(hc, nodeID){
+  
+  # if its a negative value, just return the gene
+  if(sign(nodeID) == -1){
+    
+    # this ID is negative, return gene name
+    return(hc$labels[[-nodeID]])
+    
+  } else {
+    # if clusterID is positive, it means it has been previously merged
+    # the merge matrix points to the row where this took place 
+    node1 <- hc$merge[nodeID, 1]
+    node2 <- hc$merge[nodeID, 2]
+    
+    # recursively search for the nodes
+    leftSetNodes <- getGenesfromClusters(hc, node1)
+    rightSetNodes <- getGenesfromClusters(hc, node2)
+    
+    return(c(leftSetNodes, rightSetNodes))
+  }
+}
+
+
+# now extract sets that meet these thresholds
+
+extractClustersfromDendogram <- function(hc, threshold){
+  
+  message(paste0('found ',length(unique(hc$labels)), ' leaf nodes. Extracting clusters..'))
+
+  if (missing(threshold)){
+    message(paste0('No threshold specified. Extracting all clusters (maximum distance =', threshold, ')...'))
+    threshold <- max(hc$height)
+  }
+  message(paste0('Iterating through the dendogram and pruning groups with distance < ', threshold, '...'))
+  
+  # iterate through the dendogram
+  clusters.dt <- lapply(1:nrow(hc$merge), function(i){
+    # if the distance is below the threshold, extract all cluster members
+    if (hc$height[i] < threshold){
+    
+      dt <- data.table(index = i,
+                       members =  paste0(extractLabelsfromClusters(hc, i), collapse=';'))
+    
+    }
+  }) %>% rbindlist()
+  
+  message(paste0('Found ', nrow(clusters.dt), ' clusters with a maximum distance < ', threshold))
+  
+  return(clusters.dt)
+}
+# just pulling out sets that are very similar
+clus.test <- extractClustersfromDendogram(hc=hc)
+
+clus.test
+
+cluster.mat[rownames(cluster.mat) %in% c("LRPPRC","POLRMT","MTPAP","PNPT1"), colnames(cluster.mat) %in% c("LRPPRC","POLRMT","MTPAP","PNPT1")] %>%  View()
+```
+
+
+100924-Regen the clusters used for PCProphet
+Just randomize the genes in the clusters
+```{r}
+cluster.db <- fread('./100824.PCP.perturbSeq_data/2024_10_08_newPerturbSseq.db.txt')
+
+
+# identify all the genes used in the clustering
+sapply(strsplit(cluster.db$`subunits(Gene name)`, ';'), function(x) unlist(x)) %>% 
+  unlist()
+
+# take just the genes from these extracted clusters
+genes.oi <- unique(unlist(strsplit(cluster.db$`subunits(Gene name)`, ';')))
+
+
+
+
+# first, count the number of subunits on each row
+cluster.db[, Nmembers := as.numeric(length(unlist(strsplit(`subunits(Gene name)`, ';')))), by=ComplexID]
+cluster.db
+# replace F as dont want two of the same prots in one cluster
+
+# question: why does top one work but bottom fail
+cluster.db[, newSubunits := paste(sample(x=genes.oi, size=Nmembers), collapse=';'), by=ComplexID]
+#cluster.db[, newSubunits := paste(sample(x=genes.oi, size=Nmembers), collapse=';'),]
+
+# new complex Name
+cluster.db[, newName := paste0('randomized_oriCluster__', ComplexName)]
+
+fwrite(cluster.db[, .(ComplexID, ComplexName = newName, Organism,"subunits(Gene name)"=newSubunits)], sep='\t', ScriptAndDatedFileName('perturbSeq.clusters.randomized.csv'))
+
+fread('~/Documents/projects/100324_AForget_PCProphetPipeline/100724.makePCPDB_data/2024_10_09_perturbSeq.clusters.randomized.csv')
+```
+
+
+
+
+```{r}
+# Create a function to check which clusters are below the distance threshold
+find_subclusters <- function(hc, threshold) {
+  # Get the merge matrix from hclust object
+  merge <- hc$merge
+  heights <- hc$height
+  
+  # Initialize a list to store clusters
+  cluster_list <- list()
+  
+  # Iterate through the merge matrix to find subclusters
+  for (i in 1:nrow(merge)) {
+    if (heights[i] <= threshold) {
+      left <- merge[i, 1]
+      right <- merge[i, 2]
+      
+      # If the left or right are negative, they represent individual points
+      cluster <- c()
+      if (left < 0) cluster <- c(cluster, -left)
+      if (right < 0) cluster <- c(cluster, -right)
+      
+      # If they are positive, they represent previously merged clusters
+      if (left > 0) cluster <- c(cluster, cluster_list[[left]])
+      if (right > 0) cluster <- c(cluster, cluster_list[[right]])
+      
+      cluster_list[[i]] <- cluster
+    }
+  }
+  
+  return(cluster_list)
+}
+
+
+
+
+# maybe the first funciton should be to perepare the full list of clustered genes
+
+extractClustersfromDendogram <-  function(hc_cluster= hc, threshold=0.5){
+  
+  
+  message('Extracting clusters from dendogram')
+  message(paste0(length(unique(hc$labels)), ' leaf nodes detected'))
+  # first extract all clusters below a certain height
+  message(paste0('Finding clusters with maximum distance < ', threshold, '...'))
+  
+  # iteerate through the merge matrix rows
+  lapply(1:nrow(hc_cluster$merge), function(i){
+    
+    
+    # threshold is our distance threshold
+    if (hc_cluster$height[i] <= threshold){
+      
+      dt <- data.table(cluster = i, 
+                       nodes = '')
+      
+      # get the merge nodes
+      node1 <- merge.mat[i, 1]
+      node2 <- merge.mat[i, 2]
+      
+      # hclust clustering identifies individual nodes with '-' prefix, if positive, it represents an earlier cluster
+      ifelse(sign(node1) == -1 & sign(node2) == -1, dt[, nodes := paste(node1, node2, collapse=';')],
+             ifelse(sign(node1) == -1 & sign(node2) != -1, dt[, nodes := paste(node1, node2, collapse=';')]
+             ){
+        
+        cluster
+      }) %>% rbindlist()
+      
+    }
+    
+    
+  }) 
+  
+  message(paste0('Found N clusters with maximum distance < ', threshold, '...'))
+  
+}
+
+extractClustersfromDendogram(hc_cluster = hc, threshold = 0.5)
+
+# give a node id; pull out the genes that are members of this cluster
+extractLabelsfromClusters <- function(hc, nodeID){
+  
+  # if its a negative value, just return the gene
+  if(sign(nodeID) == -1){
+    
+    # this ID is negative, return gene name
+    return(hc$labels[[-nodeID]])
+    
+  } else {
+    # if clusterID is positive, it means it has been previously merged
+    # the merge matrix points to the row where this took place 
+    node1 <- hc$merge[nodeID, 1]
+    node2 <- hc$merge[nodeID, 2]
+    
+    # recursively search for the nodes
+    leftSetNodes <- getGenesfromClusters(hc, node1)
+    rightSetNodes <- getGenesfromClusters(hc, node2)
+    
+    return(c(leftSetNodes, rightSetNodes))
+  }
+}
+
+extractLabelsfromClusters(hc, 26)
+
+
+# correspond to 26
+test <- c(-505,  -631, -556,  -873,-911, -520, -819,  -848, -849, -887, -1054)
+
+# results look good
+sapply(test, function(x)getGenesfromClusters(hc, x)) %in% getGenesfromClusters(hc, 26) 
+```
+
+```{r}
+plot(hc)
+
+dend  %>% get_nodes_attr('members')
+
+library(dynamicTreeCut)
+
+dist.mat %>% str()
+
+clustersTest <- cutreeDynamic(hc, distM=dist.mat,deepSplit = 4)
+clustersTest %>% table()
+help(cutreeDynamic)
+```
+

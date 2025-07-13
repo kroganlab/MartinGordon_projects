@@ -1,0 +1,545 @@
+---
+title: "ISG_heatmaps"
+author: "Martin Gordon"
+date: "2023-07-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library("RColorBrewer") 
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(RcppCNPy) #R/W support to import numpy objects into R
+library(VennDiagram)
+library(pbapply) #apply functions with progress bar
+library(eulerr)
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+source ("../../utils/bp_utils/NetworkPropagation.R")
+```
+Remember 
+
+## ISG heatmaps
+
+Look at the ISG response across all 3 datasets.
+Basically take the log2FC results for the conditions of interest (or all 3 cols) and plots the 3 heatmaps 
+
+Load ISGs
+
+```{r}
+#Load ISGs from file in docs
+isg.nature <- c("ADAR", "BST2", "CASP1", "CMPK2", "CXCL10", "DDX60", "DHX58", "EIF2AK2", "EPSTI1", "GBP4", "HERC6", 
+         "IFI35", "IFIH1", "IFIT2", "IFIT3", "IRF7", "ISG15", "ISG20", "MX1", "NMI", "OASL", "OGFR", "PARP12", 
+         "PARP14", "PNPT1", "PSME2", "RSAD2", "RTP4", "SAMD9L", "SP110", "STAT2", "TDRD7", "TRAFD1", "TRIM14", 
+         "TRIM21", "TRIM25", "UBE2L6", "USP18")
+
+```
+
+
+
+Expression files: convert to matrix
+```{r}
+p.ab.quant <- fread('~/Documents/projects/051623_DSwaney/2023_05_16_DSwaney_AA08_AB_data/2023_05_25_ProteinLevelData.csv.gz') 
+p.ph.quant <- fread('~/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_protein-lvl-data.csv.gz')
+rna.quant <- fread('~/Library/CloudStorage/Box-Box/Mac1_omics_data/CellLines_RNAseq/Expression/gene_expression.xls')
+
+box.loc <- '~/Library/CloudStorage/Box-Box/Mac1_omics_data/'
+rna.ab.core <- fread(paste0(box.loc, 'CellLines_RNAseq/core_table_gene.xls.gz'), fill=T)
+
+cols.OI <- grep("^read_count|gene_symbol",colnames(rna.ab.core), value=T)
+
+rna.mat <- rna.ab.core[, colnames(rna.ab.core) %in% cols.OI, with=F] %>% 
+  .[,-25, with=F] %>% #rm dup gene_symbol
+  as.matrix(rownames='gene_symbol')
+
+```
+```{r}
+p.ph.mat <- dcast(p.ph.quant, Protein~paste0(GROUP,"_",SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+p.ab.mat <- dcast(p.ab.quant, Protein~paste0(GROUP, "_", SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+colnames(rna.mat) <- gsub('read_count_','',colnames(rna.mat))
+
+# set up colnames to match rna-seq dataset
+colnames(p.ph.mat) <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "Par_IFNg_A", "Par_IFNg_B",  "Par_IFNg_C", "Par_IFNg_D", "Par_ctrl_A",  "Par_ctrl_B",  "Par_ctrl_C",  "Par_ctrl_D", "WT_IFNg_A",   "WT_IFNg_B",   "WT_IFNg_C", "WT_IFNg_D") 
+
+colnames(p.ab.mat) <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "Par_ctrl_A", "Par_ctrl_B",  "Par_ctrl_C", "Par_ctrl_D", "Par_IFNg_A",  "Par_IFNg_B",  "Par_IFNg_C",  "Par_IFNg_D", "WT_IFNg_A",   "WT_IFNg_B",   "WT_IFNg_C", "WT_IFNg_D") 
+
+#keep only conditions of interest
+p.cond.OI <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "WT_IFNg_A",   "WT_IFNg_B",  "WT_IFNg_C", "WT_IFNg_D")
+rna.cond.OI <- c("EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "WT_IFNg_A", "WT_IFNg_B",  "WT_IFNg_C")
+
+rna.mat <- rna.mat[, rna.cond.OI]
+p.ab.mat <- p.ab.mat[, p.cond.OI]
+p.ph.mat <- p.ph.mat[, p.cond.OI]
+
+
+#prefilter low count genes
+rna.mat <- rna.mat[rowSums(rna.mat) >= 10,]
+#rna.mat <- log2(rna.mat + 1)
+
+```
+
+
+Normalise the RNA input
+
+```{r}
+
+design.mat <- data.frame(replicate=as.factor(c(rep(c('A','B','C'),3))),
+                         condition=as.factor(str_extract(colnames(rna.mat), 'IFNg|ctrl')), 
+                         celltype=as.factor(str_extract(colnames(rna.mat),'EV|ND|WT')))
+
+
+design.mat$contrast <- as.factor(paste0(design.mat$celltype,"_", design.mat$condition))
+#assign rownames from the colnames of count matrix
+rownames(design.mat) <- colnames(rna.mat)
+```
+
+Run DEseq2 to normalize library & extract variance stabilised counts
+```{r}
+# only accepts integers
+rna.mat <- round(rna.mat)
+
+dds <- DESeqDataSetFromMatrix(countData = rna.mat,
+                              colData = design.mat,
+                              design = ~ contrast)
+
+
+#maybe use log2 as more gaussian? Let look again after feature selection
+# vst handles the transformation of the data better than log2 + pseudocount, so proceed with this
+vsd <- rlog(dds)
+rna.mat <- assay(vsd)
+
+#using log2 transformed counts instead as more Gaussian
+#rna.mat <- log2(assay(dds) + 1)
+
+```
+
+```{r}
+mat.list <- list(p.ph = p.ph.mat,
+                 p.ab = p.ab.mat,
+                 rna = rna.mat)
+
+# 
+# #simplify ph rownames
+# rownames(mat.list[['p.ph']])  <- gsub("_[STY][0-9]+", "", rownames(mat.list[['p.ph']])) %>% #strip phosphosite info
+#           strsplit (";") %>%  #split multiprots; creates a list of vectors of each element
+#           lapply (unique) %>% #removes any duplicate elements in list
+#           lapply (paste, collapse = ";") %>% #colapses back to unique prot names
+#           unlist
+
+rownames(mat.list[['p.ph']]) <- multiUniprotSites2multiGeneSites(rownames(mat.list[['p.ph']]))
+rownames(mat.list[['p.ab']]) <- translateUniprot2GeneName(rownames(mat.list[['p.ab']]))
+
+
+```
+
+```{r}
+rownames(mat.list[['p.ph']])
+
+# need to subset  the string and find where this is true
+which(isg.nature %in% gsub("_[STY][0-9]+", '', rownames(mat.list[['p.ph']])) == TRUE)
+
+gsub('[STY][0-9]+_', '', rownames(mat.list[['p.ph']]))
+```
+
+
+Extract rows of the matrix with ISGs
+
+```{r}
+isg.mat.list <- lapply(seq_along(mat.list), function(x,n,i){
+  if (n[[i]] == 'p.ph'){
+    
+     x[[i]] <- x[[i]][gsub("_[STY][0-9]+", '', rownames(x[[i]])) %in% isg.nature,]
+    
+  } else {
+   x[[i]] <-  x[[i]][rownames(x[[i]]) %in% isg.nature,]
+  }
+    
+}, x=mat.list, n=names(mat.list))
+
+names(isg.mat.list) <- names(mat.list)
+```
+
+Heatmap the normalised expression values of the ISGs
+
+```{r}
+type <- (sub("_[ABCD]$", "", colnames(mat.list[[3]])))
+
+
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+
+
+  rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+  
+  
+lapply(isg.mat.list, colnames)
+  
+lapply(seq_along(isg.mat.list), function(x,n,i){
+  
+  type <- sub("_[A-D]{1}$", "", colnames(x[[i]]))
+  
+  ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+  
+   hm <- Heatmap(x[[i]],
+        column_title = paste0(n[[i]], ' ISG expression'),
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(x[[i]]),
+        show_row_names = TRUE,
+        column_names_gp = gpar(fontsize = 10),
+       #row_title = sprintf("%d subsampled proteins", nrow(isg.mat.list[[1]])),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 8)
+       # column_title = paste0(' heatmap')
+       )
+  hm
+  BackupAsPDF(hm, paste0(n[[i]], '.ISG.heatmap'))
+  
+  
+}, x=isg.mat.list, n=names(isg.mat.list))
+  
+```
+Doesnt look to be differential expression for the ISGs among the conditions... Combine the results into one heatmap
+Threshold? 50% increase/decrease too severe?  untargeted global profiling
+
+```{r}
+# colllapse the list 
+
+#commmon ha for all 
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+
+
+type <- sub("_[A-D]{1}$", "", colnames(isg.mat.list[['rna']]))
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+
+  
+hm.rna <- Heatmap(isg.mat.list[['rna']],
+        column_title = 'RNA ISG expression',
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(isg.mat.list[['rna']]),
+        show_row_names = TRUE,
+        column_names_gp = gpar(fontsize = 10),
+       #row_title = sprintf("%d subsampled proteins", nrow(isg.mat.list[[1]])),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 8)
+       # column_title = paste0(' heatmap')
+       )
+
+
+type <- sub("_[A-D]{1}$", "", colnames(isg.mat.list[['p.ab']]))
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+
+
+hm.p.ab <- Heatmap(isg.mat.list[['p.ab']],
+        column_title = 'Prot AB ISG expression',
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(isg.mat.list[['p.ab']]),
+        show_row_names = TRUE,
+        column_names_gp = gpar(fontsize = 10),
+       #row_title = sprintf("%d subsampled proteins", nrow(isg.mat.list[[1]])),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 8)
+       # column_title = paste0(' heatmap')
+       )
+
+hm.p.ab
+
+
+hm.p.ab + hm.rna
+
+
+```
+
+Take the list of significant differentially expressed genes and generate heatmaps and enrichment
+For heatmaps take the raw expression values for the samples and plot:
+
+- rna.ab
+-ph.ab
+-ab-ph
+
+```{r}
+#read in sig genes
+exp.sig <- fread('./output/17.06.experimental-omics-sig-genes.csv')
+
+exp.sig[, .N, by=omics]
+```
+
+```{r}
+
+g <- ggplot(exp.sig, aes(x=omics, fill=omics)) +
+  geom_bar() +
+  ggtitle('sig features (adj.pval < 0.05 & log2FC > 0.58)') +
+  theme_bw() +
+  facet_wrap(~Label)
+g
+
+BackupAsPDF(g, 'barplot.sig.features.all.omics.label')
+```
+
+
+Extract rows of the expression matrix with these significant genes
+
+```{r}
+# sig genes in all? smartest way to do this
+sig.genes <- exp.sig[, unique(gene)]
+
+sig.genes
+
+
+sig.mat.list <- lapply(seq_along(mat.list), function(x,n,i){
+  if (n[[i]] == 'p.ph'){
+    
+     x[[i]] <- x[[i]][gsub("_[STY][0-9]+", '', rownames(x[[i]])) %in% sig.genes,]
+    
+  } else {
+   x[[i]] <-  x[[i]][rownames(x[[i]]) %in% sig.genes,]
+  }
+    
+}, x=mat.list, n=names(mat.list))
+
+names(sig.mat.list) <- names(mat.list)
+```
+
+Heatmaps
+#long vectors not supported yet: /Volumes/Builds/R4/R-4.2.3/src/main/subassign.c:1833??
+```{r}
+lapply(seq_along(sig.mat.list), function(x,n,i){
+  
+  type <- sub("_[A-D]{1}$", "", colnames(x[[i]]))
+  
+  ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+  
+   hm <- Heatmap(x[[i]],
+        column_title = paste0(n[[i]], ' sig. feature expression'),
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(x[[i]]),
+        show_row_names = TRUE,
+        column_names_gp = gpar(fontsize = 10),
+       #row_title = sprintf("%d subsampled proteins", nrow(isg.mat.list[[1]])),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 4)
+       )
+  hm
+  BackupAsPDF(hm, paste0(n[[i]], '.sig.feature.heatmap'), dimensions = c(8,12))
+  
+  
+}, x=sig.mat.list, n=names(sig.mat.list))
+
+```
+Median-scaled
+
+```{r}
+lapply(seq_along(sig.mat.list), function(x,n,i){
+  
+  type <- sub("_[A-D]{1}$", "", colnames(x[[i]]))
+  
+  ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+  
+  med.mat <-sweep(x[[i]], MARGIN = 1, apply(x[[i]],1, median,na.rm = T))
+  
+   hm <- Heatmap(med.mat,
+        column_title = paste0(n[[i]], ' sig. feature expression (- median)'),
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(med.mat),
+        show_row_names = TRUE,
+        column_names_gp = gpar(fontsize = 10),
+       row_title = sprintf("%d significant features", nrow(n[[i]])),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 4)
+       )
+  hm
+  BackupAsPDF(hm, paste0(n[[i]], '.sig.feature.median.sub.heatmap'), dimensions = c(8,6))
+  
+  
+}, x=sig.mat.list, n=names(sig.mat.list))
+
+```
+Lets generate individual heatmaps. Want heatmaps for:
+
+i)rna-ab
+
+```{r}
+
+# get genes only in ab & rna
+
+rna.ab <- exp.sig[omics == 'rna.ab.sig', unique(gene)]
+
+rownames(sig.mat.list[['rna']][rownames(sig.mat.list[['rna']]) %in% rna.ab,]) %in% rownames(sig.mat.list[['p.ab']][rownames(sig.mat.list[['p.ab']]),])
+
+rownames(sig.mat.list[['rna']][rownames(sig.mat.list[['rna']]) %in% rna.ab,])[22] #drop UGT1A7
+
+
+
+```
+
+```{r}
+#drop UGT1A7 as not in ,list
+
+type <- sub("_[A-D]{1}$", "", colnames(sig.mat.list[['rna']]))
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+
+# take sig shared sig gene rows
+mat <- sig.mat.list[['rna']][rownames(sig.mat.list[['rna']]) %in% rna.ab & rownames(sig.mat.list[['rna']]) != 'UGT1A7',] 
+med.mat <- sweep(mat, MARGIN = 1, apply(mat,1, median, na.rm = T))
+
+hm.rna <- Heatmap(med.mat,
+        column_title = 'RNA sig features',
+        top_annotation = ha,
+        width = unit(10, 'cm'),
+        name = 'rna exp. (- median)',
+        cluster_rows = rowClusterWithNA(med.mat),
+        show_row_names = TRUE,
+        column_names_gp = gpar(fontsize = 10),
+       #row_title = sprintf("%d subsampled proteins", nrow(isg.mat.list[[1]])),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 8)
+       # column_title = paste0(' heatmap')
+       )
+
+
+type <- sub("_[A-D]{1}$", "", colnames(sig.mat.list[['p.ab']]))
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+
+# take sig shared sig gene rows
+mat <- sig.mat.list[['p.ab']][rownames(sig.mat.list[['p.ab']]) %in% rna.ab,] 
+med.mat <- sweep(mat, MARGIN = 1, apply(mat,1, median, na.rm = T))
+
+
+hm.p.ab <- Heatmap(med.mat,
+        column_title = 'P AB sig features',
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(med.mat),
+        show_row_names = TRUE,
+        name = 'p ab exp. (- median)',
+        column_names_gp = gpar(fontsize = 10),
+       #row_title = sprintf("%d subsampled proteins", nrow(isg.mat.list[[1]])),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 8)
+       # column_title = paste0(' heatmap')
+       )
+
+ht.list <- hm.p.ab + hm.rna
+
+draw(ht.list,
+    column_title = "Shared significant genes", column_title_gp = gpar(fontsize = 16))
+
+BackupAsPDF(draw(ht.list,
+    column_title = "Shared significant genes", column_title_gp = gpar(fontsize = 16)), 
+    'rna.p.ab.shared.sig.features.medianscale.heatmap', dimensions = c(12,7))
+```
+
+Now do same for rna and p.ph
+What features to select for PH?
+For PH data to compare with other modalities, only take the most significant site per protein
+
+Forget for now.. Just share the plots seperately
+
+```{r}
+p.ph.quant[, gene := multiUniprotSites2multiGeneSites(Protein)]
+
+p.ph.quant[gsub("_[STY][0-9]+", '', gene) %in% rna.ph, .N, by=.(interaction(GROUP,SUBJECT), Label, Protein)] # these are the significant sites
+
+max.var <- apply(mat, 1 , var, na.rm=T)
+max.var
+keep <- c(1,2,4,7,)
+```
+
+
+
+```{r}
+rna.ph <- exp.sig[omics == 'rna.ph.sig', unique(gene)]
+
+type <- sub("_[A-D]{1}$", "", colnames(sig.mat.list[['rna']]))
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+
+# take sig shared sig gene rows
+mat <- sig.mat.list[['rna']][rownames(sig.mat.list[['rna']]) %in% rna.ph,] 
+med.mat <- sweep(mat, MARGIN = 1, apply(mat,1, median, na.rm = T))
+
+hm.rna <- Heatmap(med.mat,
+        column_title = 'RNA sig features',
+        top_annotation = ha,
+        width = unit(10, 'cm'),
+        name = 'rna exp. (- median)',
+        cluster_rows = rowClusterWithNA(med.mat),
+        show_row_names = TRUE,
+        column_names_gp = gpar(fontsize = 10),
+       #row_title = sprintf("%d subsampled proteins", nrow(isg.mat.list[[1]])),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 8)
+       # column_title = paste0(' heatmap')
+       )
+
+BackupAsPDF(hm.rna, 'rna.rna.phsig.sig.features.medianscaled.heatmap')
+
+type <- sub("_[A-D]{1}$", "", colnames(sig.mat.list[['p.ph']]))
+ha <- HeatmapAnnotation(type = type, annotation_name_side = "right", col= list(type = c('EV_IFNg'='red', 'ND_IFNg' = 'blue', 'WT_IFNg'='green')))
+
+# take sig shared sig gene rows
+mat <- sig.mat.list[['p.ph']][gsub("_[STY][0-9]+", '', rownames(sig.mat.list[['p.ph']])) %in% rna.ph,] 
+
+gsub("_[STY][0-9]+", '', rownames(mat))
+
+
+med.mat <- sweep(mat, MARGIN = 1, apply(mat,1, median, na.rm = T))
+unique(med.mat)
+
+hm.p.ph <- Heatmap(med.mat,
+        column_title = 'P PH sig features',
+        top_annotation = ha,
+        cluster_rows = rowClusterWithNA(med.mat),
+        show_row_names = TRUE,
+        name = 'p ph exp. (- median)',
+        column_names_gp = gpar(fontsize = 10),
+       #row_title = sprintf("%d subsampled proteins", nrow(isg.mat.list[[1]])),
+        na_col = 'grey',
+        row_names_gp = gpar(fontsize = 4)
+       # column_title = paste0(' heatmap')
+       )
+
+BackupAsPDF(hm.p.ph, 'p-ph.rna.phsig.features.medianscaled.heatmap', dimensions = c(8,9))
+```
+
+Enrichment analysis of the sig genes; combine label, and omics sig 
+Not considering direciton here, idea to to find processes these features might be involved in
+
+```{r}
+
+```
+
+
+
+which.max()
+
+#BackupAsPDF(draw(ht.list,
+    #column_title = "Shared significant genes", column_title_gp = gpar(fontsize = 16)), 
+    #'rna.p.ab.shared.sig.features.medianscale.heatmap', dimensions = c(12,7))
+
+# get rownames with maximum vairance per group
+max.var <- apply(mat, 1 , var, na.rm=T)
+names(max.var) <- gsub("_[STY][0-9]+", '', names(max.var))
+
+
+
+```
+
+
+CEACAM: check out expression in the EV-WT comparison, shoud be elevated in WT

@@ -1,0 +1,588 @@
+---
+title: "050625_peakDetectionAndDifferentialExpression"
+author: "Martin Gordon"
+date: "2025-05-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Now happy with a set of input proteins for each of the samples, we need to perform peak detection and differential testing on each of the samples
+My first inking is that we will need to try the peak alignment for the samples, then proceed with differential testing... I don't have a good handle on the sample clustering/intra-sample variation atm, but it may be the case that samples need to be processed donor-wise and then search for overlap in ids/differential proteins/complexes
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# flag consec proteins
+source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+```
+
+read in the processed SEC_MS data and lets look to see if we can identify peaks, and finally, differential peaks between the conditions
+
+```{r, readFiles}
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.donor1donor2.normalized.interpolated.scaled.csv.gz')
+```
+
+```{r, peakDetection}
+# we wan
+normInt.mats <- scaledIntensityMatrices(sec.long)
+
+peakTables <- lapply(normInt.mats, goodPeaksTableFromIntensityMatrix, minCV = -Inf)
+allPeaks <- rbindlist(peakTables, idcol = "sample")
+#fwrite(allPeaks, ScriptAndDatedFileName('donor1donor2.detectedPeaks.csv.gz'))
+
+allPeaks <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_06_donor1donor2.detectedPeaks.csv.gz')
+```
+
+This looks really good; shows the peak detection algorithm is doing its job to seperate good and bad peaks
+It seems that fract 60 in cd4 infected2 just has globally more proteins than the surrounding 
+Speak to BP tomorrow about the above fraction; may want to drop and just interpolate to remove this inflation
+
+```{r, fig.width = 5, fig.height = 7}
+# udpate height for more samples
+p <- ggplot(allPeaks, aes(x= peakLocation, fill = goodPeak)) + 
+  geom_bar() + 
+  facet_grid(sample~.) +
+  theme_bw()
+p
+BackupAsPDF(p, "peakCountsPerFraction.barchart")
+```
+Dont really think aligning peaks across these fractions is going to do a good job...  maybe for now we can just 
+```{r, peak-fraction-adjustments}
+
+standardizeAllPeakTablesToStandard(peakTables, sec.long, standardIdx = "cd4_uninfected_2", fitPortion = 0.65, minPeaksPerFraction = 45, startFitAtPeak = 20)
+
+#fwrite(sec.long, ScriptAndDatedFileName('hiv.donor1donor2.sec.ms.wStandardisedFractions.csv.gz'))
+```
+To me, the infected and the challenged look good and similiar to the uninfected for donor2
+Undo the standardisation for both of these samples as they look good.. not sure what to do for donor1 for now.... proceed as is and speak to BP tomorrow morning.
+
+```{r, fix-peak-alignments}
+peakTables$cd4_infected_2[, cofmN.standardized := cofmN]
+sec.long[sample == "cd4_infected_2", standardFraction := fraction]
+
+peakTables$cd4_challenged_2[, cofmN.standardized := cofmN]
+sec.long[sample == "cd4_challenged_2", standardFraction := fraction]
+```
+
+We dont have the molecular weight peak standards for the second file; considering these files are run on very different dates
+I dont think we want to use the molecular weight stadnards for filtering and should just proceed with everything
+Label with their mass, but dont use this to define good/bad peaks
+```{r, mw-standards}
+mw.standards <- fread('../040825_MMuralidharan_PCProphet_HIV_CD4Tcells/data/HIV_Infection_CD4T_cells/Donor-1-032625/PCprophet/cal_SRT.txt')
+setnames(mw.standards, new=c('fraction', 'mw'))
+
+# want the standards in daltons (right?)
+mw.standards[, mw := mw*1000]
+mc <- calculateFractionMassConverters(mw.standards)
+```
+
+```{r mass-ratio-labelling}
+mw.dt <- sec.long[,.(protein, mw=as.numeric(mw))] %>% 
+  unique()
+# for joining and calculating mass below
+setkey(mw.dt, protein)
+mw.dt <- mw.dt[!is.na(mw)] # not including mass for protein groups
+proteinMW <- mw.dt
+
+# label fractions by mass, and fraction/proteins by mass ratio, aka log2MassNumber
+sec.long[, fractionMass := mc$fraction2Mass(standardFraction)]
+# this is kind 
+sec.long[, log2MassNumber := log2(fractionMass/mw.dt[protein, .(mw), on = "protein"])]
+
+
+# add a label for the filtered good peak and decide later if we want to keep
+scorePeakByMassShift <- function(peak.dt, mw){
+  peak.dt[proteinMW, fiftyPCFraction := mc$mass2Fraction(1.2 * mw), on = "protein"]
+  peak.dt[!is.na(fiftyPCFraction), filtteredGoodPeak := goodPeak & cofmN.standardized < fiftyPCFraction]
+  peak.dt
+}
+
+# need protein MW to use this as hard coded in the function
+purrr::walk(peakTables, scorePeakByMassShift, mw)
+```
+Save the output, plot the number of good peaks before and after filtering 
+```{r, fig.width = 5, fig.height = 7}
+# udpate height for more samples
+p <- ggplot(allPeaks, aes(x= peakLocation, fill = filtteredGoodPeak)) + 
+  geom_bar() + 
+  facet_grid(sample~.) +
+  theme_bw()
+p
+BackupAsPDF(p, "filteredPeakCountsPerFraction.barchart")
+```
+
+```{r}
+#fwrite(allPeaks, ScriptAndDatedFileName("allPeaks.donor1donor2.monomerMassLabelled.csv.gz"))
+allPeaks <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_allPeaks.donor1donor2.monomerMassLabelled.csv.gz')
+```
+
+plot the MW standards for both both donors
+```{r, proteinPeaks, fig.height=8, fig.width=14}
+# merge the mw info from the spectronaut search to the table
+allPeaks[mw.dt, proteinMW := i.mw, on = "protein"]
+# no obvious impacts here... cant really say atm why these peaks behave as they do
+allPeaks[, proteinMW := as.numeric(proteinMW)]
+allPeaks[!is.na(proteinMW),.N, by=sample]
+
+
+g <- ggplot(allPeaks[grepl('_1$', sample), .SD[which.max(peakHeight)], by = .(protein, sample)  ], aes( x  = as.factor(sprintf("%02d", as.integer(peakLocation))), y = proteinMW, color = log10(proteinMW))) + 
+  #geom_density_2d() + 
+  scale_y_log10() +
+  geom_boxplot(outlier.shape = NA) + 
+  ggforce::geom_sina(shape = ".",scale = "area")+
+  geom_point(data = mw.standards[, .(peakLocation = fraction, proteinMW = mw)], color = "red") + 
+  rotate.x.axis.text +
+  scale_color_viridis_c() + 
+  facet_wrap(~sample, ncol = 2) + 
+  ggtitle("Protein Peaks")
+g
+BackupAsPDF(g, 'proteinPeaksVsMWstandards.donor1.boxplots')
+
+g <- ggplot(allPeaks[grepl('_2$', sample), .SD[which.max(peakHeight)], by = .(protein, sample)  ], aes( x  = as.factor(sprintf("%02d", as.integer(peakLocation))), y = proteinMW, color = log10(proteinMW))) + 
+  #geom_density_2d() + 
+  scale_y_log10() +
+  geom_boxplot(outlier.shape = NA) + 
+  ggforce::geom_sina(shape = ".",scale = "area")+
+  geom_point(data = mw.standards[, .(peakLocation = fraction, proteinMW = mw)], color = "red") + 
+  rotate.x.axis.text +
+  scale_color_viridis_c() + 
+  facet_wrap(~sample, ncol = 2) + 
+  ggtitle("Protein Peaks")
+g
+BackupAsPDF(g, 'proteinPeaksVsMWstandards.donor2.boxplots')
+```
+
+
+**Question**
+Why do we seem to see a difference in plotting density??
+We actually have less proteins...what are we actually plotting here?
+Wont figure this out tonight, try just generate some plots of the different complexes and share tomorrow...
+```{r}
+allPeaks[goodPeak == TRUE, .N, by=sample]
+sec.long[,length(unique(protein)), by=sample]
+allPeaks[ , .SD[which.max(peakHeight)], by = .(protein, sample)][!is.na(peakLocation),.N, by=sample]
+
+allPeaks[goodPeak == TRUE, .N, by=sample]
+allPeaks[ , .SD[which.max(peakHeight)], by = .(protein, sample)  ]
+```
+
+Leave as is for now, not using the MW for filtering, so lets push forward
+Run analysis both ways and if we get a better TP/FP ratio, can filter out these masses
+
+## GS and decoy set
+
+First read in our ID mapper
+```{r}
+hu.string.dt <- fread('~/Documents/utils/mg_utils/data/stringDB/9606.protein.aliases.v12.0.txt.gz')
+huString.mapper <- hu.string.dt[source == 'Ensembl_UniProt', .(protein=alias, stringID=`#string_protein_id`)]
+huString.mapper[protein %in% sec.long$protein, unique(stringID)]
+
+# save this file for future use
+#fwrite(huString.mapper, ScriptAndDatedFileName('protein.string.idMapper.csv.gz'))
+huString.mapper <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_protein.string.idMapper.csv.gz')
+
+# also, read int he 
+hiv.nodes <- fread('~/Documents/utils/mg_utils/data/stringDB/11676.protein.aliases.v10.5.txt.gz')
+setnames(hiv.nodes, new=c('stringID', 'gene', 'db'))
+hiv.nodes[, gene := toupper(gene)]
+hiv.nodes$db <- NULL # not used for now
+```
+
+```{r, gs-decoy-sets eval = FALSE}
+#need to merge our protein ids with 
+gs.interactors <- goldStandardPairs(huString.mapper[protein %in% sec.long$protein, unique(stringID)], 
+                                    corum.path = NULL,
+                                    string.links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                                    string.info.path =  NULL,
+                                    stringCombinedScoreThreshold = 250)
+gs.decoys <- decoysFromString(huString.mapper[protein %in% sec.long$protein, unique(stringID)], 
+                              links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                              info.path =  NULL)
+gs.decoys[, source := 'string']
+
+gs.comb.interactors <- rbind(gs.interactors, gs.decoys)
+```
+
+## peak-peak correlations
+
+```{r, peak-correlations}
+# just ensure a refresh
+sec.long$intensity_totalScaled <- NULL
+intMats <- scaledIntensityMatrices(sec.long)
+intensityHeatmaps(intMats, border=T)
+
+#saveRDS(intMats, ScriptAndDatedFileName('hiv.donor1donor2.norm.totalScaled.intsMats.rds'))
+intMats <- readRDS('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_hiv.donor1donor2.norm.totalScaled.intsMats.rds')
+
+normMatrices <- intMats
+
+peakMatrices <- purrr::map2(normMatrices, peakTables, goodPeaksMatFromPeaksTable)
+#corPeaks6 <- windowedCorrelation(npc1Mat, peaksMatrix, outerRadius = 6)
+corPeaks.ls <- purrr::map2(normMatrices, peakMatrices, windowedCorrelation, outerRadius = 6)
+allPeakCorrs <- rbindlist(purrr::map(corPeaks.ls, "cor"), idcol = "sample")
+```
+
+```{r annotate-peakDT}
+anno.dt <- sec.long[, .(protein, gene)] %>% 
+  unique()
+
+allPeakCorrs[huString.mapper, gene1 := i.stringID, on = c(protein1 = "protein")]
+allPeakCorrs[huString.mapper, gene2 := i.stringID, on = c(protein2 = "protein")]
+allPeakCorrs[anno.dt, alias1 := i.gene, on = c(protein1 = "protein")]
+allPeakCorrs[anno.dt, alias2 := i.gene, on = c(protein2 = "protein")]
+
+# for now use protein as gene for the NA gene
+#allPeakCorrs[is.na(gene1), gene1 := protein1]
+#allPeakCorrs[is.na(gene2), gene2 := protein2]
+
+#fwrite(allPeakCorrs, ScriptAndDatedFileName('donor1donor2.allByallPeakCorr.csv.gz'))
+allPeakCorrs <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_donor1donor2.allByallPeakCorr.csv.gz')
+```
+
+Rerun with the peak filtering included and see how this looks with regards to TP/FP recovery
+
+```{r}
+temp <- names(peakTables)
+
+
+lapply(peakTables, function(x){
+  
+  x[, originalGoodPeak := goodPeak]
+  x[, goodPeak := filtteredGoodPeak]
+})
+
+f.peakMatrices <- purrr::map2(normMatrices, peakTables, goodPeaksMatFromPeaksTable)
+#corPeaks6 <- windowedCorrelation(npc1Mat, peaksMatrix, outerRadius = 6)
+f.corPeaks.ls <- purrr::map2(normMatrices, f.peakMatrices, windowedCorrelation, outerRadius = 6)
+f.allPeakCorrs <- rbindlist(purrr::map(f.corPeaks.ls, "cor"), idcol = "sample")
+```
+```{r, annotate-filtered}
+f.allPeakCorrs[huString.mapper, gene1 := i.stringID, on = c(protein1 = "protein")]
+f.allPeakCorrs[huString.mapper, gene2 := i.stringID, on = c(protein2 = "protein")]
+f.allPeakCorrs[anno.dt, alias1 := i.gene, on = c(protein1 = "protein")]
+f.allPeakCorrs[anno.dt, alias2 := i.gene, on = c(protein2 = "protein")]
+
+# for now use protein as gene for the NA gene
+f.allPeakCorrs[is.na(gene1), gene1 := protein1]
+f.allPeakCorrs[is.na(gene2), gene2 := protein2]
+
+#fwrite(f.allPeakCorrs, ScriptAndDatedFileName('donor1donor2.allByallPeakCorr.filteredPeaks.csv.gz'))
+```
+Read in the original and filtered peak correlations
+
+```{r}
+allPeakCorrs <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_donor1donor2.allByallPeakCorr.csv.gz')
+filteredPeakCorrs <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_donor1donor2.allByallPeakCorr.filteredPeaks.csv.gz')
+```
+
+Run the rest of the analysis on both
+```{r}
+peakCor.ls <- list(filtered=filteredPeakCorrs,
+                   all=allPeakCorrs)
+```
+Label the genesets in each
+```{r}
+lapply(peakCor.ls, function(x){
+  
+  x[, gs := "unknown"]
+  x[gs.interactors ,gs := "interactor" , on = c("gene1", "gene2")]
+  x[gs.decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+})
+```
+plot the recovery of peaks in each
+```{r,plot-correlations, fig.width=9,fig.height=6}
+
+lapply(names(peakCor.ls), function(x){
+  
+  g <- ggplot(peakCor.ls[[x]][gene1 < gene2 & gs != 'unknown'], aes(x = sample, fill = gs)) +
+    geom_bar() + 
+    labs(title=paste0(x, ' Breakdown of detected interactors')) +
+    theme_bw() + 
+    scale_fill_manual(values=c('decoy'='grey70', 'interactor'='gold'))
+
+  BackupAsPDF(g, paste0(x,'.interactorSet.breakdown.barplot'))
+})
+```
+## scoring PPI based on peak-peak correlation
+Setup
+```{r}
+allGenes <- huString.mapper$stringID %>% 
+  unique()
+denomInteractor <- nrow(gs.interactors[gene1 %in% allGenes & gene2 %in% allGenes])
+denomDecoy <- nrow(gs.decoys[gene1 %in% allGenes & gene2 %in% allGenes])
+```
+Using log-likihood ratio approach; how more likey is the PPI derived from the truth set than the random set
+```{r ppi-scoring}
+lapply(names(peakCor.ls), function(x){
+  scoreByGS(peakCor.ls[[x]], denomDecoy, denomInteractor, column = "corScore", groupByVariable = c("sample", "start"))
+})
+```
+plotting the LLR; distance between the line is what we are scoring 
+```{r}
+
+
+# an example LL plot
+startOI = 31
+
+peakCor.ls[['filtered']]
+
+sampleOI <- 'cd4_uninfected_2'
+
+corScoreLabels <- function(corScore){
+  1- signif(10^(-corScore), 2)
+}
+
+allwindows <- peakCor.ls[['filtered']]$start %>%
+  unique() %>% 
+  sort()
+
+outDir <- './050625_peakDetectionAndDifferentialExpression_data/pdfs/logliklihood_plots/'
+
+for (i in allwindows){
+  
+  p <- ggplot(peakCor.ls[['filtered']][start == i & sample == sampleOI], aes(x = corScore)) +
+    geom_line(aes(y = log10IntRate, color = "interactor")) +
+    #geom_segment(aes(y =   log10IntRate-log10RateRatioID, yend = log10IntRate,color = "ratio", xend = corScore)) + 
+    geom_line(aes(y = log10DecoyRate, color = "decoy")) +
+    scale_color_manual(values = c(decoy = "grey", interactor = "red", ratio = "purple")) +
+    ggtitle(label= paste0(sampleOI, " fraction ", i)) + 
+    scale_x_continuous(labels = corScoreLabels, name = "Pearson's R") + 
+    scale_y_continuous(name = "Log Likelihood (i.e. what portion passes threshold)") + 
+    theme_bw()
+  BackupAsPDF(p, paste0('loglikelihood_plots/',i,'.decoyTruthRatio.linechart'))
+}
+```
+
+LLR plots; see where we have the best descriminatory power
+```{r, llr-plots, fig.width=11, fig.height=7}
+lapply(names(peakCor.ls), function(x){
+  
+  g <- ggplot(peakCor.ls[[x]], aes(x = corScore, y = log10RateRatioID, color = start)) + geom_hline(yintercept = 0.0, lty = "dotted") + 
+    geom_line(aes(group = start)) + 
+    labs(title=x) +
+    facet_wrap(~sample, ncol=3) + 
+    scale_color_viridis_c(option = "H", name = "fraction") + 
+    theme_bw()
+  g
+  BackupAsPDF(g, paste0(x,'.llratios.linechart'))
+})
+```
+
+peak summarization to proteins 
+focus on. the filtereSet
+```{r, protein-summarization}
+allPeakCorrs <- peakCor.ls[['filtered']]
+
+stoichDevThreshold <- log2(1 + 0.2)
+setorder(allPeakCorrs, sample, -log10RateRatioID )
+
+summary <- allPeakCorrs[, .SD[1], by= .(sample, protein1, protein2, gene1, gene2, alias1=gsub('[.].+','',alias1), alias2=sub('[.].+','',alias2), prot1Peak, prot2Peak, gs) # best correlation per pair of peaks
+                          ][, .(sumLLRatio = sum(log10RateRatioID[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]), # only sum peaks that are within 20% of the first
+                                numPeaks = .N,
+                                numSameStoichPeaks  = sum (abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold)),
+                            by = .(sample, protein1, protein2, gene1, gene2, alias1, alias2, gs)
+                            ]
+setorder(summary, sample, -sumLLRatio)
+fwrite(summary[gene1 < gene2], ScriptAndDatedFileName("filteredset.peakSimilarityScores.csv.gz"))
+
+allPeakCorrs <- peakCor.ls[['all']]
+setorder(allPeakCorrs, sample, -log10RateRatioID )
+
+summary <- allPeakCorrs[, .SD[1], by= .(sample, protein1, protein2, gene1, gene2, alias1=gsub('[.].+','',alias1), alias2=sub('[.].+','',alias2), prot1Peak, prot2Peak, gs) # best correlation per pair of peaks
+                          ][, .(sumLLRatio = sum(log10RateRatioID[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]), # only sum peaks that are within 20% of the first
+                                numPeaks = .N,
+                                numSameStoichPeaks  = sum (abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold)),
+                            by = .(sample, protein1, protein2, gene1, gene2, alias1, alias2, gs)
+                            ]
+setorder(summary, sample, -sumLLRatio)
+fwrite(summary[gene1 < gene2], ScriptAndDatedFileName("fullSet.peakSimilarityScores.csv.gz"))
+```
+
+```{r}
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.donor1donor2.normalized.interpolated.scaled.csv.gz')
+
+anno.dt <- sec.long[, .(protein, gene)] %>% 
+  unique()
+
+summary <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_filteredset.peakSimilarityScores.csv.gz')
+allPeakCorrs <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_donor1donor2.allByallPeakCorr.csv.gz')
+normMatrices <- readRDS('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_hiv.donor1donor2.norm.totalScaled.intsMats.rds')
+```
+
+
+```{r}
+cosMats <- pbapply::pblapply(normMatrices, cosineMatrix)
+```
+```{r}
+
+cosineMat2Table <- function(mat, threshold = 0.9){
+  idx <- which(mat > threshold , arr.ind = TRUE)
+  
+  dt <- as.data.table(idx,
+                    keep.rownames = TRUE)
+  setnames(dt, "rn", "protein1")
+  dt[, protein2 := colnames(mat)[col]]
+  dt[, cosSim := mat[idx]]
+  dt[, c("row", "col") := NULL ]
+  return (dt[protein1 != protein2,])
+}
+
+cosSim.dt <- pbapply::pblapply(cosMats, cosineMat2Table, threshold = -1) %>% 
+  rbindlist(idcol = "sample")
+cosSim.dt[, gene1 := protein1]
+cosSim.dt[, gene2 := protein2]
+
+# get stringIDs where I have them...
+cosSim.dt[huString.mapper, gene1 := stringID, on = c(protein1 = "protein")]
+cosSim.dt[huString.mapper, gene2 := stringID, on = c(protein2 = "protein")]
+cosSim.dt[anno.dt, alias1 := i.gene, on = c(protein1 = "protein")]
+cosSim.dt[anno.dt, alias2 := i.gene, on = c(protein2 = "protein")]
+
+cosSim.dt[, gs := "unknown"]
+cosSim.dt[gene1 > gene2, gs := "reverse"]
+cosSim.dt[gs.interactors ,gs := "interactor" , on = c("gene1", "gene2")]
+cosSim.dt[gs.decoys, gs := "decoy" , on = c("gene1", "gene2")]
+```
+Distribution of the cosine similarity of the data; doesnt look good, not freat seperation of the two sets
+Weird plot... why arewe biased towards 0 in the donor1 samples? For now just use the peak differential analysis
+```{r, cosSim-histogram, fig.width=10, fig.height=7}
+g <- ggplot(cosSim.dt[gs %in% c("decoy", "interactor")], aes (x = cosSim, fill=gs)) + 
+  geom_histogram(boundary = 1.0, binwidth = 0.003) +
+  scale_fill_manual(values=c('interactor'='gold', 'decoy'='grey70')) +
+  facet_grid(gs~sample, scales = "free_y") +
+  theme_bw()
+g
+BackupAsPDF(g, 'cosineSimilarity.decoyVsinteractor.histogram')
+```
+
+Save the cosine similarity results
+```{r}
+cosSim.dt <- cosSim.dt[cosSim > 0.8][gene1 < gene2]
+fwrite(cosSim.dt, ScriptAndDatedFileName('donor1donor2.hiv.cosineSimilarity.highScores.csv.gz'))
+
+cosSim.dt <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_donor1donor2.hiv.cosineSimilarity.highScores.csv.gz')
+```
+
+## Differential peak analysis
+
+add A standard fractions to the allPeaksTable
+```{r}
+# all filtered peaks 
+allPeaks <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_allPeaks.donor1donor2.monomerMassLabelled.csv.gz')
+allPeaks[, unfilteredPeaks := goodPeak]
+allPeaks[, goodPeak := filtteredGoodPeak]
+
+# with standardised fractions
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_hiv.donor1donor2.sec.ms.wStandardisedFractions.csv.gz') 
+sec.long[, treatment := status] # I think we use status?
+sec.long[, replicate := donor]
+```
+
+```{r}
+# per protein, join peaks across runs into clusters
+allPeaks[goodPeak == TRUE, proteinPeakCluster := clusterPeaks(cofmN.standardized, maxDistance = 2.5), by = protein]
+
+# per peak cluster (per protein), summarize to a center (and height etc, but most important is center)
+peakClusters <- allPeaks[!is.na(proteinPeakCluster), 
+                         .(.N, meanPeakHeight  = mean(peakHeight), center = mean(cofmN.standardized)),
+                         keyby = .(protein, proteinPeakCluster)]
+
+
+# split data into single-protein chunks
+# peaks in the protein
+peakClusters.subTables <- split(peakClusters, by = "protein")
+
+# sec data per protein (only those in above table)
+allProteins <- names(peakClusters.subTables)
+sec.subTables <- split(sec.long[protein %in% allProteins], by = "protein" )
+
+names(allProteins) <- allProteins
+
+anova.ls <- pbapply::pblapply(allProteins, function(proteinOI) anovaPeaksInOneProtein(sec.subTables[[proteinOI]], peakClusters.subTables[[proteinOI]], radius = 5))
+# format output
+anova.dt <- rbindlist(anova.ls, use.names = TRUE, fill = TRUE, idcol = "protein")
+
+setnames(anova.dt,
+         old = c( "rn",        "Sum.Sq",     "Mean.Sq",    "F.value", "Pr..F."), # anova col names to change
+         new = c( "modelTerm", "SumSquares", "MeanSquare", "F",       "p.F"))
+
+peakClusters[anova.dt[modelTerm == "poly(standardFraction, 4):treatment"], treatmentDiff.p := i.p.F]
+peakClusters[anova.dt[modelTerm == "treatment"], treatmentIntensity.p := i.p.F]
+
+# term we are interested in: what peak profiles change in response to treatment?
+setorder(peakClusters, treatmentDiff.p, na.last = T)
+#fwrite(peakClusters, ScriptAndDatedFileName('donor1donor2.de.anova.results.csv.gz'))
+
+peakClusters <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_donor1donor2.de.anova.results.csv.gz')
+```
+
+
+Save the peaks and combine later...
+Combine the peak and elution correlation scores (maybe for now just use the peak correlation score?)
+```{r}
+allGenes <- protein.info$stringID |> unique()
+denomInteractor <- nrow(gs.interactors[gene1 %in% allGenes & gene2 %in% allGenes])
+denomDecoy <- nrow(gs.decoys[gene1 %in% allGenes & gene2 %in% allGenes])
+
+```
+
+
+```{r}
+
+scoreByGS(allPeakCorrs, denomDecoy, denomInteractor, column = "corScore", groupByVariable = c("sample", "start"))
+```
+
+
+**Not used **
+apms data integration.. ignore for now
+```{r}
+#take our interactors passing mist and see if these overlap 
+hiv.hu.mist <- fread('/Users/martingordon/Documents/projects/112024_RKakke_AF2_HIV_hitsInvestigation/201124_AFInteractiorsIntegration_data/2024_11_20_af_interactors_mistScores.csv')
+# REV, VPR,  
+# GAG-POL are there but seperate entities
+# ENV is either GP120 or GP160
+
+# just take those with score > 0.75 in either set
+# add this to the gold standard set
+highConf.interactors <- hiv.hu.mist[Bait %in% c('REV', 'VPR') & (HEK_MiST_score > 0.75 | Jurkat_MiST_score > 0.75), .(protein1=Bait, protein2=Protein_1, source='HIV-HU_MIST')]
+
+# a datatable merge ; the on argument  in quotes is the col in i..
+highConf.interactors[huString.mapper, stringID2 := i.stringID, on=c(protein2='protein')]
+# now merge the viral prot IDs
+highConf.interactors[hiv.nodes, stringID1 := i.stringID, on=c(protein1='gene')]
+hu.hiv.gs <- highConf.interactors[, .(gene1=stringID1, gene2=stringID2, source='Jager et al')]
+```
+
+
+```{r}
+#sec.dt[up2gene.dt, gene := i.geneLabel, on = c(protein = "uniprot")]
+gs.interactors <- goldStandardPairs(unique(protein.info[!is.na(stringID)]$stringID), corum.path = NULL,
+                  string.links.path = "/Users/ben/Downloads/208964.protein.physical.links.detailed.v12.0.txt.gz",
+                  string.info.path =  NULL,
+                  stringCombinedScoreThreshold = 250)
+
+gs.decoys <- decoysFromString(unique(protein.info[!is.na(stringID)]$stringID),
+                  links.path = "/Users/ben/Downloads/208964.protein.physical.links.detailed.v12.0.txt.gz",
+                  info.path =  NULL)
+```
+
+

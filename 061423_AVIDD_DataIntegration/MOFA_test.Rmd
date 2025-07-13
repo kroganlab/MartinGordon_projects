@@ -1,0 +1,431 @@
+---
+title: "MOFA-omics-int"
+author: "Martin Gordon"
+date: "2023-06-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## MOFA first run
+ big N*P problem; we don't have enough samples (recommended at least 15 per cond for results to be meaningful) and far too many features
+For now, we will use the top n (500) features used for the network propagation analysis
+Features were ranked on adj.pvalue log2FC geometric mean, take these gene names and subset for each of the datasets and rerun
+
+##Impressions:
+Only 3 factors learned, factor 1 explained most of the variance in the data, but only factor 2 seemed to show some correlation with condition
+When I ran enrichment on the output found no signnificant hits
+
+## R Markdown
+
+## Packages
+
+```{r}
+library(RColorBrewer) 
+library(mixOmics)
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(RcppCNPy) #R/W support to import numpy objects into R
+library(VennDiagram)
+library(pbapply) #apply functions with progress bar
+library(eulerr)
+library(MOFA2) #this is the tool used for 
+library(MOFAdata)
+
+library(DESeq2)
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+source ("../../utils/bp_utils/NetworkPropagation.R")
+
+
+# using pyhton installation with correct architecute
+#Sys.setenv(RETICULATE_PYTHON = "/Users/martingordon/anaconda3/bin/python")
+#library(reticulate)
+#reticulate::py_config()
+
+```
+
+TO DO
+---
+Create data matricies for the 3 omics technologies (raw data)
+
+
+First lets view the raw data:
+```{r}
+utils::data("CLL_data")       
+lapply(CLL_data,dim)
+```
+
+Lets import our own data and generate a matrix
+For now use all samples as we don't have enough per condition
+
+Protein RNA & PH data
+```{r}
+p.ab.quant <- fread('~/Documents/projects/051623_DSwaney/2023_05_16_DSwaney_AA08_AB_data/2023_05_25_ProteinLevelData.csv.gz') 
+p.ph.quant <- fread('~/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_protein-lvl-data.csv.gz')
+rna.quant <- fread('~/Library/CloudStorage/Box-Box/Mac1_omics_data/CellLines_RNAseq/Expression/gene_expression.xls')
+p.ph.quant
+box.loc <- '~/Library/CloudStorage/Box-Box/Mac1_omics_data/'
+rna.ab.core <- fread(paste0(box.loc, 'CellLines_RNAseq/core_table_gene.xls.gz'), fill=T)
+
+cols.OI <- grep("^read_count|gene_symbol",colnames(rna.ab.core), value=T)
+
+rna.mat <- rna.ab.core[, colnames(rna.ab.core) %in% cols.OI, with=F] %>% 
+  .[,-25, with=F] #rm dup gene_symbol
+
+```
+
+Convert to matrix and adjust colnames
+```{r}
+p.ph.mat <- dcast(p.ph.quant, Protein~paste0(GROUP,"_",SUBJECT), value.var = 'LogIntensities')
+p.ab.mat <- dcast(p.ab.quant, Protein~paste0(GROUP, "_", SUBJECT), value.var = 'LogIntensities')
+
+colnames(rna.mat) <- gsub('read_count_','',colnames(rna.mat))
+
+# set up colnames to match rna-seq dataset
+colnames(p.ph.mat) <- c("Protein", "EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "Par_IFNg_A", "Par_IFNg_B",  "Par_IFNg_C", "Par_IFNg_D", "Par_ctrl_A",  "Par_ctrl_B",  "Par_ctrl_C",  "Par_ctrl_D", "WT_IFNg_A",   "WT_IFNg_B",   "WT_IFNg_C", "WT_IFNg_C") 
+colnames(p.ab.mat) <- c("Protein", "EV_IFNg_A",  "EV_IFNg_B",   "EV_IFNg_C",  "EV_IFNg_D",  "ND_IFNg_A",   "ND_IFNg_B",   "ND_IFNg_C", "ND_IFNg_D", "Par_ctrl_A", "Par_ctrl_B",  "Par_ctrl_C", "Par_ctrl_D", "Par_IFNg_A",  "Par_IFNg_B",  "Par_IFNg_C",  "Par_IFNg_D", "WT_IFNg_A",   "WT_IFNg_B",   "WT_IFNg_C", "WT_IFNg_C") 
+```
+Drop any columns in RNA DT not in the AB PH datasets
+
+```{r}
+cond.OI <- c(grep('_[ABC]', colnames(p.ab.mat), value=T), 'gene_symbol')
+rna.mat <- rna.mat[, colnames(rna.mat) %in% cond.OI, with = F ]
+```
+
+Normalise RNA input
+-----
+
+PH & AB data normalised by msstats.
+Need to repeat this for RNAseq; create a design matrix and input
+Normalise the RNAseq data and remove low-info features
+
+```{r}
+#convert to matrix
+rna.mat <- rna.mat %>% 
+  as.matrix(rownames='gene_symbol')
+
+design.mat <- data.frame(replicate=as.factor(c(rep(c('A','B','C'),3),'B','C','A','B','C')),
+                         condition=as.factor(str_extract(colnames(rna.mat), 'IFNg|ctrl')), 
+                         celltype=as.factor(str_extract(colnames(rna.mat),'EV|Par|ND|WT')))
+
+design.mat$contrast <- as.factor(paste0(design.mat$celltype,"_", design.mat$condition))
+
+
+
+#assign rownames from the colnames of count matrix
+rownames(design.mat) <- colnames(rna.mat)
+```
+
+Run DEseq2 to normalize library & extract variance stabilised counts
+```{r}
+# only accepts integers
+rna.mat <- round(rna.mat)
+
+dds <- DESeqDataSetFromMatrix(countData = rna.mat,
+                              colData = design.mat,
+                              design = ~ contrast)
+
+all(rownames(design.mat) == colnames(rna.mat))
+
+
+#rna.mat <- assay(vsd)
+
+#using log2 transformed counts instead as more gaussian
+rna.mat <- log2(assay(dds))
+```
+
+
+
+Create 3 matrices and make list
+```{r}
+p.ph.mat <- p.ph.mat %>% 
+  as.matrix(rownames='Protein')
+
+p.ab.mat <- p.ab.mat %>% 
+  as.matrix(rownames='Protein')
+
+
+omics.list <- list(p.ph = p.ph.mat, 
+                   p.ab = p.ab.mat,
+                   rna = rna.mat)
+
+```
+
+Cant run the analysis where the sample list is different.. subset the samplses but then the dataset will likely be too small
+Remove 
+```{r}
+# minimal set of shared samples
+minimal.set <- c("EV_IFNg_A","EV_IFNg_B","EV_IFNg_C","ND_IFNg_A","ND_IFNg_B","ND_IFNg_C","Par_IFNg_A","Par_IFNg_B","Par_IFNg_C","WT_IFNg_A","WT_IFNg_B","WT_IFNg_C", "Par_ctrl_B" ,"Par_ctrl_C")
+
+omics.list[['rna']] <- omics.list[['rna']][, colnames(omics.list[['rna']]) %in% minimal.set]
+
+omics.list[['p.ph']] <- omics.list[['p.ph']][, colnames(omics.list[['p.ph']]) %in% minimal.set]
+omics.list[['p.ph']] <- omics.list[['p.ph']][, -15]
+
+
+omics.list[['p.ab']] <- omics.list[['p.ab']][, colnames(omics.list[['p.ab']]) %in% minimal.set]
+omics.list[['p.ab']] <- omics.list[['p.ab']][, -15]
+
+
+# need to reorder samples in rna.mat to align with other omics 
+colnames(omics.list[['rna']])
+colnames(omics.list[['p.ab']])
+colnames(omics.list[['p.ph']])
+
+# reorder to align with other modes
+omics.list[['p.ab']] <- omics.list[['p.ab']][, c(1:6,9:11,7:8,12:14)]
+```
+Feature selection
+----
+Need to reduce the number of features in each dataset to limit 
+Now lets select the most variable genes in each of the datasets
+Will use tools built in mixomics 
+
+Identifiy genes with low variance - unfortunately for most of the datasets there is quite a bit of variance as we are looking at many different conditions
+```{r, eval=FALSE}
+near0Var.list <- lapply(omics.list, function(x){
+    nearZeroVar(as.data.frame(t(x)))
+})
+  
+```
+
+Instead, select the top features that were deg in contrasts of interest
+For first pass, take the top 1k differential features (500 per contrast) per dataset and use this as input
+
+```{r}
+topn.g <- fread('./output/top_n_genes.csv.gz')
+
+omics.list[['rna']] <- omics.list[['rna']][rownames(omics.list[['rna']]) %in% topn.g[omics == 'rna', gene],]
+
+topn.uniprot <- translateGeneName2Uniprot(topn.g[omics == 'p.ab',gene])
+omics.list[['p.ab']] <- omics.list[['p.ab']][rownames(omics.list[['p.ab']]) %in% topn.uniprot,]
+
+
+
+# you never changed the protein names to gene.. many replicates of the same proteins...
+#rownames(omics.list[['p.ph']]) #%in% topn.g[omics == 'p.ab', ]
+
+# for now drop the ph data
+omics.list[['p.ph']] <- NULL
+
+omics.list[['p.ab']]<- omics.list[['p.ab']][!is.na(rownames(omics.list[['p.ab']])),]
+
+#omics.list[['p.ab']] <- omics.list[['p.ab']][!rownames(omics.list[['p.ab']]) %in% c('TMPO', 'CUX1'),]
+
+
+#topn.g[, .N, by=.(Label,omics)]
+```
+
+
+
+
+Remvoe NA & infinite values from the. dataset
+```{r}
+#remove rows with NA values; don't want these proteins to influence factor generation
+omics.list[['p.ab']] <- omics.list[['p.ab']][complete.cases(omics.list[['p.ab']]),]
+
+#remove any infinite values omics.list[['rna']][!is.infinite(omics.list[['rna']])] <- NA
+omics.list[['rna']][!is.finite(omics.list[['rna']])] <- NA
+omics.list[['rna']] <- omics.list[['rna']][complete.cases(omics.list[['rna']]),]
+
+
+lapply(omics.list, function(x){
+   #any(is.infinite((x)))
+   any(is.na(x))
+  # dim(x)
+})
+
+```
+
+
+
+```{r}
+
+MOFAobject <- create_mofa(omics.list)
+
+```
+
+Plot overview of the data
+```{r}
+plot_data_overview(MOFAobject)
+```
+for first run get the default options for training options just to visualise
+
+```{r}
+
+data_opts <- get_default_data_options(MOFAobject)
+# custom settings
+data_opts$scale_views <- TRUE #scale different omics to same total variance
+
+
+model_opts <- get_default_model_options(MOFAobject)
+# custom settings; 3 factors only for this n sample size
+model_opts$num_factors <- 3
+
+train_opts <- get_default_training_options(MOFAobject)
+# custom
+train_opts$convergence_mode <- 'slow'
+train_opts$seed <- 42 #set random seed
+```
+
+Train the model
+
+```{r}
+MOFAobject <- prepare_mofa(
+  object = MOFAobject,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+```
+
+```{r}
+outfile = file.path(getwd(),"model.hdf5")
+MOFAobject.trained <- run_mofa(MOFAobject, outfile, use_basilisk = T) #use_basilisk: R conda installation to maintain a python environment with necessary packages installed
+
+```
+Add sample metadata to the MOFA object
+```{r}
+#col must be named sample
+meta <- data.frame(sample=colnames(omics.list[['rna']]),
+                   condition=gsub('_[ABC]','',colnames(omics.list[['rna']])))
+
+samples_metadata(MOFAobject.trained) <- meta
+```
+
+Look at amt of variance explained by each factor in each modality
+Seems factor 1 is capturing most variance in both datasets, can see that facotr 2 also captures some 15-20% so might be interesting
+
+
+Second plot: is the model a good fit? explains only 40% of variance in p.ab, but 80% in rna
+```{r}
+plot_variance_explained(MOFAobject.trained, x="view", y="factor")
+
+plot_variance_explained(MOFAobject.trained, plot_total = T)[[2]] #amt of variance explained by each factor in each modality; seems MS prot much noisier
+```
+Visualise samples in latent space:
+Factor 2 looks to distinguish WT_IFNg & EV_IFNg
+In all 3 factors WT_INFg and ND_IFng are quite close
+
+```{r}
+plot_factor(MOFAobject.trained, 
+  factor = 1:3,
+  color_by = "condition"
+)
+```
+Can also visualise as violin plots
+Don't have the sample N for this type of analysis
+
+```{r}
+p <- plot_factor(MOFAobject.trained, 
+  factors = c(1,2,3),
+  color_by = "condition",
+  dot_size = 3,        # change dot size
+  dodge = T,           # dodge points with different colors
+  legend = F,          # remove legend
+  add_violin = T,      # add violin plots,
+  violin_alpha = 0.25  # transparency of violin plots
+)
+p
+```
+```{r}
+plot_factors(MOFAobject.trained, 
+  factors = 1:3,
+  color_by = "condition"
+)
+```
+
+
+What genes/proteins contribute most to each factor?
+Most negatively scored; indicates that feature has low levels in cells with positve factor values
+
+```{r}
+plot_weights(MOFAobject.trained,
+  view = "rna",
+  factor = 1,
+  nfeatures = 10,     # Number of features to highlight
+  scale = T,          # Scale weights from -1 to 1
+  abs = F             # Take the absolute value?
+)
+
+
+```
+```{r}
+plot_top_weights(MOFAobject.trained,
+  view = "rna",
+  factor = 2,
+  nfeatures = 10
+)
+```
+See how the factors are correlated with condititon:
+Looks like only factor 2 may correlate with condition
+
+```{r}
+correlate_factors_with_covariates(MOFAobject.trained, 
+  covariates = c('condition'), 
+  cluster_cols = F,
+  plot="log_pval"
+)
+
+```
+Quickly run enrichment to see if the same information pops out:
+No 
+```{r}
+# for ENSG conversion to gene symbol
+library("AnnotationDbi")
+library("org.Hs.eg.db")
+
+#convert colnames to 
+colnames(MSigDB_v6.0_C2_human) = mapIds(org.Hs.eg.db, 
+                                        keys=colnames(MSigDB_v6.0_C2_human), 
+                                        column="SYMBOL",
+                                        keytype="ENSEMBL",
+                                        multiVals="first")
+
+
+# GSEA on positive weights, with default options
+res.positive <- run_enrichment(MOFAobject.trained, 
+  feature.sets = MSigDB_v6.0_C2_human, 
+  view = "rna",
+  factors = 1,
+  sign = "positive"
+)
+
+# GSEA on negative weights, with default options
+res.negative <- run_enrichment(MOFAobject.trained, 
+  feature.sets = MSigDB_v6.0_C2_human, 
+  view = "rna",
+  factors = 1,
+  sign = "negative"
+)
+
+#convert the entrez ids to 
+colnames(MSigDB_v6.0_C2_human) <- translateEntrez2Uniprot(colnames(MSigDB_v6.0_C2_human)) 
+  
+plot_enrichment(res.negative, factor=2, max.pathways=1)
+
+```
+
+
+
+Look at test data to see what is needed:
+```{r}
+utils::data("CLL_data")       
+lapply(CLL_data,dim)
+
+#check this out for metadata formatting
+CLL_metadata <- fread("ftp://ftp.ebi.ac.uk/pub/databases/mofa/cll_vignette/sample_metadata.txt")
+```

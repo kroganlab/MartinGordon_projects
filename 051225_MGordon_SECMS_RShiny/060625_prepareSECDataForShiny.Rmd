@@ -1,0 +1,157 @@
+---
+title: "060625_prepareSECDataForShiny"
+author: "Martin Gordon"
+date: "2025-06-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview 
+
+One issue with our sec input file for the Shiny app; it appears quite jagged and the fractions are clearly not aligned 
+What we may want to do here is to use the aligned (and interpolated fractions) and normalized data as input for our visualization
+Read in the SEC data and present 
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# flag consec proteins
+source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+```
+
+```{r}
+sec.in <- fread('./data/hiv.donor12.seclong.csv.gz')
+sec.in
+
+
+View(scaledIntensityMatrices)
+```
+
+Look at QC plots to confirm these are normalized; they are normalized so look good
+
+```{r}
+qc.dt <- qcSummaryTable(sec.long)
+
+g <- qcPlotMedianInt(qc.dt) +
+  theme_bw()
+g
+```
+Need to fix the fractions; use the same alignment function as in the differential testing, then use interpolation to fix the 
+Read in the allPeaks 
+
+Dont really think aligning peaks across these fractions is going to do a good job...  maybe for now we can just 
+
+```{r, readFiles}
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.donor1donor2.normalized.interpolated.scaled.csv.gz')
+allPeaks <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_06_donor1donor2.detectedPeaks.csv.gz')
+
+peakTables <- split(allPeaks, allPeaks$sample)
+```
+Align fractions
+
+```{r}
+standardizeAllPeakTablesToStandard(peakTables, sec.long, standardIdx = "cd4_uninfected_2", fitPortion = 0.65, minPeaksPerFraction = 45, startFitAtPeak = 20)
+```
+Now, want to interpolate the fractions 
+
+```{r}
+# interpolating log2 values
+
+sec.long[,c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(2,3))]
+sec.long[, interpolatedIntensity := approx(standardFraction, intensity, xout = fraction)$y, by = .(sample, protein)]
+
+sec.long[, newInts := ifelse(interpolatedIntensity == 0, NA, interpolatedIntensity)]
+sec.long[, newInts := 2^interpolatedIntensity]
+
+fwrite(sec.long[, .(sample, treatment, replicate, protein, gene, fraction, intensity=interpolatedIntensity)], ScriptAndDatedFileName('hiv.2donor.interpolatedVals.secShiny.csv.gz'))
+fwrite(sec.long[, .(sample, treatment, replicate, protein, gene, fraction, intensity)], ScriptAndDatedFileName('hiv.2donor.normalizedVals.secShiny.csv.gz'))
+
+
+
+
+sec.long[, intensity := 2^intensity]
+sec.long[, interpolatedIntensity := 2^interpolatedIntensity]
+
+sec.long
+sec.long[,  intensity.interpolated := approx(x=standardFraction, y=ifelse(is.na(intensity), 0, intensity), xout=fraction)$y, by=.(protein, sample)]
+
+
+sec.long[sample == 'cd4_infected_1' & gene == 'E2F8']$fraction
+sec.long[sample == 'cd4_infected_1' & gene == 'E2F8']$standardFraction
+sec.long[sample == 'cd4_infected_1' & gene == 'E2F8']$intensity_totalScaled
+sec.long[sample == 'cd4_infected_1' & gene == 'E2F8']$intensity
+sec.long[sample == 'cd4_infected_1' & gene == 'E2F8']$interpolatedIntensity
+sec.long[sample == 'cd4_infected_1' & gene == 'E2F8']$newInts
+sec.long[sample == 'cd4_infected_1' & gene == 'E2F8']$fraction.standardised
+sec.long[sample == 'cd4_infected_1' & gene == 'E2F8']$intensity.standardised
+
+# now we want to interpolate the intensity value per fraction per protein/sample
+
+# x is independent (our stdFraction), y is response norm(intensity) 
+approx(xtestStd, yInts, xout=xtest, method = "linear")
+
+
+# could also use this to take the average but fine as is for now
+sec.in
+```
+
+To me, the infected and the challenged look good and similiar to the uninfected for donor2
+Undo the standardisation for both of these samples as they look good.. not sure what to do for donor1 for now.... proceed as is and speak to BP tomorrow morning.
+
+```{r, fix-peak-alignments}
+peakTables$cd4_infected_2[, cofmN.standardized := cofmN]
+sec.long[sample == "cd4_infected_2", standardFraction := fraction]
+
+peakTables$cd4_challenged_2[, cofmN.standardized := cofmN]
+sec.long[sample == "cd4_challenged_2", standardFraction := fraction]
+```
+
+# 06-18-25
+## prepare the Donor 123 samples and the differential analysis tables 
+
+Ok the DE contrast set looks good! Compare the uploaded SEC-MS and the sec profiles
+```{r}
+anova.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.pwContrasts.rmfrac20peaks.csv.gz')
+anova.dt[, donor := tstrsplit(contrast, '_', keep=3)]
+fwrite(anova.dt, ScriptAndDatedFileName('hiv.d123.anova.csv.gz'))
+```
+
+look at the sec dt data
+
+```{r}
+sec.eg <- fread('./data/2025_06_06_hiv.2donor.normalizedVals.secShiny.csv.gz')
+head(sec.eg)
+```
+change to include all 3
+```{r}
+sec.dt <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.processed.ints.csv.gz')
+
+fwrite(sec.dt[, .(sample, treatment, replicate, protein, gene, fraction, intensity=intensity_interpolated)], ScriptAndDatedFileName('hiv.3donors.interpolatedVals.secShiny.csv.gz'))
+fwrite(sec.dt[, .(sample, treatment, replicate, protein, gene, fraction, intensity)], ScriptAndDatedFileName('hiv.3donors.normalizedVals.secShiny.csv.gz'))
+```
+these are cmds fro the Phagemap server
+
+```{r}
+ nano  //bpolacco/ShinyApps/060625_HIVDonor12_SECMS/app.R
+
+sudo nano  /home/bpolacco/shiny_server_logs
+sudo nano /home/bpolacco/shiny_server_logs
+```
+

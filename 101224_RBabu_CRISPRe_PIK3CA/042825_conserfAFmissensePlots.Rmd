@@ -1,0 +1,386 @@
+---
+title: "042825_conserfAFmissensePlots"
+author: "Martin Gordon"
+date: "2025-04-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview 
+
+Look at the mutations Ronald has selected for screening, and see how these scores correlate with 
+
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(seqinr)
+library(readxl)
+library(ggridges)
+library(RColorBrewer)
+library(ggforce) # additional ggp utilities
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_bw() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+
+col.pal
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# for heatmaps etc use this palette
+redBlue <- RedBlueColPal()
+
+# clinvar palette
+clinvar.pal <- c(brewer.pal(8, "Blues"), 'grey')
+
+
+
+ "dodgerblue2" "#E31A1C"     "green4"      "#6A3D9A"     "#FF7F00"     "black"       "gold1"       "skyblue2"    "#FB9A99"     "palegreen2"  "#CAB2D6"     "#121111"     "gray70"  
+```
+
+```{r data}
+counts.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/012825_requestedMeetingPlots_data/2025_01_29_sampleCounts.rawAndNormalized.dt')
+counts.dt$group %>% unique()
+grp.levels <- c('LibraryRepresentation_0', 'Alpelisib_22', 'Alpelisib_7', 'DMSO_22', 'DMSO_7', 'Paxalisib_22', 'Paxalisib_7')
+counts.dt[, group := factor(paste(treatment, timepoint, sep='_'), levels=grp.levels)]
+
+# also nned the PW comparisons and anno; this should be the set of everything we have
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/111824_plotsForKroganWeekly_data/2025_01_22_deseq.pwcomparisons.allAnno.csv')
+
+gene.oi <- c('MTOR','PIK3CA', 'PTEN', 'AKT1')
+
+de.dt[, c('numerator', 'denominator') := tstrsplit(contrast, '_vs_', keep=c(1,2))]
+de.dt[, numerator := factor(numerator, levels=c('DMSO_7','DMSO_22', 'Paxalisib_7','Paxalisib_22', 'Alpelisib_7','Alpelisib_22'))]
+de.dt[, numeratorTreatment := gsub('_[0-9]{1,2}', '', numerator)]
+de.dt[, Gene := gene] # just to avoid reediting
+
+
+selected.targets <- setDT(read_xlsx('./data/ronald_targets.xlsx', col_names =F))
+setnames(selected.targets, new=c('guideName', 'sequence','status'))
+
+de.dt <- merge(de.dt, selected.targets[,.(guideName,sequence, status)], by.x=c('guide'), by.y=c('sequence'), all.x=T)
+
+# get the list of IDs to label
+guidesOI <- de.dt[status != 'NA', unique(id)]
+guidesOI
+```
+
+get the positions of our guides and their IDs 
+```{r}
+expand.dt <- de.dt[status != 'NA', .(gene, id, peptide_position, mutant_type)] %>% 
+  .[, lapply(.SD, function(x) unlist(tstrsplit(x, ";"))), .SDcols = c("peptide_position","mutant_type"), by = c("gene","id")] %>% 
+  # remove introns, splice site
+  .[peptide_position != '']
+expand.dt[, peptide_position := as.integer(peptide_position)]
+
+unique(expand.dt$gene) %in% unique(consurf.dt$gene)
+
+```
+
+
+color palette stuff 
+```{r colpals}
+
+brewer.pal(n=9, name = 'Blues')[4:8]
+brewer.pal(n=9, name = 'PuRd')[4:8]
+brewer.pal(n=9, name = 'Reds')[4:8]
+brewer.pal(n=9, name = 'YlOrRd')[4:8]
+brewer.pal(n=9, name = 'YlGn')[4:8]
+brewer.pal(n=9, name = 'Greys')[4:8]
+# blues
+
+group.pal <- c("#BDBDBD", "#DF65B0", "#C994C7", "#6BAED6", "#9ECAE1","#FB6A4A", "#FC9272" )
+#names(group.pal) <- unique(counts.dt$group)
+names(group.pal) <- c('LibraryRepresentation_0', 'Alpelisib_22', 'Alpelisib_7', 'DMSO_22 DMSO_7', 'Paxalisib_22', 'Paxalisib_7')
+
+# "#FC9272" "#FB6A4A" "#EF3B2C" "#CB181D" "#A50F15"
+# "#9ECAE1" "#6BAED6" "#4292C6" "#2171B5" "#08519C"
+# "#C994C7" "#DF65B0" "#E7298A" "#CE1256" "#980043"
+# "#ADDD8E" "#78C679" "#41AB5D" "#238443" "#006837"
+# "#BDBDBD" "#969696" "#737373" "#525252" "#252525"
+# "#FEB24C" "#FD8D3C" "#FC4E2A" "#E31A1C" "#BD0026"
+
+
+# timepoint and editor col pal
+counts.dt$timepoint %>% unique()
+
+group.pal <- c("#BDBDBD", "#DF65B0", "#C994C7", "#6BAED6", "#9ECAE1","#FB6A4A", "#FC9272" )
+names(group.pal) <- unique(counts.dt$group)
+
+timepoint.pal <- c("#ADDD8E" ,"#78C679", "#41AB5D")
+names(timepoint.pal) <-c('0','7', '22')
+
+editor.pal <- brewer.pal(n=9, name = 'Set3')[4:6]
+names(editor.pal) <- c('abe8e', 'bemax', 'plasmid')
+
+gene.col <- brewer.pal(n=6, name = 'Set2')
+# set6 if need non targeting
+gene.col <- c("#66C2A5" ,"#FC8D62","#FFD92F", "#8DA0CB") # "#A6D854" "#FFD92F" "#E78AC3""#8DA0CB"
+
+# vector iun col plotting tools
+consurf.pal <- consurf_palette
+names(consurf.pal) <- as.character(seq(1,9))
+```
+
+read in conserf scores (taken from the server)
+Identify positions that are highly conserved in the data 
+
+
+Scatterplot of AFmissense scores and the LFC for 22 tp comparisons
+Add the conserv scores to the heatmaps 
+Add the scores to the tileplots? What about adding the triangles to highlight the evolutionary conserved regions?
+
+```{r}
+cols.oi <- c('V1', 'V2', 'V4', 'V5')
+
+consurf.list <- list('AKT1' = fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/output/AKT1_consurf_grades.txt', skip=27, sep='\t'),
+                   'PIK3CA' = fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/output/PIK3CA_chainA_consurf_grades.txt', skip=27, sep='\t'),
+                   'PTEN' = fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/output/PTEN_chainA_consurf_grades.txt', skip=27, sep='\t'),
+                   'MTOR' = fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/output/MTOR_A_consurf_grades.txt', skip=27, sep='\t')
+                   )
+
+consurf.dt <- lapply(consurf.list, function(x){
+    x <- x[, ..cols.oi]
+    setnames(x, new=c('POS','SEQ','SCORE','COLOR'))
+}) %>% 
+  rbindlist(idcol='gene')
+
+# rm special characters
+consurf.dt[, COLOR := as.numeric(gsub('[*]', '', COLOR))]
+
+# scores 9 conserved 1 is variable
+annodt <- merge(consurf.dt, expand.dt, by.x=c('gene', 'POS'), by.y=c('gene', 'peptide_position')) %>% 
+  unique()
+```
+
+how to weight conserv scores that hit multiple sites; take the lowest within the editing window
+Dont want to take average, as double counting residues with multiple edits
+Use low/high or editTarget
+
+```{r}
+# get the average conserv score per guide (incase edits map over multiple positions)
+annodt[, AVGSCORE := as.character(round(mean(COLOR))), by=id]
+# min and high
+annodt[, MINSCORE := as.character(min(COLOR)), by=id]
+annodt[, MAXSCORE := as.character(max(COLOR)), by=id]
+annodt <- annodt[, .(gene, POS, id, mutant_type, AVGSCORE, MINSCORE, MAXSCORE)] %>% 
+  unique()
+```
+
+Try out min and max scores first;
+adjust the ID names to give residue
+
+```{r, screen_heatmaps, fig.width=9, fig.height=8}
+counts.dt
+abe8e.mat <- dcast(counts.dt[editor == 'abe8e' & sgRNA %in% guidesOI,], sgRNA~paste0(treatment, '_', timepoint, '_', replicate), value.var='deseq.norm.counts') %>% 
+  as.matrix(rownames='sgRNA')
+bemax.mat <- dcast(counts.dt[editor == 'bemax' & sgRNA %in% guidesOI,], sgRNA~paste0(treatment, '_', timepoint,'_', replicate), value.var='deseq.norm.counts') %>% 
+  as.matrix(rownames='sgRNA')
+
+# sweep the library Rep valuea
+bemax.mat <- log2(bemax.mat +1)
+abe8e.mat <- log2(abe8e.mat +1)
+
+
+bemax.sub <- sweep(bemax.mat, 1, apply(bemax.mat[, grepl('LibraryRepresentation', colnames(bemax.mat))], 1, mean))
+abe8e.sub <- sweep(abe8e.mat, 1, apply(abe8e.mat[, grepl('LibraryRepresentation', colnames(abe8e.mat))], 1, mean))
+
+bemax.sub <- bemax.sub[, !grepl('Library', colnames(bemax.sub))]
+abe8e.sub <- abe8e.sub[, !grepl('Library', colnames(abe8e.sub))]
+
+corder <- c("DMSO_7_1","DMSO_7_2", "DMSO_22_1","DMSO_22_2","Paxalisib_7_1","Paxalisib_7_2",
+            "Paxalisib_22_1","Paxalisib_22_2","Alpelisib_7_1","Alpelisib_7_2","Alpelisib_22_1","Alpelisib_22_2")
+
+# sort row and col order
+bemax.sub <- bemax.sub[,corder]
+abe8e.sub <- abe8e.sub[,corder]
+# reorder mat to match annodt
+
+bemax.sub <- bemax.sub[match(annodt$id, rownames(bemax.sub)), ]
+abe8e.sub <- abe8e.sub[match(annodt$id, rownames(abe8e.sub)), ]
+  
+names(gene.col) <- c("MTOR","PIK3CA","PTEN","AKT1")
+
+rowHa <- rowAnnotation('gene'=annodt$gene, 
+                       'Consurf score\n(1-9)'=annodt$MAXSCORE,
+                       col=list('gene'=gene.col, 'Consurf score\n(1-9)'=consurf.pal)) #subset to same socring srt
+
+
+hm <- Heatmap(bemax.sub, 
+              cluster_columns = F,
+              cluster_rows=F, 
+              row_split = annodt$gene,
+              show_column_names = F,
+              cluster_column_slices = F,
+              col=colorRamp2(breaks=c(-2,0,2), colors = c(redBlue[5],  redBlue[3], redBlue[1])),
+              #column_split = factor(gsub('_[12]','', corder), levels = unique(sub('_[12]','', corder))),
+              column_split = factor(gsub("_[12]{1}$", '', colnames(bemax.sub)), levels=c('DMSO_7', 'DMSO_22', 'Paxalisib_7', 'Paxalisib_22', 'Alpelisib_7', 'Alpelisib_22')),
+              name='log2 counts/\nmean(Librep)',
+              border=T,
+              right_annotation = rowHa,
+              row_title_gp=gpar(fontsize=10, fontface = "bold"),
+              column_title_gp=gpar(fontsize=12, fontface = "bold"),
+              row_names_gp = gpar(fontsize=9),
+              show_row_names = T)
+hm
+BackupAsPDF(hm, 'bemaxEditor.selectedGuides.consurfScores.heatmap')
+
+hm <- Heatmap(abe8e.sub, 
+              cluster_columns = F,
+              cluster_rows=F, 
+              row_split = annodt$gene,
+              show_column_names = F,
+              cluster_column_slices = F,
+              col=colorRamp2(breaks=c(-4,0,4), colors = c(redBlue[5],  redBlue[3], redBlue[1])),
+              #column_split = factor(gsub('_[12]','', corder), levels = unique(sub('_[12]','', corder))),
+              column_split = factor(gsub("_[12]{1}$", '', colnames(abe8e.sub)), levels=c('DMSO_7', 'DMSO_22', 'Paxalisib_7', 'Paxalisib_22', 'Alpelisib_7', 'Alpelisib_22')),
+              name='log2 counts/\nmean(Librep)',
+              border=T,
+              right_annotation = rowHa,
+              row_title_gp=gpar(fontsize=10, fontface = "bold"),
+              column_title_gp=gpar(fontsize=12, fontface = "bold"),
+              row_names_gp = gpar(fontsize=9),
+              show_row_names = T)
+hm
+BackupAsPDF(hm, 'abe8eEditor.selectedGuides.consurfScores.heatmap')
+```
+**today**
+
+How can we use these conseurf scores? Color the lollipop charts by this?
+Is there a significant association between score and LFC? test per gene/contrast combo
+Is SCORE a predictor of LFC? run an lm and anova to see how significant the terms are
+
+merge de.dt and consurf scores
+```{r}
+de.dt <- merge(de.dt, consurf.dt, by.x=c('gene', 'first_peptide_pos'), by.y=c('gene','POS'), all.x=T)
+#fwrite(de.dt, ScriptAndDatedFileName('guide.dea.results.consurfAnno.csv.gz'))
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/042825_conserfAFmissensePlots_data/2025_04_28_guide.dea.results.consurfAnno.csv.gz')
+```
+```{r, single_lollipop, fig.width=14, fig.height=6}
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[contrast == x & !gene %in% c('INTERGENIC', 'NON-TARGETING'),]
+  subdt[, lfcSig := 'not']
+  subdt[abs(log2FoldChange) > 1, lfcSig := ifelse(log2FoldChange > 0, 'up', 'down')]
+  subdt[, screening := ifelse(id %in% guidesOI, 'selected for screening', 'ns')]
+  
+  # loop over the genes in each contrast
+  
+  lapply(gene.oi, function(g){
+    
+    line.data <- subdt[gene %in% g, .(first_peptide_pos, y = 0, COLOR)]
+
+    p <- ggplot(subdt[gene %in% g,], aes(x=first_peptide_pos, y=log2FoldChange, fill=lfcSig, shape=editor, label=pep_mutant_id, alpha=lfcSig)) +
+    geom_segment(aes(x=first_peptide_pos, xend=first_peptide_pos, y=0, yend=log2FoldChange), color="grey") +
+    geom_point(aes(size=-log10(pvalue))) +
+    geom_hline(yintercept=c(-1,1), alpha=0.6, linetype=2) +
+    #geom_hline(yintercept=0,size=4, aes(color=COLOR)) +
+    #geom_link(aes(x = 0, xend = max(first_peptide_pos), y = -0.5, yend = 0.5, colour = COLOR), lineend = "round") +
+    scale_x_continuous(n.breaks = 20, expand=c(0,0),limits=c(0,NA)) +
+    #facet_wrap(~gene, ncol=1, scales='free') +
+    labs(title=g, subtitle=x, x='amino acid residue', y='Log2FoldChange') +
+    ggrepel::geom_text_repel(data=subdt[lfcSig != 'not' & gene %in% g & !grepl('silent', most_common_mutant),], 
+                            # aes(color=screening),
+                             show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 8, size=1.75) +
+    # now label the selected guides
+    #ggrepel::geom_text_repel(data=subdt[lfcSig != 'not' & gene %in% c("AKT1","MTOR","PIK3CA","PTEN") & !grepl('silent', most_common_mutant) & id %in% guidesOI,], 
+    #                         show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 8, size=2, color='maroon') +   
+    #scale_color_manual(values=c('selected for screening'='maroon', 'ns'='black')) +
+    scale_fill_manual(values=c('not'='grey70', 'up'=redBlue[2], 'down'=redBlue[4]), name='abs(LFC) > 1') +
+    scale_alpha_manual(values = c('up' = 1, 'down'=1, 'not' =  0.2)) +
+    scale_size_continuous(breaks=c(0,1,3,4), range=c(1.5,6)) +
+    scale_shape_manual(values = 21:22) +
+    customTheme +
+    theme(plot.title = element_text(size = 20, face = "bold")) 
+  
+  nameToplot <- paste0(x,'_', g)
+  p <- p +
+    geom_path(data = line.data, inherit.aes = FALSE, aes(x = first_peptide_pos, y = y, color = COLOR, size=4)) +
+    scale_color_gradientn(colors=consurf.pal) + 
+    guides(alpha='none',
+           fill = guide_legend(override.aes = list(shape =21) ) ,
+           size = 'none',
+           color = guide_legend('Consurf score'))
+    
+  BackupAsPDF(p, paste0(nameToplot,'.tileplot'))
+  })
+})
+```
+ No obvious strong correlation between LFC and conservation score; doesnt look predicitve
+
+```{r}
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[!is.na(SCORE) & editor == 'abe8e' & contrast == x & !gene %in% c('INTERGENIC', 'NON-TARGETING'),]
+  subdt[, lfcSig := 'not']
+  subdt[abs(log2FoldChange) > 1, lfcSig := ifelse(log2FoldChange > 0, 'up', 'down')]
+  # loop over the genes in each contrast
+  
+  p <- ggplot(subdt, aes(y=abs(log2FoldChange), x=as.factor(COLOR), fill=as.factor(COLOR))) +
+    geom_violin(draw_quantiles = T) +
+    geom_hline(yintercept=1, linetype='dashed', color='grey70') +
+    geom_boxplot(outliers = F,width=0.2, color="grey70", alpha=0.2) +
+    labs(title=x, y='abs LFC', x='Conservation score') +
+    scale_fill_manual(values=unname(consurf.pal)) +
+    scale_shape_manual(values = 21:22) +
+    customTheme +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill='none')
+  
+  p
+})
+```
+*Fishers Exact Test*
+Run a fishers exact test to assess if the sig set are enriched for conserved sites (makes sense if we hit these that the phenotypic impact is severe)
+Convert the scores to table; no significance so don't run
+```{r}
+de.dt[, conservationStatus := ifelse(COLOR >= 8, 'highlyConserved', 'ns')]
+
+# no significance; we can see that conservation is not clearly implicated 
+# no obvious relationship between conservation and sig status
+as.matrix(table(de.dt[!is.na(conservationStatus) & contrast == 'Alpelisib_22_vs_LibraryRep_0', sig],  de.dt[!is.na(conservationStatus) & contrast == 'Alpelisib_22_vs_LibraryRep_0', conservationStatus])) %>% 
+  fisher.test()
+```
+*Todo* 
+Alphafold missense scores plotting; correlation
+Show correlation scores along the Y axis; x axis can be the different mutation types; show 
+K-S test to see if distributions are different?
+
+
+```{r}
+
+```
+

@@ -1,0 +1,162 @@
+---
+title: "121124_AFCRISPR_Integration"
+author: "Martin Gordon"
+date: "2024-12-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 
+
+```{r}
+library(data.table)
+library(magrittr)
+library(readxl)
+library(ggplot2)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+```
+
+# read in the CRISPR results (summarised to the gene level) and annotate the data.table with the CRISPR positive and negative selection hits from Ujwals analysis
+# also first confirm my table scores match the inital datatable
+
+# CRISPRactivation: upreg (GTF+ pop) are proviral, downreg (GFP -vep pop) are antiviral
+# CRISPR inhibition: upreg (GTF+ pop) are antiviral, downreg (GFP -ve pop) are proviral
+
+```{r}
+
+merge.dt <- fread('./201124_AFInteractiorsIntegration_data/2024_11_21_af.hiv.interactors.MISTscores.iMEX.anno.csv')
+# this is the HIV interacted set
+ori.dt <-  fread('./data/AF2M_HsHIV_interactors.csv')
+
+ori.dt[Protein_1_name == 'PPIAL4F' & Protein_2 %in% c('CA-SF', 'Gag-SF'),]
+merge.dt[Protein_1_name == 'PPIAL4F' &  Protein_2 %in% c('CA-SF', 'Gag-SF'),]
+
+# this looks v similar
+merge.dt[!is.na(HEK_MiST_score) & Bait =='CA' & Protein_1_name == 'PC']
+ori.dt[ Protein_2 =='CA-SF' & Protein_1_name == 'PC']
+```
+Read in the CRISPR data and visualize
+
+
+I think maybe we want pvalue, 
+```{r}
+crispr.ko.dt <- read_xlsx('./data/CRISPRko_significant_genes.xlsx') %>% 
+  as.data.table()
+crispr.act.dt <- read_xlsx('./data/CRISPRact_significant_genes.xlsx') %>% 
+  as.data.table(colnames)
+
+
+# mageck tests each gene for both positive and negative selection... I think we only want to show the results
+# maybe as this is a targeted subset, we should only report
+# no geens are both positively and negatively enriched
+colnames(crispr.ko.dt) <- gsub("\"", "", colnames(crispr.ko.dt)) 
+colnames(crispr.act.dt) <- gsub("\"", "", colnames(crispr.act.dt)) 
+
+# ok, no genes significant at both directions
+crispr.ko.dt[neg.fdr < 0.05 | pos.fdr < 0.05,]
+crispr.act.dt[neg.fdr < 0.05 | pos.fdr < 0.05,]
+```
+Lets take the most signficiant result for each crispr screen 
+```{r}
+# to use for merging 
+crispr.ko.dt[, Protein_1_name := id]
+crispr.act.dt[, Protein_1_name := id]
+
+
+#ko so donwreg are GFP+ proviral factors
+crispr.ko.dt[, status := 'na']
+crispr.ko.dt[, status := ifelse(neg.p.value < pos.p.value, 'proviral', 'antiviral')]
+
+#ko so donwreg are GFP+ proviral factors
+crispr.act.dt[, status := 'na']
+crispr.act.dt[, status := ifelse(neg.p.value > pos.p.value, 'proviral', 'antiviral')]
+
+# sanity check
+crispr.act.dt[id == 'CD4']
+crispr.ko.dt[id == 'CD4']
+crispr.act.dt[id == 'TRIM5']
+crispr.ko.dt[id == 'MYB']
+```
+ # okcreate new columns based pval and lfc and 
+```{r}
+crispr.act.dt[, `:=`(CRISPRa_adj.pvalue=ifelse(status == 'proviral', pos.fdr, neg.fdr),
+                     CRISPRa_log2FoldChange=ifelse(status == 'proviral', pos.lfc, neg.lfc),
+                     CRISPRa_pvalue=ifelse(status == 'proviral', pos.p.value, neg.p.value)
+                     )]
+
+crispr.ko.dt[, `:=`(CRISPRko_adj.pvalue=ifelse(status == 'proviral', neg.fdr, pos.fdr),
+                    CRISPRko_log2FoldChange=ifelse(status == 'proviral', neg.lfc, pos.lfc),
+                    CRISPRko_pvalue=ifelse(status == 'proviral', neg.p.value, pos.p.value)
+                     )]
+
+crispr.act.dt[id == 'CD4', .(pos.fdr, pos.lfc, neg.fdr, neg.lfc, CRISPRa_adj.pvalue, CRISPRa_Log2FoldChange)]
+crispr.act.dt[id == 'TRIM5', .(pos.fdr, pos.lfc, neg.fdr, neg.lfc, CRISPRa_adj.pvalue, CRISPRa_Log2FoldChange)]
+
+crispr.ko.dt[id == 'CD4', .(pos.fdr, pos.lfc, neg.fdr, neg.lfc, CRISPRko_adjPvalue, CRISPRko_log2FoldChange)]
+crispr.ko.dt[id == 'MYB', .(pos.fdr, pos.lfc, neg.fdr, neg.lfc, CRISPRko_adjPvalue, CRISPRko_log2FoldChange)]
+```
+
+Ok, merge the CRISPR data  with the full set of results
+```{r}
+merge.dt <- fread('./201124_AFInteractiorsIntegration_data/2024_11_21_af.hiv.interactors.MISTscores.iMEX.anno.csv')
+merge.dt
+# ok, now lets merge with the activating set
+new.merge.dt  <- merge(x=merge.dt, y=crispr.act.dt[, .(Protein_1_name=id, CRISPRa_log2FoldChange, CRISPRa_pvalue, CRISPRa_adj.pvalue)], by='Protein_1_name', all.x=T)
+
+
+# now with the inhibiting set
+new.merge.dt  <- merge(x=new.merge.dt, y=crispr.ko.dt[, .(Protein_1_name=id, CRISPRko_log2FoldChange, CRISPRko_pvalue, CRISPRko_adj.pvalue)], by='Protein_1_name', all.x=T)
+
+
+new.merge.dt[!is.na(CRISPRa_log2FoldChange), unique(Protein_1_name)]
+
+# 15 of these records are sig
+crispr.act.dt[!id %in% new.merge.dt[!is.na(CRISPRa_log2FoldChange), unique(Protein_1_name)]]
+crispr.act.dt[!id %in% new.merge.dt[!is.na(CRISPRa_log2FoldChange), unique(Protein_1_name)] & (neg.fdr < 0.05 | pos.fdr < 0.05) & abs(pos.lfc) > 1, unique(id)]
+
+
+# 20 hits not found # KMT2A not found
+crispr.ko.dt[!id %in% new.merge.dt[!is.na(CRISPRko_log2FoldChange), unique(Protein_1_name)]]
+crispr.ko.dt[!id %in% new.merge.dt[!is.na(CRISPRko_log2FoldChange), unique(Protein_1_name)] & (neg.fdr < 0.05 | pos.fdr < 0.05)  & abs(pos.lfc) > 1, unique(id)]
+
+```
+May want to share the non-overlaping set, but for now write outpu
+
+```{r}
+fwrite(new.merge.dt, ScriptAndDatedFileName('af.hiv.interactors.MISTscores.iMEX.CRISPR.anno.txt'))
+```
+
+
+Prepare our AF3 input to compare results
+
+```{r}
+# take this set as we have AF scores for these interactors
+ppi.dt <- merge.dt[HEK_MiST_score >= 0.75 | Jurkat_MiST_score >= 0.75, .(Bait, Protein_1)]
+
+# write out the files we need
+fwrite(ppi.dt, sep=',', col.names =F, ScriptAndDatedFileName('af3.hiv.jobTable.txt'))
+fwrite(data.table(merge.dt[HEK_MiST_score >= 0.75 | Jurkat_MiST_score >= 0.75, unique(Protein_1),]), col.names = F, ScriptAndDatedFileName('af3.hiv.preyuniprots.txt'))
+```
+
+
+```{r}
+mist.scores.list <- list(HEK = as.data.table(read_xls('./docs/NIHMS358189-supplement-Supplementary_Data_2.xls', sheet=1)),
+                         Jurkat = as.data.table(read_xls('./docs/NIHMS358189-supplement-Supplementary_Data_2.xls', sheet=2)))
+
+
+mist.scores.dt <- rbindlist(mist.scores.list, idcol='cellline')
+mist.scores.dt[, PPI := paste(Bait, '__', PreyGene)]
+mist.scores.dt[, PreyGene := multiUniprots2multiGenes(Prey, species='HUMAN')]
+
+
+mist.scores.dt[`MiST score` > 0.75, .(Bait, Prey)] %>%  unique()
+mis
+```
+
+ori.dt[Protein_1_name == 'PPIAL4F',]

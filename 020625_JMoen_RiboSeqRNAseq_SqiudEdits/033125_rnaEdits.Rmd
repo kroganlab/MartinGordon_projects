@@ -1,0 +1,161 @@
+---
+title: "033125_rnaEdits"
+author: "Martin Gordon"
+date: "2025-03-31"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(Rsamtools)
+library(magrittr)
+library(ggplot2)
+library(devtools)
+library(riboWaltz)
+library(hrbrthemes)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+#library(extrafont)
+#font_import()
+#loadfonts()
+
+# directly from google font
+#sysfonts::font_add_google("Roboto Condensed")
+#showtext_auto()
+
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90,size=6)
+        )
+```
+
+```{r}
+
+in.tables <- dir(path='./output/reditools/032825_transcriptomeMap', pattern="*outTable", recursive = T, full.names=T)
+in.tables
+edits <- lapply(in.tables, fread)
+
+names(edits)  <- gsub('./output/reditools/032825_transcriptomeMap/|/DnaRna_.+', '', in.tables)
+
+edits.dt <- rbindlist(edits, idcol = 'sample')
+```
+
+```{r}
+ggplot(edits.dt[`Coverage-q30` >= 10,.N, by=.(sample, AllSubs)], aes(x=AllSubs, y=N)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~sample, scales='free_y')
+```
+Use the missing gtf to extract transcripts that are not edited
+```{r}
+missing.transcripts <- fread('./docs/missing_in_fasta.gtf')
+missing.transcripts[, c('tid', 'gid') := tstrsplit(V9, ';', keep=c(1,2))]
+
+cols.oi <- c('tid', 'gid')
+# extract everything in quites
+missing.transcripts[, (cols.oi) :=  lapply(.SD, function(x){
+  stringr::str_extract(x, '(?<=\\s\\")[A-Za-z0-9:.]+')
+}), .SDcols = cols.oi]
+
+transcriptToDrop <- missing.transcripts$tid %>% unique()
+```
+
+drop the edits in the non-coding transcripts
+```{r}
+sub.dt <- edits.dt[!Region %in% transcriptToDrop, ]
+
+#fwrite(sub.dt, ScriptAndDatedFileName('proteinCoding.edits.csv.gz'))
+edits.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/033125_rnaEdits_data/2025_03_31_proteinCoding.edits.csv.gz')
+
+ggplot(edits.dt[`Coverage-q30` >= 10 & Frequency > 0.1,.N, by=.(sample, AllSubs)], aes(x=AllSubs, y=N)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~sample, scales='free_y')
+```
+Find the edit reads; read in the outReads file and use this to subset to edits in the gill
+
+```{r}
+in.reads <- dir(path='./output/reditools/032825_transcriptomeMap', pattern="*outReads", recursive = T, full.names=T)
+in.reads
+edit.reads <- lapply(in.reads, fread, header=F)
+
+names(edit.reads)  <- gsub('./output/reditools/032825_transcriptomeMap/|/DnaRna_.+', '', in.reads)
+edit.reads
+
+reads.dt <- rbindlist(edit.reads, idcol='sample')
+reads.dt <- reads.dt[grepl('>', V1),]
+
+
+# drop the non-coding references 
+reads.dt[, c('header', 'ref', 'site') := tstrsplit(V1, '[$]', keep=c(1,2,3))]
+reads.dt$V1 <- NULL
+reads.dt <- reads.dt[!ref %in% transcriptToDrop, ]
+
+reads.dt[!grepl('_0', header)]
+reads.dt[, flag := tstrsplit(header, '_', keep=3)]
+reads.dt[, header := gsub('>|_[0]$', '',header)]
+```
+subset to the edited reads; then we also want to take everything but the reads in this group
+
+```{r}
+samples.oi <- unique(reads.dt$sample)
+
+lapply(samples.oi, function(x){
+  
+  fwrite(reads.dt[sample == x, .(header)], col.names = F, ScriptAndDatedFileName(paste0(x,'.all.editedTranscripts.txt')))
+  fwrite(reads.dt[sample == x & !ref %in% missing.transcripts, .(header)], col.names = F, ScriptAndDatedFileName(paste0(x,'.proteinCoding.editedTranscripts.txt')))
+})
+```
+Sanity check to make sure the edits have been handled correctly.. looks good to me after a couple of spot checks!
+
+```{r}
+# this was pulled from the no edits file; check again
+reads.dt[grepl('LH00587:87:22HHJ5LT4:8:2196:24030:6295_TCTGGTAT', header)]
+reads.dt[grepl('LH00587:87:22HHJ5LT4:8:2201:41599:20037_GCTGAAGT', header)]
+
+# now try one of the files with edits
+reads.dt[grepl('LH00587:87:22HHJ5LT4:8:2274:44002:17221_ACGCCCGC', header)]
+reads.dt[grepl('LH00587:87:22HHJ5LT4:8:1302:34720:26256_CCGCCGAT', header)]
+
+```
+
+For our comparisons tomorrow we may need to consider if we are confounding things here... Should we subset to reads mapping to the same transcripts to avoid somekind of sequece bias? Could just be rarity or lack of represnetation in the edited set that showcases differences
+
+
+**not used**
+Now read in the bam files and pull out the references with/without edits
+
+```{r}
+in.bam<- dir(path='./output/riboseq_bamfiles_firstpass/riboseq', pattern="*.bam$", recursive = T, full.names=T)
+
+
+ribo.list <- lapply(in.bam, BamFile)
+param <- ScanBamParam(what=c('qname'), flag=scanBamFlag(isUnmappedQuery=FALSE))
+ribo.list <- lapply(ribo.list, function(x) scanBam(x, param = param))
+
+```
+
+
+```{r}
+reads.dt
+```
+

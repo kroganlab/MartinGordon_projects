@@ -1,0 +1,164 @@
+---
+title: "R Notebook"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+This template file located at:
+/Applications/RStudio.app/Contents/Resources/resources/templates/notebook_osx.Rmd
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("../../bp_utils/ManageScriptData.R")
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+
+Data is mouse tissue. Mice are pre-treated +/- HTR2A agonist, and then treated +/- psilocin, and observed at time 05 and 24 hours.
+
+The two way anova is agonist x psilocin.
+
+Main goal is to detect psilocin-dependent phosphorylation that is unique to the -agonist case. To answer that, these statistics look for significant differences in the psilocin effect with and without agonist, and then we inspect the data to see if the differences are in the direction of interest.
+
+# Fit linear models, one per "protein"
+protein is actually a phopho-site-combination
+
+```{r}
+protQuant <- fread ("~/UCSF/kroganlab/BenPolacco/darpa2022/2023_06_29_HTR2A_MB02_PH_data/2023_06_29_ProteinLevelData.csv")
+
+# parse GROUP names to define the actual columns that the linear models will work on
+# this work depends on how your columsn are defined
+protQuant[, psi := ifelse( grepl ("Psi", GROUP), "PsiPos", "PsiNeg")]
+protQuant[, ant := ifelse( grepl ("Ant", GROUP), "AntPos", "AntNeg")]
+protQuant[, time := ifelse(grepl("05", GROUP), "05", "24")]
+
+# in this dataset, the extra time variable complicates things (3 way anova). I simplify to a single time point
+protQuant <- protQuant[time == "05"]
+
+source("../../bp_utils/LinearModels.R")
+
+# linearModelsAllProteins can this function which computes statistic for a contrast of two different log2FC
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~psi|ant){  # how does the psi effect change per antagonist level
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+# postProcessFunction = emmeans.contrastOfContrasts tells it to use the function above after doing anova.
+# it is optional, adds significant time to the computation (~5x), but is nice to
+# put a magnitude and p value on specific differences of differences
+#
+# cl = 6 parameter says to use 6 processes.  Set to NULL if multiprocess is failing, or higher or lower as you wish.
+# Numbers near the number of processors available in your machine is probably counterproductive.
+lm.out <- linearModelsAllProteins(protQuant, 
+                                  formulaList = list(interaction = LogIntensities~psi + ant + ant:psi ), # you could define other models here, but we name and define one model. 
+                                  splitColumn = "Protein", postProcessFunction = emmeans.contrastOfContrasts, cl = 6) |> suppressWarnings()
+
+
+
+```
+
+# inspect anova p values per term
+```{r}
+ggplot (lm.out$anova, aes(x = p.value)) + geom_histogram(boundary = c(0.0), 
+                                                         # adjust binwidth to as narrow as is legible
+                                                         binwidth = 0.005)+
+  facet_wrap(~term)
+
+```
+
+## adjusted p values in anova
+```{r}
+lm.out$anova[, fdr := p.adjust(p.value, method = "BH"), by = term]
+```
+
+
+## Antagonist effects viewed as a heatmap
+
+```{r}
+#play with thresholds here
+sigProtein <- lm.out$anova[term %in% c( "ant") & fdr < 0.05, Protein]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+source ("../../bp_utils/UniprotIDMapping.R")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "MOUSE")
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+Heatmap (prot.mat, cluster_columns = FALSE, 
+         column_split = list (ifelse(grepl("24", colnames(prot.mat)), "24", "05"),
+                              ifelse(grepl("Ant", colnames(prot.mat)), "Ant+", "Ant-"),
+                              ifelse(grepl("Veh", colnames(prot.mat)), "Psi-", "Psi+")))
+
+```
+
+
+
+
+## Psilocin effects
+
+```{r}
+#play with thresholds here
+# there weren't many hits by fdr, so use a strong p.value
+sigProtein <- lm.out$anova[term %in% c( "psi") & p.value < 0.001, Protein]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "MOUSE")
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+Heatmap (prot.mat, cluster_columns = FALSE, 
+         column_split = list (ifelse(grepl("24", colnames(prot.mat)), "24", "05"),
+                              ifelse(grepl("Ant", colnames(prot.mat)), "Ant+", "Ant-"),
+                              ifelse(grepl("Veh", colnames(prot.mat)), "Psi-", "Psi+")))
+
+```
+
+## interaction effects 
+(different response to psilocin with and without antagonist)
+
+```{r, fig.width = 8, fig.height = 8}
+#play with thresholds here
+# there weren't many hits by fdr, so use a strong p.value
+sigProtein <- lm.out$anova[term %in% c( "psi:ant") & p.value < 0.001, Protein]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "MOUSE")
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+Heatmap (prot.mat, cluster_columns = FALSE, 
+         column_split = list (ifelse(grepl("24", colnames(prot.mat)), "24", "05"),
+                              ifelse(grepl("Ant", colnames(prot.mat)), "Ant+", "Ant-"),
+                              ifelse(grepl("Veh", colnames(prot.mat)), "Psi-", "Psi+")))
+
+```
+
+
+
+## interaction effects observed in contrast of contrasts
+
+Value here is we can require a magnitude of difference.  See below where I require abs(estimate) > 1.0.  Signs are confusing here because the loss of a negative effect will show as  a positive effect, and vice versa. 
+
+```{r, fig.width = 8, fig.height = 8}
+#play with thresholds here
+# there weren't many hits by fdr, so use a strong p.value
+sigProtein <- lm.out$postProcess[contrast  %in% c( "(PsiNeg - PsiPos AntNeg) - (PsiNeg - PsiPos AntPos)") & p.value < 0.001 & abs(estimate) > 1.0, Protein]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "MOUSE")
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+Heatmap (prot.mat, cluster_columns = FALSE, 
+         column_split = list (ifelse(grepl("24", colnames(prot.mat)), "24", "05"),
+                              ifelse(grepl("Ant", colnames(prot.mat)), "Ant+", "Ant-"),
+                              ifelse(grepl("Veh", colnames(prot.mat)), "Psi-", "Psi+")))
+
+```

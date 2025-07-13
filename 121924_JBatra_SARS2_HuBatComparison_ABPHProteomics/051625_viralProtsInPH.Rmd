@@ -1,0 +1,1028 @@
+---
+title: "051625_viralProtsInPH"
+author: "Martin Gordon"
+date: "2025-05-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Jyoti would like to look at expression of viral proteins in the PH data... plots? 
+Boxplots of viral protein expression perhaps across the different conditions
+
+Reprocess the researched data to identify the 
+
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(patchwork)
+library(readxl)
+library(MSstats)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/spectronautFile2ArtMS.R")
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# kinase enrichment analysis
+source("/Users/martingordon/Documents/utils/bp_utils/KinaseActivityScores.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+
+customTheme <- theme_bw(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90,size=6)
+        )
+
+
+```
+read in the PH data and identify the viral proteins 
+```{r}
+mrc5 <- readRDS('./022525_PH_pwComparisons_data/2025_02_25_MRC5.mss.dataProc.rds')
+rfe <- readRDS('./022525_PH_pwComparisons_data/2025_02_25_RFe.mss.dataProc.rds')
+```
+
+viral prots in the data?
+```{r}
+input.list <- list(MRC5=fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/123024_PH_InitialQC_data/2025_02_25_MRC5.mssInput.csv'),
+                  RFe=fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/123024_PH_InitialQC_data/2025_02_25_Rfe.mssInput.csv'))
+
+
+input.dt <- rbindlist(input.list, idcol='cellline')
+
+# viral protein
+viral.prots <- read.csv('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_08_viralproteins.csv')
+
+# viral proteins present
+input.dt[ProteinName %in% viral.prots,]
+```
+
+```{r}
+hu.list <- list(msstats=fread('./data/010425_ViralProtsInDBSearch/MRC5_PH/MSstats_20250104_180149_JB_MRC5_PH_rerun_010425_Report.tsv'),
+             keys=fread('./data/010425_ViralProtsInDBSearch/MRC5_PH/JB_MRC5_PH_rerun_010425_ConditionSetup.tsv'))
+
+bat.list <-  list(msstats=fread('./data/010425_ViralProtsInDBSearch/RFe_PH/MSstats_20250104_194351_JB_RFe_PH_rerun_010425_Report.tsv'),
+               keys=fread('./data/010425_ViralProtsInDBSearch/RFe_PH/JB_RFe_PH_rerun_010425_ConditionSetup.tsv'))
+
+bat.list[[1]][ProteinName %in% viral.prots$viral.prots]
+hu.list[[1]][ProteinName %in% viral.prots$viral.prots]
+```
+```{r}
+hu.list[[2]][,.N, by=Condition][order(Condition)]
+bat.list[[2]][,.N, by=Condition][order(Condition)]
+
+# make level orders easier
+bat.list[[1]][, Condition := gsub('_6hpi', '_06hpi', Condition)]
+bat.list[[2]][, Condition := gsub('_6hpi', '_06hpi', Condition)]
+```
+No doubly eluting features
+```{r}
+hu.list[[1]][,.N, by=.(Run, ProteinName, PeptideSequence,PrecursorCharge)][N > 1,]
+bat.list[[1]][,.N, by=.(Run, ProteinName, PeptideSequence,PrecursorCharge)][N > 1,]
+```
+
+```{r}
+plotNPhosphoFeatures <-  function(dt){
+  
+  summary.dt <- dt[, .(Features=.N, phosphorylatedFeatures=sum(grepl('Phospho', PeptideSequence))), by=.(Run, Condition, BioReplicate)]
+  
+  ggplot(summary.dt, aes(x=paste0(Condition, '.', BioReplicate), y=Features, fill=Condition)) +
+    geom_bar(stat='Identity', position='dodge') +
+    labs(x='sample') +
+    ggtitle('N phosphorylated features per sample') +
+    scale_fill_manual(values=col.pal) +
+    customTheme
+}
+
+BackupAsPDF(plotNPhosphoFeatures(hu.list[[1]]), 'hu.nPhosphoFeatures.barplot')
+BackupAsPDF(plotNPhosphoFeatures(bat.list[[1]]), 'bat.nPhosphoFeatures.barplot')
+```
+```{r}
+hu.list[[1]][, phosphorylated := ifelse(grepl('Phospho', PeptideSequence), 'yes', 'no')]
+bat.list[[1]][, phosphorylated := ifelse(grepl('Phospho', PeptideSequence), 'yes', 'no')]
+
+g <- ggplot(hu.list[[1]][, .N, by=.(Condition, BioReplicate, phosphorylated)], aes(x=paste0(Condition, '.', BioReplicate), y=N, fill=phosphorylated)) +
+    geom_bar(stat='Identity', position='stack') +
+    labs(x='sample') +
+    ggtitle('Breakdown of phosphorylated features per sample') +
+    scale_fill_manual(values=col.pal) +
+    customTheme
+g
+BackupAsPDF(g, 'hu.PhosphoFeaturesBreakdown.barplot')
+
+
+g <- ggplot(bat.list[[1]][, .N, by=.(Condition, BioReplicate, phosphorylated)], aes(x=paste0(Condition, '.', BioReplicate), y=N, fill=phosphorylated)) +
+    geom_bar(stat='Identity', position='stack') +
+    labs(x='sample') +
+    ggtitle('Breakdown of phosphorylated features per sample') +
+    scale_fill_manual(values=col.pal) +
+    customTheme
+g
+BackupAsPDF(g, 'bat.PhosphoFeaturesBreakdown.barplot')
+```
+```{r}
+# MRC5 features
+g <- ggplot(hu.list[[1]][,.N, by=.(Condition,BioReplicate,Run)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('MRC5 Features') +
+  xlab('Condition.Replicate') +
+  ylab('Number of Features') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=8))
+g
+BackupAsPDF(g, 'MRC5.nFeatures.barplot')
+
+
+#RFe features
+g <- ggplot(bat.list[[1]][,.N, by=.(Condition,BioReplicate,Run)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('RFe Features') +
+  xlab('Condition.Replicate') +
+  ylab('Number of Features') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=8))
+g
+BackupAsPDF(g, 'RFe.nFeatures.barplot')
+```
+```{r}
+g <-  ggplot(bat.list[[1]], aes(x=log2(Intensity))) +
+  geom_histogram(bins=50, fill="palegreen2") +
+  ggtitle('RFe feature ints.') +
+  theme_bw()
+
+p <- ggplot(hu.list[[1]], aes(x=log2(Intensity))) +
+  geom_histogram(bins=50, fill="#CAB2D6") +
+  ggtitle('MRC5 feature ints.') +
+  theme_bw()
+
+BackupAsPDF(p+g, 'feature.intensity.histograms')
+```
+```{r}
+spec.list <- list('MRC5'=hu.list[[1]],
+                  'Rfe'=bat.list[[1]])
+
+spec.list <- lapply(spec.list, function(x){
+  
+  unique(x$Condition) %>%  print()
+  x[, strain := gsub('_12hpi|_24hpi|_48hpi|_06hpi', '', Condition)]
+  x[, timepoint := ifelse(grepl('Mock', Condition), 'na', str_extract(Condition, '[012468]+hpi'))]
+})
+
+```
+
+Change protein name
+```{r}
+# there are also help functions that use a input fasta and peptide seq to map the protein sequences to sites, but use this function to handle the site info directly
+# I normally usee the other function with human samples..)
+specPTMLocation2artmsStyleSingleProtein <- function (ProteinName, ptmLocations, ptmRE = "^(S|T|Y)"){
+  # sanity check for supplied cols; must have parenthesis and no semi-colon
+  stopifnot (substr(ptmLocations[1], 1, 1) == "(")
+  stopifnot (!any(grepl(";", ProteinName)))
+  stopifnot (!any(grepl(";", ptmLocations)))
+  
+  noEdgeParens <- substr(ptmLocations ,2, nchar(ptmLocations)-1 ) # remove the parentheses
+  
+  if(any(grepl("\\)\\(", noEdgeParens))){
+    message ("Some proteins with PTMs in duplicated peptides. Choosing the first peptide/positions reported")
+    noEdgeParens <- tstrsplit(noEdgeParens, "\\)\\(")[[1]]
+  }
+  
+  listOfSingleMods <- strsplit(noEdgeParens,",")
+  # remove those that don't match ptmRE, C123 as the usual example
+  listOfSingleMods <- lapply(listOfSingleMods, function(v)grep(ptmRE, v, value = TRUE) )
+  listOfProteinNames <- lapply(1:length(listOfSingleMods),
+                               function (i) ifelse(length(listOfSingleMods[[i]]) > 0,  # can happen when mods are all Cys_CAM etc.
+                                                   paste0(ProteinName[i], "_", listOfSingleMods[[i]], collapse = ";"),
+                                                   ""))
+  #result <- sapply(listOfProteinNames, paste0, collapse = ";")
+  return (listOfProteinNames)
+}
+```
+
+preprocessing for msstats input
+```{r}
+specPTMLocation2ProteinNames <- function(specFile){
+  multiProtMapper <- unique(specFile[EG.ProteinPTMLocations != "", .(ProteinName, EG.ProteinPTMLocations)])
+  singleProtMapper <- multiProtMapper[, .(singleProtein = unlist(strsplit(ProteinName, ";")), singlePTMset = unlist(strsplit(EG.ProteinPTMLocations, ";"))), by = .(ProteinName, EG.ProteinPTMLocations) ]
+  singleProtMapper[, artMSName := specPTMLocation2artmsStyleSingleProtein(singleProtein, singlePTMset)]
+  
+  # collapse back to multiProts
+  multiProtMapper <- singleProtMapper[artMSName != "", .(artMSName = paste0(artMSName, collapse = ";")), by = .(ProteinName, EG.ProteinPTMLocations)]
+  
+  multiProtMapper[specFile, artMSName, on = c ("ProteinName", "EG.ProteinPTMLocations")]
+}
+```
+
+I think now we can use this name to summarize to the protein level
+```{r}
+spec.list[[1]][, artMSProteinName := specPTMLocation2ProteinNames(spec.list[[1]])]
+spec.list[[2]][, artMSProteinName := specPTMLocation2ProteinNames(spec.list[[2]])]
+
+
+spec.list <- lapply(spec.list, function(z){
+  
+  z[, oldProteinName := ProteinName]
+  z[, ProteinName := artMSProteinName]
+  return(z[!is.na(EG.PTMAssayProbability)])
+})
+```
+
+many viral prots left?... 28 phosphorylated sites
+```{r}
+phViralSet <- sapply(spec.list, function(z){z[ oldProteinName %in% viral.prots$viral.prots, unique(ProteinName)]}) %>% 
+  unlist() %>% 
+  unname()
+
+```
+save to file 
+
+```{r}
+fwrite(rbindlist(spec.list, idcol='cellline'), ScriptAndDatedFileName('mssInput.csv'))
+```
+
+```{r}
+spec.list <- lapply(spec.list, function(x){
+  x[!is.na(ProteinName)]
+  x[, IsotopeLabelType := "L"]
+})
+```
+
+
+```{r}
+dp.list <- lapply(spec.list, function(x){
+  
+  dp.out <- MSstats::dataProcess(x, 
+                                 MBimpute =  FALSE, 
+                                 normalization = 'equalizeMedians',
+                                 summaryMethod = "TMP")
+
+  return(dp.out)
+})
+```
+```{r}
+saveRDS(dp.list, ScriptAndDatedFileName('mss.dataproc.rds'))
+
+dp.list <- readRDS('051625_viralProtsInPH_data/2025_05_16_mss.dataproc.rds')
+
+lapply(dp.list, function(x){
+  setDT(x$ProteinLevelData)
+})
+
+lapply(dp.list, function(x){
+  x$ProteinLevelData[grepl('M_', Protein)]
+})
+```
+
+```{r}
+# look fine 
+lapply(names(dp.list), function(x){
+  
+ g <-  ggplot(dp.list[[x]]$ProteinLevelData, aes(x=paste0(GROUP,SUBJECT), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot() +
+    ggtitle(x, 'Protein intensity distributions') +
+    scale_fill_manual(values=col.pal) +
+    customTheme +
+   theme_bw() +
+   theme(axis.text.x = element_text(angle=90))
+
+ BackupAsPDF(g, paste0(x, '.prot.boxplot'))
+})
+```
+
+PCA for each
+
+Early and late timepoint seems to be the divider
+```{r}
+lapply(seq_along(names(dp.list)), function(x,n,i){
+  
+  spec <- dp.list[[i]]$ProteinLevelData
+  
+  p.quant <- as.data.table(x)
+  
+  
+  p.mat <- dcast(p.quant, Protein~paste0(SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+  
+  p.mat <- p.mat[complete.cases(p.mat),]
+  
+  pcaOut <- prcomp(t(p.mat))
+  colInfo <- data.table(colname = colnames(p.mat))
+  colInfo[, c("group", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+  colInfo[, strain := gsub('_[12468]+hpi', '', group)]
+  colInfo[, timepoint := ifelse(strain == 'Mock', 'na', str_extract(group, '[12468]{1,2}hpi'))]
+
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  
+    p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = strain, shape = timepoint)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_manual(values=col.pal) +
+    #scale_fill_ipsum() +
+    theme_bw() + 
+    ggtitle(paste(spec, "PCA using", nrow(p.mat), "PH sites (log intensity)", sep=' ')) +
+    customTheme +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  #BackupAsPDF(p, paste0(spec,'.proteins.strainCol.pca'), dimensions=c(8,6))
+
+},x=dp.list, n=names(dp.list))
+```
+
+make contrast matrix; compare all strains vs wild type
+orf9b names seem to mismatch betweeen contrast; fix mismatch and perform PW contrasts
+```{r}
+contrasts.oi <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/022525_PH_pwComparisons_data/RFe/contrast.txt', header = F)
+
+contrast.set <- lapply(contrasts.oi$V1, function(x) unlist(strsplit(x, '[-]'))) %>% 
+  unlist() %>% 
+  unique() %>% 
+  sort()
+
+exp.set <- unique(dp.list[[2]]$ProteinLevelData$GROUP) %>% 
+  sort()
+
+exp.set[!exp.set %in% contrast.set]
+contrast.set[!contrast.set %in% exp.set]
+
+dp.list[[1]]$ProteinLevelData[grepl("^9b", GROUP), GROUP := gsub("9b_", "orf9b_", GROUP)]
+dp.list[[2]]$ProteinLevelData[grepl("^9b", GROUP), GROUP := gsub("9b_", "orf9b_", GROUP)]
+
+all(unique(dp.list[[1]]$ProteinLevelData$GROUP) %in% contrast.set)
+```
+
+prepare the contrast matrix 
+```{r}
+input <- split(contrasts.oi, contrasts.oi$V1)
+
+input <- lapply(input, function(x){
+  
+  cond <- unlist(strsplit(x$V1, '[-]'))
+  num <- cond[1]; denom <- cond[2]
+  return(c(num,denom))
+})
+
+contrast.mat <- MSstatsContrastMatrix(contrasts=input, conditions = unique(dp.list[[2]]$ProteinLevelData$GROUP))
+```
+
+Run the pairwise contrasts; use grouped pw contrast
+
+```{r}
+ms.list <- lapply(names(dp.list), function(x){
+  
+  obj <- dp.list[[x]]
+
+  if (x == 'MRC5'){
+    cmat <- contrast.mat[!grepl('06hpi', rownames(contrast.mat)),!grepl('06hpi', colnames(contrast.mat))]
+  } else {
+    cmat <-  contrast.mat
+  }
+  print(obj$ProteinLevelData)
+  p.quant <- setDT(obj$ProteinLevelData)
+  p.quant[, SUBJECT := factor(paste0(GROUP, '.', SUBJECT))]
+  p.quant[, GROUP := factor(GROUP)]
+
+  obj$ProteinLevelData <-  p.quant
+  message('runnning MS contrasts on ', x)
+  mss <- groupComparison(contrast.matrix=cmat, data=obj)
+  mss.dt <- setDT(mss$ComparisonResult)
+  return(mss.dt)
+})
+names(ms.list) <- c('MRC5', 'RFe')
+```
+
+```{r}
+fwrite(rbindlist(ms.list, idcol='cell_line'), ScriptAndDatedFileName('mss.pwcomparisons.rerunWviralProts.csv.gz'))
+```
+
+```{r}
+mss.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/051625_viralProtsInPH_data/2025_05_16_mss.pwcomparisons.rerunWviralProts.csv.gz')
+mss.dt[, gene := multiUniprotSites2multiGeneSites(Protein, species = 'HUMAN')]
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+mss.dt[, sig := 'not']
+mss.dt[abs(log2FC) > 0.58 & p.adj < 0.05 & !issue %in% c("oneConditionMissing","completeMissing"), sig := ifelse(log2FC > 0, 'up', 'down')]
+# remove modifications
+mss.dt[, simplifiedProtein := gsub('[_][STY][0-9]+', '', Protein)]
+mss.dt[, sites := lapply(.SD, function(x) paste0(unlist(str_extract_all(x,  '[_][STY][0-9]+')), collapse=';')), .SDcols = 'Protein', by=.I]
+
+fwrite(mss.dt, ScriptAndDatedFileName('rerunWviralProts.clean.csv.gz'))
+```
+
+```{r, sighits, fig.width=9, fig.height=6}
+g <- ggplot(mss.dt[sig != 'not',.N, by=.(cell_line, sig, Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('Number of significant hits per contrast', "abs LFC > 0.58 & adj.pval < 0.05") +
+  labs(x='') +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(cell_line~.) +
+  customTheme
+g
+BackupAsPDF(g, 'nSighits.barplot')
+```
+
+Why are some of the results duplicated? Remove these from the output tables 
+
+```{r}
+cotrasts.noi <- c("N_P80T_06hpi vs orf9b_T72I_N_P80T_06hpi", "N_P80T_12hpi vs orf9b_T72I_N_P80T_12hpi","N_P80T_24hpi vs orf9b_T72I_N_P80T_24hpi","N_P80T_48hpi vs orf9b_T72I_N_P80T_48hpi")
+
+#remove these duplicates
+mss.dt <- mss.dt[!Label %in% cotrasts.noi,]
+```
+
+Tidy the ID mapping for the bat set and replot, then share with others
+```{r}
+id.mapping.dt <- read_xlsx('../080624_JBatra_SARS2RNAseqHuBat/docs/human_to_RFE_gene_conversion_table_FINAL.xlsx') %>% 
+  as.data.table()
+id.dt <- id.mapping.dt[,.(RFE_uniprot_ID, RFE_gene_name, Human_uniprot_ID, Human_gene_name)] %>% 
+  unique()
+# get rid of empty annos 
+id.dt <- id.dt[!(is.na(RFE_gene_name) & is.na(Human_gene_name))]
+# just take the first annotation
+id.dt <- id.dt[, head(.SD, 1), by=RFE_uniprot_ID]
+
+# use this function to convertbatIDs in the table
+getIDMapping <- function(db=id.mapping.dt, ids, from='RFE_uniprot_ID', to='Human_gene_name', sep=';', fill=T){
+  
+  mapping.dt <- db
+  id.vec <- c(unlist(strsplit(ids, sep)))
+  
+  mapping.vec <- mapping.dt[match(id.vec, mapping.dt[[from]]), ..to][[1]] # use [[]] notation to extract col
+  
+  if (fill == TRUE){
+    #print('filling in missing symbols with uniprotID...')
+    missing.idx <- which(is.na(mapping.vec))
+    mapping.vec[is.na(mapping.vec)] <- id.vec[missing.idx]
+    return(paste0(mapping.vec, collapse=sep))
+  } else {
+    #print('returning NA where gene symbol is missing...')
+    return(paste0(mapping.vec, collapse=sep))
+  }
+}
+```
+
+Sort out gene IDs
+```{r}
+mss.dt[cell_line == 'RFe', simplifiedGene := getIDMapping(id.mapping.dt, simplifiedProtein), by=.I]
+
+# doesnt work; see below
+#mss.dt[cell_line == 'RFe', gene := paste0(unlist(strsplit(simplifiedGene,';')),  unlist(strsplit(sites,';'))), by=.I]
+mss.dt[cell_line == 'RFe', gene := {
+
+  gene_list <- strsplit(simplifiedGene, ';')[[1]]
+  site_list <- strsplit(sites, ';')[[1]]
+  
+  # Combine corresponding elements with an underscore; loop over both lists
+  combined <- mapply(function(gene, site) paste0(gene, site), gene_list, site_list)
+  paste(combined, collapse = ';')
+}, by = .I]
+
+
+# looks good
+mss.dt[cell_line == 'RFe' & grepl('NA_', gene), unique(simplifiedGene)]
+mss.dt[cell_line == 'MRC5', gene := multiUniprotSites2multiGeneSites(Protein, species='HUMAN')]
+# write out and save the files
+#fwrite(mss.dt, ScriptAndDatedFileName('mss.pwComparisons.tidy.wGeneNames.csv.gz'))
+
+mss.dt$cell_line %>% unique()
+mss.dt[cell_line =='RFe' & simplifiedGene == ''] 
+mss.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/051625_viralProtsInPH_data/2025_05_17_mss.pwComparisons.tidy.wGeneNames.csv.gz')
+```
+
+volcanoplots
+
+```{r, volcano, fig.width=12, fig.height=12}
+
+contrasts.oi <- grep('vs Mock', mss.dt$Label, value=T)
+g <- ggplot(mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & !grepl('06hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(p.adj), col=sig, label=gene)) +
+  geom_point(shape='.') + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 contrasts vs Mock') +
+  ggrepel::geom_text_repel(data=mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, scales='free') +
+  customTheme +
+  guides(color=guide_legend(title='label')) +
+  coord_cartesian(xlim=c(-10,10))
+g
+BackupAsPDF(g, 'MRC5.contrasts.vs.Mock.freeScales.volcano')
+
+
+g <- ggplot(mss.dt[cell_line == 'RFe' & Label %in% contrasts.oi & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(p.adj), col=sig, label=gene)) +
+  geom_point(shape='.') + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('RFe contrasts vs Mock') +
+  ggrepel::geom_text_repel(data=mss.dt[cell_line == 'RFe' & Label %in% contrasts.oi & sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, scales='free', ncol=4) +
+  customTheme +
+  guides(color=guide_legend(title='label')) #+
+  coord_cartesian(xlim=c(-10,10))
+g
+BackupAsPDF(g, 'RFe.contrasts.vs.Mock.freeScales.volcano')
+```
+
+```{r, volcano, fig.width=12, fig.height=8}
+
+contrasts.oi <- grep('vs WT', mss.dt$Label, value=T) %>% 
+  unique()
+
+g <- ggplot(mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & !grepl('06hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(p.adj), col=sig, label=gene)) +
+  geom_point(shape='.') + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 contrasts vs WT') +
+  ggrepel::geom_text_repel(data=mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, scales='free') +
+  customTheme +
+  guides(color=guide_legend(title='label')) +
+  coord_cartesian(xlim=c(-10,10))
+g
+BackupAsPDF(g, 'MRC5.contrasts.vs.WT.freeScales.volcano')
+
+
+g <- ggplot(mss.dt[cell_line == 'RFe' & Label %in% contrasts.oi & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(p.adj), col=sig, label=gene)) +
+  geom_point(shape='.') + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('RFe contrasts vs WT') +
+  ggrepel::geom_text_repel(data=mss.dt[cell_line == 'RFe' & Label %in% contrasts.oi & sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, scales='free', ncol=4) +
+  customTheme +
+  guides(color=guide_legend(title='label')) #+
+  coord_cartesian(xlim=c(-10,10))
+g
+BackupAsPDF(g, 'RFe.contrasts.vs.WT.freeScales.volcano')
+```
+
+```{r,  fig.width=12, fig.height=8}
+contrasts.oi <- grep('N_P80T.+N_P80T', mss.dt$Label, value=T) %>% 
+  unique()
+
+g <- ggplot(mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(p.adj), col=sig, label=gene)) +
+  geom_point(shape='.') + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 contrasts mutant comparison') +
+  ggrepel::geom_text_repel(data=mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, scales='free') +
+  customTheme +
+  guides(color=guide_legend(title='label')) +
+  coord_cartesian(xlim=c(-10,10))
+g
+BackupAsPDF(g, 'MRC5.contrasts.mutComparison.freeScales.volcano')
+
+
+g <- ggplot(mss.dt[cell_line == 'RFe' & Label %in% contrasts.oi & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(p.adj), col=sig, label=gene)) +
+  geom_point(shape='.') + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('RFe contrasts mutant comparison') +
+  ggrepel::geom_text_repel(data=mss.dt[cell_line == 'RFe' & Label %in% contrasts.oi & sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, scales='free', ncol=2) +
+  customTheme +
+  guides(color=guide_legend(title='label')) +
+  coord_cartesian(xlim=c(-5,5))
+g
+BackupAsPDF(g, 'RFe.contrasts.mutComparison.freeScales.volcano')
+```
+Prepare kinase enrichment plots
+MRC5
+```{r}
+kinaseData  <- loadKinaseDataOmniPath(species='HUMAN')
+
+
+singleSiteResults <- prepare_AMSS_ResultsFile(mss.dt[cell_line == 'MRC5'], column = "gene")
+
+
+
+labels <- unique(singleSiteResults$Label)
+
+kinActList <- lapply (labels, FUN=function(lab){kinaseActivity(singleSiteResults[Label == lab & representative==TRUE],
+                                                               plots = FALSE,
+                                                               kinaseData = kinaseData, 
+                                                               do.sea = TRUE)})
+
+names(kinActList) <- labels
+
+kinActFull.scores <- rbindlist(lapply(kinActList, FUN = function(x)x$scores), idcol="Label")
+kinActFull.mapped <- rbindlist(lapply(kinActList, FUN = function(x)x$kinaseMapped)) # Label is already in these tables
+
+kinaseSummaryScores.csv <- ScriptAndDatedFileName("MRC5.kinaseSummaryScores.csv")
+kinaseSubstrateData.csv <- ScriptAndDatedFileName("MRC5.kinaseSubstrateData.csv")
+message (sprintf("Writing kinase output files to\n\t%s\n\t%s", kinaseSummaryScores.csv, kinaseSubstrateData.csv))
+fwrite (kinActFull.scores, kinaseSummaryScores.csv)
+fwrite (kinActFull.mapped, kinaseSubstrateData.csv)
+```
+
+```{r}
+kinActFull.scores <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/051625_viralProtsInPH_data/2025_05_17_MRC5.kinaseSummaryScores.csv')
+kinActFull.mapped <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/051625_viralProtsInPH_data/2025_05_17_MRC5.kinaseSubstrateData.csv')
+```
+
+## Heatmap of significant kinases
+```{r, fig.width = 6, fig.height= 7}
+# only look at kinases < 0.05
+sigKinases <-  kinActFull.scores[fdr.BH < 0.05 & N > 2, unique(CTRL_GENE_NAME)]
+
+sigKinase.mat.z <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "Z"),
+                              rownames = "CTRL_GENE_NAME")
+
+sigKinase.mat.N <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "N"),
+                                  rownames = "CTRL_GENE_NAME")
+
+hm <- Heatmap (sigKinase.mat.z, 
+               border=T,
+               cluster_columns=TRUE, 
+               name = "Kinase Z Score",
+               column_names_gp = gpar(fontsize=7),
+              # column_split = tstrsplit(colnames(sigKinase.mat.z), split="[-]", keep=2)[[1]],
+               col = circlize::colorRamp2(breaks = c(-3, -1, 1, 3), colors = c(col.pal[1], "gray", "gray", col.pal[2])),  # two midpoints in case you want to have a wider gray bar around 0
+               row_title = '',
+               row_names_gp = gpar(fontsize=8),
+               cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=8, col="white"))
+                                  }
+                                })
+
+BackupAsPDF(draw(hm, column_title='MRC5 significantly enriched kinases'), prefix = "MRC5.sigKinases.heatmap")
+```
+```{r, fig.width=8, fig.height=10}
+# like this plot, but range is too extreme
+#p <- BarplotKinaseActivities(kinActFull.scores, kinActFull.mapped, sigKinases = sigKinases, labelPoints = TRUE)
+
+BarplotKinaseActivities <- function(scores, kinaseMapped, 
+                                    max_pValue = 1.0, max_fdr = 1.0, min_N = 2,
+                                    sigKinases = NULL, reverse = FALSE,
+                                    useMonoFont = FALSE, useViolin = FALSE,
+                                    useSEA = FALSE, reorder = TRUE,
+                                    ncol = 3, labelPoints = FALSE){
+  by.col <- c("CTRL_GENE_NAME")
+  
+  if ("Label" %in% colnames(kinaseMapped)){
+    #expected in kinaseMapped, even with just 1 label
+    if ("Label" %in% colnames(scores)){
+      # if  we get here, make sure we are joining by Label
+      by.col <- c(by.col, "Label")
+    } else if(length(unique(kinaseMapped$Label)) != 1){
+      # we're going to ignore label, so make sure data is only from one Label
+      warning("Multiple Labels detected in kinaseMapped, but no Label information in scores.  You might be combining log2FC from multiple contrasts inappropriately: ", paste0(unique(kinaseMapped$Label), collpase = ", "))
+    }
+  }
+
+  b <- merge (scores, kinaseMapped, by = by.col)
+  
+  if (is.null(sigKinases)){
+    if (useSEA){
+      sigKinases <-  unique(scores[pval.sea< max_pValue & padj.sea < max_fdr & size >= min_N]$CTRL_GENE_NAME)
+    }else{
+      sigKinases <-  unique(scores[pValue< max_pValue & fdr.BH < max_fdr & N >= min_N]$CTRL_GENE_NAME)
+    }
+  }
+  
+  if (length(sigKinases) == 0){
+    return ("No significant kinases")
+  }
+  
+  if (reorder == TRUE){
+    scoreSummary <- scores[,.(meanZ = mean(Z, na.rm = TRUE)), by = CTRL_GENE_NAME]
+    setorder(scoreSummary, meanZ)
+    if (useSEA){
+      scoreSummary <- scores[,.(meanNES = mean(NES, na.rm = TRUE)), by = CTRL_GENE_NAME]
+      setorder(scoreSummary, meanNES)
+    }
+    kinasesSorted <- scoreSummary[,CTRL_GENE_NAME]
+  }else kinasesSorted <- sigKinases
+  
+  b[,CTRL_GENE_NAME := factor(CTRL_GENE_NAME, levels = kinasesSorted)]
+  
+  if (reverse){
+    p <- ggplot (b[CTRL_GENE_NAME %in% sigKinases,], aes(x=log2FC, y = Label, fill = sigScore, col = sigScore, label = phSiteCombo)) + 
+      facet_wrap(facets = ~CTRL_GENE_NAME, ncol = ncol)
+  }else{
+    p <- ggplot (b[CTRL_GENE_NAME %in% sigKinases,], aes(x=log2FC, y = CTRL_GENE_NAME, fill = sigScore, col = sigScore, label = phSiteCombo)) + 
+      facet_wrap(facets = ~Label, ncol = ncol)
+  }
+  if (useSEA){
+    p <- p + aes(fill = sigScore.sea, col = sigScore.sea)
+  }
+  p <- p +
+    geom_vline(xintercept=0.0, lty="dotted", col = "black") + 
+    geom_jitter(width=0.0, height=0.1, col="black", alpha=0.5)
+  if (useViolin){
+    p <- p + geom_violin(scale = "area",  alpha=0.7) 
+  } else{
+    p <-  p + geom_boxplot( varwidth=FALSE, alpha=0.7,outlier.shape = NA)
+  }
+  p <- p + 
+    xlim(-5,5) +
+    ylab('Kinase') +
+    scale_color_gradient2(low = "blue", mid= "gray", high="red", midpoint=0.0) + 
+    scale_fill_gradient2(low = "blue", mid= "gray", high="red", midpoint=0.0) + 
+    theme_bw() +
+    theme(axis.text.y=element_text(size=7))
+  
+  if (useMonoFont) p <- p  + theme(axis.text.y = element_text( size = 10, family = "mono"))
+  
+
+  if (labelPoints){
+    p <- p + ggrepel::geom_text_repel(data = b[CTRL_GENE_NAME %in% sigKinases & abs(sigScore) > 1.5,
+                                               .SD[which.max(abs(log2FC))], by = .(Label, CTRL_GENE_NAME)], size = 2, min.segment.length = 0 )
+  }
+  
+  
+
+  return (p)
+}
+
+p <- BarplotKinaseActivities(kinActFull.scores[grepl('-Mock', Label)], kinActFull.mapped, sigKinases = sigKinases, labelPoints = TRUE)
+BackupAsPDF(p, 'MRC5.vsMock.barplot.kinase.activities.barplot')
+
+
+p <- BarplotKinaseActivities(kinActFull.scores[grepl('-WT', Label)], kinActFull.mapped, sigKinases = sigKinases, labelPoints = TRUE)
+BackupAsPDF(p, 'MRC5.vsWT.barplot.kinase.activities.barplot.')
+
+# plot the strain comparisons
+p <- BarplotKinaseActivities(kinActFull.scores[grepl('[-].+N_P80T', Label)], kinActFull.mapped, sigKinases = sigKinases, labelPoints = TRUE)
+BackupAsPDF(p, 'MRC5.strainComparisons.barplot.kinase.activities.barplot.')
+```
+
+volcano plots
+
+```{r, fig.width=9, fig.height=4}
+kinActFull.scores[, sig := ifelse(fdr.BH <= 0.05, 'yes', 'no')]
+
+g <- ggplot(kinActFull.scores[grepl('-Mock', Label)], aes(x=meanLog2FC, y=-log10(pValue), col=sigScore, label=CTRL_GENE_NAME)) +
+  geom_point() +
+  facet_wrap(~Label) +
+  ggtitle('MRC5 kinase enrichment', 'Comparisons vs Mock') +
+  geom_text_repel(data=kinActFull.scores[grepl('-Mock', Label) & sig == 'yes',], aes(label=CTRL_GENE_NAME)) +
+  scale_color_gradient2(low = col.pal[1], mid= "gray", high=col.pal[2], midpoint=0.0) + 
+  customTheme
+
+g
+BackupAsPDF(g, 'kinaseEnrichmentscores.vsMock.volcanoplot')
+
+g <- ggplot(kinActFull.scores[grepl('-WT', Label)], aes(x=meanLog2FC, y=-log10(pValue), col=sigScore, label=CTRL_GENE_NAME)) +
+  geom_point() +
+  facet_wrap(~Label) +
+  ggtitle('MRC5 kinase enrichment', 'Comparisons vs WT') +
+  geom_text_repel(data=kinActFull.scores[grepl('-WT', Label) & sig == 'yes',], aes(label=CTRL_GENE_NAME)) +
+  scale_color_gradient2(low = col.pal[1], mid= "gray", high=col.pal[2], midpoint=0.0) + 
+  customTheme
+g
+BackupAsPDF(g, 'kinaseEnrichmentscores.vsWT.volcanoplot')
+
+g <- ggplot(kinActFull.scores[grepl('[-].+N_P80T', Label)], aes(x=meanLog2FC, y=-log10(pValue), col=sigScore, label=CTRL_GENE_NAME)) +
+  geom_point() +
+  facet_wrap(~Label) +
+  ggtitle('MRC5 kinase enrichment', 'Strain comparisons') +
+  geom_text_repel(data=kinActFull.scores[grepl('[-].+N_P80T', Label) & sig == 'yes',], aes(label=CTRL_GENE_NAME)) +
+  scale_color_gradient2(low = col.pal[1], mid= "gray", high=col.pal[2], midpoint=0.0) + 
+  customTheme
+g
+BackupAsPDF(g, 'kinaseEnrichmentscores.strainComparison.volcanoplot')
+```
+
+```{r}
+# map the orthologs
+idmapper.dt <- merge(x=mss.dt[cell_line == 'RFe', .(singleSite = unlist(strsplit(simplifiedProtein, ';'))), by=.(simplifiedProtein)], y=unique(id.mapping.dt[, .(RFE_uniprot_ID, Human_uniprot_ID)]), 
+      by.x='singleSite', by.y='RFE_uniprot_ID', all.x=T, all.y=F) %>% 
+  # collapse back to multiline
+  .[,.(simplifiedOrtholog  = paste0(Human_uniprot_ID, collapse = ';')), by = simplifiedProtein]
+
+bat.mss <- merge(mss.dt[cell_line == 'RFe',], y=idmapper.dt, by='simplifiedProtein', all.x=T)
+```
+
+```{r}
+bat.mss[, orthologGene := multiUniprots2multiGenes(simplifiedOrtholog, species='HUMAN')]
+
+bat.mss[, ortholog := {
+
+  gene_list <- strsplit(orthologGene, ';')[[1]]
+  site_list <- strsplit(sites, ';')[[1]]
+  
+  # Combine corresponding elements with an underscore; loop over both lists
+  combined <- mapply(function(gene, site) paste0(gene, site), gene_list, site_list)
+  paste(combined, collapse = ';')
+}, by = .I]
+bat.mss[, .(gene,Protein, simplifiedOrtholog, ortholog, orthologGene)] %>% 
+  .[gene != ortholog]
+```
+Use ortholog for the enrichment 
+Kinase enrichment for the orthologs vs the human background
+
+```{r}
+singleSiteResults <- prepare_AMSS_ResultsFile(bat.mss, column = "ortholog")
+
+labels <- unique(singleSiteResults$Label)
+
+kinActList <- lapply (labels, FUN=function(lab){kinaseActivity(singleSiteResults[Label == lab & representative==TRUE],
+                                                               plots = FALSE,
+                                                               kinaseData = kinaseData, 
+                                                               do.sea = TRUE)})
+
+names(kinActList) <- labels
+
+kinActFull.scores <- rbindlist(lapply(kinActList, FUN = function(x)x$scores), idcol="Label")
+kinActFull.mapped <- rbindlist(lapply(kinActList, FUN = function(x)x$kinaseMapped)) # Label is already in these tables
+
+kinaseSummaryScores.csv <- ScriptAndDatedFileName("RFe.kinaseSummaryScores.csv")
+kinaseSubstrateData.csv <- ScriptAndDatedFileName("RFe.kinaseSubstrateData.csv")
+message (sprintf("Writing kinase output files to\n\t%s\n\t%s", kinaseSummaryScores.csv, kinaseSubstrateData.csv))
+fwrite (kinActFull.scores, kinaseSummaryScores.csv)
+fwrite (kinActFull.mapped, kinaseSubstrateData.csv)
+```
+
+kinase summary scores 
+
+```{r}
+kinActFull.scores <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/051625_viralProtsInPH_data/2025_05_17_RFe.kinaseSummaryScores.csv')
+kinActFull.mapped <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/051625_viralProtsInPH_data/2025_05_17_RFe.kinaseSubstrateData.csv')
+```
+
+## Heatmap of significant kinases
+```{r, fig.width = 7, fig.height= 7}
+# only look at kinases < 0.05
+sigKinases <-  kinActFull.scores[fdr.BH < 0.05 & N > 2, unique(CTRL_GENE_NAME)]
+sigKinases
+
+sigKinase.mat.z <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "Z"),
+                              rownames = "CTRL_GENE_NAME")
+
+sigKinase.mat.N <- as.matrix(dcast (kinActFull.scores[CTRL_GENE_NAME %in% sigKinases], CTRL_GENE_NAME~Label, value.var = "N"),
+                                  rownames = "CTRL_GENE_NAME")
+
+hm <- Heatmap (sigKinase.mat.z, 
+               border=T,
+               cluster_columns=TRUE, 
+               name = "Kinase Z Score",
+               column_names_gp = gpar(fontsize=7),
+              # column_split = tstrsplit(colnames(sigKinase.mat.z), split="[-]", keep=2)[[1]],
+               col = circlize::colorRamp2(breaks = c(-3, -1, 1, 3), colors = c(col.pal[1], "gray", "gray", col.pal[2])),  # two midpoints in case you want to have a wider gray bar around 0
+               row_title = '',
+               cell_fun = function(j, i, x, y, width, height, fill) {
+                                  if (!is.na(sigKinase.mat.N[i,j])){
+                                    grid.text(sprintf("%.0f", sigKinase.mat.N[i, j]), x, y, gp = gpar(fontsize=10, col="white"))
+                                  }
+                                })
+
+hm
+BackupAsPDF(draw(hm, column_title='RFe significantly enriched kinases'), prefix = "RFe.sigKinases.heatmap")
+```
+barplots of RFe
+
+```{r}
+p <- BarplotKinaseActivities(kinActFull.scores[grepl('vs Mock', Label)], kinActFull.mapped, sigKinases = sigKinases, labelPoints = TRUE)
+BackupAsPDF(p, 'RFe.vsMock.barplot.kinase.activities.barplot.', dimensions=c(14,18))
+
+p <- BarplotKinaseActivities(kinActFull.scores[grepl('vs WT', Label)], kinActFull.mapped, sigKinases = sigKinases, labelPoints = TRUE)
+BackupAsPDF(p, 'RFe.vsWT.barplot.kinase.activities.barplot.', dimensions=c(14,16))
+
+# plot the strain comparisons
+p <- BarplotKinaseActivities(kinActFull.scores[grepl('vs N_P80T', Label)], kinActFull.mapped, sigKinases = sigKinases, labelPoints = TRUE)
+BackupAsPDF(p, 'RFe.strainComparisons.barplot.kinase.activities.barplot.', dimensions=c(10,6))
+```
+Create wide format files to share
+
+```{r}
+fwrite(dcast(mss.dt[cell_line == 'MRC5',], Protein+gene~Label, value.var=c('log2FC','pvalue','p.adj')), ScriptAndDatedFileName('mrc5.pairwiseComparisons.wViralprots.wideformat.csv'))
+fwrite(dcast(mss.dt[cell_line == 'RFe',], Protein+gene~Label, value.var=c('log2FC','pvalue','p.adj')), ScriptAndDatedFileName('rfe.pairwiseComparisons.wViralprots.wideformat.csv'))
+
+# count data
+dp.list <- readRDS('051625_viralProtsInPH_data/2025_05_16_mss.dataproc.rds')
+dp.list <- lapply(dp.list, function(x){ return(x$ProteinLevelData)})
+p.quant <- rbindlist(dp.list, idcol='cell_line')
+
+# fix for human
+id.mapper[simplifiedGene == '', simplifiedGene :=  gsub('[_][STY][0-9]+', '', gene)]
+
+# map using the mss mapping results
+id.mapper <- unique(id.mapper)
+p.quant[simplifiedProtein %in% viral.prots$viral.prots, .N, by=.(simplifiedProtein, simplifiedGene,cell_line)] 
+
+p.quant <- merge(p.quant, id.mapper, by='Protein', all.x=T)
+
+fwrite(p.quant[cell_line == 'MRC5'], ScriptAndDatedFileName('mrc5.proteinquant.csv'))
+fwrite(p.quant[cell_line == 'Rfe'], ScriptAndDatedFileName('rfe.proteinquant.csv'))
+
+
+# convert both to wide format and save
+fwrite(dcast(p.quant[cell_line == 'MRC5'], gene+Protein~paste0(GROUP, '.', SUBJECT), value.var='LogIntensities'),  ScriptAndDatedFileName('mrc5.proteinquant.wide.csv'))
+# issues w
+fwrite(dcast(p.quant[cell_line == 'Rfe'], gene+Protein~paste0(GROUP, '.', SUBJECT), value.var='LogIntensities'),  ScriptAndDatedFileName('rfe.proteinquant.wide.csv'))
+```
+Quick heatmap of the viral proteins 
+```{r, fig.width=7, fig.height=4}
+# MRC5
+mat <- dcast(p.quant[cell_line == 'MRC5' & simplifiedProtein %in% viral.prots$viral.prots & !grepl('Mock', GROUP) ], Protein~paste0(GROUP, '.', SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+  
+submat <- sweep(mat, 1, apply(mat, 1, median, na.rm=T))
+
+colanno <- columnAnnotation(timepoint=anno_text(gsub('_','', str_extract(colnames(submat), '_[0-9]{2}'))))
+
+hm <- Heatmap(submat, 
+        name='Intensity/Median',
+        cluster_columns = FALSE,
+        border=T,
+        col=colorRamp2(breaks=c(-2,0,2), colors=c(col.pal[1], 'white', col.pal[2])),
+        bottom_annotation = colanno,
+        show_column_names = FALSE,
+        column_split = stringr::str_extract(colnames(submat),'^WT|^N_P80T|^9b_T72I_N_P80T'),
+        cluster_rows = clusterWNA(submat))
+
+hm <- draw(hm)
+BackupAsPDF(hm, 'MRC5.viralprots.heatmap')
+```
+
+
+Quick heatmap of the viral proteins 
+```{r, fig.width=8, fig.height=4}
+# MRC5
+mat <- dcast(p.quant[cell_line == 'Rfe' & simplifiedProtein %in% viral.prots$viral.prots & !grepl('Mock', GROUP) ], Protein~paste0(GROUP, '.', SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+  
+submat <- sweep(mat, 1, apply(mat, 1, median, na.rm=T))
+
+colanno <- columnAnnotation(timepoint=anno_text(gsub('_','', str_extract(colnames(submat), '_[0-9]{2}'))))
+
+hm <- Heatmap(submat, 
+        name='Intensity/Median',
+        cluster_columns = FALSE,
+        border=T,
+        col=colorRamp2(breaks=c(-2,0,2), colors=c(col.pal[1], 'white', col.pal[2])),
+        bottom_annotation = colanno,
+        show_column_names = FALSE,
+        column_split = stringr::str_extract(colnames(submat),'^WT|^N_P80T|^9b_T72I_N_P80T'),
+        cluster_rows = clusterWNA(submat))
+
+hm <- draw(hm)
+BackupAsPDF(hm, 'Rfe.viralprots.heatmap')
+```
+
+Share all this output with Jyoti and with Ben; update the Box drive so they can access 

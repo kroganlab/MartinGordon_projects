@@ -1,0 +1,1106 @@
+---
+title: "150125_newPlotsForWeekly"
+author: "Martin Gordon"
+date: "2025-01-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Thoughts on the ROC curve:
+It seems the tool is doing a very good job of distinguishing the sets at high scores, but then it seems to do worse than random? Is this bc the scores 
+
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(seqinr)
+library(readxl)
+library(DESeq2)
+library(tidymodels) 
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+```
+read in the anno info/data
+```{r}
+isg <- setDT(read_xlsx('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/docs/List of ISGs and cytokines.xlsx', sheet = 2))
+proinflam <-  setDT(read_xlsx('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/docs/List of ISGs and cytokines.xlsx', sheet = 1))
+cytochemo <- setDT(read_xlsx('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/docs/List of ISGs and cytokines.xlsx', sheet = 3))
+
+#colnames are ID,parent, gene
+hu.txt2g <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/output/tx2gene/huSARS.tx2gene.tsv', header=F)
+bat.txt2g <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/output/tx2gene/batSARS.tx2gene.tsv', header =F)
+
+# previously filtered id mapping 1:1
+hu.bat.key <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_bat.hu.1to1.idMapping.firstPass.csv')
+```
+
+read in the files previously prepared/annotated 
+I think I need to redo the annotations here by cellline
+```{r}
+mss.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_protPWcomparisons.newEnsemblAnnotations.csv') 
+deseq.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_rnaPWcomparisons.newEnsemblAnnotations.csv')
+
+# the quant info....
+p.quant.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_protQuant.newEnsemblAnnotations.csv')
+rna.quant.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/100125_ABandRNAseq_ISG&Viralplots_data/2025_01_10_rnaQuant.newEnsemblAnnotations.csv')
+```
+
+# im going to remove the new human/bat mapping
+```{r}
+# I think I just need a new id col to use 
+mss.dt[, hu_gene_label := ifelse(cell_line == 'MRC5', gene, human_gene_name)]
+deseq.dt[, hu_gene_label := ifelse(cell_line == 'MRC5', gene, human_gene_name)]
+deseq.dt[, log2FC := log2FoldChange]
+
+# placeholders; just use the gene IDs from mapping uniprots if no hu iD mapping available
+mss.dt[hu_gene_label == '', hu_gene_label := gene]
+deseq.dt[hu_gene_label == '', hu_gene_label := gene]
+
+p.quant.dt[, hu_gene_label := ifelse(cell_line == 'MRC5', gene, human_gene_name)]
+p.quant.dt[hu_gene_label == '', hu_gene_label := gene]
+
+rna.quant.dt[, hu_gene_label := ifelse(cell_line == 'MRC5', gene, human_gene_name)]
+rna.quant.dt[hu_gene_label == '', hu_gene_label := gene]
+```
+
+
+Look at the ISGs and find the homology set
+
+```{r}
+# find the ISG set in both RNAseq and AB proteomics
+ortholog.isgs <- intersect(p.quant.dt[hu_gene_label %in% isg$ISG, unique(hu_gene_label)], rna.quant.dt[hu_gene_label %in% isg$ISG, unique(hu_gene_label)])
+```
+
+combine the RNAseq and the protein quantification information
+```{r}
+mss.dt[, modality := 'AB Proteomics']
+deseq.dt[, modality := 'RNAseq']
+rna.quant.dt[, modality := 'RNAseq']
+p.quant.dt[, modality := 'AB Proteomics']
+
+# for the rnaseq and pquant, just rename log counts/intensity
+rna.quant.dt[, log2ReadOut := vst.counts]
+p.quant.dt[, log2ReadOut := LogIntensities]
+
+cols.oi <- colnames(mss.dt)[colnames(mss.dt)  %in% colnames(deseq.dt)]
+comb.de <- rbind(mss.dt[, ..cols.oi], deseq.dt[, ..cols.oi])
+
+cols.oi <- colnames(p.quant.dt)[colnames(p.quant.dt)  %in% colnames(rna.quant.dt)]
+comb.quant <-  rbind(p.quant.dt[, ..cols.oi], rna.quant.dt[, ..cols.oi])
+```
+
+calculate z-score for each of these datasets and use this for the plot
+
+```{r}
+comb.de[!is.na(log2FC) & !is.infinite(abs(log2FC)), zscore.LFC := (log2FC - mean(log2FC, na.rm=T))/sd(log2FC, na.rm=T), by=.(modality,Label,cell_line)]
+
+comb.quant[!is.na(log2ReadOut) & !is.infinite(abs(log2ReadOut)), zscore.log2ReadOut := (log2ReadOut - mean(log2ReadOut, na.rm=T))/sd(log2ReadOut, na.rm=T), by=.(modality, GROUP,SUBJECT, cell_line)]
+
+comb.quant[, strain := gsub('_[0-9]{1,2}hpi','', GROUP)]
+comb.quant[strain == 'WA', strain := 'WT']
+
+
+```
+
+Write out the files and produce the plots
+```{r}
+#fwrite(comb.de, ScriptAndDatedFileName('AB.RNAseq.combined.DE.csv'))
+#fwrite(comb.quant, ScriptAndDatedFileName('AB.RNAseq.combined.quant.csv'))
+comb.quant <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/011525_newPlotsKroganWeekly_data/2025_01_15_AB.RNAseq.combined.quant.csv')
+comb.de <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/011525_newPlotsKroganWeekly_data/2025_01_15_AB.RNAseq.combined.DE.csv')
+
+# set as factors
+comb.quant[, timepoint := factor(timepoint, levels=c("na", "6hpi", "12hpi", "24hpi", "48hpi"))]
+comb.quant[, strain := factor(strain, levels=c('Mock', 'WT', 'N_P80T', '9b_T72I_N_P80T'))]
+# fix WT label
+comb.quant[grepl('^WA_', GROUP), GROUP := sub('WA_', 'WT_', GROUP)]
+```
+
+Out of all the contrasts performed, just subset to contrasts we are interested in 
+
+plot the z-score distributions 
+Quant first.. need to summarise to one value
+```{r}
+quant.col.pal <- c('WT'="#3363ff", "N_P80T"="#83ffed", "9b_T72I_N_P80T"="#ff5c91", 'Mock'='grey50')
+
+#get the mean z-score of the readouts across the 3 replicates
+summary.quant <- comb.quant[,.(meanZscore=mean(zscore.log2ReadOut, na.rm=T)) , by=.(cell_line, modality, GROUP, timepoint, strain, hu_gene_label)]
+summary.quant[, timepoint := factor(timepoint, levels=c("na", "6hpi", "12hpi", "24hpi", "48hpi"))]
+summary.quant[, strain := factor(strain, levels=c('Mock', 'WT', 'N_P80T', '9b_T72I_N_P80T'))]
+
+g <- ggplot(summary.quant[cell_line == 'MRC5' & hu_gene_label %in% isg$ISG & timepoint != '6hpi'], aes(x=timepoint, y=meanZscore, color=strain)) + 
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill =  strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('MRC5 ISG profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="z-score log2 Ints/Counts") +
+  scale_fill_manual(values=quant.col.pal) +
+  scale_color_manual(values=quant.col.pal) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1) +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'mrc5.quant.zscore.ISGprofiles.boxplot', dimensions=c(10,8))
+
+g <- ggplot(summary.quant[cell_line == 'RFe' & hu_gene_label %in% isg$ISG], aes(x=timepoint, y=meanZscore, color=strain)) + 
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill =  strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="z-score log2 Ints/Counts") +
+  scale_fill_manual(values=quant.col.pal) +
+  scale_color_manual(values=quant.col.pal) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1) +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'rfe.quant.zscore.ISGprofiles.boxplot', dimensions=c(10,8))
+```
+Subset to just the orthologs 
+
+```{r}
+g <- ggplot(summary.quant[cell_line == 'MRC5' & hu_gene_label %in% ortholog.isgs & timepoint != '6hpi'], aes(x=timepoint, y=meanZscore, color=strain)) + 
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill =  strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('MRC5 ISG profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="z-score log2 Ints/Counts") +
+  scale_fill_manual(values=quant.col.pal) +
+  scale_color_manual(values=quant.col.pal) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1) +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'mrc5.quant.zscore.ISGprofiles.orthologsOnly.boxplot', dimensions=c(10,8))
+
+g <- ggplot(summary.quant[cell_line == 'RFe' & hu_gene_label %in% ortholog.isgs], aes(x=timepoint, y=meanZscore, color=strain)) + 
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill =  strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG profiles') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="z-score log2 Ints/Counts") +
+  scale_fill_manual(values=quant.col.pal) +
+  scale_color_manual(values=quant.col.pal) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1) +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+g
+BackupAsPDF(g, 'rfe.quant.zscore.ISGprofiles.orthologsOnly.boxplot', dimensions=c(10,8))
+```
+
+Same plots of the ISGs FC vs the different groups from the differential expression
+
+```{r}
+contrasts.oi <- grep('Mock', unique(comb.de$contrast_strain), invert=, value=T)
+comb.de[, contrast_strain := factor(contrast_strain, levels=c("WT-Mock", "N_P80T-Mock", "9b_T72I_N_P80T-Mock"))]
+comb.de[, timepoint := factor(timepoint, levels=c("6hpi","12hpi", "24hpi" ,"48hpi"))]
+
+g <- ggplot(comb.de[cell_line == 'MRC5' & contrast_strain %in% contrasts.oi & gene %in% ortholog.isgs & !is.infinite(abs(zscore.LFC)),], 
+            aes(x=timepoint, y=zscore.LFC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  geom_text_repel(data=comb.de[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% ortholog.isgs & !is.infinite(abs(zscore.LFC)),], aes(label=ifelse(abs(zscore.LFC) > 2, hu_gene_label, '')),
+                  position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  ggtitle('MRC5 ISG (FCs vs Mock)') +
+  labs(x='timepoint (hrs)', y='z-score log2 fold change') +
+  scale_fill_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  scale_color_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) +
+  coord_cartesian(ylim=c(-5, 20))
+g
+BackupAsPDF(g, 'MRC5.isg.response.lfc.vsMock.boxplot', format='pdf', dimensions = c(9,12))
+
+# RFes loo
+g <- ggplot(comb.de[cell_line == 'RFe' & contrast_strain %in% contrasts.oi & gene %in% ortholog.isgs & !is.infinite(abs(zscore.LFC)),], 
+            aes(x=timepoint, y=zscore.LFC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  geom_text_repel(data=comb.de[cell_line == 'RFe' & Label %in% contrasts.oi & gene %in% ortholog.isgs & !is.infinite(abs(zscore.LFC)),], aes(label=ifelse(abs(zscore.LFC) > 2, hu_gene_label, '')),
+                  position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  ggtitle('RFe ISG (FCs vs Mock)') +
+  labs(x='timepoint (hrs)', y='z-score log2 fold change') +
+  scale_fill_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  scale_color_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) +
+  coord_cartesian(ylim=c(-4,4))
+g
+BackupAsPDF(g, 'RFe.isg.response.lfc.vsMock.boxplot', format='pdf', dimensions = c(9,12))
+```
+ISG heatmap of the RNAseq and AB data for both species
+
+Extract matrices for each
+```{r}
+# log2 read out of the zscore per sample
+comp.wide <-  dcast(comb.quant[hu_gene_label %in% ortholog.isgs,], hu_gene_label+cell_line+modality~paste0(GROUP, '.', SUBJECT), value.var = 'zscore.log2ReadOut')
+colnames(comp.wide) <- gsub('_6hpi', '_06hpi', colnames(comp.wide))
+
+
+rna.mrc5.mat <- comp.wide[cell_line == 'MRC5' & modality == 'RNAseq',] %>% 
+  .[, c('cell_line', 'modality') := NULL] %>% 
+  as.matrix(rownames='hu_gene_label')
+
+rna.rfe.mat <- comp.wide[cell_line == 'RFe' & modality == 'RNAseq',] %>% 
+  .[, c('cell_line', 'modality') := NULL] %>% 
+  as.matrix(rownames='hu_gene_label')
+
+prot.mrc5.mat <- comp.wide[cell_line == 'MRC5' & modality == 'AB Proteomics',] %>% 
+  .[, c('cell_line', 'modality') := NULL] %>% 
+  as.matrix(rownames='hu_gene_label')
+
+prot.rfe.mat <- comp.wide[cell_line == 'RFe' & modality == 'AB Proteomics',] %>% 
+  .[, c('cell_line', 'modality') := NULL] %>% 
+  as.matrix(rownames='hu_gene_label')
+```
+
+```{r}
+# shared names in rna and ab mrc5
+mrc5.genes <- intersect(rownames(rna.mrc5.mat), rownames(prot.mrc5.mat))
+
+rna.mrc5.submat <- rna.mrc5.mat[rownames(rna.mrc5.mat) %in% mrc5.genes,  !grepl('6hpi', colnames(rna.mrc5.mat))]
+prot.mrc5.submat <- prot.mrc5.mat[rownames(prot.mrc5.mat) %in% mrc5.genes, !grepl('6hpi', colnames(prot.mrc5.mat))]
+
+clust.order <- clusterWNA(rna.mrc5.submat)
+
+hm_list <- Heatmap(rna.mrc5.submat, 
+        cluster_rows=clust.order,
+        column_split=gsub('.[123]$', '', colnames(rna.mrc5.submat)),
+        name='RNAseq Log2Counts',
+        border=T, 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-3,0,3)), 
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom',
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(rna.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(rna.mrc5.submat))),
+        cluster_columns=F) +
+   Heatmap(prot.mrc5.submat, 
+        cluster_rows=clust.order,
+        border=T,
+        name='AB Proteomics Log2Ints',
+        row_title_side = 'right',
+        #col=rev(RColorBrewer::brewer.pal(name = "PiYG", n = 3)), 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-3,0,3)), 
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom',
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(prot.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(prot.mrc5.submat))),
+        column_split=gsub('.[123]$', '', colnames(prot.mrc5.submat)),
+        cluster_columns=F) 
+
+hm_list <- draw(hm_list, row_title = sprintf("%s shared ISGs", nrow(rna.mrc5.submat)), ht_gap = unit(2, "cm"),
+    column_title =  "RNAseq (left) AB Proteomics (right) Shared ISG expression profiles", column_title_gp = gpar(fontsize = 14, fontface='bold'))
+
+BackupAsPDF(hm_list, 'MRC5.sharedISG.quant.zscores.heatmap', dimensions=c(14,9))
+```
+Now plot the RFe set
+
+```{r}
+# shared names in rna and ab mrc5
+rfe.genes <- intersect(rownames(rna.rfe.mat), rownames(prot.rfe.mat))
+
+rna.rfe.submat <- rna.rfe.mat[rownames(rna.rfe.mat) %in% rfe.genes,]
+prot.rfe.submat <- prot.rfe.mat[rownames(prot.rfe.mat) %in% rfe.genes,]
+
+clust.order <- clusterWNA(rna.rfe.submat)
+
+hm_list <- Heatmap(rna.rfe.submat, 
+        cluster_rows=clust.order,
+        column_split=gsub('.[123]$', '', colnames(rna.rfe.submat)),
+        name='RNAseq Log2Counts',
+        border=T, 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-3,0,3)), 
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom',
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(rna.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(rna.mrc5.submat))),
+        cluster_columns=F) +
+   Heatmap(prot.rfe.submat, 
+        cluster_rows=clust.order,
+        border=T,
+        name='AB Proteomics Log2Ints',
+        row_title_side = 'right',
+        #col=rev(RColorBrewer::brewer.pal(name = "PiYG", n = 3)), 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-3,0,3)), 
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom',
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(prot.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(prot.mrc5.submat))),
+        column_split=gsub('.[123]$', '', colnames(prot.rfe.submat)),
+        cluster_columns=F) 
+
+
+hm_list <- draw(hm_list, row_title = sprintf("%s shared ISGs", nrow(rna.mrc5.submat)), ht_gap = unit(2, "cm"),
+    column_title =  "RNAseq (left) AB Proteomics (right) Shared ISG expression profiles", column_title_gp = gpar(fontsize = 14, fontface='bold'))
+
+BackupAsPDF(hm_list, 'RFe.sharedISG.quant.zscores.heatmap', dimensions=c(14,9))
+```
+I think we want to take the readout scores and median scale them - easier to interpret
+```{r}
+# log2 read out of the zscore per sample
+comp.wide <-  dcast(comb.quant[hu_gene_label %in% ortholog.isgs,], hu_gene_label+cell_line+modality~paste0(GROUP, '.', SUBJECT), value.var = 'log2ReadOut')
+colnames(comp.wide) <- gsub('_6hpi', '_06hpi', colnames(comp.wide))
+
+rna.mrc5.mat <- comp.wide[cell_line == 'MRC5' & modality == 'RNAseq',] %>% 
+  .[, c('cell_line', 'modality') := NULL] %>% 
+  as.matrix(rownames='hu_gene_label')
+
+rna.rfe.mat <- comp.wide[cell_line == 'RFe' & modality == 'RNAseq',] %>% 
+  .[, c('cell_line', 'modality') := NULL] %>% 
+  as.matrix(rownames='hu_gene_label')
+
+prot.mrc5.mat <- comp.wide[cell_line == 'MRC5' & modality == 'AB Proteomics',] %>% 
+  .[, c('cell_line', 'modality') := NULL] %>% 
+  as.matrix(rownames='hu_gene_label')
+
+prot.rfe.mat <- comp.wide[cell_line == 'RFe' & modality == 'AB Proteomics',] %>% 
+  .[, c('cell_line', 'modality') := NULL] %>% 
+  as.matrix(rownames='hu_gene_label')
+```
+ISG median scaled
+```{r}
+# shared names in rna and ab mrc5
+mrc5.genes <- intersect(rownames(rna.mrc5.mat), rownames(prot.mrc5.mat))
+
+rna.mrc5.submat <- rna.mrc5.mat[rownames(rna.mrc5.mat) %in% mrc5.genes,  !grepl('6hpi', colnames(rna.mrc5.mat))]
+prot.mrc5.submat <- prot.mrc5.mat[rownames(prot.mrc5.mat) %in% mrc5.genes, !grepl('6hpi', colnames(prot.mrc5.mat))]
+
+# median sweep the values
+rna.mrc5.submat <-  sweep(rna.mrc5.submat, 1, apply(rna.mrc5.submat, 1, median, na.rm=T))
+prot.mrc5.submat <-  sweep(prot.mrc5.submat, 1, apply(prot.mrc5.submat, 1, median, na.rm=T))
+
+row.order <- clusterWNA(rna.mrc5.submat)
+
+# set col order; not needed just set levels implicitly
+col.order <- c("Mock.1" , "Mock.2" ,"Mock.3",
+               "WT_06hpi.1","WT_06hpi.2","WT_06hpi.3",
+               "N_P80T_06hpi.1","N_P80T_06hpi.2","N_P80T_06hpi.3",
+              "9b_T72I_N_P80T_06hpi.1", "9b_T72I_N_P80T_06hpi.2", "9b_T72I_N_P80T_06hpi.3",
+               "WT_12hpi.1","WT_12hpi.2","WT_12hpi.3",
+               "N_P80T_12hpi.1","N_P80T_12hpi.2","N_P80T_12hpi.3",
+              "9b_T72I_N_P80T_12hpi.1", "9b_T72I_N_P80T_12hpi.2", "9b_T72I_N_P80T_12hpi.3",
+               "WT_24hpi.1","WT_24hpi.2","WT_24hpi.3",
+               "N_P80T_24hpi.1","N_P80T_24hpi.2","N_P80T_24hpi.3",
+              "9b_T72I_N_P80T_24hpi.1", "9b_T72I_N_P80T_24hpi.2", "9b_T72I_N_P80T_24hpi.3",
+               "WT_48hpi.1","WT_48hpi.2","WT_48hpi.3",
+               "N_P80T_48hpi.1","N_P80T_24hpi.2","N_P80T_48hpi.3",
+              "9b_T72I_N_P80T_48hpi.1", "9b_T72I_N_P80T_48hpi.2", "9b_T72I_N_P80T_48hpi.3")       
+      
+levels.oi <- gsub('[.][123]$' ,'', col.order) %>% 
+  unique()
+
+#reorder 
+rna.mrc5.submat <- rna.mrc5.submat[, col.order]
+prot.mrc5.submat <- prot.mrc5.submat[, col.order]
+
+hm_list <- Heatmap(rna.mrc5.submat, 
+        cluster_rows=row.order,
+        column_split=factor(gsub('.[123]$', '', colnames(rna.mrc5.submat)), levels=levels.oi),
+        name='Log2Counts/\nmedian',
+        border=T, 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-3,0,3)), 
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom',
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(rna.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(rna.mrc5.submat))),
+        cluster_columns=F,
+        cluster_column_slices = F) +
+   Heatmap(prot.mrc5.submat, 
+        cluster_rows=row.order,
+        column_split=factor(gsub('.[123]$', '', colnames(prot.mrc5.submat)), levels=levels.oi),
+        border=T,
+        name='Log2Ints/\nmedian',
+        row_title_side = 'right',
+        #col=rev(RColorBrewer::brewer.pal(name = "PiYG", n = 3)), 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-3,0,3)), 
+        show_column_names = F,
+        cluster_column_slices = F,
+        cluster_columns=F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom')
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(prot.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(prot.mrc5.submat))),
+
+
+hm_list <- draw(hm_list, row_title = sprintf("%s shared ISGs", nrow(rna.mrc5.submat)), ht_gap = unit(2, "cm"),
+    column_title =  "RNAseq (left) AB Proteomics (right) Shared ISG expression profiles", column_title_gp = gpar(fontsize = 14, fontface='bold'))
+
+hm_list
+
+BackupAsPDF(hm_list, 'MRC5.sharedISG.quant.medianScaled.heatmap', dimensions=c(14,9))
+
+
+hm_list <- Heatmap(rna.mrc5.submat, 
+        cluster_rows=row.order,
+        column_split=factor(gsub('.[123]$', '', colnames(rna.mrc5.submat)), levels=levels.oi),
+        name='Log2Counts/\nmedian',
+        border=T, 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom',
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(rna.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(rna.mrc5.submat))),
+        cluster_columns=F,
+        cluster_column_slices = F) +
+   Heatmap(prot.mrc5.submat, 
+        cluster_rows=row.order,
+        column_split=factor(gsub('.[123]$', '', colnames(prot.mrc5.submat)), levels=levels.oi),
+        border=T,
+        name='Log2Ints/\nmedian',
+        row_title_side = 'right',
+        #col=rev(RColorBrewer::brewer.pal(name = "PiYG", n = 3)), 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+        show_column_names = F,
+        cluster_column_slices = F,
+        cluster_columns=F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom')
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(prot.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(prot.mrc5.submat))),
+
+
+hm_list <- draw(hm_list, row_title = sprintf("%s shared ISGs", nrow(rna.mrc5.submat)), ht_gap = unit(2, "cm"),
+    column_title =  "RNAseq (left) AB Proteomics (right) Shared ISG expression profiles", column_title_gp = gpar(fontsize = 14, fontface='bold'))
+
+BackupAsPDF(hm_list, 'MRC5.sharedISG.quant.medianScaled.scaledColor.heatmap', dimensions=c(14,9))
+```
+```{r}
+# shared names in rna and ab mrc5
+rfe.genes <- intersect(rownames(rna.rfe.mat), rownames(prot.rfe.mat))
+
+rna.rfe.submat <- rna.rfe.mat[rownames(rna.rfe.mat) %in% rfe.genes,]
+prot.rfe.submat <- prot.rfe.mat[rownames(prot.rfe.mat) %in% rfe.genes,]
+
+# median sweep the values
+rna.rfe.submat <-  sweep(rna.rfe.submat, 1, apply(rna.rfe.submat, 1, median, na.rm=T))
+prot.rfe.submat <-  sweep(prot.rfe.submat, 1, apply(prot.rfe.submat, 1, median, na.rm=T))
+
+row.order <- clusterWNA(rna.rfe.submat)
+
+hm_list <- Heatmap(rna.rfe.submat, 
+        cluster_rows=row.order,
+        column_split=factor(gsub('.[123]$', '', colnames(rna.rfe.submat)),levels=levels.oi),
+        name='Log2Counts/\nmedian',
+        border=T, 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-3,0,3)), 
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom',
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(rna.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(rna.mrc5.submat))),
+        cluster_columns=F) +
+   Heatmap(prot.rfe.submat, 
+        cluster_rows=row.order,
+        border=T,
+        name='Log2Ints/\nmedian',
+        row_title_side = 'right',
+        #col=rev(RColorBrewer::brewer.pal(name = "PiYG", n = 3)), 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-3,0,3)), 
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom',
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(prot.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(prot.mrc5.submat))),
+        column_split = factor(gsub('.[123]$', '', colnames(prot.rfe.submat)),levels=levels.oi),
+        cluster_columns=F) 
+
+
+hm_list <- draw(hm_list, row_title = sprintf("%s shared ISGs", nrow(rna.mrc5.submat)), ht_gap = unit(2, "cm"),
+    column_title =  "RNAseq (left) AB Proteomics (right) Shared ISG expression profiles", column_title_gp = gpar(fontsize = 14, fontface='bold'))
+
+BackupAsPDF(hm_list, 'RFe.sharedISG.quant.medianScaled.heatmap', dimensions=c(14,9))
+
+
+
+#replot with adjusted color pal
+hm_list <- Heatmap(rna.rfe.submat, 
+        cluster_rows=row.order,
+        column_split=factor(gsub('.[123]$', '', colnames(rna.rfe.submat)),levels=levels.oi),
+        name='Log2Counts/\nmedian',
+        border=T, 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom',
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(rna.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(rna.mrc5.submat))),
+        cluster_columns=F) +
+   Heatmap(prot.rfe.submat, 
+        cluster_rows=row.order,
+        border=T,
+        name='Log2Ints/\nmedian',
+        row_title_side = 'right',
+        #col=rev(RColorBrewer::brewer.pal(name = "PiYG", n = 3)), 
+        col=colorRamp2(colors=c("dodgerblue2", "white", "#E31A1C"),  breaks=c(-2,0,2)), 
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=12),
+        column_title_rot = 90,
+        column_title_side = 'bottom',
+        #bottom_annotation = HeatmapAnnotation(
+        #text = anno_text(str_extract(colnames(prot.mrc5.submat), '[123]$'), rot = 90, offset = unit(1, "npc"), just = "right"),
+        #annotation_height = max_text_width(colnames(prot.mrc5.submat))),
+        column_split = factor(gsub('.[123]$', '', colnames(prot.rfe.submat)),levels=levels.oi),
+        cluster_columns=F) 
+
+
+hm_list <- draw(hm_list, row_title = sprintf("%s shared ISGs", nrow(rna.mrc5.submat)), ht_gap = unit(2, "cm"),
+    column_title =  "RNAseq (left) AB Proteomics (right) Shared ISG expression profiles", column_title_gp = gpar(fontsize = 14, fontface='bold'))
+hm_list
+
+BackupAsPDF(hm_list, 'RFe.sharedISG.quant.medianScaled.scaledColor.heatmap', dimensions=c(14,9))
+
+```
+Maybe still show the LFC changes between groups with just the intersec orthologs
+
+Create a factor to use for color 
+```{r}
+comb.de[, contrast_strain := paste0(numerator_strain, '-', denominator_strain)]
+comb.de[, contrast_strain := factor(contrast_strain, levels=c("WT-Mock", "N_P80T-Mock", "9b_T72I_N_P80T-Mock","9b_T72I_N_P80T-N_P80T", "9b_T72I_N_P80T-WT","N_P80T-WT"))]
+
+contrasts.oi <- grep('-Mock', comb.de$Label, value=T) %>% 
+  unique()
+
+
+g <- ggplot(comb.de[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% mrc5.genes & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('MRC5 ISG fold changes vs Mock') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 FC") +
+  scale_fill_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  scale_color_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  coord_cartesian(ylim=c(-2.5,8))
+g
+BackupAsPDF(g, 'MRC5.isg.response.LFC.vsMock.boxplot', format='pdf', dimensions = c(8,11))
+
+# do the same for RFe
+g <- ggplot(comb.de[cell_line == 'RFe' & Label %in% contrasts.oi & gene %in% rfe.genes & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG fold changes vs Mock') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 FC") +
+  scale_fill_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  scale_color_manual(values=c('WT-Mock'="#3363ff", "N_P80T-Mock"="#83ffed", "9b_T72I_N_P80T-Mock"="#ff5c91")) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate'))  +
+  coord_cartesian(ylim=c(-2,2))
+
+BackupAsPDF(g, 'RFe.isg.response.lfc.vsMock.boxplot', format='pdf', dimensions = c(8,11))
+```
+Show plot comparisons within strains and how these distributions change over time
+
+```{r}
+
+contrasts.oi <- grep('-Mock|-N_P80T', comb.de$Label, value=T, invert=T) %>% 
+  unique()
+
+g <- ggplot(comb.de[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% mrc5.genes & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('MRC5 ISG fold changes vs Wild Type') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 FC") +
+  scale_fill_manual(values=c("N_P80T-WT"="#83ffed", "9b_T72I_N_P80T-WT"="#ff5c91")) +
+  scale_color_manual(values=c("N_P80T-WT"="#83ffed", "9b_T72I_N_P80T-WT"="#ff5c91")) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  coord_cartesian(ylim=c(-2,4))
+g
+BackupAsPDF(g, 'MRC5.isg.response.LFC.vsWT.boxplot', format='pdf', dimensions = c(8,8))
+
+# do the same for RFe
+g <- ggplot(comb.de[cell_line == 'RFe' & Label %in% contrasts.oi & gene %in% rfe.genes & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG fold changes vs Wild Type') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 FC") +
+  scale_fill_manual(values=c("N_P80T-WT"="#83ffed", "9b_T72I_N_P80T-WT"="#ff5c91")) +
+  scale_color_manual(values=c("N_P80T-WT"="#83ffed", "9b_T72I_N_P80T-WT"="#ff5c91")) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) +
+  coord_cartesian(ylim=c(-2,2))
+g
+BackupAsPDF(g, 'RFe.isg.response.lfc.vsWT.boxplot', format='pdf', dimensions = c(8,11))
+```
+
+Update to the scatterplots; just plot the points vs each other
+Plot first, same contrasts for AB vs RNAseq
+Same contrast in AB for hu and bat
+
+
+For hu, just plotting the strain contrasts
+```{r}
+contrasts.oi <- grep('-Mock|-N_P80T', comb.de$Label, value=T, invert=T) %>% 
+  unique()
+
+# let calcualte a reduced significance threshold as the numbers are quite small
+comb.de[, p.adj := p.adjust(pvalue, method='BH'), by=.(cell_line, modality, Label)]
+comb.de[, reduced.sig := 'not']
+comb.de[abs(log2FC) > 0.58 & pvalue < 0.005, reduced.sig := ifelse(abs(log2FC) > 0, 'up', 'down')]
+
+# first do a modality scatterplot
+lapply(grep('6hpi', contrasts.oi, value=T, invert=T), function(x){
+  
+  wide.dt <- dcast(comb.de[cell_line == 'MRC5' & Label == x,], hu_gene_label~modality, value.var=c('log2FC', 'reduced.sig'))
+  
+  # do we want to replace missing with 0 to plot these points? or is it better to only look things measured in both
+  # I think for now we drop?
+  wide.dt <- wide.dt[!is.na(`log2FC_AB Proteomics`) & !is.na(log2FC_RNAseq) & !is.infinite(abs(`log2FC_AB Proteomics`)) & !is.infinite(abs(log2FC_RNAseq))]
+  
+  colnames(wide.dt) <- sub('reduced.sig', 'sig', colnames(wide.dt))
+  
+  # create a col factor for 
+  wide.dt[,status := ifelse(sig_RNAseq != 'not' & `sig_AB Proteomics` != 'not', 'both',
+                            ifelse(sig_RNAseq != 'not' & `sig_AB Proteomics` == 'not', 'RNAseq',
+                                   ifelse(sig_RNAseq == 'not' & `sig_AB Proteomics` != 'not', 'AB proteomics',
+                                          'not')))]
+  
+  wide.dt[, status := factor(status, levels=c('not','AB proteomics', 'RNAseq', 'both'))]
+  
+  # remove 
+  
+  g <- ggplot(arrange(wide.dt, status), aes(x=`log2FC_AB Proteomics`, y=log2FC_RNAseq, color=status, label=hu_gene_label)) +
+    geom_point(size=1.5) +
+    ggrepel::geom_text_repel(data=wide.dt[status != 'not',], size=2, max.overlaps = 20, segment.linetype=1, segment.alpha=0.4) +
+    ggtitle(x) +
+    xlab(expression(log[2] ~ "fold change AB Proteomics")) +
+    ylab(expression(log[2] ~ "fold change RNAseq")) +
+    geom_vline(xintercept=c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept=c(-0.58,0.58), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('not'='grey', 'both'="#440154FF", 'AB proteomics'="#35B779FF", 'RNAseq'="#FDE725FF")) +
+    coord_obs_pred() +
+    theme_ipsum_rc() +
+    theme(axis.text.x = element_text(angle=90),
+         panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color=guide_legend(title='|LFC| > 0.58 & pval < 0.005')) 
+    
+ g
+ BackupAsPDF(g, paste0('/scatterplots/viralStrains/mrc5.',x,'.FC.vsStrain.scatterplot'), dimensions = c(8,8))
+})
+```
+
+Same for RFe
+Sort out multimapper issue!
+
+```{r}
+
+test <-  dcast(comb.de[cell_line == 'RFe',], hu_gene_label~interaction(modality,Label), value.var=c('log2FC', 'reduced.sig')) %>% 
+  as.matrix(rownames='hu_gene_label')
+
+multimappers <- rownames(test)[which(apply(test, 1, function(x) any(x > 1)))] 
+# CENPH only for gene ID
+
+new.comb.de <- rbind(comb.de[cell_line == 'MRC5',],
+      comb.de[cell_line == 'RFe' & gene != 'CENPH',],        
+      comb.de[cell_line == 'RFe' & gene == 'CENPH', .SD[which.min(pvalue)],  by=.(cell_line, modality, Label, hu_gene_label)])
+# stuck with this for now
+
+new.comb.de[, p.adj := p.adjust(pvalue, method='BH'), by=.(cell_line, modality, Label)]
+new.comb.de[, reduced.sig := 'not']
+new.comb.de[abs(log2FC) > 0.58 & pvalue < 0.005, reduced.sig := ifelse(abs(log2FC) > 0, 'up', 'down')]
+```
+
+RFe remaining 
+```{r}
+# first do a modality scatterplot
+contrasts.all <- new.comb.de$Label %>% unique()
+contrasts.oi <- grep('-N_P80T|-Mock', contrasts.all, value=T)
+
+lapply(contrasts.oi, function(x){
+  
+  wide.dt <- dcast(new.comb.de[cell_line == 'RFe' & Label == x,], gene~modality, value.var=c('log2FC', 'sig'))
+  
+  # do we want to replace missing with 0 to plot these points? or is it better to only look things measured in both
+  # I think for now we drop?
+  wide.dt <- wide.dt[!is.na(`log2FC_AB Proteomics`) & !is.na(log2FC_RNAseq) & !is.infinite(abs(`log2FC_AB Proteomics`)) & !is.infinite(abs(log2FC_RNAseq))]
+  
+  #colnames(wide.dt) <- sub('reduced.sig', 'sig', colnames(wide.dt))
+  
+  # create a col factor for 
+  wide.dt[,status := ifelse(sig_RNAseq != 'not' & `sig_AB Proteomics` != 'not', 'both',
+                            ifelse(sig_RNAseq != 'not' & `sig_AB Proteomics` == 'not', 'RNAseq',
+                                   ifelse(sig_RNAseq == 'not' & `sig_AB Proteomics` != 'not', 'AB proteomics',
+                                          'not')))]
+  
+  wide.dt[, status := factor(status, levels=c('not','AB proteomics', 'RNAseq', 'both'))]
+  
+  # remove 
+  
+  g <- ggplot(arrange(wide.dt, status), aes(x=`log2FC_AB Proteomics`, y=log2FC_RNAseq, color=status, label=gene)) +
+    geom_point(size=1.5) +
+    ggrepel::geom_text_repel(data=wide.dt[status == 'both',], size=2.2, max.overlaps = 20, segment.linetype=1, segment.alpha=0.4) +
+    ggtitle(x) +
+    xlab(expression(log[2] ~ "fold change AB Proteomics")) +
+    ylab(expression(log[2] ~ "fold change RNAseq")) +
+    geom_vline(xintercept=c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept=c(-1,1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('not'='grey', 'both'="#440154FF", 'AB proteomics'="#35B779FF", 'RNAseq'="#FDE725FF")) +
+    coord_obs_pred() +
+    theme_ipsum_rc() +
+    theme(axis.text.x = element_text(angle=90),
+         panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color=guide_legend(title='|LFC| > 0.58 & p.adj < 0.05'))  +
+    coord_cartesian(xlim=c(-4,4), ylim=c(-4,4))
+ g
+ BackupAsPDF(g, paste0('/scatterplots/viralStrains/rfe.',x,'.FC.vsStrain.scatterplot'), dimensions = c(8,6))
+})
+```
+
+plot the human cell line remaining
+
+```{r}
+# first do a modality scatterplot
+lapply(grep('6hpi', contrasts.oi, value=T, invert=T), function(x){
+  
+  wide.dt <- dcast(comb.de[cell_line == 'MRC5' & Label == x,], hu_gene_label~modality, value.var=c('log2FC', 'sig'))
+  
+  # do we want to replace missing with 0 to plot these points? or is it better to only look things measured in both
+  # I think for now we drop?
+  wide.dt <- wide.dt[!is.na(`log2FC_AB Proteomics`) & !is.na(log2FC_RNAseq) & !is.infinite(abs(`log2FC_AB Proteomics`)) & !is.infinite(abs(log2FC_RNAseq))]
+  
+  colnames(wide.dt) <- sub('reduced.sig', 'sig', colnames(wide.dt))
+  
+  # create a col factor for 
+  wide.dt[,status := ifelse(sig_RNAseq != 'not' & `sig_AB Proteomics` != 'not', 'both',
+                            ifelse(sig_RNAseq != 'not' & `sig_AB Proteomics` == 'not', 'RNAseq',
+                                   ifelse(sig_RNAseq == 'not' & `sig_AB Proteomics` != 'not', 'AB proteomics',
+                                          'not')))]
+  
+  wide.dt[, status := factor(status, levels=c('not','AB proteomics', 'RNAseq', 'both'))]
+  
+  # remove 
+  g <- ggplot(arrange(wide.dt, status), aes(x=`log2FC_AB Proteomics`, y=log2FC_RNAseq, color=status, label=hu_gene_label)) +
+    geom_point(size=1.5) +
+    ggrepel::geom_text_repel(data=wide.dt[status != 'not',], size=2, max.overlaps = 20, segment.linetype=1, segment.alpha=0.4) +
+    ggtitle(x) +
+    xlab(expression(log[2] ~ "fold change AB Proteomics")) +
+    ylab(expression(log[2] ~ "fold change RNAseq")) +
+    geom_vline(xintercept=c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept=c(-1,1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('not'='grey', 'both'="#440154FF", 'AB proteomics'="#35B779FF", 'RNAseq'="#FDE725FF")) +
+    coord_obs_pred() +
+    theme_ipsum_rc() +
+    theme(axis.text.x = element_text(angle=90),
+         panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color=guide_legend(title='|LFC| > 0.58 & pval < 0.005')) +
+    coord_cartesian(xlim=c(-4,4), ylim=c(-4,4))
+    
+ g
+ BackupAsPDF(g, paste0('/scatterplots/ABvsRNAseq/mrc5.',x,'.FC.vsStrain.scatterplot'), dimensions = c(8,8))
+})
+```
+
+
+
+
+**Not used**
+
+```{r}
+# I think maybe what we want to do, is take the most sig multimapper for analysis..
+comb.de[ hu_gene_label %in% multimappers, .N, by=.(cell_line, modality, Label, hu_gene_label)]
+
+bestpvalSet <- comb.de[ hu_gene_label %in% multimappers, .SD[which.min(pvalue)], by=.(cell_line, modality, Label, hu_gene_label)]
+worstpvalSet <- comb.de[ hu_gene_label %in% multimappers, .SD[which.max(pvalue)], by=.(cell_line, modality, Label, hu_gene_label)]
+
+
+
+#nomulti.comb.de <- rbind(comb.de[!hu_gene_label %in% multimappers,],
+#                 bestpvalSet)
+
+bestpvalSet[,.N, by=cell_line]
+
+
+ comb.de[ hu_gene_label %in% multimappers, .N, by=.(cell_line, modality, Label, hu_gene_label)][N>1,.N, by=cell_line]
+```
+
+<- rownames(test)[which(apply(test, 1, function(x) any(x > 1)))] # for HU-bat mapping set,
+
+lapply(contrasts.oi, function(x){
+  
+  wide.dt <- dcast(comb.de[cell_line == 'RFe',], gene~interaction(modality,Label), value.var=c('log2FC', 'reduced.sig'))
+})
+
+
+#handle duplicate gene names 
+comb.de[cell_line == 'RFe']
+
+# first do a modality scatterplot
+lapply(contrasts.oi, function(x){
+  
+  wide.dt <- dcast(comb.de[cell_line == 'RFe' & Label == x,], hu_gene_label~modality, value.var=c('log2FC', 'reduced.sig'))
+  
+  # do we want to replace missing with 0 to plot these points? or is it better to only look things measured in both
+  # I think for now we drop?
+  wide.dt <- wide.dt[!is.na(`log2FC_AB Proteomics`) & !is.na(log2FC_RNAseq) & !is.infinite(abs(`log2FC_AB Proteomics`)) & !is.infinite(abs(log2FC_RNAseq))]
+  
+  colnames(wide.dt) <- sub('reduced.sig', 'sig', colnames(wide.dt))
+  
+  # create a col factor for 
+  wide.dt[,status := ifelse(sig_RNAseq != 'not' & `sig_AB Proteomics` != 'not', 'both',
+                            ifelse(sig_RNAseq != 'not' & `sig_AB Proteomics` == 'not', 'RNAseq',
+                                   ifelse(sig_RNAseq == 'not' & `sig_AB Proteomics` != 'not', 'AB proteomics',
+                                          'not')))]
+  
+  wide.dt[, status := factor(status, levels=c('not','AB proteomics', 'RNAseq', 'both'))]
+  
+  # remove 
+  
+  g <- ggplot(arrange(wide.dt, status), aes(x=`log2FC_AB Proteomics`, y=log2FC_RNAseq, color=status, label=hu_gene_label)) +
+    geom_point(size=1.5) +
+    ggrepel::geom_text_repel(data=wide.dt[status != 'not',], size=2, max.overlaps = 20, segment.linetype=1, segment.alpha=0.4) +
+    ggtitle(x) +
+    xlab(expression(log[2] ~ "fold change AB Proteomics")) +
+    ylab(expression(log[2] ~ "fold change RNAseq")) +
+    geom_vline(xintercept=c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept=c(-0.58,0.58), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('not'='grey', 'both'="#440154FF", 'AB proteomics'="#35B779FF", 'RNAseq'="#FDE725FF")) +
+    coord_obs_pred() +
+    theme_ipsum_rc() +
+    theme(axis.text.x = element_text(angle=90),
+         panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color=guide_legend(title='|LFC| > 0.58 & pval < 0.005')) 
+    
+ g
+ #BackupAsPDF(g, paste0('/scatterplots/viralStrains/rfe.',x,'.FC.vsMock.scatterplot'), dimensions = c(8,8))
+})
+```
+
+```{r}
+print('hello')
+```
+
+
+*Not used*
+
+plot the same contrasts; with distributions b
+```{r}
+comb.de$contrast_strain %>% unique()
+
+# do the same for RFe
+g <- ggplot(comb.de[gene %in% c(mrc5.genes, rfe.genes) & contrast_strain =='9b_T72I_N_P80T-N_P80T' & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=modality)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = modality), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG fold changes vs Wild Type') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 FC") +
+  #scale_fill_manual(values=c("N_P80T-WT"="#83ffed", "9b_T72I_N_P80T-WT"="#ff5c91")) +
+  #scale_color_manual(values=c("N_P80T-WT"="#83ffed", "9b_T72I_N_P80T-WT"="#ff5c91")) +
+  theme_ipsum_rc() +
+  scale_fill_ipsum() +
+  scale_color_ipsum() +
+  facet_wrap(~cell_line, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) +
+  coord_cartesian(ylim=c(-2,2))
+g
+BackupAsPDF(g, 'RFe.isg.response.lfc.vsWT.boxplot', format='pdf', dimensions = c(8,11))
+```
+
+Final plots to show can be updated log2FC scatterplots (use z-score)
+
+```{r}
+g <- ggplot(comb.de[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% mrc5.genes & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('MRC5 ISG fold changes vs Wild Type') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 FC") +
+  scale_fill_manual(values=c("N_P80T-WT"="#83ffed", "9b_T72I_N_P80T-WT"="#ff5c91")) +
+  scale_color_manual(values=c("N_P80T-WT"="#83ffed", "9b_T72I_N_P80T-WT"="#ff5c91")) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  coord_cartesian(ylim=c(-2,4))
+g
+BackupAsPDF(g, 'MRC5.isg.response.LFC.vsWT.boxplot', format='pdf', dimensions = c(8,8))
+
+# do the same for RFe
+g <- ggplot(comb.de[cell_line == 'RFe' & Label %in% contrasts.oi & gene %in% mrc5.genes & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, color=contrast_strain)) +
+  geom_hline(yintercept=0, linetype=2, alpha=0.3) +
+  geom_boxplot(outliers=F, show.legend = F) +
+  geom_point(aes(fill = contrast_strain), size = 1.25, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+  ggtitle('RFe ISG fold changes vs Wild Type') +
+  #geom_text_repel(data=deseq.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & gene %in% isg$ISG,], aes(label=ifelse(abs(log2FC) > 1.5, gene, '')),
+  #                position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), size=1.5) +
+  labs(x='timepoint (hrs)', y="Log2 FC") +
+  scale_fill_manual(values=c("N_P80T-WT"="#83ffed", "9b_T72I_N_P80T-WT"="#ff5c91")) +
+  scale_color_manual(values=c("N_P80T-WT"="#83ffed", "9b_T72I_N_P80T-WT"="#ff5c91")) +
+  theme_ipsum_rc() +
+  facet_wrap(~modality, ncol=1, scales = 'free_y') +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(color= guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) +
+  coord_cartesian(ylim=c(-2,2))
+g
+
+BackupAsPDF(g, 'RFe.isg.response.lfc.vsWT.boxplot', format='pdf', dimensions = c(8,11))
+```
+

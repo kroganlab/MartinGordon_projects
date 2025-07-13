@@ -1,0 +1,575 @@
+---
+title: "040324_SiteOriginSampleComparisons"
+author: "Martin Gordon"
+date: "2024-04-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+#### Individual analysis within every category
+Experiment done in replicate
+
+Non targeting controls vs Intergenic targeting controls vs Targeting gRNA 
+Controls for the analysis
+Non targeting controls and intergenic controls (do not introduce mutations) gRNA are present in the libraries and will be used for comparing the gRNAs (targeting gRNA that introduce mutations).
+
+Categories to be analyzed 
+Bemax_torin (sample 4 and sample 12)
+BemaxBafA1 (sample 5 and sample 13)
+Serum starvation (sample 6 and sample 14)
+Bemax_GPN (sample 3 and sample 11)
+Bemax_Doxorubicin (sample 8 and sample 16)
+
+Abe8e_torin (sample 20 and sample 28)
+Abe8eBafA1 (sample 22 and sample 24)
+Abe8e Serum starvation (sample 21 and sample 23)
+Abe8e_GPN  (sample 19 and sample 27)
+Abe8e_Doxorubicin (sample 30 and sample 32)
+
+
+Right now our LFC threhold is FC +/- 50%; maybe need to look at +/-1 as many movers. (normalisation issue?)
+I need to confirm the normalisation looks good; to do this, run with the raw matrix and use the standard normalization method
+
+For the z-score FCs we are comparing to in the paper, they use the targeting controls as the background/numerator for the comparison (what about the day0 samples?)
+TO do:
+Identify suitable controls
+Ask ROnald for the Cas9 PAM motifs
+Maybe the plot is just abundance? the one with the distributions? and per gene
+
+Just also look at breakdown of Counts per condition (z score distributions for each of the gorups)
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(ggrepel)
+library(ggridges) # ridgeline plots
+
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+```
+
+Read in the normalised datatables
+
+```{r}
+input.dt <- fread("/Users/martingordon/Documents/projects/032124_RBabu_CRISPRMutantScreen/032824_MAGECK_DE_firstPass_data/2024_03_28_sampleCounts.csv")
+
+input.dt[, .N, by=.(sample_no,group)]
+```
+
+As we are following the available manuscript, we will use their transformations
+
+```{r}
+# checked; looks good
+input.dt[, logNormCounts := log2((rawCounts/sum(rawCounts)) * 10^6 + 1), by=.(sample)]
+
+# get mean of reps
+input.dt[, mean.count := mean(logNormCounts, na.rm=T), by=.(sgRNA, Gene, group)]
+
+# add replicate info
+input.dt[, Replicate := seq_len(.N), by=.(group, sgRNA, Gene)]
+```
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(k=length(unique(input.dt$group)))
+
+norm.mat <-  dcast(input.dt, sgRNA_Gene~sample, value.var='logNormCounts') %>% 
+  as.matrix(rownames='sgRNA_Gene')
+
+submat <- norm.mat[sample(rownames(norm.mat), 2500),]
+
+submat <- sweep(submat, 1, apply(submat, 1,median, na.rm=T))
+
+# create annotation
+ann <- data.table(group=str_extract(colnames(submat), 'BAFA1|Lib|DOXO|CTRL[123]|STARVE|TORIN|GPN|plasmid_BE|gRNA_noBE'),
+                  cas9=ifelse(grepl('Abe8e|Bemax', colnames(submat)), str_extract(colnames(submat), 'Abe8e|Bemax'), 'Ctrl'))
+
+colours <- list('cas9' = c('Abe8e' = '#4477AA', 'Bemax'="#228833", 'Ctrl'="#CCBB44"),
+                'group' =c('BAFA1' = col.pal[1], 'Lib'=col.pal[2], 'DOXO'=col.pal[3], 'CTRL1'=col.pal[4], 'CTRL2'=col.pal[5], 'CTRL3'=col.pal[6],
+                           'STARVE' = col.pal[7], 'TORIN'=col.pal[8], 'GPN'=col.pal[9], 'plasmid_BE'=col.pal[10], 'gRNA_noBE'=col.pal[11]))
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+# weirdly, our sample clustering isnt great
+hm <- Heatmap(submat, cluster_rows = clusterWNA(submat),na_col = 'grey', show_row_names = F,  top_annotation = colAnn)
+BackupAsPDF(hm, 'logNormCounts.heatmap',  dimensions=c(10,8))
+```
+
+
+Get the fold-changes between conditions
+Perform this per replicate, then look at the clustering of the replicates and calculate the pearson corr
+
+Q. How will we handle the low counts? In the manuscript, they just dropped these... I think maybe we can use a glm or something but do we have the DF to estimate variance with two reps per condition?
+
+```{r}
+# looks good
+lfc.dt <- input.dt[, .( # dropouts quant
+              BemaxDMSO_CTRL1.vs.Bemax_Lib = logNormCounts[group == 'BemaxDMSO_CTRL1'] - logNormCounts[group == 'Bemax_Lib'],
+              BemaxDMSO_CTRL2.vs.Bemax_Lib = logNormCounts[group == 'BemaxDMSO_CTRL2'] - logNormCounts[group == 'Bemax_Lib'],
+              Abe8eDMSO_CTRL1.vs.Abe8e_Lib = logNormCounts[group == 'Abe8eDMSO_CTRL1'] - logNormCounts[group == 'Abe8e_Lib'],
+              Abe8eDMSO_CTRL2.vs.Abe8e_Lib = logNormCounts[group == 'Abe8eDMSO_CTRL2'] - logNormCounts[group == 'Abe8e_Lib'],
+              # drug sensitivty 
+              # bemax
+              Bemax_TORIN.vs.BemaxDMSO_CTRL1 = logNormCounts[group == 'Bemax_TORIN'] - logNormCounts[group == 'BemaxDMSO_CTRL1'],
+              Bemax_BAFA1.vs.BemaxDMSO_CTRL1 = logNormCounts[group == 'Bemax_BAFA1'] - logNormCounts[group == 'BemaxDMSO_CTRL1'],
+              BemaxSerum_STARVE.vs.BemaxDMSO_CTRL1 = logNormCounts[group == 'BemaxSerum_STARVE'] - logNormCounts[group == 'BemaxDMSO_CTRL1'],
+              Bemax_GPN.vs.BemaxDMSO_CTRL2 = logNormCounts[group == 'Bemax_BAFA1'] - logNormCounts[group == 'BemaxDMSO_CTRL2'],
+              Bemax_DOXO.vs.BemaxDMSO_CTRL3 = logNormCounts[group == 'Bemax_DOXO'] - logNormCounts[group == 'BemaxDMSO_CTRL3'],
+              # abe8e
+              Abe8e_TORIN.vs.Abe8e_CTRL1 = logNormCounts[group == 'Abe8e_TORIN'] - logNormCounts[group == 'Abe8eDMSO_CTRL1'],
+              Abe8e_BAFA1.vs.Abe8eDMSO_CTRL1 = logNormCounts[group == 'Abe8e_BAFA1'] - logNormCounts[group == 'Abe8eDMSO_CTRL1'],
+              Abe8eSerum_STARVE.vs.Abe8eDMSO_CTRL1 = logNormCounts[group == 'Abe8eSerum_STARVE'] - logNormCounts[group == 'Abe8eDMSO_CTRL1'],
+              Abe8e_GPN.vs.Abe8eDMSO_CTRL2 = logNormCounts[group == 'Abe8e_BAFA1'] - logNormCounts[group == 'Abe8eDMSO_CTRL2'],
+              Abe8e_DOXO.vs.Abe8eDMSO_CTRL3 = logNormCounts[group == 'Abe8e_DOXO'] - logNormCounts[group == 'Abe8eDMSO_CTRL3']             
+             ), by=.(sgRNA,Gene, Replicate)]
+```
+PWcorrelations of FC replicates
+
+Am I doing something wrong here correlating the lfc changes? I think as the samples are all quite similar
+
+```{r}
+# reform to wide
+lfc.dt.wide <- melt(lfc.dt, id.vars=c('sgRNA','Gene','Replicate')) %>% 
+  dcast(sgRNA+Gene~paste0(variable,'.',Replicate), value.var = 'value')
+
+
+lfc.dt.wide[, sgRNA_Gene := paste0(sgRNA, '_', Gene)]
+
+lfc.mat <- as.matrix(lfc.dt.wide[, -c('sgRNA','Gene')], rownames=c('sgRNA_Gene'))
+
+```
+
+Generate heatmap of lfc correlations
+Correlations do not look good.. basically no agreement between samples... is there any possible batch effects here?
+
+```{r}
+# create a correlation matrix; use spearman as data not normally distributed (negBinomial)
+cor.mat <-  cor(lfc.mat, method='spearman', use='pairwise.complete.obs')
+
+#set ordering for diagonal mat
+od =  hclust(dist(cor.mat))$order
+cm = cor.mat[od, od]
+
+hm <- Heatmap(cm, 
+        name='logFC Pearson R.',
+        rect_gp = gpar(type = "none"), 
+        cluster_rows = F, 
+        cluster_columns = F,
+        column_names_gp = gpar(fontsize=8),
+        row_names_gp = gpar(fontsize=8),
+	cell_fun = function(j, i, x, y, w, h, fill) {
+		if(i >= j) {
+			grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		  grid.text(sprintf("%.2f", cm[i, j]), x, y, gp = gpar(fontsize = 6, col='black'))
+		}
+	})
+
+hm
+BackupAsPDF(draw(hm, column_title='sgRNA exp. fold change correlation matrix'), 'sgRNA.FoldChange.corHeatmap', dimensions=c(14,10))
+
+```
+Read in the MAGECK processed data
+- read in the sgRNA data and ii) the gene level data
+
+```{r}
+de.sgRNA.meta <- dir(path='./output/mageck_test', pattern='*.sgrna_summary.txt', full.names = T, recursive = T) %>% 
+  as.data.table()
+de.gene.meta <- dir(path='./output/mageck_test', pattern='*.gene_summary.txt', full.names = T, recursive = T) %>% 
+  as.data.table()
+
+de.sgRNA.meta[, contrast := sub('.sgrna_summary.txt', '', sub('./output/mageck_test/', '', .)) ]
+de.sgRNA.meta[, c('numerator', 'denominator') :=  tstrsplit(contrast, '-', keep=c(1,2))]
+
+de.gene.meta[, contrast := sub('.sgrna_summary.txt', '', sub('./output/mageck_test/', '', .)) ]
+de.gene.meta[, c('numerator', 'denominator') :=  tstrsplit(contrast, '-', keep=c(1,2))]
+```
+
+```{r}
+de.sgRNA.list <- lapply(de.sgRNA.meta$., fread)
+names(de.sgRNA.list) <- de.sgRNA.meta$contrast
+
+# ok the results look good, bind and lets visualise hits
+sgRNA.dt <- rbindlist(de.sgRNA.list, idcol = 'contrast')
+
+sgRNA.dt[, c('Treatment', 'Control') := tstrsplit(contrast, '-', keep=c(1,2))]
+
+sgRNA.dt <- sgRNA.dt[, c("contrast","sgrna","Gene","Control", "Treatment", "control_count","treatment_count","control_mean","treat_mean","LFC","control_var",
+             "adj_var","score","p.low","p.high","p.twosided","FDR","high_in_treatment")]
+
+fwrite(sgRNA.dt, ScriptAndDatedFileName('sgRNA.mageck.test.csv'))
+
+sgRNA.wide <- dcast(sgRNA.dt, sgrna+Gene~contrast, value.var = c('LFC', 'p.low', 'p.high', 'p.twosided', 'FDR'))
+fwrite(sgRNA.wide, ScriptAndDatedFileName('sgRNA.mageck.test.wideformat.csv'))
+
+```
+
+What is the 'score' value? Seems to be based ont he pvale (strongly correlated)
+
+```{r}
+ggplot(sgRNA.dt, aes(x=-log10(FDR), y=score)) +
+  geom_point()
+```
+Plots of the analysis
+
+```{r}
+# add a sig title
+sgRNA.dt[,sig := 'not']
+sgRNA.dt[abs(LFC) > 0.58 & FDR < 0.05, sig := ifelse(LFC > 0, 'up', 'down')]
+
+sgRNA.dt[, cas9 := ifelse(grepl('Abe8e', contrast), 'Abe8e', 'Bemax')]
+sgRNA.dt[, grp_comparison := paste0(sub('Abe8e[_]{0,1}|Bemax[_]{0,1}', '', Treatment), '-vs-', sub('Abe8e[_]{0,1}|Bemax[_]{0,1}', '', Control))]
+```
+
+
+First; bar plots of sig hits per contrast
+
+```{r}
+# breakdown by contrast
+g <- ggplot(sgRNA.dt[,.N, by=.(sig,grp_comparison, cas9)][sig != 'not',], aes(x=cas9, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~grp_comparison) +
+  ggtitle('Significant sgRNA (FC +/- 50% & p.adjust < 0.05)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+
+BackupAsPDF(g, 'sgRNA.sigHits.breakdownbyContrast', dimensions=c(10,14))
+
+# breakdown by contrast and gene
+g <- ggplot(sgRNA.dt[,.N, by=.(sig,grp_comparison,Gene, cas9)][sig != 'not',], aes(x=cas9, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_grid(Gene~grp_comparison) +
+  ggtitle('Significant sgRNA (FC +/- 50% & p.adjust < 0.05)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        strip.text.x = element_text(size=5))
+g
+
+BackupAsPDF(g, 'sgRNA.sigHits.breakdownbyGeneandContrast', dimensions=c(10,14))
+```
+Rank plots 
+
+```{r}
+lapply(unique(sgRNA.dt$contrast), function(x){
+
+  subdt <- sgRNA.dt[contrast == x,]
+    
+  g <- ggplot(data=subdt, aes(x=reorder(sgrna,LFC), y=LFC, label=sgrna, col=sig)) +
+    geom_point(size=1, aes(col=ifelse(LFC > 1, 'up', 
+                                      ifelse(LFC< -1,'down', 'not')))) +
+    #geom_hline(aes(alpha=0.6), yintercept = 0, linetype='dotdash') +
+    geom_label_repel(data=subdt[sig != 'not',], aes(label=sgrna),  segment.linetype=3, max.overlaps = 20,size=1.5) +
+    ggtitle(paste0(x, ' rank plot')) +
+    xlab('Rank') +
+    theme_classic() +
+    # here we add numeric vals to expand the scales
+    scale_x_discrete(expand = expansion(add=500)) +
+    scale_y_discrete(expand = expansion(add=1)) +
+    scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+    theme(axis.text.x = element_blank(),
+          #axis.title.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          legend.position = 'none'
+        )
+  
+ BackupAsPDF(g, paste0(x, '.LFC.rankplot'), dimensions = c(6.5,10))
+})
+
+getwd()
+```
+
+Heatmap of sig sgRNA
+# cant be right... almost 1/3 of the dataset DE? I suppose we have a lot of conditions though...
+```{r}
+sigHits <-  sgRNA.dt[FDR < 0.05 & abs(LFC) > 0.58, unique(sgrna)]
+sigHits %>%  length()
+
+input.dt <- fread("/Users/martingordon/Documents/projects/032124_RBabu_CRISPRMutantScreen/032824_MAGECK_DE_firstPass_data/2024_03_28_sampleCounts.csv")
+input.dt[, logNormCounts := log2((rawCounts/sum(rawCounts)) * 10^6 + 1), by=.(sample)]
+input.dt[, Replicate := seq_len(.N), by=.(group, sgRNA, Gene)]
+```
+
+Plot heatmap
+```{r}
+sg.mat <- dcast(sgRNA.dt[sgrna %in% sigHits,], sgrna~contrast, value.var = 'LFC') %>% 
+  as.matrix(rownames='sgrna')
+
+# create annotation
+ann <- data.table(treatment=str_extract(colnames(sg.mat), 'BAFA1|Lib|DOXO|STARVE|TORIN|GPN'),
+                  cas9=ifelse(grepl('Abe8e|Bemax', colnames(sg.mat)), str_extract(colnames(sg.mat), 'Abe8e|Bemax'), 'Ctrl'))
+
+colours <- list('cas9' = c('Abe8e' = '#4477AA', 'Bemax'="#228833", 'Ctrl'="#CCBB44"),
+                'treatment' =c('BAFA1' = col.pal[1], 'Lib'=col.pal[2], 'DOXO'=col.pal[3], 'CTRL1'=col.pal[4], 'CTRL2'=col.pal[5], 'CTRL3'=col.pal[6],
+                           'STARVE' = col.pal[7], 'TORIN'=col.pal[8], 'GPN'=col.pal[9], 'plasmid_BE'=col.pal[10], 'gRNA_noBE'=col.pal[11]))
+
+colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+hm <- Heatmap(sg.mat, 
+        cluster_rows = clusterWNA(sg.mat, method='pearson'),
+        top_annotation = colAnn,
+        row_title = paste0(nrow(sg.mat), ' DE sgRNA'),
+        name='LFC',
+        column_names_gp = gpar(fontsize=6),
+        show_row_names = F)
+hm
+BackupAsPDF(draw(hm, column_title='Sig sgRNA'), 'sigsgRNA.LFC.pearsonDist.Heatmap', dimensions=c(10,10))
+```
+
+Scatterplots;
+plot the two cas9 approaches against each other for each contrast
+Does this make sense? Maybe makes more sense to look at similiar/different treatments?
+
+```{r}
+library(ggpubr) # for the cor statistic
+
+# funciton in utils to generate an df with two vects of unique combos
+contrast.pairs <- data.table(Var1=c("Abe8e_BAFA1-Abe8eDMSO_CTRL1","Abe8e_TORIN-Abe8eDMSO_CTRL1","Abe8e_DOXO-Abe8eDMSO_CTRL3","Abe8e_GPN-Abe8eDMSO_CTRL2",
+                                  "Abe8eDMSO_CTRL1-Abe8e_Lib","Abe8eDMSO_CTRL2-Abe8e_Lib","Abe8eSerum_STARVE-Abe8eDMSO_CTRL1"),
+                           Var2=c("Bemax_BAFA1-BemaxDMSO_CTRL1","Bemax_TORIN-BemaxDMSO_CTRL1","Bemax_DOXO-BemaxDMSO_CTRL3","Bemax_GPN-BemaxDMSO_CTRL2",
+                                  "BemaxDMSO_CTRL1-Bemax_Lib","BemaxDMSO_CTRL2-Bemax_Lib","BemaxSerum_STARVE-BemaxDMSO_CTRL1"))
+
+
+apply(contrast.pairs,1,  function(x){
+  
+  print(x)
+  print(sgRNA.dt[contrast %in% x, unique(contrast)])
+  
+  dt <- dcast(sgRNA.dt[contrast %in% x,], sgrna+Gene~contrast, value.var = c('LFC','sig'))
+  # print
+  setnames(dt, new=c('sgRNA', 'gene', 'log2FC.x', 'log2FC.y', 'sig.x', 'sig.y'))
+
+  
+  # could try nested if else but not working v well....
+  dt[, label := 'not']
+  dt[sig.x %in% c('up','down') & !sig.y %in% c('up','down'), label :=  'x-axis sig']
+  dt[!sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'y-axis sig']
+  dt[sig.x %in% c('up','down') & sig.y %in% c('up','down'), label :=  'both']
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=sgRNA)) +
+    geom_point() +
+    geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('y-axis sig'='#990033', 'x-axis sig'="#2A788EFF", 'not'='grey', 'both'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label != 'not',],size = 2, max.overlaps = 20, show.legend = F) +
+    xlab(paste(x[1], 'log2 fold change',sep=' ')) +
+    ylab(paste(x[2], 'log2 fold change',sep=' ')) +
+    ggtitle(paste('Fold Change Comparisons')) + 
+    theme_bw()
+  
+  g + stat_cor(data=dt, aes(x=log2FC.x, y=log2FC.y, label=..r.label..), method='spearman', inherit.aes = F)
+  
+  BackupAsPDF(g, paste0('scatterplots/',x[1], 'vs', x[2],'.log2FC.scatterplots.'))
+})
+```
+
+Volcanoplot of the sig hits
+
+Facet by genomic location
+```{r}
+lapply(unique(sgRNA.dt$contrast), function(x){
+  
+  subdt <- sgRNA.dt[contrast == x,]
+  
+  g <- ggplot(subdt, aes(x=LFC, y=-log10(FDR), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not'], show.legend = F, size=2, max.overlaps = 20) +
+  facet_wrap(~Gene, ncol=3, scales='free_y') +
+  ggtitle(x) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+  BackupAsPDF(g, paste0('volcanoplots_individual/genomic_location_breakdown/',x ,'.volcanoplots'), dimensions=c(12,14))
+})
+```
+
+Color by genomic location 
+--
+Not very informative; no real clustering by genomic breakdown, but maybe look at annotating heatmap
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=10)
+
+lapply(unique(sgRNA.dt$contrast), function(x){
+  
+  subdt <- sgRNA.dt[contrast == x,]
+  subdt[, adj.pval := -log10(FDR)]
+  subdt[ adj.pval > 20, adj.pval := 20 ]
+  
+  g <- ggplot(subdt, aes(x=LFC, y=(adj.pval), label=sgrna)) +
+  geom_point(color='grey') +
+  geom_point(data=subdt[sig != 'not' & contrast == x,], aes(x=LFC, y=adj.pval, color=Gene)) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not'], show.legend = F, size=2, max.overlaps = 20) +
+  ggtitle(x) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=col.pal) +
+  theme_classic() 
+  
+  g
+  
+  BackupAsPDF(g, paste0('volcanoplots_individual/col_by_genomic_location/',x ,'.volcanoplots'))
+})
+```
+Ridge plots; plot z-scores of the log2FC values
+
+```{r}
+sgRNA.dt[, LFC.zscore := scale(LFC, center=T, scale=T), by=.(contrast)]
+
+g <- ggplot(sgRNA.dt, aes(x=LFC, y=Gene, fill=Gene)) +
+  geom_density_ridges() +
+  ggtitle('LFC distributions') +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~contrast) +
+  theme_minimal() 
+
+
+BackupAsPDF(g, 'LFC.distributions.genebreakdown.ridgeplot', dimensions=c(16,20))
+```
+
+Boxplots of the log2FC distributions for each of the contrasts
+
+```{r}
+g <- ggplot(sgRNA.dt, aes(x=contrast, y=LFC, fill=Gene)) +
+  geom_boxplot()+
+  ggtitle('LFC distributions') +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~Gene, ncol = 3) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90, size=6))
+
+g
+
+BackupAsPDF(g, 'LFC.distributions.genebreakdown.boxplot', dimensions=c(14,20))
+
+```
+
+
+BackHeatmap(cor(lfc.mat, use='pairwise.complete.obs', method='pearson'))
+
+
+
+ggplot(lfc.dt.wide, aes(x=Abe8eDMSO_CTRL1.vs.Abe8e_Lib.1, y=Abe8eDMSO_CTRL1.vs.Abe8e_Lib.2
+)) +
+  geom_point() +
+  geom_density_2d()
+
+
+
+lfc.dt %>%  colnames()
+
+lfc.dt$BemaxDMSO_CTRL1.vs.Bemax_Lib[lfc.dt$Replicate == 2]
+
+plot(x=lfc.dt$BemaxDMSO_CTRL2.vs.Bemax_Lib[lfc.dt$Replicate == 1], y=lfc.dt$BemaxDMSO_CTRL2.vs.Bemax_Lib[lfc.dt$Replicate == 2]) 
+
+
+cor(x=lfc.dt$BemaxDMSO_CTRL2.vs.Bemax_Lib[lfc.dt$Replicate == 1], y=lfc.dt$BemaxDMSO_CTRL2.vs.Bemax_Lib[lfc.dt$Replicate == 2])
+
+
+# high correlation between counts
+cor(input.dt[sample =='BemaxDMSO_CTRL1_1', logNormCounts], input.dt[sample =='BemaxDMSO_CTRL1_9', logNormCounts])
+
+# these samples are also v similiar
+cor(input.dt[sample =='Bemax_Lib1_33', logNormCounts], input.dt[sample =='Bemax_Lib2_34', logNormCounts])
+
+
+input.dt$sample %>%  unique()
+
+
+
+cor(x=(input.dt[sample =='BemaxDMSO_CTRL1_1', logNormCounts] - input.dt[sample =='Bemax_Lib1_33', logNormCounts]), y=(input.dt[sample =='BemaxDMSO_CTRL1_9', logNormCounts] - input.dt[sample =='Bemax_Lib2_34', logNormCounts]), use="pairwise.complete.obs", method='pearson')
+
+
+(input.dt[sample =='BemaxDMSO_CTRL1_1', logNormCounts] - input.dt[sample =='Bemax_Lib1_33', logNormCounts])
+(input.dt[sample =='BemaxDMSO_CTRL1_9', logNormCounts] - input.dt[sample =='Bemax_Lib2_34', logNormCounts])
+
+help(cor)
+```
+
+
+
+To deal with heteroskedacity, the just dropped these samples with extreme count values in controls;
+leave in for now; when we find our 'interesting' hits, we can map back to count data and remove if exceeds this threshold
+
+look at outliers in plasmid control; any sgRNA with +/- 3SD counts of the mean distribution, remove from the dataset
+
+```{r}
+
+```
+
+
+Two types of analysis to calculate the dropouts of gRNA
+----
+1. Comparison between two different categories for the gRNA counts in replicate samples
+------
+
+Bemax_Lib rep_1 and Bemax_lib rep_2 at day 0 (sample 33 and sample 34) vs 
+BemaxDMSO_CTRL1 and BemaxDMSO_CTRL1 at day 12 (sample 1  and sample 9)
+
+Bemax_Lib rep_1 and Bemax_lib rep_2 at day 0 (sample 35 and sample 36) vs 
+BemaxDMSO_CTRL2 and BemaxDMSO_CTRL2 (sample 2 and sample 10) at day 12
+
+ABE8E_lib rep1 and ABE8e_LIB rep2 at day 0 (sample 35 and sample 36)vs 
+ABE8E_DMSO_CTRL1 and ABE8eDMSO_CTRL1  (sample 17 and sample 25) at day 12 
+
+ABE8E_lib rep1 and ABE8e_LIB rep2 at day 0 (sample 35 and sample 36) vs 
+ABE8E_DMSO_CTRL2 and ABE8eDMSO_CTRL2  at day 12  (sample 18 and 26)
+
+
+Calculate FC between selected groups
+---------------
+Just take average of the two groups and calculate FC
+
+```{r}
+input.dt$group %>%  unique()
+
+
+lfc.dt <- input.dt[, .( # dropouts quant
+              BemaxDMSO_CTRL1.vs.Bemax_Lib = mean.count[group == 'BemaxDMSO_CTRL1'] - mean.count[group == 'Bemax_Lib'],
+              BemaxDMSO_CTRL2.vs.Bemax_Lib = mean.count[group == 'BemaxDMSO_CTRL2'] - mean.count[group == 'Bemax_Lib'],
+              Abe8eDMSO_CTRL1.vs.Abe8e_Lib = mean.count[group == 'Abe8eDMSO_CTRL1'] - mean.count[group == 'Abe8e_Lib'],
+              Abe8eDMSO_CTRL2.vs.Abe8e_Lib = mean.count[group == 'Abe8eDMSO_CTRL2'] - mean.count[group == 'Abe8e_Lib'],
+              # drug sensitivty 
+              # bemax
+              Bemax_TORIN.vs.BemaxDMSO_CTRL1 = mean.count[group == 'Bemax_TORIN'] - mean.count[group == 'BemaxDMSO_CTRL1'],
+              Bemax_BAFA1.vs.BemaxDMSO_CTRL1 = mean.count[group == 'Bemax_BAFA1'] - mean.count[group == 'BemaxDMSO_CTRL1'],
+              BemaxSerum_STARVE.vs.BemaxDMSO_CTRL1 = mean.count[group == 'BemaxSerum_STARVE'] - mean.count[group == 'BemaxDMSO_CTRL1'],
+              Bemax_GPN.vs.BemaxDMSO_CTRL2 = mean.count[group == 'Bemax_BAFA1'] - mean.count[group == 'BemaxDMSO_CTRL2'],
+              Bemax_DOXO.vs.BemaxDMSO_CTRL3 = mean.count[group == 'Bemax_DOXO'] - mean.count[group == 'BemaxDMSO_CTRL3'],
+              # abe8e
+              Abe8e_TORIN.vs.Abe8e_CTRL1 = mean.count[group == 'Abe8e_TORIN'] - mean.count[group == 'Abe8eDMSO_CTRL1'],
+              Abe8e_BAFA1.vs.Abe8eDMSO_CTRL1 = mean.count[group == 'Abe8e_BAFA1'] - mean.count[group == 'Abe8eDMSO_CTRL1'],
+              Abe8eSerum_STARVE.vs.Abe8eDMSO_CTRL1 = mean.count[group == 'Abe8eSerum_STARVE'] - mean.count[group == 'Abe8eDMSO_CTRL1'],
+              Abe8e_GPN.vs.Abe8eDMSO_CTRL2 = mean.count[group == 'Abe8e_BAFA1'] - mean.count[group == 'Abe8eDMSO_CTRL2'],
+              Abe8e_DOXO.vs.Abe8eDMSO_CTRL3 = mean.count[group == 'Abe8e_DOXO'] - mean.count[group == 'Abe8eDMSO_CTRL3']             
+             ), by=.(sgRNA,Gene)]
+
+
+lfc.dt %>%  head()
+```

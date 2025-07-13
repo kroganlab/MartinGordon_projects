@@ -1,0 +1,1978 @@
+---
+title: "240124.APMS.redoWTMPnorm"
+author: "Martin Gordon"
+date: "2024-01-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## APMS
+
+Redo with TMP normalisation
+
+----
+25-01-24
+---
+Doesnt look like a simple method to normalise bait concentrations across the treatment batches..
+New pass; split into treatment batches and normalise: try equilize medians and bait TMP normalisation
+
+
+different samples best normalisation
+-----
+orf3a control - equilize medians best
+orf3a treatment -tmp 'best', but equilizemedians prey are closest
+nsp6 control - all bad, maybe equilize medians best
+nsp6 - same as above nsp6 by far worst quality
+
+**update**
+Seems like the worst adjusted by bait global standards are the ones with a lower number of peptides to use for standardisation..
+orf3a control a good example, nsp6 treatment a bad one...
+
+
+Q. Would you like to look at expression across samples of any particular genes?
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library(readxl)
+library(MSstats)
+library(circlize)
+library(ggvenn)
+library (emmeans)
+library(stringr)
+library(patchwork) # combine plots
+
+
+source ("../../utils/bp_utils/spectronautFile2ArtMS.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/LinearModels.R")
+
+
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+```
+
+
+### 16-01-23
+Try a new normalization method to normalzse to bait concentration
+TMP on bait to take column offsets and subtract from thne logIntensities
+
+
+## tmp normalisation not working effectively on one of the samples.. for now proceed with standard normalisatio
+
+```{r}
+dataDir <- '/Users/martingordon/Documents/projects/121123_DSwaney_APMSFirstRun/data/'
+
+```
+
+run tmp, subtract the column offset for each sample to 'normalise',  then run TMP normalising by global standards
+```{r}
+spec <- fread(paste(dataDir, 'MSstats.csv', sep=''))
+#remove contaminant proteins
+spec <- spec[!ProteinName %like% 'contam_sp',]
+
+spec[, group_subject := paste(Condition, BioReplicate,sep='_')]
+
+# lets create a flag for pre-treatment; will use this to split the datasets
+spec %>%  str()
+spec[, treatment := ifelse(grepl("^[DL]{1}", Condition), 'treatment', 'control') ]
+spec[, condition := sub("^[DL]{1}","",Condition)]
+
+#sanity check
+spec[, .N, by=.(Condition,treatment, condition)]
+```
+plot all of the data and order by run order
+
+```{r}
+sub('exLewis', '',unique(spec$Run)) %>% as.integer()
+sub('exLewis', '',unique(spec$Run))
+
+spec[, runID := as.integer(sub('exLewis', '', Run))]
+
+ggplot(spec, aes(x=runID, y=log2(Intensity), fill=Condition)) +
+  geom_bar(stat='Identity') +
+  theme(axis.text= element_text(angle=90))
+```
+Lets look at bait concentration across the samples 
+
+```{r}
+mssGS.list
+
+bak.spec
+spec
+bak.spec <- spec
+bak.spec[, uniprot := str_extract(ProteinName,'(?<=\\|).+(?=\\|)')]
+bak.spec[, ProteinName := uniprot]
+
+bak.spec
+
+bait.dt <- bak.spec[ProteinName %in% c("P0DTC3","P0DTC1"),  .(Condition,ProteinName, BioReplicate,Intensity,Run)] %>% 
+  .[, mean(Intensity, na.rm=T), by=.(Condition,BioReplicate,ProteinName,Run)] %>% 
+    .[,NAME := ifelse(ProteinName == 'P0DTC3', 'orf3a_mean_bait', 'nsp6_mean_bait')]
+
+med.bait.dt <- bak.spec[ProteinName %in% c("P0DTC3","P0DTC1"),  .(Condition,ProteinName, BioReplicate,Intensity,Run)] %>% 
+  .[, median(Intensity, na.rm=T), by=.(Condition,BioReplicate,ProteinName,Run)] %>% 
+     .[,NAME := ifelse(ProteinName == 'P0DTC3', 'orf3a_median_bait', 'nsp6_median_bait')]
+  
+gl.mean.dt <- bak.spec[!ProteinName %in% c("P0DTC3","P0DTC1"), mean(Intensity, na.rm=T), by=.(Condition,BioReplicate,Run)] %>% 
+    .[,NAME := 'mean']
+
+gl.med.dt <-bak.spec[!ProteinName %in% c("P0DTC3","P0DTC1"), median(Intensity, na.rm=T), by=.(Condition,BioReplicate,Run)] %>% 
+    .[,NAME := 'median']
+  
+setnames(med.bait.dt, old='V1', new='Intensity')
+setnames(bait.dt, old='V1', new='Intensity')
+setnames(gl.mean.dt, old='V1', new='Intensity')
+setnames(gl.med.dt, old='V1', new='Intensity')
+  
+p.dt <- rbind(bait.dt,med.bait.dt, gl.mean.dt, gl.med.dt, fill=T)
+  
+
+bait.dt[,.N, by=.(Condition)]
+g <-  ggplot(p.dt, aes(x=Run, y=log2(Intensity), color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(' raw intensities') +
+    theme_classic() +
+    theme(axis.text.x =element_text(angle=90))
+g
+
+```
+plot bait intensity by run
+
+```{r}
+ggplot(spec[ProteinName %in% c("P0DTC3","P0DTC1")], aes(x=Run, y=log2(Intensity), color=ProteinName, group=ProteinName)) +
+  geom_point() +
+  geom_line() +
+  theme(axis.text = element_text(angle=90))
+```
+seperate the two bait groups into two treatment groups
+```{r}
+orf3a.grps <- c('Lorf3aBeta', 'Lorf3aQ57H', 'Lorf3aS171L', 'Lorf3aWT', 
+               'orf3aBeta', 'orf3aQ57H', 'orf3aS171L', 'orf3aWT')
+
+nsp6.gprs <- c('Dnsp6BA1', 'Dnsp6BA2', 'Dnsp6WT', 'Dnsp6XBB',
+               'nsp6BA1', 'nsp6BA2', 'nsp6WT', 'nsp6XBB')
+
+
+spec.orf3a <- spec[Condition %in% orf3a.grps,]
+spec.nsp6 <- spec[Condition %in% nsp6.gprs,]
+
+# now split the two into a lis
+orf3a <- split(spec.orf3a, by='treatment')
+nsp6 <- split(spec.nsp6, by='treatment')
+
+names(orf3a) <- paste0('orf3a_', names(orf3a))
+names(nsp6) <- paste0('nsp6_', names(nsp6))
+```
+concatenate the tables into lists
+```{r}
+spec.list <- c(orf3a, nsp6)
+
+names(spec.list)
+```
+
+Now lets look at a couple of normalisation procedures
+- equilizeMeidans
+- normalise by bait concentration
+
+```{r}
+mssGS.list <-  list(orf3a_control ='P0DTC3',
+                    orf3a_treatment ='P0DTC3',
+                    nsp6_control ='P0DTC1',
+                    nsp6_treatment='P0DTC1')
+```
+Two normalisation approaches:
+
+First try standard equilize_medians
+
+```{r}
+mssInput.list <- lapply(seq_along(spec.list), function(x,n,i){
+  
+  # iterate through list grp
+  group <- n[[i]]
+  
+  # tidy the protein names
+  dt <- x[[group]][, uniprot := str_extract(ProteinName,'(?<=\\|).+(?=\\|)')]
+  dt[, ProteinName := uniprot]
+
+  # configure for MSstats input
+  dt[, PeptideModifiedSequence := PeptideSequence]
+  mssInput <- specFileToCompleteMSstats(dt)
+  mssInput[, IsotopeLabelType := 'L']
+  
+  return(mssInput)
+},x=spec.list, n=names(spec.list))
+
+# reuse for both normalisatio proceedures
+mssInput.list
+
+names(mssInput.list) <-  names(spec.list)
+```
+
+plot the raw intensities
+```{r}
+lapply(seq_along(mssInput.list),  function(x,n,i){
+g <-  ggplot(x[[i]], aes(x=group_subject, y=log2(Intensity), fill=Condition)) +
+    geom_boxplot() +
+    ggtitle(n[[i]]) +
+    theme(axis.text.x = (element_text(angle=90)))
+    BackupAsPDF(g, paste0(n[[i]], '.raw.intensities.boxplots.'))
+},x=mssInput.list, n=names(mssInput.list))
+```
+bait peptide vs global raw intensities
+```{r}
+
+mssInput.list
+lapply(seq_along(mssInput.list),  function(x,y,n,i){
+  
+  bait <- n[[i]]
+  dt <- x[[bait]]
+  print(dt)
+  
+  #make new tables
+  bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean_bait']
+   med.bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median_bait']
+  
+  gl.mean.dt <- dt[ProteinName != y[[bait]], mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean']
+  gl.med.dt <-dt[ProteinName != y[[bait]], median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median']
+  
+  setnames(med.bait.dt, old='V1', new='Intensity')
+  setnames(bait.dt, old='V1', new='Intensity')
+  setnames(gl.mean.dt, old='V1', new='Intensity')
+  setnames(gl.med.dt, old='V1', new='Intensity')
+  
+  p.dt <- rbind(bait.dt,med.bait.dt, gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(paste0(bait, ' raw intensities')) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  #BackupAsPDF(g, paste0(bait,'raw.intensities.linechart'))
+},x=mssInput.list, y=mssGS.list, n=names(mssInput.list))
+```
+Normalise the data using equilize medians and regenerate the above two plots
+
+```{r}
+mss.em.list <-  lapply(seq_along(mssInput.list), function(x,i){
+  
+  mss.x <-  dataProcess(x[[i]], 
+                        normalization = 'EQUALIZEMEDIANS', #preran with globalStandards and didnt work well...
+                        summaryMethod="TMP",
+                        remove_uninformative_feature_outlier=TRUE,
+                        featureSubset="highQuality",
+                        MBimpute =  FALSE)
+ return(mss.x)
+  
+}, x=mssInput.list)
+
+names(mss.em.list) <- names(mssInput.list)
+```
+
+plot the em normalised intensities
+```{r}
+lapply(seq_along(mss.em.list),  function(x,n,i){
+   group <- n[[i]]
+   
+  
+  g <-  ggplot(x[[group]]$ProteinLevelData, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot() +
+    ggtitle( paste0(n[[i]], ' equilize medians')) +
+    theme(axis.text.x = (element_text(angle=90)))
+    BackupAsPDF(g, paste0(n[[i]], '.equilizemedians.intensities.boxplots.'))
+},x=mss.em.list, n=names(mss.em.list))
+```
+plot the linecharts of the equilized medians
+
+```{r}
+
+lapply(seq_along(mss.em.list),  function(x,y,n,i){
+  
+  group <- n[[i]]
+  dt <- setDT(x[[group]]$ProteinLevelData)
+  
+  #make new tables
+  bait.dt <- dt[Protein == y[[group]], .(GROUP,SUBJECT,LogIntensities)] %>% 
+    .[,NAME := 'bait']
+  
+  gl.mean.dt <- dt[Protein != y[[group]], mean(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global_mean']
+  gl.med.dt <-dt[Protein != y[[group]], median(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global_median']
+  
+  setnames(gl.mean.dt, old='V1', new='LogIntensities')
+  setnames(gl.med.dt, old='V1', new='LogIntensities')
+  
+  p.dt <- rbind(bait.dt,gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(paste0(group, ' equilize median normalization')) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(group,'equilizeMedian.intensities.linechart'))
+},x=mss.em.list, y=mssGS.list, n=names(mss.em.list))
+```
+
+now return to the mssInput data.table and run with global standard normalisation
+
+```{r}
+mss.gs.list <-  lapply(seq_along(mssInput.list), function(x,y,i){
+  
+  bait <- y[[i]]
+  
+  mss.x <-  dataProcess(x[[i]], 
+                        normalization = 'globalStandards', #preran with globalStandards and didnt work well...
+                        nameStandards = bait, # name of protein to use for standards
+                        summaryMethod="TMP",
+                        remove_uninformative_feature_outlier=TRUE,
+                        featureSubset="highQuality",
+                        MBimpute =  FALSE)
+ return(mss.x)
+  
+}, x=mssInput.list, y=mssGS.list)
+
+names(mss.gs.list) <-  names(mssInput.list)
+names(mss.gs.list) 
+```
+Doesn't look good.. look at global abundance
+
+```{r}
+lapply(seq_along(mss.gs.list),  function(x,n,i){
+   group <- n[[i]]
+   
+  g <-  ggplot(x[[group]]$ProteinLevelData, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot() +
+    ggtitle( paste0(n[[i]], ' global standards (bait) normalization')) +
+    theme(axis.text.x = (element_text(angle=90)))
+    BackupAsPDF(g, paste0(n[[i]], '.globalStandards.intensities.boxplots.'))
+},x=mss.gs.list, n=names(mss.gs.list))
+```
+Lets just quickly check if the global standards normalisation works
+```{r}
+lapply(seq_along(mss.gs.list),  function(x,y,n,i){
+  
+  group <- n[[i]]
+  dt <- setDT(x[[group]]$ProteinLevelData)
+  
+  #make new tables
+  bait.dt <- dt[Protein == y[[group]], .(GROUP,SUBJECT,LogIntensities)] %>% 
+  #.[, LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'bait']
+  
+  gl.mean.dt <- dt[Protein != y[[group]], mean(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global_mean']
+  gl.med.dt <-dt[Protein != y[[group]], median(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global_median']
+  
+  setnames(gl.mean.dt, old='V1', new='LogIntensities')
+  setnames(gl.med.dt, old='V1', new='LogIntensities')
+  
+  p.dt <- rbind(bait.dt,gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(paste0(group, ' global standards (bait) normalization')) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(group,'globalStandards.intensities.linechart'))
+},x=mss.gs.list, y=mssGS.list, n=names(mss.gs.list))
+```
+possibly the best approach?
+have  N peptides in each sample, compare this to the normalisation proceedure output
+Possible less info (peptides for the adjustment??)
+
+```{r}
+# create. a plot of the number of bait peptides in each of the runs
+lapply(seq_along(mssInput.list), function(x,n, y,i){
+  
+  group <- n[[i]]
+  
+  x <- x[[group]][ProteinName %in% c('P0DTC3', 'P0DTC1')]
+  
+  # how many bait peptides belong to each sample?
+  dt <- x[!is.na(Intensity), .N, by=.(Condition,BioReplicate,ProteinName)] %>% 
+    .[order(-N)] %>%  print()
+  
+  g <- ggplot(dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition) ) +
+    geom_bar(stat='Identity') + 
+    ylim(0,13) +
+    ggtitle(group, 'N bait peptides') +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+  g
+ # BackupAsPDF(g, paste0(group, '.Nbaitpeptides.barplot.'))
+},x=mssInput.list, n=names(mssInput.list), y=mssGS.list)
+       
+```
+
+
+
+```{r}    
+
+lapply(seq_along(mssInput.list),  function(x,y,n,i){
+  
+  group <- n[[i]]
+  print(paste0('working on ', group))
+
+  # get table of bait peptide ints. 
+  sub.x <-  x[[group]][ProteinName == y[[group]], ]
+
+  # make matrix
+  spec.x <- dcast(sub.x, interaction(PeptideSequence,PrecursorCharge)~group_subject, value.var = 'Intensity') %>% 
+   as.matrix(rownames=1)
+  
+  # convert  matrix to log space
+  spec.x <-  log2(spec.x)
+  
+  #perform tmp normalisation
+  tmp <- medpolish(spec.x, na.rm = TRUE) #iteratively subtract row (peptide) and col (sample) median values to get the additive effects
+  # we want the sample effect to subtract from the data
+  tmp.dt <- data.table(offset = tmp$col, group_subject = names(tmp$col))
+  
+  tmp.dt[, direction := ifelse(offset > 0, 'up','down')]
+  
+  g <- ggplot(tmp.dt, aes(x=group_subject, y=offset, fill=direction)) +
+    geom_bar(stat='Identity') +
+    coord_flip() +
+    scale_color_manual(values=c('up'='red','down'='blue')) +
+    ggtitle(group) +
+    theme(axis.text.x =element_text(angle=90, size=),
+          legend.text = element_text(size=6))
+  
+  BackupAsPDF(g, paste0(group, '.tmp.sampleadjustments.'))
+  print(g)
+  
+  # merge dts
+  x[[group]][tmp.dt, normalize.offset := i.offset, on = "group_subject"]
+  
+  return(x[[group]])
+  
+},x=mssInput.list, y=mssGS.list, n=names(mssInput.list))
+```
+ok, lets subtract these values on log scale and convert to linear for msstats. processing
+
+```{r}
+lapply(mssInput.list,  function(x){
+  x[, newIntensity := log2(Intensity)]
+  x[, newIntensity := newIntensity - normalize.offset]
+  x[, newIntensity := 2^newIntensity ]
+  return(x)
+})
+```
+
+
+```{r}
+lapply(seq_along(mssInput.list),  function(x,n,i){
+   group <- n[[i]]
+   
+  g <-  ggplot(x[[group]], aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(newIntensity), fill=Condition)) +
+    geom_boxplot() +
+    ggtitle( paste0(n[[i]], ' tukey median polish (bait) normalization')) +
+    theme(axis.text.x = (element_text(angle=90)))
+    #BackupAsPDF(g, paste0(n[[i]], '.tmp.peptideintensities.boxplots.'))
+},x=mssInput.list, n=names(mssInput.list))
+```
+line charts of peptide intensities
+---
+really doesnt look good..
+
+```{r}
+lapply(seq_along(mssInput.list),  function(x,y,n,i){
+  
+  bait <- n[[i]]
+  dt <- x[[bait]]
+  print(dt)
+  
+  #make new tables
+  bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,newIntensity)] %>% 
+  .[, mean(newIntensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean_bait']
+   med.bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,newIntensity)] %>% 
+  .[, median(newIntensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median_bait']
+  
+  gl.mean.dt <- dt[ProteinName != y[[bait]], mean(newIntensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean']
+  gl.med.dt <-dt[ProteinName != y[[bait]], median(newIntensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median']
+  
+  setnames(med.bait.dt, old='V1', new='Intensity')
+  setnames(bait.dt, old='V1', new='Intensity')
+  setnames(gl.mean.dt, old='V1', new='Intensity')
+  setnames(gl.med.dt, old='V1', new='Intensity')
+  
+  p.dt <- rbind(bait.dt,med.bait.dt, gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(paste0(bait, ' bait normalization (tukey median polish) peptide intensities')) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+ # BackupAsPDF(g, paste0(bait,'tmp.norm.peptideintensities.linechart'))
+},x=mssInput.list, y=mssGS.list, n=names(mssInput.list))
+```
+```{r}
+lapply(mssInput.list,  function(x){
+  x[, tmpIntensity := Intensity] 
+  x[, Intensity := newIntensity] 
+  return(x)
+})
+```
+summarise to protein
+```{r}
+mssInput.list
+
+mss.tmp.list <-  lapply(seq_along(mssInput.list), function(x,i){
+  
+  mss.x <-  dataProcess(x[[i]], 
+                        normalization = FALSE, 
+                        summaryMethod="TMP",
+                        remove_uninformative_feature_outlier=TRUE,
+                        featureSubset="highQuality",
+                        MBimpute =  FALSE)
+ return(mss.x)
+  
+},x=mssInput.list)
+names(mss.tmp.list) <- names(mssInput.list)
+```
+
+
+```{r}
+lapply(seq_along(mss.tmp.list),  function(x,y,n,i){
+  
+  group <- n[[i]]
+  dt <- setDT(x[[group]]$ProteinLevelData)
+  
+  #make new tables
+  bait.dt <- dt[Protein == y[[group]], .(GROUP,SUBJECT,LogIntensities)] %>% 
+  #.[, LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'bait']
+  
+  gl.mean.dt <- dt[Protein != y[[group]], mean(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global_mean']
+  gl.med.dt <-dt[Protein != y[[group]], median(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global_median']
+  
+  setnames(gl.mean.dt, old='V1', new='LogIntensities')
+  setnames(gl.med.dt, old='V1', new='LogIntensities')
+  
+  p.dt <- rbind(bait.dt,gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(paste0(group, ' tukey median polish (bait) normalization')) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(group,'tmp.proteinintensities.linechart'))
+},x=mss.tmp.list, y=mssGS.list, n=names(mss.tmp.list))
+
+
+
+```
+Differential Expression Testing
+-----
+MSstats pw comparisons
+Do all by all, correct at the local level and then drop comparisons that don't make sense 
+
+```{r}
+
+mss.contrasts <-  list(orf3a_control = makeContrast.AllByAll(mss.em.list$orf3a_control),
+                       orf3a_treatment = makeContrast.AllByAll(mss.em.list$orf3a_treatment),
+                       nsp6_control = makeContrast.AllByAll(mss.em.list$nsp6_control),
+                       nsp6_treatment = makeContrast.AllByAll(mss.em.list$nsp6_treatment))
+
+
+rownames(mss.contrasts$orf3a_control)[3] <- "orf3aWT-orf3aBeta"
+mss.contrasts$orf3a_control[3,] <- c(-1,0,0,1)
+rownames(mss.contrasts$orf3a_control)[5] <- "orf3aWT-orf3aQ57H"
+mss.contrasts$orf3a_control[5,] <- c(0,-1,0,1)
+rownames(mss.contrasts$orf3a_control)[6] <- "orf3aWT-orf3aS171L"
+mss.contrasts$orf3a_control[6,] <- c(0,0,-1,1)
+
+rownames(mss.contrasts$orf3a_treatment)[3] <- "Lorf3aWT-Lorf3aBeta"
+mss.contrasts$orf3a_treatment[3,] <- c(-1,0,0,1)
+rownames(mss.contrasts$orf3a_treatment)[5] <- "Lorf3aWT-Lorf3aQ57H"
+mss.contrasts$orf3a_treatment[5,] <- c(0,-1,0,1)
+rownames(mss.contrasts$orf3a_treatment)[6] <- "Lorf3aWT-Lorf3aS171L"
+mss.contrasts$orf3a_treatment[6,] <- c(0,0,-1,1)
+
+
+rownames(mss.contrasts$nsp6_control)[2] <- "nsp6WT-nsp6BA1"
+mss.contrasts$nsp6_control[2,] <- c(-1,0,1,0)
+rownames(mss.contrasts$nsp6_control)[4] <- "nsp6WT-nsp6BA2"
+mss.contrasts$nsp6_control[4,] <- c(0,-1,1,0)
+
+mss.contrasts$nsp6_treatment
+
+
+rownames(mss.contrasts$nsp6_treatment)[2] <- "Dnsp6WT-Dnsp6BA1"
+mss.contrasts$nsp6_treatment[2,] <- c(-1,0,1,0)
+rownames(mss.contrasts$nsp6_treatment)[4] <- "Dnsp6WT-Dnsp6BA2"
+mss.contrasts$nsp6_treatment[4,] <- c(0,-1,1,0)
+
+```
+Run the pw comparisons for each of the conditions
+First ensure subject is corrected for; we dont want to underestimate SE 
+
+```{r}
+lapply(mss.em.list, function(x){
+  x$ProteinLevelData[, SUBJECT := paste0(GROUP, '_', SUBJECT)]
+  setDT(x$FeatureLevelData)
+  x$FeatureLevelData[, SUBJECT := paste0(GROUP, '_', SUBJECT)]
+})
+```
+```{r}
+# these are seperate samples, so we want each subject to be treated seperately
+# is there. relationship between the different subjects w/wo treatment?
+mss.out.list <- lapply(seq_along(mss.em.list), function(x,y,n,i){
+
+  group <- n[[i]]
+  print(paste0('running comparison on ', group))
+  
+  # run msstats correcting for batch 
+  mss <- groupComparison(contrast.matrix=y[[group]], data=x[[group]])
+  mss.dt <- setDT(mss$ComparisonResult)
+  
+  return(mss.dt)
+  
+},x=mss.em.list, n=names(mss.em.list), y=mss.contrasts)
+
+names(mss.out.list) <- names(mss.em.list)
+```
+
+all the comparisons formatted
+
+```{r}
+# 
+lapply(seq_along(mss.out.list), function(x,n,i){
+  dt <- x[[i]]
+  
+   dt[,gene := multiUniprots2multiGenes(as.character(Protein))] %>% #needed as in factor format
+  .[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)] %>% 
+  .[, sig := 'not'] %>% 
+  .[!issue %in% c('completeMissing') & abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')] 
+   fwrite(dt, paste0('./output/26.01.24.', n[[i]], '.batch.mss.pwcomparisons.csv'))
+  }, x=mss.out.list, n=names(mss.out.list))
+
+
+lapply(mss.out.list, print)
+      
+```
+
+filter to the proteins in the 
+saint.fdr1prc.list
+
+```{r}
+# duplicate and rename records
+saint.fdr1prc.list[3] <- saint.fdr1prc.list[2]
+saint.fdr1prc.list[4] <- saint.fdr1prc.list[3]
+saint.fdr1prc.list[2] <- saint.fdr1prc.list[1]
+names(saint.fdr1prc.list) <- names(mss.out.list)
+
+#ceate another table to filter out to only sig hits in the 
+f.mss.out.list <- lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  group <-  n[[i]]
+  
+  dt <- x[[group]] %>% 
+    .[Protein %in% y[[group]] | Protein %in% prots.oi, ] %>% 
+    .[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)] %>%
+    .[, sig := 'not'] %>% 
+    .[!issue %in% c('completeMissing') & abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')] 
+   
+   fwrite(dt, paste0('./output/26.01.24.SAINTsigprots.',group, '.batch.mss.pwcomparisons.proc.csv'))
+  
+  return(dt)
+  }, x=mss.out.list, y=saint.fdr1prc.list, n=names(mss.out.list))
+
+names(f.mss.out.list) <- names(mss.out.list)
+```
+Heatmap of all proteins missing in one condition in pw test
+```{r}
+lapply(seq_along(f.mss.out.list), function(x,n,i){
+  
+  group <- n[[i]]  
+  missing.prots <- (x[[group]][issue == 'oneConditionMissing', unique(Protein)])
+  
+  p.mat <-  dcast(mss.em.list[[group]]$ProteinLevelData, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+
+  submat <-  p.mat[rownames(p.mat) %in% missing.prots,]
+  # convert to binay
+  submat[!is.na(submat)] <- 1
+  submat[is.na(submat)] <- 0
+  
+  if (length(rownames(submat)) > 1){
+    rownames(submat) <- multiUniprots2multiGenes(rownames(submat))
+    hm <- Heatmap(submat, cluster_rows = T, na_col='grey', name = group)
+    
+    BackupAsPDF(hm, paste0(group, 'geneswConditionMissing.heatmap.'))
+  
+  }
+  
+},x=f.mss.out.list, n=names(f.mss.out.list))
+
+
+# creating a list of the gene names that should be removed
+missing.genes.list <- list(orf3a_control = c('WDR37'),
+                           orf3a_treatment = c('IST1','DSG2','MAP2K3'),
+                           nsp6_treatment = c('CDC20','ACADM'))
+                                              
+
+names(f.mss.out.list)
+```
+
+
+
+
+add hits present in one condition only
+
+```{r}
+prots.oi <- c("P0DTC1","P0DTC3")
+
+#dir.create(paste0(getwd(), '/240124.APMS.redo_data/pdfs/equilizeMedians_normalization'))
+outpath <- paste0(getwd(), '/240124.APMS.redo_data/pdfs/equilizeMedians_normalization')
+
+
+lapply(seq_along(f.mss.out.list), function(x,y,n,i){
+   
+  # get the contrast grp
+  group <- n[[i]]
+  
+  dt <- x[[group]]
+  
+   # iterate through  indv contrasts
+   contrasts.oi <- dt$Label %>%  unique()
+  
+   # nested loop w 
+   lapply(contrasts.oi, function(cont){
+     
+     # get the max p.adj from this comparison
+     min.padj <-   dt[Label == cont & !is.na(p.adj), min(p.adj)]
+     min.log2FC <- dt[Label == cont & !is.na(log2FC) & !is.infinite(log2FC), min(log2FC)]
+     max.log2FC <- dt[Label == cont & !is.na(log2FC) & !is.infinite(log2FC), max(log2FC)]
+
+      # create another data table with the oneCondition missing data
+     # dt modifies the reference dt, so without explicitly copying will change ori in place... https://stackoverflow.com/questions/22956098/r-data-table-copy-and-modification-alters-original-one
+     missing.dt <- copy(dt[Label == cont & issue == ('oneConditionMissing'),])
+     missing.dt[, sig := 'oneConditionMissing'] 
+     missing.dt[, `:=`(p.adj = min.padj,
+                       log2FC = ifelse(log2FC > 0,  max.log2FC, min.log2FC) )] 
+     
+     bait.dt <- copy(dt[Label == cont & Protein %in% prots.oi,])
+     
+     print(bait.dt)
+      
+     ## match coordinates for geom_jitter and geom_text_repel
+      pos <- position_jitter(width = 0.15, seed = 2)
+     
+    
+      #print(dt[Label == cont & issue %in% c('oneConditionMissing')])
+      g <- ggplot(dt[Label == cont & !issue %in% c('completeMissing'),], 
+                  aes(x=log2FC, y=-log10(p.adj), color=sig, label=gene)) + 
+        geom_point() +
+        ggrepel::geom_text_repel(data=dt[Label == cont & sig != 'not' & !Protein %in% prots.oi & !gene %in% y[[group]],], size = 2, max.overlaps = 20) +
+        geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+        geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+        
+        # add bait info to plot
+        geom_point(data=dt[Label == cont & Protein %in% prots.oi,], aes(x=log2FC, y=-log10(p.adj), color='bait')) +
+        ggrepel::geom_text_repel(data=dt[Label == cont & Protein %in% prots.oi,],  size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "green") +
+        
+        # add missing values info to plot
+        geom_jitter(data=missing.dt[Label == cont,], aes(x=log2FC, y=-log10(p.adj),color='oneConditionMissing'), position=pos) +
+        ggrepel::geom_text_repel(data=missing.dt[Label == cont,], position=pos,  size = 2) +
+
+        
+        scale_color_manual(values=c('up'='red', 'down'='blue', 'not'='grey', 'bait'='green','oneConditionMissing'='purple')) +
+        ggtitle(paste0(group, ' ', cont, ' (FC +/ 50% & p.adj < 0.05)')) +
+        # facet_wrap(~Label, scales = 'free') +
+        theme_bw() +
+        theme(strip.text.x = element_text(size = 5))
+      
+      BackupAsPDF(g, paste0('equilizeMedians_normalization/', n[[i]],'.',cont,'.SAINT.bfdr0.1.volcanoplot.'))
+  })
+  
+  }, x=f.mss.out.list, y=missing.genes.list, n=names(f.mss.out.list))
+
+names(f.mss.out.list)
+```
+
+heatmaps of significant hits in both datasets for the equilize medians normalisation
+
+```{r}
+# read back in the EM normalized data
+outdir <-  paste0(getwd(), '/output/')
+
+f.mss.out.list <- list(orf3a_control = fread(paste0(outdir, '26.01.24.SAINTsigprots.orf3a_control.batch.mss.pwcomparisons.proc.csv')),
+                       orf3a_treatment = fread(paste0(outdir, '26.01.24.SAINTsigprots.orf3a_treatment.batch.mss.pwcomparisons.proc.csv')),
+                       nsp6_control = fread(paste0(outdir, '26.01.24.SAINTsigprots.nsp6_control.batch.mss.pwcomparisons.proc.csv')),
+                       nsp6_treatment =fread(paste0(outdir, '26.01.24.SAINTsigprots.nsp6_treatment.batch.mss.pwcomparisons.proc.csv')) )
+
+dir.create(paste0(getwd(), '/240124.APMS.redo_data/pdfs/heatmaps/equilizeMedian'))
+
+lapply(seq_along(f.mss.out.list), function(x,y,z,n,i){
+   
+  # get sig hits
+  group <- n[[i]]
+  dt <- x[[group]]
+   # get the significant proteins for each compoarison
+  sigProts <-  dt[sig != 'not', unique(Protein)]
+  
+  # look at expression limited to SAINT hits
+  pmat <- dcast(y[[group]]$ProteinLevelData, Protein~SUBJECT, value.var = 'LogIntensities') %>% 
+     as.matrix(rownames='Protein')
+  
+  print(colnames(pmat))
+  
+  test.mat <- pmat[sample(rownames(pmat), 2000), ]
+  test.mat <-  sweep(test.mat, 1, STATS = apply(test.mat,1, median, na.rm=T))
+ 
+  hm <-  Heatmap(test.mat, cluster_rows = clusterwNA(test.mat), name='log2(Ints.)/Median', 
+                 cluster_columns = F, show_row_names = F, col = colorRamp2(seq(-2, 2, length = 3), c("blue", "#EEEEEE", "red")),
+                 column_names_gp = gpar(fontsize=7), column_split = sub('_[123]{1}$','', colnames(test.mat)),
+                 column_title_gp = gpar(fontsize=6))
+  BackupAsPDF(draw(hm, column_title=paste0(group, ' random sample of 2000 proteins')), paste0('heatmaps/equilizeMedian/', group, '.randomSample_emnorm_heatmap.'))
+
+  submat <-  pmat[rownames(pmat) %in% sigProts,]
+  
+  if (length(rownames(submat)) > 1){
+    rownames(submat) <- multiUniprots2multiGenes(rownames(submat))
+  
+    submat <-  sweep(submat, 1, STATS = apply(submat,1, median, na.rm=T))
+  
+    hm <- Heatmap(submat, cluster_rows = clusterwNA(submat), cluster_columns = F, 
+                name='log2(Ints.)/Median', row_names_gp = gpar(fontsize=7), 
+                col = colorRamp2(seq(-2, 2, length = 3), c("blue", "#EEEEEE", "red")),
+                column_names_gp = gpar(fontsize=7), column_split = sub('_[123]{1}$','', colnames(test.mat)),
+                column_title_gp = gpar(fontsize=6))
+    BackupAsPDF(draw(hm, column_title=paste0(group, ' sig hits from SAINT interactors')), paste0('heatmaps/equilizeMedian/', group, '.SAINTsig_emnorm_heatmap.'))
+  }
+  
+  }, x=f.mss.out.list, y=mss.em.list, z=saint.fdr1prc.list, n=names(f.mss.out.list))
+#mss.em.list[['orf3a_control']]$ProteinLevelData[,SUBJECT := gsub('*_[A-Za-z]', '', SUBJECT])]
+```
+
+
+bait normalisation testing
+----------
+repeat the mss processing for each using the bait normalisation proceedure 
+Which one? use globalStandards as recommended by Danielle
+
+```{r}
+lapply(mss.gs.list, function(x){
+  x$ProteinLevelData[, SUBJECT := paste0(GROUP, '_', SUBJECT)]
+  setDT(x$FeatureLevelData)
+  x$FeatureLevelData[, SUBJECT := paste0(GROUP, '_', SUBJECT)]
+})
+```
+
+
+```{r}
+# these are seperate samples, so we want each subject to be treated seperately
+# is there. relationship between the different subjects w/wo treatment?
+mss.out.list <- lapply(seq_along(mss.gs.list), function(x,y,n,i){
+
+  group <- n[[i]]
+  print(paste0('running comparison on ', group))
+  
+  # run msstats correcting for batch 
+  mss <- groupComparison(contrast.matrix=y[[group]], data=x[[group]])
+  mss.dt <- setDT(mss$ComparisonResult)
+  
+  return(mss.dt)
+  
+},x=mss.gs.list, n=names(mss.gs.list), y=mss.contrasts)
+
+names(mss.out.list) <-  names(mss.gs.list)
+```
+
+```{r}
+
+lapply(seq_along(mss.out.list), function(x,n,i){
+  dt <- x[[i]]
+  
+   dt[,gene := multiUniprots2multiGenes(as.character(Protein))] %>% #needed as in factor format
+  .[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)] %>% 
+  .[, sig := 'not'] %>% 
+  .[!issue %in% c('completeMissing') & abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')] 
+   fwrite(dt, paste0('./output/26.01.24.', n[[i]], '.batch.gsnorm.mss.pwcomparisons.csv'))
+  }, x=mss.out.list, n=names(mss.out.list))
+
+
+lapply(mss.out.list, print)
+```
+
+
+filter to the proteins in the 
+saint.fdr1prc.list
+
+```{r}
+
+#ceate another table to filter out to only sig hits in the 
+f.mss.out.list <- lapply(seq_along(mss.out.list), function(x,y,n,i){
+  
+  group <-  n[[i]]
+  
+  dt <- x[[group]] %>% 
+    .[Protein %in% y[[group]] | Protein %in% prots.oi, ] %>% 
+    .[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)] %>%
+    .[, sig := 'not'] %>% 
+    .[!issue %in% c('completeMissing') & abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')] 
+   
+   #fwrite(dt, paste0('./output/26.01.24.SAINTsigprots.',group, '.batch.gsnorm.mss.pwcomparisons.proc.csv'))
+  
+  return(dt)
+  }, x=mss.out.list, y=saint.fdr1prc.list, n=names(mss.out.list))
+
+names(f.mss.out.list) <- names(mss.out.list)
+```
+
+Heatmap of all proteins missing in one condition in pw test
+```{r}
+lapply(seq_along(f.mss.out.list), function(x,n,i){
+  
+  group <- n[[i]]  
+  missing.prots <- (x[[group]][issue == 'oneConditionMissing', unique(Protein)])
+  
+  p.mat <-  dcast(mss.em.list[[group]]$ProteinLevelData, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+
+  submat <-  p.mat[rownames(p.mat) %in% missing.prots,]
+  # convert to binay
+  submat[!is.na(submat)] <- 1
+  submat[is.na(submat)] <- 0
+  
+  if (length(rownames(submat)) > 1){
+    rownames(submat) <- multiUniprots2multiGenes(rownames(submat))
+    hm <- Heatmap(submat, cluster_rows = T, na_col='grey', name = group)
+    
+    BackupAsPDF(hm, paste0(group, 'geneswConditionMissing.gsnorm.heatmap.'))
+  
+  }
+  
+},x=f.mss.out.list, n=names(f.mss.out.list))
+```
+
+
+```{r}
+prots.oi <- c("P0DTC1","P0DTC3")
+
+dir.create(paste0(getwd(), '/240124.APMS.redo_data/pdfs/bait_globalStandards_normalization_volcanoplots'))
+#outpath <- paste0(getwd(), '/240124.APMS.redo_data/pdfs/globalStandards_normalization')
+
+lapply(seq_along(f.mss.out.list), function(x,y,n,i){
+   
+  # get the contrast grp
+  group <- n[[i]]
+  
+   dt <- x[[group]]
+  
+   # iterate through  indv contrasts
+   contrasts.oi <- dt$Label %>%  unique()
+  
+   # nested loop w 
+   lapply(contrasts.oi, function(cont){
+     # get the max p.adj from this comparison
+     min.padj <-   dt[Label == cont & !is.na(p.adj), min(p.adj)]
+     min.log2FC <- dt[Label == cont & !is.na(log2FC) & !is.infinite(log2FC), min(log2FC)]
+     max.log2FC <- dt[Label == cont & !is.na(log2FC) & !is.infinite(log2FC), max(log2FC)]
+
+     missing.dt <- copy(dt[Label == cont & issue == ('oneConditionMissing'),])
+     missing.dt[, sig := 'oneConditionMissing'] 
+     missing.dt[, `:=`(p.adj = min.padj,
+                       log2FC = ifelse(log2FC > 0,  max.log2FC, min.log2FC) )] 
+     
+     bait.dt <- copy(dt[Label == cont & Protein %in% prots.oi,])
+     
+     ## match coordinates for geom_jitter and geom_text_repel
+      pos <- position_jitter(width = 0.15, seed = 2)
+     
+    
+      #print(dt[Label == cont & issue %in% c('oneConditionMissing')])
+      g <- ggplot(dt[Label == cont & !issue %in% c('completeMissing'),], 
+                  aes(x=log2FC, y=-log10(p.adj), color=sig, label=gene)) + 
+        geom_point() +
+        ggrepel::geom_text_repel(data=dt[Label == cont & sig != 'not' & !Protein %in% prots.oi & !gene %in% y[[group]],], size = 2, max.overlaps = 20) +
+        geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+        geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+        
+        # add bait info to plot
+        geom_point(data=dt[Label == cont & Protein %in% prots.oi,], aes(x=log2FC, y=-log10(p.adj), color='bait')) +
+        ggrepel::geom_text_repel(data=dt[Label == cont & Protein %in% prots.oi,],  size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "green") +
+        
+        # add missing values info to plot
+        geom_jitter(data=missing.dt[Label == cont,], aes(x=log2FC, y=-log10(p.adj),color='oneConditionMissing'), position=pos) +
+        ggrepel::geom_text_repel(data=missing.dt[Label == cont,], position=pos,  size = 2) +
+
+        
+        scale_color_manual(values=c('up'='red', 'down'='blue', 'not'='grey', 'bait'='green','oneConditionMissing'='purple')) +
+        ggtitle(paste0(group, ' ', cont, ' (FC +/ 50% & p.adj < 0.05)')) +
+        # facet_wrap(~Label, scales = 'free') +
+        theme_bw() +
+        theme(strip.text.x = element_text(size = 5))
+      
+      BackupAsPDF(g, paste0('bait_globalStandards_normalization_volcanoplots/', n[[i]],'.',cont,'.SAINT.bfdr0.1.volcanoplot.'))
+  })
+  
+  }, x=f.mss.out.list, y=missing.genes.list, n=names(f.mss.out.list))
+
+names(f.mss.out.list)
+names()
+```
+
+heatmaps of significant hits in both datasets for the global standards normalisation
+
+```{r}
+
+dir.create(paste0(getwd(), '/240124.APMS.redo_data/pdfs/heatmaps/bait_globalStandards'))
+lapply(seq_along(f.mss.out.list), function(x,y,z,n,i){
+   
+  # get sig hits
+  group <- n[[i]]
+  dt <- x[[group]]
+   # get the significant proteins for each compoarison
+  sigProts <-  dt[sig != 'not', unique(Protein)]
+  
+  # look at expression limited to SAINT hits
+  pmat <- dcast(y[[group]]$ProteinLevelData, Protein~SUBJECT, value.var = 'LogIntensities') %>% 
+     as.matrix(rownames='Protein')
+  
+  test.mat <- pmat[sample(rownames(pmat), 2000), ]
+  test.mat <-  sweep(test.mat, 1, STATS = apply(test.mat,1, median, na.rm=T))
+ 
+  hm <-  Heatmap(test.mat, cluster_rows = clusterwNA(test.mat), name='log2(Ints.)/Median', cluster_columns = F, show_row_names = F, 
+                 col = colorRamp2(seq(-2, 2, length = 3), c("blue", "#EEEEEE", "red")),
+                 column_names_gp = gpar(fontsize=7), column_split = sub('_[123]{1}$','', colnames(test.mat)),
+                 column_title_gp = gpar(fontsize=6))
+  BackupAsPDF(draw(hm, column_title=paste0(group, ' random sample of 2000 proteins')), paste0('heatmaps/bait_globalStandards/', group, '.randomSample_gsnorm_heatmap.'))
+
+  submat <-  pmat[rownames(pmat) %in% sigProts,]
+  rownames(submat) <- multiUniprots2multiGenes(rownames(submat))
+  
+  submat <-  sweep(submat, 1, STATS = apply(submat,1, median, na.rm=T))
+  
+  hm <- Heatmap(submat, cluster_rows = clusterwNA(submat), cluster_columns = F, 
+                name='log2(Ints.)/Median', row_names_gp = gpar(fontsize=7), 
+                col = colorRamp2(seq(-2, 2, length = 3), c("blue", "#EEEEEE", "red")),
+                column_names_gp = gpar(fontsize=7), column_split = sub('_[123]{1}$','', colnames(test.mat)),
+                column_title_gp = gpar(fontsize=6))
+  BackupAsPDF(draw(hm, column_title=paste0(group, ' sig hits from SAINT interactors')), paste0('heatmaps/bait_globalStandards/', group, '.SAINTsig_gsnorm_heatmap.'))
+  
+  }, x=f.mss.out.list, y=mss.gs.list, z=saint.fdr1prc.list, n=names(f.mss.out.list))
+```
+
+
+
+
+```{r}
+lapply(seq_along(f.mss.out.list), function(x,y,n,i){
+   
+  # get the contrast grp
+  group <- n[[i]]
+  
+   dt <- x[[group]]
+  
+   # iterate through  indv contrasts
+   contrasts.oi <- dt$Label %>%  unique()
+  
+   # nested loop w 
+   lapply(contrasts.oi, function(cont){
+     # get the max p.adj from this comparison
+     min.padj <-   dt[Label == cont & !is.na(p.adj), min(p.adj)]
+     min.log2FC <- dt[Label == cont & !is.na(log2FC) & !is.infinite(log2FC), min(log2FC)]
+     max.log2FC <- dt[Label == cont & !is.na(log2FC) & !is.infinite(log2FC), max(log2FC)]
+
+     missing.dt <- copy(dt[Label == cont & issue == ('oneConditionMissing'),])
+     missing.dt[, sig := 'oneConditionMissing'] 
+     missing.dt[, `:=`(p.adj = min.padj,
+                       log2FC = ifelse(log2FC > 0,  max.log2FC, min.log2FC) )] 
+     
+     bait.dt <- copy(dt[Label == cont & Protein %in% prots.oi,])
+     
+     ## match coordinates for geom_jitter and geom_text_repel
+      pos <- position_jitter(width = 0.15, seed = 2)
+     
+    
+      #print(dt[Label == cont & issue %in% c('oneConditionMissing')])
+      g <- ggplot(dt[Label == cont & !issue %in% c('completeMissing'),], 
+                  aes(x=log2FC, y=-log10(p.adj), color=sig, label=gene)) + 
+        geom_point() +
+        ggrepel::geom_text_repel(data=dt[Label == cont & sig != 'not' & !Protein %in% prots.oi & !gene %in% y[[group]],], size = 2, max.overlaps = 20) +
+        geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+        geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+        
+        # add bait info to plot
+        geom_point(data=dt[Label == cont & Protein %in% prots.oi,], aes(x=log2FC, y=-log10(p.adj), color='bait')) +
+        ggrepel::geom_text_repel(data=dt[Label == cont & Protein %in% prots.oi,],  size = 2, max.overlaps = 20, segment.color = 'grey80', colour = "green") +
+        
+        # add missing values info to plot
+        geom_jitter(data=missing.dt[Label == cont,], aes(x=log2FC, y=-log10(p.adj),color='oneConditionMissing'), position=pos) +
+        ggrepel::geom_text_repel(data=missing.dt[Label == cont,], position=pos,  size = 2) +
+
+        
+        scale_color_manual(values=c('up'='red', 'down'='blue', 'not'='grey', 'bait'='green','oneConditionMissing'='purple')) +
+        ggtitle(paste0(group, ' ', cont, ' (FC +/ 50% & p.adj < 0.05)')) +
+        # facet_wrap(~Label, scales = 'free') +
+        theme_bw() +
+        theme(strip.text.x = element_text(size = 5))
+      
+      BackupAsPDF(g, paste0('bait_globalStandards_normalization_volcanoplots/', n[[i]],'.',cont,'.SAINT.bfdr0.1.volcanoplot.'))
+  })
+  
+  }, x=f.mss.out.list, y=missing.genes.list, n=names(f.mss.out.list))
+```
+
+write out all the filtered output to tidy format
+```{r}
+# equilizemedians
+f.mss.out.list <- list(orf3a_control = fread(paste0(outdir, '26.01.24.SAINTsigprots.orf3a_control.batch.mss.pwcomparisons.proc.csv')),
+                       orf3a_treatment = fread(paste0(outdir, '26.01.24.SAINTsigprots.orf3a_treatment.batch.mss.pwcomparisons.proc.csv')),
+                       nsp6_control = fread(paste0(outdir, '26.01.24.SAINTsigprots.nsp6_control.batch.mss.pwcomparisons.proc.csv')),
+                       nsp6_treatment =fread(paste0(outdir, '26.01.24.SAINTsigprots.nsp6_treatment.batch.mss.pwcomparisons.proc.csv')) )
+
+lapply(seq_along(f.mss.out.list), function(x,n,i){
+  group <- n[[i]]
+  dt <- dcast(x[[group]], gene+Protein~Label, value.var = c('log2FC','pvalue','p.adj'))
+  fwrite(dt, paste0('./output/26.01.24.SAINTsigprots.',group, '.batch.emnorm.mss.pwcomparisons.wideformat.csv'))
+},x=f.mss.out.list, n=names(f.mss.out.list))
+
+
+# equilizemedians
+f.mss.out.list <- list(orf3a_control = fread(paste0(outdir, '26.01.24.SAINTsigprots.orf3a_control.batch.gsnorm.mss.pwcomparisons.proc.csv')),
+                       orf3a_treatment = fread(paste0(outdir, '26.01.24.SAINTsigprots.orf3a_treatment.batch.gsnorm.mss.pwcomparisons.proc.csv')),
+                       nsp6_control = fread(paste0(outdir, '26.01.24.SAINTsigprots.nsp6_control.batch.gsnorm.mss.pwcomparisons.proc.csv')),
+                       nsp6_treatment =fread(paste0(outdir, '26.01.24.SAINTsigprots.nsp6_treatment.batch.gsnorm.mss.pwcomparisons.proc.csv')) )
+
+lapply(seq_along(f.mss.out.list), function(x,n,i){
+  group <- n[[i]]
+  dt <- dcast(x[[group]], gene+Protein~Label, value.var = c('log2FC','pvalue','p.adj'))
+  fwrite(dt, paste0('./output/26.01.24.SAINTsigprots.',group, '.batch.baitgsnorm.mss.pwcomparisons.wideformat.csv'))
+},x=f.mss.out.list, n=names(f.mss.out.list))
+
+```
+
+Interaction Analysis
+-----
+What happens when we 
+
+
+
+
+
+Not used....
+----
+
+generate boxplots of the normalised data
+Looks a lot better... I think proceed with this
+
+```{r}
+
+lapply(seq_along(mssInput.list),  function(x,n,i){
+g <-  ggplot(x[[i]], aes(x=group_subject, y=log2(newIntensity), fill=Condition)) +
+    geom_boxplot() +
+    ggtitle(n[[i]]) +
+    theme(axis.text.x = (element_text(angle=90)))
+  #BackupAsPDF(g, paste0(n[[i]], '.baitTMPnorm.boxplots.'))
+},x=mssInput.list, n=names(mssInput.list))
+```
+plot the sample intensities for the raw and adjusted peptides
+
+```{r}
+
+lapply(seq_along(spec.list),  function(x,y,n,i){
+  
+  
+  bait <- n[[i]]
+  dt <- x[[bait]]
+  print(dt)
+  
+  #make new tables
+  bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean_bait']
+   med.bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median_bait']
+  
+  gl.mean.dt <- dt[ProteinName != y[[bait]], mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean']
+  gl.med.dt <-dt[ProteinName != y[[bait]], median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median']
+  
+  setnames(med.bait.dt, old='V1', new='Intensity')
+  setnames(bait.dt, old='V1', new='Intensity')
+  setnames(gl.mean.dt, old='V1', new='Intensity')
+  setnames(gl.med.dt, old='V1', new='Intensity')
+  
+  p.dt <- rbind(bait.dt,med.bait.dt, gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(bait) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(bait,'.raw.ints.linechart' ))
+},x=spec.list, y=mssGS.list, n=names(spec.list))
+
+
+lapply(spec.list,  function(x){
+  x[, Intensity := newIntensity]
+  return(x)
+})
+
+
+lapply(seq_along(spec.list),  function(x,y,n,i){
+  
+  
+  bait <- n[[i]]
+  dt <- x[[bait]]
+  print(dt)
+  
+  #make new tables
+  bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean_bait']
+   med.bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median_bait']
+  
+  gl.mean.dt <- dt[ProteinName != y[[bait]], mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean']
+  gl.med.dt <-dt[ProteinName != y[[bait]], median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median']
+  
+  setnames(med.bait.dt, old='V1', new='Intensity')
+  setnames(bait.dt, old='V1', new='Intensity')
+  setnames(gl.mean.dt, old='V1', new='Intensity')
+  setnames(gl.med.dt, old='V1', new='Intensity')
+  
+  p.dt <- rbind(bait.dt,med.bait.dt, gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=Intensity, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(bait) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(bait,'.baitTMPnorm.ints.linechart' ))
+},x=spec.list, y=mssGS.list, n=names(spec.list))
+
+```
+
+
+
+
+
+```{r}
+spec.list <-  list(orf3a = spec.orf3a,
+                   
+                   
+    
+                   
+                   "orf3a_control"   "orf3a_treatment" "nsp6_control"    "nsp6_treatment" 
+                   nsp6 = spec.nsp6)
+```
+
+
+
+TMP normalisation
+----
+Try normalize using bait expression levels using tmp; subtract the col offsets (samples) for the bait 
+
+## run the medpolish then subtract that from the whole dataset
+Run TMP on just the bait matrix
+Then apply offsets to the data matrix
+
+get names of baits 
+
+```{r}
+mssGS.list <-  list(orf3a = 'P0DTC3',
+                   nsp6 = 'P0DTC1')
+```
+
+create a plot of the intensity of the peptides for each sample
+Peptide intensities dont seem to follow bait...
+
+```{r}
+
+lapply(seq_along(spec.list),  function(x,y,n,i){
+  
+  bait <-  n[[i]] 
+  # recover baits
+  sub.x <- x[[bait]][, uniprot := str_extract(ProteinName,'(?<=\\|).+(?=\\|)')]
+  sub.x[, ProteinName := uniprot]
+  sub.x <- sub.x[uniprot == y[[bait]], ]
+
+  
+  # linechart
+  g <- ggplot(sub.x, aes(x=reorder(interaction(Condition, BioReplicate)), y=log2(Intensity), 
+                         color=interaction(PeptideSequence,PrecursorCharge), group=interaction(PeptideSequence,PrecursorCharge))) +
+    geom_point() +
+    geom_line() +
+    ggtitle(n[[i]]) +
+    theme(axis.text.x =element_text(angle=90),
+          legend.text = element_text(size=6))
+  
+ # BackupAsPDF(g, paste0(n[[i]], '.baitpeptideIntensities'), dimensions = c(12,6))
+},x=spec.list, y=mssGS.list, n=names(spec.list))
+
+
+
+
+lapply(seq_along(spec.list),  function(x,y,n,i){
+  
+  bait <-  n[[i]] 
+  sub.x <- x[[i]][uniprot == y[[bait]], ] %>% 
+    .[, name := 'bait peptide Ints.']
+  med.x <-  x[[bait]][, median(Intensity, na.rm=T), by=.(Condition, BioReplicate)] %>% 
+    .[, name := 'global peptide median ints.']
+  
+  setnames(med.x, old='V1', new='Intensity')
+  
+  dt <- rbind(sub.x, med.x, fill=TRUE)
+
+ # linechart
+  g <- ggplot(dt, aes(x=reorder(interaction(Condition, BioReplicate)), y=log2(Intensity), 
+                         color=name, group=interaction(PeptideSequence,PrecursorCharge, name))) +
+    geom_point() +
+    geom_line() +
+    ggtitle(n[[i]]) +
+    theme(axis.text.x =element_text(angle=90, size=),
+         legend.text = element_text(size=6))
+  
+  #BackupAsPDF(g, paste0(n[[i]], '.raw.baitpeptideIntensities.globalpeptideIntensities.'), dimensions = c(12,6))
+},x=spec.list, y=mssGS.list, n=names(spec.list))
+```
+## run the medpolish then subtract that from the whole dataset
+Run TMP on just the bait matrix
+Then apply offsets to the data matrix
+
+```{r}
+lapply(seq_along(spec.list),  function(x,y,n,i){
+  
+  
+  bait <-  n[[i]]
+  print(paste0('working on ', bait))
+  # recover baits
+
+  sub.x <-  x[[bait]][ProteinName == y[[bait]], ]
+
+  # make matrix
+  spec.x <- dcast(sub.x, interaction(PeptideSequence,PrecursorCharge)~group_subject, value.var = 'Intensity') %>% 
+   as.matrix(rownames=1)
+  
+  # convert  matrix to log space
+  spec.x <-  log2(spec.x)
+  
+  #perform tmp normalisation
+  tmp <- medpolish(spec.x, na.rm = TRUE) #iteratively subtract row and col median values to get the offsets
+  tmp.dt <- data.table(offset = tmp$col, group_subject = names(tmp$col))
+  
+  tmp.dt[, direction := ifelse(offset > 0, 'up','blue')]
+  
+  g <- ggplot(tmp.dt, aes(x=group_subject, y=offset, fill=direction)) +
+    geom_bar(stat='Identity') +
+    ggtitle(bait) +
+    theme(axis.text.x =element_text(angle=90, size=),
+          legend.text = element_text(size=6))
+  
+  #BackupAsPDF(g, paste0(bait, 'tmp.sampleadjustments.'))
+  print(g)
+  
+  # merge dts
+  x[[bait]][tmp.dt, normalize.offset := i.offset, on = "group_subject"]
+  
+  return(x[[bait]])
+  
+},x=spec.list, y=mssGS.list, n=names(spec.list))
+
+```
+
+as working on linear scale, need to divide (in log scale would subtract difference)
+```{r}
+lapply(spec.list,  function(x){
+  x[, newIntensity := log2(Intensity)  - normalize.offset]
+  return(x)
+})
+```
+generate boxplots of the normalised data
+Looks a lot better... I think proceed with this
+
+```{r}
+
+lapply(seq_along(spec.list),  function(x,n,i){
+g <-  ggplot(x[[i]], aes(x=group_subject, y=newIntensity, fill=Condition)) +
+    geom_boxplot() +
+    ggtitle(n[[i]]) +
+    theme(axis.text.x = (element_text(angle=90)))
+  #BackupAsPDF(g, paste0(n[[i]], '.baitTMPnorm.boxplots.'))
+},x=spec.list, n=names(spec.list))
+```
+plot the sample intensities for the raw and adjusted peptides
+
+```{r}
+
+lapply(seq_along(spec.list),  function(x,y,n,i){
+  
+  
+  bait <- n[[i]]
+  dt <- x[[bait]]
+  print(dt)
+  
+  #make new tables
+  bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean_bait']
+   med.bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median_bait']
+  
+  gl.mean.dt <- dt[ProteinName != y[[bait]], mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean']
+  gl.med.dt <-dt[ProteinName != y[[bait]], median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median']
+  
+  setnames(med.bait.dt, old='V1', new='Intensity')
+  setnames(bait.dt, old='V1', new='Intensity')
+  setnames(gl.mean.dt, old='V1', new='Intensity')
+  setnames(gl.med.dt, old='V1', new='Intensity')
+  
+  p.dt <- rbind(bait.dt,med.bait.dt, gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(bait) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(bait,'.raw.ints.linechart' ))
+},x=spec.list, y=mssGS.list, n=names(spec.list))
+
+
+lapply(spec.list,  function(x){
+  x[, Intensity := newIntensity]
+  return(x)
+})
+
+
+lapply(seq_along(spec.list),  function(x,y,n,i){
+  
+  
+  bait <- n[[i]]
+  dt <- x[[bait]]
+  print(dt)
+  
+  #make new tables
+  bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean_bait']
+   med.bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median_bait']
+  
+  gl.mean.dt <- dt[ProteinName != y[[bait]], mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean']
+  gl.med.dt <-dt[ProteinName != y[[bait]], median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median']
+  
+  setnames(med.bait.dt, old='V1', new='Intensity')
+  setnames(bait.dt, old='V1', new='Intensity')
+  setnames(gl.mean.dt, old='V1', new='Intensity')
+  setnames(gl.med.dt, old='V1', new='Intensity')
+  
+  p.dt <- rbind(bait.dt,med.bait.dt, gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=Intensity, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(bait) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(bait,'.baitTMPnorm.ints.linechart' ))
+},x=spec.list, y=mssGS.list, n=names(spec.list))
+
+```
+
+
+```{r}
+mssInput.list <- lapply(spec.list, function(x){
+  
+  # configure for MSstats input
+  x[, PeptideModifiedSequence := PeptideSequence]
+  mssInput <- specFileToCompleteMSstats(x)
+  mssInput[, IsotopeLabelType := 'L']
+  
+  
+  # convert to linear scale to run MSstats
+  mssInput[, Intensity := 2^Intensity]
+  return(mssInput)
+})
+```
+process each dataset; normalise using global standards with bait peptides
+```{r}
+mss.list <-  lapply(seq_along(mssInput.list), function(x,i){
+  
+  mss.x <-  dataProcess(x[[i]], 
+                        normalization = FALSE, #preran with globalStandards and didnt work well...
+                        summaryMethod="TMP",
+                        remove_uninformative_feature_outlier=TRUE,
+                        featureSubset="highQuality",
+                        MBimpute =  FALSE)
+ return(mss.x)
+  
+}, x=mssInput.list)
+
+names(mss.list) <- c("orf3a","nsp6")
+```
+## ok look at the distribution of the protein intensities
+
+all proteins:
+```{r}
+lapply(mss.list, function(x){
+  
+  ggplot(x$ProteinLevelData, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot()
+})
+```
+proteins significant in spec
+
+proteins significant in SAINT
+```{r}
+nsp6.spc.saint <-  fread('./output/SAINT.scoring/nsp6.spc.saint.list.txt')
+nsp6.int.saint <-  fread('./output/SAINT.scoring/nsp6.ints.saint.list.txt')
+orf3a.spc.saint <-fread('./output/SAINT.scoring/orf3a.spc.saint.list.txt')
+orf3a.int.saint <-fread('./output/SAINT.scoring/orf3a.ints.saint.list.txt')
+
+saint.list <- list(nsp6.spc = nsp6.spc.saint,
+                   nsp6.int = nsp6.int.saint,
+                   orf3a.spc = orf3a.spc.saint,
+                   orf3a.int = orf3a.int.saint)
+
+
+lapply(saint.list, str)
+
+f.saint.list <- lapply(saint.list, function(x){
+  
+  x.dt <- x[BFDR < 0.1, unique(Prey)]
+  return(x.dt)
+})
+
+nsp6.saint.fdr.01 <- unique(c(f.saint.list[[1]],f.saint.list[[2]]))
+orf3a.saint.fdr.01 <- unique(c(f.saint.list[[3]],f.saint.list[[4]]))
+
+
+saint.fdr1prc.list <- list(orf3a = orf3a.saint.fdr.01,
+                           nsp6 = nsp6.saint.fdr.01)
+```
+do we expect the expression of most of these interactors to change between conditions? Im not sure and looks like so pretty big global differences..
+
+```{r}
+
+lapply(seq_along(mss.list), function(x,y,n, i){
+  
+  bait <- n[[i]]
+  
+  dt <- setDT(x[[bait]]$ProteinLevelData)
+  
+  g <- ggplot(dt[Protein %in% y[[bait]], ], aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot() +
+    ylim(18,32) +
+    ggtitle(paste0(bait, ' SAINT hits (BFDR < 0.1)')) +
+    theme(axis.text=element_text(angle=90))
+  
+  fg <- ggplot(dt, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot() +
+    ylim(18,32) +
+    ggtitle(paste0(bait)) +
+    theme(axis.text=element_text(angle=90))
+  
+  fg + g + plot_layout(guides = "collect", ncol=2)
+  BackupAsPDF(fg + g + plot_layout(guides = "collect", ncol=2), paste0(bait, '.globalandSAINTsig.boxplots.'), dimensions=c(9,6))
+  
+},x=mss.list, n=names(mss.list), y=saint.fdr1prc.list)
+
+
+
+
+lapply(dp.out.list, function(x){
+  
+  
+  dim()
+  
+}
+```
+heatmap of all sig (fdr < 0.1) SAINT hits
+----
+```{r}
+rowClusterWithNA <- function(mat, na.value = 0, ...){
+    mat[is.na(mat)] <- na.value
+    hclust(dist(mat), ...)
+  }
+
+#play with thresholds here
+lapply(seq_along(mss.list), function(x,y,n,i){
+  
+  bait <- n[[i]] 
+  print(paste0('Working on: ', bait))
+  sigProtein <- y[[bait]] 
+
+  # filter just to our data
+  prot.mat <- dcast(x[[bait]]$ProteinLevelData, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+  
+  prot.mat <-  scale(prot.mat, center = T, scale = T)
+  
+  prot.mat <-  prot.mat[rownames(prot.mat) %in% sigProtein,]
+  
+  # convert to gene names
+  rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  # median sweep
+  #prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  hm <- Heatmap(prot.mat, 
+                cluster_columns = FALSE, 
+                cluster_rows = rowClusterWithNA(prot.mat),
+                name = 'Ints z-score',
+                show_row_names = T,
+                #column_title = paste0(n[[i]]),
+                row_title = sprintf('%s Proteins (SAINT fdr < 0.1)', nrow(prot.mat)),
+                row_names_gp = gpar(fontsize = 5),
+                column_names_gp = gpar(fontsize = 8),#,
+                column_split = ifelse(grepl("^[DL]{1}", colnames(prot.mat)), 'pre-treatment', "no pre-treatment") )
+  
+ BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' interactors (SAINT fdr < 0.1)')), paste0(n[[i]], '.saintsig.proteins.intensity.heatmap'), dimensions = c(8,7))
+  
+},x=mss.list, y=saint.fdr1prc.list, n=names(mss.list))
+```
+
+Generate a line chart of the samples
+
+```{r}
+
+lapply(seq_along(mss.list),  function(x,y,z,n,i){
+  
+  bait <- n[[i]]
+  
+  dt <- setDT(x[[bait]]$ProteinLevelData)
+  
+  #make new tables
+  bait.dt <- dt[Protein == z[[bait]], .(GROUP,SUBJECT,LogIntensities)] %>% 
+    .[,NAME := 'bait']
+  print(bait.dt)
+  gl.med.dt <- dt[Protein != y[[bait]], median(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global.median']
+  #print(gl.med.dt)
+  saint.med.dt <- dt[Protein %in% y[[bait]], median(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'SAINT.sig.median']
+  #print(saint.med.dt)
+
+  
+  setnames(saint.med.dt, old='V1', new='LogIntensities')
+  setnames(gl.med.dt, old='V1', new='LogIntensities')
+  
+  p.dt <- rbind(bait.dt, saint.med.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(bait) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(bait,'baitTMP.norm.wSAINTsighits.linechart' ))
+},x=mss.list, y=saint.fdr1prc.list, z=mssGS.list, n=names(mss.list))
+
+```
+SAINT sig hit trends follow global trends, we dont expect all of these interactors to differ greatly between conditions
+What about a subset of the SAINT hits? Lets look at their expression
+
+
+Run MSstats DE on the hits:
+------------
+create the contrast matrices for both groups
+```{r}
+orf3a.contrasts <- makeContrast.AllByAll(mss.list$orf3a)
+nsp6.contrasts  <- makeContrast.AllByAll(mss.list$nsp6)
+```
+
+```{r}
+contrast.list <-  list(orf3a = orf3a.contrasts,
+                       nsp6 = nsp6.contrasts)
+```
+
+```{r}
+mss.out.list <- lapply(seq_along(dp.out.list), function(x,n,i){
+
+  bait <- n[[i]]
+  print(paste0('running comparison on ', bait))
+  
+  # run msstats correcting for batch 
+  mss <- groupComparison(contrast.matrix=contrast.list[[bait]], data=x[[bait]])
+  mss.dt <- setDT(mss$ComparisonResult)
+  
+  return(mss.dt)
+  
+},x=mss.list, n=names(mss.list))
+
+names(mss.out.list) <- names(mss.list)
+```
+filter to hits from SAINT
+```{r}
+
+lapply(seq_along(mss.out.list), function(x,n,y,i){
+   
+   dt <- x[[i]]
+   
+   dt[,gene := multiUniprots2multiGenes(as.character(Protein))] %>% #needed as in factor format
+  .[Protein %in% y[[i]] ] %>% 
+  .[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)] %>% 
+  .[, sig := 'not'] %>% 
+  .[!issue %in% c('completeMissing', 'oneConditionMissing') & abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')] 
+   
+   dt[sig != 'not',.N, by=.(Label,sig)]
+   
+   #fwrite(dt, paste0('./output/', n[[i]], '.mss.pwcomparisons.proc.csv'))
+  }, x=mss.out.list, y=saint.fdr1prc.list,  n=names(mss.out.list))
+```
+
+how many DE hits in each contrast?
+
+```{r}
+
+lapply(seq_along(mss.out.list), function(x,n,i){
+  
+  bait <- n[[i]]
+  #print(mss.out.list[[bait]][Protein %in% saint.fdr1prc.list[[bait]] & p.adj < 0.05 & log2FC > 0.58,])
+  mss.out.list[[bait]][sig != 'not' & , .N, by=.(Label,sig)]
+},x=mss.out.list, n=names(mss.out.list))
+
+
+f.mss.out.list <- list(orf3a = mss.out.list[['orf3a']][Protein %in% orf3a.saint.fdr.01,],
+                       nsp6 =  mss.out.list[['nsp6']][Protein %in% nsp6.saint.fdr.01,])
+
+```
+
+
+```{r}
+lapply(seq_along(spec.list),  function(x,y,n,i){
+  
+  
+  bait <- n[[i]]
+  dt <- x[[bait]]
+  print(dt)
+  
+  #make new tables
+  bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean_bait']
+   med.bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median_bait']
+  
+  gl.mean.dt <- dt[ProteinName != y[[bait]], mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean']
+  gl.med.dt <-dt[ProteinName != y[[bait]], median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median']
+  
+  setnames(med.bait.dt, old='V1', new='Intensity')
+  setnames(bait.dt, old='V1', new='Intensity')
+  setnames(gl.mean.dt, old='V1', new='Intensity')
+  setnames(gl.med.dt, old='V1', new='Intensity')
+  
+  p.dt <- rbind(bait.dt,med.bait.dt, gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=Intensity, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(bait) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(bait,'.tmpBaitnorm.ints.linechart' ))
+},x=spec.list, y=mssGS.list, n=names(spec.list))
+```
+That looks a lot better.. lets try summarising to protein level and see how it looks. Possibly will need another round of normalisation with all. prots but looks better
+
+```{r}
+
+mssInput.list <- lapply(spec.list, function(x){
+  
+  # configure for MSstats input
+  x[, PeptideModifiedSequence := PeptideSequence]
+  mssInput <- specFileToCompleteMSstats(x)
+  mssInput[, IsotopeLabelType := 'L']
+  
+  
+  mssInput[, uniprot := str_extract(ProteinName,'(?<=\\|).+(?=\\|)')]
+  mssInput[, ProteinName := uniprot]
+
+  return(mssInput)
+})
+
+```
+process each dataset; normalise using global standards with bait peptides
+```{r}
+
+mss.list <-  lapply(seq_along(mssInput.list), function(x,y,i){
+  
+  mss.x <-  dataProcess(x[[i]], 
+                        normalization = '', #preran with globalStandards and didnt work well...
+                        summaryMethod="TMP",
+                        remove_uninformative_feature_outlier=TRUE,
+                        featureSubset="highQuality",
+                        MBimpute =  FALSE)
+ return(mss.x)
+  
+}, x=mssInput.list, y=mssGS.list)
+
+
+names(mss.list) <- c("orf3a","nsp6")
+
+help(dataProcess)
+```
+
+```{r}
+lapply(mss.list, function(x){
+
+  ggplot(x$ProteinLevelData, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot()
+})
+```
+
+
+**not used**
+
+Still doesnt look good...try normalising spec using quantile normalisation to account
+no use either...
+```{r}
+orf3a.grps <- c('Empty', 'Lempty', 'Lorf3aBeta', 'Lorf3aQ57H', 'Lorf3aS171L', 'Lorf3aWT', 
+               'orf3aBeta', 'orf3aQ57H', 'orf3aS171L', 'orf3aWT', 'UT')
+
+nsp6.gprs <- c('DemptyVector', 'Dnsp6BA1', 'Dnsp6BA2', 'Dnsp6WT', 'Dnsp6XBB', 'Empty',
+               'nsp6BA1', 'nsp6BA2', 'nsp6WT', 'nsp6XBB', 'UT')
+
+
+spec.orf3a <- spec[Condition %in% orf3a.grps,]
+spec.nsp6 <- spec[Condition %in% nsp6.gprs,]
+```
+
+```{r}
+spec.list <-  list(orf3a = spec.orf3a,
+                   nsp6 = spec.nsp6)
+```
+
+
+```{r}
+
+mssInput.list <- lapply(spec.list, function(x){
+  
+  # configure for MSstats input
+  x[, PeptideModifiedSequence := PeptideSequence]
+  mssInput <- specFileToCompleteMSstats(x)
+  mssInput[, IsotopeLabelType := 'L']
+  
+  
+  mssInput[, uniprot := str_extract(ProteinName,'(?<=\\|).+(?=\\|)')]
+  mssInput[, ProteinName := uniprot]
+
+  return(mssInput)
+})
+
+```
+process each dataset; normalise using global standards with bait peptides
+```{r}
+
+mss.list <-  lapply(seq_along(mssInput.list), function(x,y,i){
+  
+  mss.x <-  dataProcess(x[[i]], 
+                        normalization = 'quantile', #preran with globalStandards and didnt work well...
+                        summaryMethod="TMP",
+                        remove_uninformative_feature_outlier=TRUE,
+                        featureSubset="highQuality",
+                        MBimpute =  FALSE)
+ return(mss.x)
+  
+}, x=mssInput.list, y=mssGS.list)
+
+
+names(mss.list) <- c("orf3a","nsp6")
+
+help(dataProcess)
+```
+
+```{r}
+lapply(mss.list, function(x){
+
+  ggplot(x$ProteinLevelData, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot()
+})
+```
+
+now lets plot the output and see whta the normalised data looks like
+still no good... retry with tmp normalisation
+
+```{r}
+lapply(seq_along(mss.list),  function(x,y,n,i){
+  
+  bait <- n[[i]]
+  
+  dt <- setDT(x[[bait]]$ProteinLevelData)
+  
+  #make new tables
+  bait.dt <- dt[Protein == y[[bait]], .(GROUP,SUBJECT,LogIntensities)] %>% 
+    .[,NAME := 'bait']
+  gl.mean.dt <- dt[Protein != y[[bait]], mean(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'mean']
+  gl.med.dt <-dt[Protein != y[[bait]], median(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'median']
+  
+  setnames(gl.mean.dt, old='V1', new='LogIntensities')
+  setnames(gl.med.dt, old='V1', new='LogIntensities')
+  
+  p.dt <- rbind(bait.dt, gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(bait) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  #BackupAsPDF(g, paste0(bait,'quantile.norm.linechart' ))
+},x=mss.list, y=mssGS.list, n=names(mss.list))
+
+
+names(mss.list)
+```
+

@@ -1,0 +1,921 @@
+---
+title: "102224_PIK3CAplots_CCMI"
+author: "Martin Gordon"
+date: "2024-10-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Generate plots for Nevan to showcase at PCMI
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ComplexHeatmap)
+library(viridis)
+library(dendextend) # for dendogram modifications
+library(DESeq2)
+library(patchwork)
+library(ggrepel)
+library(tidymodels)
+library(Biostrings)
+library(readxl)
+library(gggenes)
+library(BSgenome.Hsapiens.NCBI.GRCh38) # NCBI reference; important to match with the clinvar annotations
+library(ggpubr) # could also use geom_annotate..
+library(tidymodels)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+source ("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+```
+
+Read in the DE analysis results, perform the merge to the variant annotation information
+(To do) align the guides to the clinvar database; need to match up gene and position from reference. Work on scripts
+
+```{r}
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101624_annotateGuides_data/2024_10_17_mageck.DEvsT0.mutAnno.csv')
+# I think keep this mutant for now
+de.dt[, mostSevereMutant := factor(mostSevereMutant, levels=c('Splice-acceptor','Splice-donor','Nonsense','Missense','UTR','Intron','Silent'))]
+```
+calculate z-score for this gene
+```{r}
+# for now, scale at the level of each comparison
+de.dt[, zscore.LFC := scale(LFC, center=T, scale=T),  by=.(editor,comparison,Gene)]
+subdt <- de.dt[Gene == 'PIK3CA',]
+
+
+# create a title for subDT
+subdt[, comparison := gsub('control', 'DMSO', comparison)]
+subdt[, grp_comparion := gsub('control', 'DMSO', comparison)]
+subdt[, title := paste(tstrsplit(grp_comparion, '_', keep=1), 'Day', numeratorTimepoint, 'vs Control Day 0', sep=' '), by=.I]
+
+```
+
+
+```{r}
+lapply(unique(subdt$title), function(x){
+
+    sub.dt <- subdt[!is.na(mostSevereMutant) &  !mostSevereMutant %in% c('Nonsense','UTR') & title == x,]
+    # take tidy the naming convention
+    
+    plotTitle <- sub.dt$title
+    
+    g <- ggplot(sub.dt, aes(x=LFC, fill=mostSevereMutant)) + #,  height = after_stat(density))) +
+      geom_density(alpha=0.7) +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+      xlim(c(-4,4)) +
+     # scale_x_continuous(labels=seq(-4,4,1)) +
+      #ggtitle(paste('PIK3CA', title, sep=' ')) +
+     # ggtitle(plotTitle) +
+      ggtitle(paste('PIK3CA', x, sep=' ')) +
+      scale_fill_viridis_d(option=2) +
+      facet_grid(mostSevereMutant~editor) +
+      theme_ridges() +
+      theme(strip.text.y=element_blank(),
+            axis.text.y = element_blank()
+            ) +
+      guides(fill= guide_legend('Category'))
+  g
+  #BackupAsPDF(g, paste0('ridgeplots/editors_faceted/',x,'.PIK3CA.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions = c(10,8))
+})
+```
+Maybe combine the two editors, take the z-scores
+
+```{r}
+lapply(unique(subdt$title), function(x){
+
+    sub.dt <- subdt[!is.na(mostSevereMutant) &  !mostSevereMutant %in% c('Nonsense','UTR') & title == x,]
+    
+    # get z-scores across editors
+    sub.dt[, zscore := scale(LFC, center=T, scale=T), by=.(title)]
+    
+    # take tidy the naming convention
+    
+    plotTitle <- sub.dt$title
+    
+    g <- ggplot(sub.dt, aes(x=zscore, fill=mostSevereMutant)) + #,  height = after_stat(density))) +
+      geom_density(alpha=0.7) +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+      #xlim(c(-4,4)) +
+     # scale_x_continuous(labels=seq(-4,4,1)) +
+      #ggtitle(paste('PIK3CA', title, sep=' ')) +
+     # ggtitle(plotTitle) +
+      ggtitle(paste('PIK3CA', x, sep=' ')) +
+      scale_fill_viridis_d(option=2) +
+      facet_grid(mostSevereMutant~.) +
+      theme_ridges() +
+      theme(strip.text.y=element_blank(),
+            axis.text.y = element_blank()
+            ) +
+      guides(fill= guide_legend('Category'))
+  g
+  #BackupAsPDF(g, paste0('ridgeplots/editors_faceted/',x,'.PIK3CA.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions = c(10,8))
+})
+
+```
+I dont think we want to collapse the two, for now just proceed as is with seperate plots
+```{r}
+lapply(unique(subdt$title), function(x){
+
+    sub.dt <- subdt[!is.na(mostSevereMutant) &  !mostSevereMutant %in% c('Nonsense','UTR') & title == x,]
+    
+    # get z-scores across editors
+    sub.dt[, zscore := scale(LFC, center=T, scale=T), by=.(title)]
+    
+    # take tidy the naming convention
+    
+    plotTitle <- sub.dt$title
+    
+    g <- ggplot(sub.dt, aes(x=zscore, fill=mostSevereMutant)) + #,  height = after_stat(density))) +
+      geom_density(alpha=0.7) +
+      xlab('Log2FC') +
+      ylab('Mutation Consequence') +
+      geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+      #xlim(c(-4,4)) +
+     # scale_x_continuous(labels=seq(-4,4,1)) +
+      #ggtitle(paste('PIK3CA', title, sep=' ')) +
+     # ggtitle(plotTitle) +
+      ggtitle(paste('PIK3CA', x, sep=' ')) +
+      scale_fill_viridis_d(option=2) +
+      facet_grid(mostSevereMutant~., scales='free_y') +
+      theme_ridges() +
+      theme(strip.text.y=element_blank(),
+            axis.text.y = element_blank()
+            ) +
+      guides(fill= guide_legend('Category'))
+  g
+  #BackupAsPDF(g, paste0('ridgeplots/editors_faceted/',x,'.PIK3CA.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions = c(10,8))
+})
+```
+scatterplots of LFC for comparisons
+
+```{r}
+# plot all (inc. non-synomonous) mutations
+subdt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense'), edit_Position := gsub('[A-Za-z]','', Amino_acid_edits)]
+subdt[!is.na(edit_Position), firstSite := tstrsplit(edit_Position,';', keep=1)]
+
+# do scatterplots of the different contrast pairs
+subdt.onlySites <- subdt[!is.na(firstSite),]
+subdt.onlySites[, firstSite := as.numeric(firstSite)]
+
+contrast.pairs <-  data.table(Var1 = c("abe8e_Alpelisib_22-vs-librep_0", "abe8e_Alpelisib_22-vs-librep_0", "abe8e_Alpelisib_22-vs-librep_0", "abe8e_Paxalisib_22-vs-librep_0",
+                                      "bemax_Alpelisib_22-vs-librep_0", "bemax_Alpelisib_22-vs-librep_0", "bemax_Alpelisib_22-vs-librep_0",  "bemax_Paxalisib_22-vs-librep_0"),
+                             Var2 = c("abe8e_Alpelisib_7-vs-librep_0",  "abe8e_DMSO_22-vs-librep_0", "abe8e_Paxalisib_22-vs-librep_0", "abe8e_DMSO_22-vs-librep_0",
+                                      "bemax_Alpelisib_7-vs-librep_0", "bemax_DMSO_22-vs-librep_0" , "bemax_Paxalisib_22-vs-librep_0", "bemax_DMSO_22-vs-librep_0"))
+
+
+subdt[, contrast := paste0(editor,'_', comparison)]
+
+
+
+apply(contrast.pairs, 1,  function(x){
+
+  
+  dt <- dcast(subdt.onlySites[contrast %in% x,], sgrna+firstSite+Amino_acid_edits+Gene~contrast, value.var = c('LFC'))
+
+  setnames(dt, new=c('sgrna', 'firstSite', 'Amino_acid_edits',  'gene', 'log2FC.x', 'log2FC.y'))
+
+  dt[, label := ifelse(abs(log2FC.x) > 1 & abs(log2FC.y) > 1, 'abs(LFC) > 1 both conditions',
+                              ifelse(abs(log2FC.x) > 1 & abs(log2FC.y)  < 1, 'abs(LFC) > 1 x-axis condition',
+                                     ifelse(abs(log2FC.y) > 1 & abs(log2FC.x)  < 1, 'abs(LFC) > 1 y-axis condition', 'abs(LFC) < 1')))]
+
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=firstSite)) +
+    geom_point(size=1) +
+    geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-1,1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('abs(LFC) > 1 x-axis condition'='#35B779FF','abs(LFC) > 1 y-axis condition'="#FDE725FF", 'abs(LFC) < 1'='grey','abs(LFC) > 1 both conditions'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label == 'abs(LFC) > 1 both conditions' & abs(log2FC.x) > 1.5 & abs(log2FC.y) > 1.5,],size = 3, max.overlaps = 20, segment.alpha=0.5, segment.linetype=2, show.legend = F) +
+    xlab(paste(x[1], 'log2 fold change',sep=' ')) +
+    ylab(paste(x[2], 'log2 fold change',sep=' ')) +
+    ggtitle(paste('PIK3CA Fold Change Comparisons')) + 
+    theme_bw() +
+    coord_obs_pred()
+  
+  #add cor score
+  #g <- g + stat_cor(data=dt, aes(x=log2FC.x, y=log2FC.y, label=..r.label..), method='pearson', inherit.aes = F)
+  
+  g
+  #BackupAsPDF(g, paste0('scatterplots/',x[1], '__', x[2],'.log2FC.scatterplots.'), dimensions=c(10,10))
+})
+```
+```{r}
+apply(contrast.pairs, 1,  function(x){
+
+  
+  dt <- dcast(subdt.onlySites[contrast %in% x,], sgrna+firstSite+Amino_acid_edits+Gene~title, value.var = c('LFC'))
+
+  xlab.title <- colnames(dt)[5]
+  ylab.title <- colnames(dt)[6]
+  
+  setnames(dt, new=c('sgrna', 'firstSite', 'Amino_acid_edits',  'gene', 'log2FC.x', 'log2FC.y'))
+  
+  dt[, aaLabel := gsub(';$', '', Amino_acid_edits)]
+
+    
+  print(x[1])
+  print(xlab.title)
+  print(x[2])
+  print(ylab.title)
+  
+  dt[, label := ifelse(abs(log2FC.x) > 1 & abs(log2FC.y) > 1, 'abs(LFC) > 1 both conditions',
+                              ifelse(abs(log2FC.x) > 1 & abs(log2FC.y)  < 1, 'abs(LFC) > 1 x-axis condition',
+                                     ifelse(abs(log2FC.y) > 1 & abs(log2FC.x)  < 1, 'abs(LFC) > 1 y-axis condition', 'abs(LFC) < 1')))]
+  
+  cas9.editor <- strsplit(x[1], '_')[[1]][1]
+  print(cas9.editor)
+  
+  
+  g <- ggplot(dt, aes(x=log2FC.x, y=log2FC.y, color=label, label=aaLabel)) +
+    geom_point(size=1.3) +
+    geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+    geom_hline(yintercept = c(-1,1), linetype=2, alpha=0.4) +
+    scale_color_manual(values=c('abs(LFC) > 1 x-axis condition'='#35B779FF','abs(LFC) > 1 y-axis condition'="#FDE725FF", 'abs(LFC) < 1'='grey','abs(LFC) > 1 both conditions'="#440154FF")) +
+    ggrepel::geom_text_repel(data=dt[label == 'abs(LFC) > 1 both conditions' & abs(log2FC.x) > 1.5 & abs(log2FC.y) > 1.5,],size = 3, max.overlaps = 20, segment.alpha=0.5, segment.linetype=2, show.legend = F) +
+    xlab(paste(xlab.title)) +
+    ylab(paste(ylab.title)) +
+    ggtitle(paste('PIK3CA Fold Change Comparisons (', cas9.editor, ')',  sep= '')) + 
+    theme_bw() +
+    coord_obs_pred()
+  
+  #add cor score
+  #g <- g + stat_cor(data=dt, aes(x=log2FC.x, y=log2FC.y, label=..r.label..), method='pearson', inherit.aes = F)
+  
+  g
+  BackupAsPDF(g, paste0('scatterplots/pik3ca.',x[1], '__', x[2],'.log2FC.scatterplots.'), dimensions=c(10,10))
+})
+```
+
+PIK3CA mutational hotspots; lets subset to just PIK3CA
+Find overlap intervals using foverlaps (write up note)
+```{r}
+subdt.onlySites[, status := 'abs(LFC) < 1']
+subdt.onlySites[abs(LFC) > 1, status := ifelse(LFC > 0, 'LFC > 1', 'LFC < -1')]
+
+
+PIK3CA.regions <- data.table(domain=c('PI3K-ABD','PI3K-RBD', 'C2 PI3K-type', 'PIK helical', 'PI3K/PI4K catalytic'),
+                             start=c(16,187, 330,517,765),
+                             end=c(105,289,487,694,1068))
+
+setkey(PIK3CA.regions, start,end)
+
+subdt.onlySites[, start := firstSite]
+subdt.onlySites[, end := firstSite]
+
+
+#using start and end keys for the PIK3CA lookup table
+test.dt <- foverlaps(subdt.onlySites, PIK3CA.regions, type="any")
+test.dt[is.na(domain), domain := '']
+```
+
+The plot with the gene annotation
+
+```{r}
+lapply(unique(test.dt$comparison), function(x){
+  
+  # filter to the set we are looking at right now
+  sub.dt <- test.dt[mostSevereMutant %in% c('Missense', 'Nonsense') & Gene %in% c("PIK3CA"),]
+  plot.title <- unique(sub.dt[comparison == x, title])
+  
+ # g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=LFC, fill=status, shape=editor, label=Amino_acid_edits)) +
+  g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=abs(LFC), fill=status, shape=editor)) +
+  geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=abs(LFC)), color="grey") +
+  geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-0.05), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+  geom_point(size=2.5) +
+  geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  ggtitle(paste0('PIK3CA ', plot.title)) +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  #facet_wrap(~title, ncol=1) +
+ # ggrepel::geom_text_repel(data=sub.dt[comparison == x & abs(LFC > 1.75),], 
+  #                         show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 100, size=2) +
+  scale_color_manual(values=c('LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',"PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+  scale_fill_manual(values=c('LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',  "PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5"), breaks=c('abs(LFC) < 1','LFC > 1', 'LFC < -1', "PI3K-ABD", "PI3K-RBD", "C2 PI3K-type","PIK helical", "PI3K/PI4K catalytic")) +
+  #scale_color_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  #scale_fill_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  scale_shape_manual(values = 21:22) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold")) +
+  guides(fill = guide_legend(override.aes = list(shape =21), title='key'),
+         color = guide_legend(override.aes = list(shape =21) ))
+
+  g
+ BackupAsPDF(g, paste0('tileplots/PIK3CA_proteinAnno_firstPass/', x,'.LFC.PIK3CA.lollipop.nolabel.tileplot' ), dimensions=c(16,12)) 
+})
+```
+
+Lets try fit a curve to points on ggplot
+Lets try a gaussian smoothing of the data and just plot the abs of each
+
+```{r}
+
+lapply(unique(test.dt$comparison), function(x){
+  
+  # filter to the set we are looking at right now
+  sub.dt <- test.dt[mostSevereMutant %in% c('Missense', 'Nonsense') & Gene %in% c("PIK3CA"),]
+  plot.title <- unique(sub.dt[comparison == x, title])
+  
+  
+  message('Gaussian smoothing...')
+  
+  g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=abs(LFC))) +
+    geom_segment(data=sub.dt[comparison == x,], aes(x=firstSite, xend=firstSite, y=0, yend=abs(LFC)), color="grey", alpha=0.6) +
+    geom_point(data=sub.dt[comparison == x,], aes(shape=editor, fill=status, alpha=0.6),size=2) +
+    geom_smooth(data=sub.dt[comparison == x,], method='loess', span=0.2, color='black') +
+    geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-0.05), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+    geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    ggtitle(paste0('PIK3CA ', plot.title)) +
+    xlab('amino acid residue') +
+    ylab('LFC') +
+    scale_color_manual(values=c('LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',"PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+    scale_fill_manual(values=c('LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',  "PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5"), breaks=c('abs(LFC) < 1','LFC > 1', 'LFC < -1', "PI3K-ABD", "PI3K-RBD", "C2 PI3K-type","PIK helical", "PI3K/PI4K catalytic")) +
+    scale_shape_manual(values = 21:22) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21), title='key'),
+           alpha = "none",
+           color = guide_legend(override.aes = list(shape =21) ))
+
+  g
+  #BackupAsPDF(g, paste0('tileplots/PIK3CA_proteinAnno_withSmoothCurve/', x,'.LFC.PIK3CA.lollipop.nolabel.tileplot' ), dimensions=c(16,12)) 
+})
+
+
+# repeat without color; just use the 
+
+lapply(unique(test.dt$comparison), function(x){
+  
+  # filter to the set we are looking at right now
+  sub.dt <- test.dt[mostSevereMutant %in% c('Missense', 'Nonsense') & Gene %in% c("PIK3CA"),]
+  plot.title <- unique(sub.dt[comparison == x, title])
+  
+  g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=abs(LFC))) +
+    geom_segment(data=sub.dt[comparison == x,], aes(x=firstSite, xend=firstSite, y=0, yend=abs(LFC)), color="grey", alpha=0.6) +
+    geom_point(data=sub.dt[comparison == x,], aes(shape=editor, alpha=0.6),size=2, fill='grey') +
+    geom_point(data=sub.dt[comparison == x,], aes(shape=editor, alpha=0.6),size=2, fill='grey') +
+    geom_smooth(data=sub.dt[comparison == x,], method='loess', span=0.2, color='black') +
+    geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-0.05), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+    geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    ggtitle(paste0('PIK3CA ', plot.title)) +
+    xlab('amino acid residue') +
+    ylab('LFC') +
+    scale_color_manual(values=c('LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',"PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+    scale_fill_manual(values=c('LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',  "PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5"), breaks=c('abs(LFC) < 1','LFC > 1', 'LFC < -1', "PI3K-ABD", "PI3K-RBD", "C2 PI3K-type","PIK helical", "PI3K/PI4K catalytic")) +
+    scale_shape_manual(values = 21:22) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21), title='domain'),
+           alpha = "none",
+           color = guide_legend(override.aes = list(shape =21) ))
+
+  g
+  BackupAsPDF(g, paste0('tileplots/PIK3CA_proteinAnno_withSmoothCurve/', x,'.LFC.PIK3CA.lollipop.noColor.tileplot' ), dimensions=c(16,12)) 
+})
+```
+highlight the sites that were mutated 
+
+```{r}
+ppi.guides <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/102224_CyScapse_PIK3CA_data/2024_10_22_ppi.same.mutants.guides.txt')
+
+ppi.guides$Amino_acid_edits %>%  unique()
+guides.oi <- unique(ppi.guides$sgrna)
+
+lapply(unique(test.dt$comparison), function(x){
+  
+  # filter to the set we are looking at right now
+  sub.dt <- test.dt[mostSevereMutant %in% c('Missense', 'Nonsense') & Gene %in% c("PIK3CA"),]
+  plot.title <- unique(sub.dt[comparison == x, title])
+  
+  g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=abs(LFC))) +
+    geom_segment(data=sub.dt[comparison == x,], aes(x=firstSite, xend=firstSite, y=0, yend=abs(LFC)), color="grey", alpha=0.6) +
+    geom_point(data=sub.dt[comparison == x,], aes(shape=editor, alpha=0.6),size=2) +
+    geom_point(data=sub.dt[comparison == x & sgrna %in% guides.oi,], aes(shape=editor, alpha=0.6, fill='Minkyu et al.2022'), size=2) +
+    geom_smooth(data=sub.dt[comparison == x,], method='loess', span=0.2, color='black') +
+    #geom_text_repel(data=sub.dt[comparison == x & sgrna %in% guides.oi,]) +
+    geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-0.05), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+    geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    ggtitle(paste0('PIK3CA ', plot.title)) +
+    xlab('amino acid residue') +
+    ylab('LFC') +
+    scale_color_manual(values=c('Minkyu et al.2022'='red', 'LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',"PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+    scale_fill_manual(values=c('Minkyu et al.2022'='red', 'LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',  "PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5"), breaks=c('abs(LFC) < 1','LFC > 1', 'LFC < -1', "PI3K-ABD", "PI3K-RBD", "C2 PI3K-type","PIK helical", "PI3K/PI4K catalytic")) +
+    scale_shape_manual(values = 21:22) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21), title='domain'),
+           alpha = "none",
+           color = guide_legend(override.aes = list(shape =21) ))
+
+  g
+  BackupAsPDF(g, paste0('tileplots/PIK3CA_proteinAnno_bait/', x,'.LFC.PIK3CA.lollipop.noColor.tileplot' ), dimensions=c(16,12)) 
+})
+```
+All mutants 
+```{r}
+ppi.guides <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/102224_CyScapse_PIK3CA_data/2024_10_22_ppi.same.location.guides.txt')
+guides.oi <- unique(ppi.guides$sgrna)
+
+ppi.guides$Amino_acid_edits %>%  unique()
+
+lapply(unique(test.dt$comparison), function(x){
+  
+  # filter to the set we are looking at right now
+  sub.dt <- test.dt[mostSevereMutant %in% c('Missense', 'Nonsense') & Gene %in% c("PIK3CA"),]
+  plot.title <- unique(sub.dt[comparison == x, title])
+  
+  g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=abs(LFC), label=Amino_acid_edits)) +
+    geom_segment(data=sub.dt[comparison == x,], aes(x=firstSite, xend=firstSite, y=0, yend=abs(LFC)), color="grey", alpha=0.6) +
+    geom_point(data=sub.dt[comparison == x,], aes(shape=editor, alpha=0.6),size=2) +
+    geom_point(data=sub.dt[comparison == x & sgrna %in% guides.oi,], aes(shape=editor, alpha=0.6, fill='Minkyu et al.2022'), size=2) +
+    geom_smooth(data=sub.dt[comparison == x,], method='loess', span=0.2, color='black') +
+    geom_text_repel(data=sub.dt[comparison == x & sgrna %in% guides.oi,]) +
+    geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-0.05), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+    geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+    scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+    ggtitle(paste0('PIK3CA ', plot.title)) +
+    xlab('amino acid residue') +
+    ylab('LFC') +
+    scale_color_manual(values=c('Minkyu et al.2022'='red', 'LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',"PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+    scale_fill_manual(values=c('Minkyu et al.2022'='red', 'LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',  "PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5"), breaks=c('abs(LFC) < 1','LFC > 1', 'LFC < -1', "PI3K-ABD", "PI3K-RBD", "C2 PI3K-type","PIK helical", "PI3K/PI4K catalytic")) +
+    scale_shape_manual(values = 21:22) +
+    theme_ridges() +
+    theme(plot.title = element_text(size = 20, face = "bold")) +
+    guides(fill = guide_legend(override.aes = list(shape =21), title='domain'),
+           alpha = "none",
+           color = guide_legend(override.aes = list(shape =21) ))
+
+  g
+  #BackupAsPDF(g, paste0('tileplots/PIK3CA_proteinAnno_baitLabel/', x,'.LFC.PIK3CA.lollipop.noColor.tileplot' ), dimensions=c(16,12)) 
+})
+```
+Lets just plot the smooth curves of each of the timepoints; dont plots the LFCs in the background first
+
+
+```{r}
+test.dt[, treatment := factor(str_extract(comparison, 'Alpelisib|DMSO|Paxalisib'), levels=c('DMSO','Paxalisib','Alpelisib'))]
+test.dt[, numeratorTimepoint := factor(numeratorTimepoint, levels=c('22','7'))]
+```
+
+```{r}
+
+g <- ggplot(test.dt[mostSevereMutant %in% c('Missense', 'Nonsense') & Gene %in% c("PIK3CA") & comparison =='Alpelisib_22-vs-librep_0',], aes(x=firstSite, y=abs(LFC))) +
+  geom_point(alpha=0.2) +
+  geom_smooth(span=0.3) +
+  geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-0.05), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm"), color='black') +  
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  ggtitle('PIK3CA') +
+  xlab('aa residue') +
+  ylab('abs(LFC)') +
+  scale_color_manual(values=c('Alpelisib'="#440154FF", 'DMSO'="#21908CFF",'Paxalisib'="#FDE725FF")) +
+  scale_fill_manual(values=c("PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+  scale_shape_manual(values = 21:22) +
+  facet_grid(editor~numeratorTimepoint, scales='free_y') +
+  theme_bw()
+
+g + coord_cartesian(ylim=c(-0.05,1))
+#BackupAsPDF(g + coord_cartesian(ylim=c(-0.05,1)), paste0('LFC.PIK3CA.loessSmooth.facet.tileplot'), dimensions=c(16,12)) 
+
+
+# plot without the points
+g <- ggplot(test.dt[mostSevereMutant %in% c('Missense', 'Nonsense') & Gene %in% c("PIK3CA") & comparison =='Alpelisib_22-vs-librep_0',], aes(x=firstSite, y=abs(LFC))) +
+#  geom_point(alpha=0.2, color='grey') +
+  geom_smooth(span=0.3) +
+  geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-0.05), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm"), color='black') +  
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  ggtitle('PIK3CA') +
+  xlab('aa residue') +
+#  ylim(c(-0.05,1)) +
+  ylab('abs(LFC)') +
+  scale_color_manual(values=c('Alpelisib'="#440154FF", 'DMSO'="#21908CFF",'Paxalisib'="#FDE725FF")) +
+  scale_fill_manual(values=c("PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+  scale_shape_manual(values = 21:22) +
+  facet_grid(editor~numeratorTimepoint, scales='free_y') +
+  theme_bw()
+
+g  + coord_cartesian(ylim=c(-0.05,1))
+#BackupAsPDF(g, paste0('LFC.PIK3CA.loessSmooth.facet.nopoints.tileplot'), dimensions=c(16,12)) 
+
+```
+Including points makes the plot messy...
+facet this in another way... maybe we want to facet by treatment group rather than timepoint (so see change from t7 to t22)
+
+```{r}
+g <- ggplot(test.dt[mostSevereMutant %in% c('Missense', 'Nonsense') & Gene %in% c("PIK3CA"),], aes(x=firstSite, y=abs(LFC), color=treatment, linetype=numeratorTimepoint)) +
+#  geom_point(alpha=0.2) +
+  geom_smooth(span=0.5, se=F) +
+  geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-0.05), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm"), color='black') +  
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  facet_grid(~editor, scales='free_y') +
+  ggtitle('PIK3CA') +
+  xlab('aa residue') +
+  ylab('abs(LFC)') +
+  scale_color_manual(values=c('Alpelisib'="#440154FF", 'DMSO'="#21908CFF",'Paxalisib'="#FDE725FF")) +
+  scale_fill_manual(values=c("PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+  scale_shape_manual(values = 21:22) +
+  theme_bw() +
+  guides(linetype=guide_legend(override.aes = list(shape =21)))
+
+g 
+BackupAsPDF(g, 'smoothlines.PIK3CA.linechart', dimensions = c(12,8))
+```
+ok, need to go back to the tileplots and i) increase the LFC threshold, define the other groupings and plot
+
+Example plot of only one of contrast raising the LFC to 1.5
+
+```{r}
+
+subdt.onlySites[, new.status := "abs(LFC) < 1.5"]
+subdt.onlySites[abs(LFC) >= 1.5, new.status := ifelse(LFC>0, "LFC > 1.5", "LFC < -1.5")]
+
+g <- ggplot(subdt.onlySites[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense') & comparison == 'Alpelisib_22-vs-librep_0',], 
+            aes(x=firstSite, y=LFC, fill=new.status, shape=editor, label=Amino_acid_edits)) +
+  geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=LFC), color="grey") +
+  geom_point(size=2.5) +
+  geom_hline(yintercept=c(-1.5,1.5), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  facet_wrap(~Gene, ncol=1, scales='free') +
+  ggtitle('Example contrast') +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  ggrepel::geom_text_repel(data=subdt.onlySites[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense') & comparison == 'Alpelisib_22-vs-librep_0' & Gene %in% c("AKT1","MTOR","PIK3CA","PTEN") & abs(LFC > 2),], 
+                           show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 60, size=2) +
+  scale_fill_manual(values=c("LFC < -1.5"="dodgerblue2","LFC > 1.5"="#E31A1C", "abs(LFC) < 1.5"='grey')) +
+  scale_shape_manual(values = 21:22) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+g
+```
+
+Create a new factor label to highlight groups
+```{r}
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101624_annotateGuides_data/2024_10_17_mageck.DEvsT0.mutAnno.csv')
+de.dt[, mostSevereMutant := factor(mostSevereMutant, levels=c('Splice-acceptor','Splice-donor','Nonsense','Missense','UTR','Intron','Silent'))]
+
+# we dont want mutants affecthing splicing, so dropped from plotting
+de.dt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense'), edit_Position := gsub('[A-Za-z]','', Amino_acid_edits)]
+de.dt[!is.na(edit_Position), firstSite := tstrsplit(edit_Position,';', keep=1)]
+
+# write function to extract the first 
+
+
+
+# convert the table to wide format
+de.wide.dt <- reshape2::dcast(de.dt[!is.na(firstSite) & Gene == 'PIK3CA',], sgrna+editor+Gene+firstSite+Amino_acid_edits+mostSevereMutant~comparison, value.var='LFC') %>% 
+  as.data.table()
+
+de.wide.dt[, firstSite := as.numeric(firstSite)]
+
+colnames(de.wide.dt)
+# define cateogries for the different mutations
+de.wide.dt[, `:=`(`Day22_Alpelisib-Ctrl` = `Alpelisib_22-vs-librep_0` -  `control_22-vs-librep_0`,
+                  `Day7_Alpelisib-Ctrl` = `Alpelisib_7-vs-librep_0` -  `control_7-vs-librep_0`,
+                  `Day22_Paxalisib-Ctrl` = `Paxalisib_22-vs-librep_0` -  `control_22-vs-librep_0`,
+                  `Day7_Paxalisib-Ctrl` = `Paxalisib_7-vs-librep_0` -  `control_7-vs-librep_0`
+                    )]
+
+# looks ok
+#de.wide.dt[,.(`Alpelisib_22-vs-librep_0`, `control_22-vs-librep_0`, `Day22_Alpelisib-Ctrl`)]
+
+# describe the functional impact of these mutations
+de.wide.dt[, Alpelisib_Day22_functionalImpact := ifelse(`Alpelisib_22-vs-librep_0` > 1.5 & `Day22_Alpelisib-Ctrl` > 1, 'drug dependency',
+                                                        ifelse(`Alpelisib_22-vs-librep_0` < -1.5 & `Day22_Alpelisib-Ctrl` < -1, 'drug susceptible',
+                                                               ifelse(`Alpelisib_22-vs-librep_0` < -1.5 & `control_22-vs-librep_0` < -1.5, 'drivers', '')))]
+
+
+
+
+
+g <- ggplot(de.wide.dt[Gene == 'PIK3CA',], aes(x=firstSite, y=`Alpelisib_22-vs-librep_0`, fill=Alpelisib_Day22_functionalImpact, shape=editor)) +
+  geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=`Alpelisib_22-vs-librep_0`), color="grey") +
+  geom_point(size=2.5) +
+  geom_hline(yintercept=c(-1.5,1.5), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  ggtitle('Example contrast') +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  scale_fill_manual(values=c("PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+  scale_shape_manual(values = 21:22) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+g
+```
+Ok this looks like something; but dont 
+
+merge the functional anno and the index dt
+```{r}
+index.dt <- de.wide.dt[, .(sgrna, editor, Alpelisib_Day22_functionalImpact)]
+
+tileplot.dt <- merge(x=de.dt[Gene == 'PIK3CA' & !is.na(edit_Position) & comparison %in% c('Alpelisib_22-vs-librep_0', 'control_22-vs-librep_0'), ], y=index.dt, by=c('sgrna', 'editor'), all.x=T)
+tileplot.dt[, firstSite := as.numeric(firstSite)]
+
+tileplot.dt[, treatment := ifelse(grepl('Alpelisib', comparison), 'Alpelisib', 'DMSO')]
+
+tileplot.dt %>%  head()
+```
+
+now produce the tileplot and facet the control and treatment
+Also merge the domain info to plot
+
+```{r}
+PIK3CA.regions <- data.table(domain=c('PI3K-ABD','PI3K-RBD', 'C2 PI3K-type', 'PIK helical', 'PI3K/PI4K catalytic'),
+                             start=c(16,187, 330,517,765),
+                             end=c(105,289,487,694,1068))
+# do I need this if I specify the join
+setkey(PIK3CA.regions, start,end)
+
+tileplot.dt[, start := firstSite]
+tileplot.dt[, end := firstSite]
+
+tileplot.dt <- foverlaps(tileplot.dt, PIK3CA.regions, type="any", by.x=c('start', 'end'), by.y=c('start','end'))
+tileplot.dt[is.na(domain), domain := '']
+```
+
+
+```{r}
+library(ggridges)
+
+tileplot.dt$Alpelisib_Day22_functionalImpact %>%  unique()
+tileplot.dt[Alpelisib_Day22_functionalImpact == '', Alpelisib_Day22_functionalImpact := 'abs(LFC) < 1.5']
+
+tileplot.dt$Alpelisib_Day22_functionalImpact %>%  unique()
+
+tileplot.dt[, `Functional Impact` := Alpelisib_Day22_functionalImpact]
+
+tileplot.dt[, `Functional Impact` := ifelse(`Functional Impact` == "drug dependency", "drug resistant (enriched in Alpelisib vs Control)",
+                                            ifelse(`Functional Impact` == "drug susceptible", "drug sensitive (depleted in Alpelisib vs Control)", "no significant change (Alpelisib vs Control)"))]
+
+
+g <- ggplot(tileplot.dt[grepl('Alpelisib', comparison),], aes(x=firstSite, y=LFC, shape=editor)) +
+  geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=LFC), color="grey") +
+  geom_point(size=3, aes(fill=`Functional Impact`)) +
+  geom_hline(yintercept=c(-1.5,1.5), alpha=0.6, linetype=3) +
+  geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-4.9), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  ggtitle('PIK3CA') +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  scale_fill_manual(values=c("drug resistant (enriched in Alpelisib vs Control)" = '#35B779FF', 
+                             "drug sensitive (depleted in Alpelisib vs Control)"="#440154FF", 
+                             'no significant change (Alpelisib vs Control)'='grey',
+                             "PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5"),
+                    breaks=c("drug resistant (enriched in Alpelisib vs Control)","drug sensitive (depleted in Alpelisib vs Control)",
+                             "no significant change (Alpelisib vs Control)","PIK helical","PI3K/PI4K catalytic","C2 PI3K-type", "PI3K-ABD", "PI3K-RBD")
+                    ) +
+  scale_shape_manual(values = 21:22) +
+  #facet_grid(treatment~.) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        legend.text=element_text(size=8)) +
+  guides(fill = guide_legend(override.aes = list(shape =21), title=NULL),
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+g
+BackupAsPDF(g, 'PIK3CA.Alpelisib.vsDMSO.tilechart',dimensions=c(18,8))
+
+
+tileplot.dt[grepl('Alpelisib', comparison),.N, by=sgrna]
+
+
+
+```
+```{r}
+tileplot.dt[, `Functional Impact` := Alpelisib_Day22_functionalImpact]
+
+tileplot.dt[, `Functional Impact` := ifelse(`Functional Impact` == "drug dependency", "enriched in Alpelisib vs Control",
+                                            ifelse(`Functional Impact` == "drug susceptible", "depleted in Alpelisib vs Control", "no significant change"))]
+
+
+tileplot.dt[,.(start, end)]
+
+g <- ggplot(tileplot.dt[grepl('Alpelisib', comparison),], aes(x=firstSite, y=LFC, shape=editor)) +
+  geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=LFC), color="grey") +
+  geom_point(size=3, aes(fill=`Functional Impact`)) +
+  geom_hline(yintercept=c(-1.5,1.5), alpha=0.6, linetype=3) +
+  geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-4.9), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+  geom_gene_label(data=unique(tileplot.dt[,.(domain, start,end)]), aes(xmin=start, xmax=end, label=domain)) +
+  #annotate("text", x = PIK3CA.regions$start+20, y = -4.9, label = PIK3CA.regions$domain, size=3, color='white') +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  ggtitle('PIK3CA') +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  scale_fill_manual(values=c("enriched in Alpelisib vs Control" = '#35B779FF', 
+                             "depleted in Alpelisib vs Control"="#440154FF", 
+                             'no significant change'='grey',
+                             "PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5"),
+                    breaks=c("enriched in Alpelisib vs Control","depleted in Alpelisib vs Control",
+                             "no significant change")
+                    ) +
+  scale_shape_manual(values = 21:22) +
+  #facet_grid(treatment~.) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold"),
+        legend.text=element_text(size=8)) +
+  guides(fill = guide_legend(override.aes = list(shape =21), title=NULL),
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+g
+BackupAsPDF(g, 'PIK3CA.Alpelisib.vsDMSO.tilechart',dimensions=c(18,8), format='png')
+```
+
+```{r}
+```
+
+
+scatterplot of these two conditions
+```{r}
+tileplot.wide.dt <- dcast(tileplot.dt, sgrna+`Functional Impact`+editor+domain+Gene~comparison,value.var = 'LFC')
+
+g <- ggplot(tileplot.wide.dt, aes(x=`Alpelisib_22-vs-librep_0`, y=`control_22-vs-librep_0`, color=`Functional Impact`)) +
+  geom_point(size=1.3) +
+  geom_vline(xintercept=c(-1.5,1.5), alpha=0.6, linetype=2) +
+  geom_hline(yintercept=c(-1.5,1.5), alpha=0.6, linetype=2) +
+  xlab('LFC Alpelisib Day22 vs Day0') +
+  ylab('LFC DMSO Day22 vs Day0') +
+  ggtitle('PIK3CA Alpelisib vs DMSO day22') +
+  scale_color_manual(values = c("drug susceptible (Alpelisib LFC < -1.5 & Δ DMSO LFC < -1)" = '#35B779FF', 
+                             "drug dependence (Alpelisib LFC > 1.5 & Δ DMSO LFC > 1)"="#440154FF", 
+                             "driver (Alpelisib LFC < -1.5 & DMSO LFC < -1.5)"="#FDE725FF",
+                             'abs(LFC) < 1.5'='grey')) +
+  coord_obs_pred() +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'PIK3CA.Alpelisib.vsDMSO.scatterplot',dimensions=c(9,9))
+```
+
+
+
+Not used...
+
+```{r}
+g <- ggplot(tileplot.dt, aes(x=firstSite, y=LFC, shape=editor)) +
+  geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=LFC), color="grey") +
+  geom_point(size=2.5, aes(color=Alpelisib_Day22_functionalImpact)) +
+  geom_hline(yintercept=c(-1.5,1.5), alpha=0.6, linetype=3) +
+  geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-4.9), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  ggtitle('PIK3CA') +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  scale_color_manual(values=c("drug susceptible" = '#35B779FF', "drug dependency"="#440154FF", "drivers"="#FDE725FF", 'abs(LFC) < 1.5'='grey')) +
+  scale_fill_manual(values=c("PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+  scale_shape_manual(values=c(15,16)) +
+  facet_grid(treatment~.) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold"))
+
+g
+
+BackupAsPDF(g, 'test2',dimensions=c(14,8))
+
+```
+
+
+
+Controls and treatments; for now we want to combine both in the same plots, draw smooth curves for both and see if they look similar, but possibly different
+
+```{r}
+test.dt[numeratorTimepoint == 22,]
+```
+
+
+
+testing..
+```{r}
+
+test.dt$comparison
+test.dataset <- test.dt[mostSevereMutant %in% c('Missense', 'Nonsense') & Gene %in% c("PIK3CA") &  comparison == "Alpelisib_22-vs-librep_0"]
+
+g <- ggplot(test.dataset, aes(x=firstSite, y=abs(LFC))) +
+  geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=abs(LFC)), color="grey", alpha=0.6) +
+  geom_point(data=test.dataset, aes(shape=editor, fill=status, alpha=0.6),size=2) +
+  geom_smooth(data=test.dataset, method='loess', span=0.2, color='black') +
+  geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-0.05), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+  geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  ggtitle(paste0('PIK3CA ')) +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  scale_color_manual(values=c('LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',"PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5")) +
+  scale_fill_manual(values=c('LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',  "PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5"), breaks=c('abs(LFC) < 1','LFC > 1', 'LFC < -1', "PI3K-ABD", "PI3K-RBD", "C2 PI3K-type","PIK helical", "PI3K/PI4K catalytic")) +
+  scale_shape_manual(values = 21:22) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold")) +
+  guides(fill = guide_legend(override.aes = list(shape =21), title='key'),
+         color = guide_legend(override.aes = list(shape =21) ))
+
+g
+
+
+```
+
+```{r}
+lapply(unique(test.dt$comparison), function(x){
+  
+  # filter to the set we are looking at right now
+  sub.dt <- test.dt[mostSevereMutant %in% c('Missense', 'Nonsense') & Gene %in% c("PIK3CA"),]
+  plot.title <- unique(sub.dt[comparison == x, title])
+  
+  
+  message('Gaussian smoothing...')
+  
+  sub.dt[, smooth.LFC := ksmooth(firstSite, abs(LFC), kernel='normal'), by=.(editor)]
+  
+ # g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=LFC, fill=status, shape=editor, label=Amino_acid_edits)) +
+  g <- ggplot(sub.dt[comparison == x,], aes(x=firstSite, y=(smooth.LFC), fill=editor)) +
+    geom_line() +
+ # geom_segment(aes(x=firstSite, xend=firstSite, y=0, yend=abs(LFC)), color="grey") +
+  geom_gene_arrow(aes(xmin=start, xmax=end, fill=domain, y=-0.05), arrowhead_width = grid::unit(0, "mm"), arrowhead_height = grid::unit(0, "mm")) +  
+  geom_point(size=2.5, alpha=0.3) +
+  geom_hline(yintercept=c(1), alpha=0.6, linetype=3) +
+  scale_x_continuous(n.breaks = 20, expand = c(0, 0), limits = c(0, NA)) +
+  ggtitle(paste0('PIK3CA ', plot.title)) +
+  xlab('amino acid residue') +
+  ylab('LFC') +
+  #facet_wrap(~title, ncol=1) +
+ # ggrepel::geom_text_repel(data=sub.dt[comparison == x & abs(LFC > 1.75),], 
+  #                         show.legend = F, segment.alpha=0.5, segment.linetype=2, max.overlaps = 100, size=2) +
+  scale_color_manual(values=c('LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',  "PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5"), breaks=c('abs(LFC) < 1','LFC > 1', 'LFC < -1', "PI3K-ABD", "PI3K-RBD", "C2 PI3K-type","PIK helical", "PI3K/PI4K catalytic")) +
+  scale_fill_manual(values=c('LFC < -1'="dodgerblue2",'LFC > 1'="#E31A1C", 'abs(LFC) < 1'='grey',  "PIK helical" = "#DB717F", "PI3K/PI4K catalytic"="#B95FDA", "C2 PI3K-type"="#DCC98F", "PI3K-ABD"="#98DCCD",  "PI3K-RBD"="#B1AAD5"), breaks=c('abs(LFC) < 1','LFC > 1', 'LFC < -1', "PI3K-ABD", "PI3K-RBD", "C2 PI3K-type","PIK helical", "PI3K/PI4K catalytic")) +
+  #scale_color_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  #scale_fill_manual(values=c('down'="#7AD151FF",'up'= "#FDE725FF", 'not'='grey')) +
+  scale_shape_manual(values = 21:22) +
+  theme_ridges() +
+  theme(plot.title = element_text(size = 20, face = "bold")) +
+  guides(fill = guide_legend(override.aes = list(shape =21), title='key'),
+         color = guide_legend(override.aes = list(shape =21) ))
+
+  g
+ #BackupAsPDF(g, paste0('tileplots/PIK3CA_proteinAnno_firstPass/', x,'.LFC.PIK3CA.lollipop.nolabel.tileplot' ), dimensions=c(16,12)) 
+})
+```
+
+
+```{r}
+with(cars, {
+    plot(speed, dist)
+    lines(ksmooth(speed, dist, "normal", bandwidth = 2), col = 2)
+  #  lines(ksmooth(speed, dist, "normal", bandwidth = 5), col = 3)
+})
+```
+
+
+
+
+
+```{r}
+lapply(unique(de.dt$comparison), function(x){
+
+      # subset to this data
+      subdt <-  de.dt[!is.na(mostSevereMutant) &  !mostSevereMutant %in% c('Nonsense','UTR') & comparison == x,]
+    
+      for (i in c("MTOR","AKT1","PIK3CA","PTEN")){
+        g <- ggplot(subdt[Gene == i,], aes(x=LFC, y=mostSevereMutant, fill=mostSevereMutant, height=after_stat(density))) + #,  height = after_stat(density))) +
+          geom_density_ridges(scale = 1, stat='density') +
+          xlab('Log2FC') +
+          ylab('Mutation Consequence') +
+          geom_vline(xintercept=c(-1,1), linetype=2, alpha=0.6) +
+          #scale_x_continuous(breaks=c(-5,5)) +
+          ggtitle(paste(i, x, 'LFC distributions', sep=' ')) +
+          scale_fill_viridis_d(option=2) +
+          facet_grid(~editor) +
+          theme_ridges() +
+          guides(fill='none')
+        g
+        print(g)
+       # BackupAsPDF(g, paste0('ridgeplots/perContrast_Gene_noUTR/',x,'.',i,'.LFC.Distributions.mutantConsequence.ridgeplot'), dimensions=c(8,6))      
+      }
+})
+```
+

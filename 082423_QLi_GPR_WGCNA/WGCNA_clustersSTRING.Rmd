@@ -1,0 +1,175 @@
+---
+title: "WGCNA_clustersSTRING"
+author: "Martin Gordon"
+date: "2023-10-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## WGCNA CLusters STRING network 
+
+```{r}
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library(pbapply) #apply functions with progress bar
+library(igraph)
+library(RCy3) # cytoscape interface
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+source ("../../utils/bp_utils/NetworkPropagation.R")
+source("../../utils/bp_utils/PPINetworkModularized.R")
+
+```
+
+Load the cluster assignment and submit each cluster gene list to STRING to generate a PPIs
+
+```{r}
+# file with cluster assignment for each gene/protein
+cluster.assignment <- fread('./output/wgcna.clustergenes.adjmat.csv')
+
+string.gene.map <- fread('./data/9606.protein.aliases.v12.0.txt.gz')
+string.gene.map[,GeneID := alias]
+colnames(string.gene.map) <- c('string', 'alias', 'source', 'GeneID')
+
+cluster.assignment[string.gene.map, stringID := i.string, on=c('GeneID', 'GeneID') ]
+cluster.assignment[, Cluster := sub('cluster', '', Cluster)]
+
+# add ME info to node table
+MEs <- fread('./output/top10.K.percluster.csv')
+
+MEs[, GeneID := rn]
+
+cluster.assignment[MEs, ME := GeneID, on=c('GeneID', 'GeneID')]
+cluster.assignment[!is.na(ME),]
+
+cluster.node.table <- split(cluster.assignment, cluster.assignment$Cluster)
+#reorder
+cluster.node.table <- cluster.node.table[clusters]
+
+```
+
+
+
+
+Create a visual style for the network
+
+```{r}
+#deleteVisualStyle("gcpr.style")
+# color palette for the 11 modules
+col.pal <- c("#D57AC7","#8DDDE1","#A1E4AC","#6EE766","#CEDF5F","#DEC5D2","#85A693","#DBBB7C","#7D9AD6","#D96A6E","#A94FDD")  #"#999933" '#DDCC77' "grey"
+
+
+style.name = "gcpr.style"
+
+
+defaults <- list(NODE_SHAPE="ellipse",
+                 LABEL_FONT_SIZE=30,
+                 NODE_SIZE=50,
+                 EDGE_TRANSPARENCY=100,
+                 EDGE_OPACITY=100,
+                 NODE_COLOR="#D3D3D3",
+                 NODE_BORDER_WIDTH =2)
+
+nodeLabels      <- mapVisualProperty('node label','GeneID','p')
+nodeFills       <- mapVisualProperty('node fill color','Cluster','d', c("1","2", "3","4","5","6","7","8","9", "10","11"), col.pal)
+edgeWidth       <- mapVisualProperty('edge width','stringdb::score','c', c(0.8,1), c(1,5))
+
+
+createVisualStyle(style.name, defaults, list(nodeLabels,nodeFills,edgeWidth))
+```
+
+iterate through the clusters and create a string network from each 
+
+```{r}
+clusters <- cluster.assignment[, unique(Cluster)]
+```
+
+create a  high-confidence PPI from the STRING network (0.8)
+Don't add connectors right now as want to see differences in what we are measuring 
+```{r}
+str.query <- lapply(clusters, function(x){
+  string.cmd <- paste('string protein query query="', paste(cluster.assignment[Cluster == x, GeneID], collapse = '\n'), '" cutoff=0.8 limit=0 species="Homo sapiens"',  sep = "")
+  })
+
+names(str.query) <- clusters
+```
+
+Create the networks and apply node table data and styles
+
+```{r}
+lapply(seq_along(str.query), function(x,n,i){
+  # create STRING network
+  commandsRun(x[[i]])
+  # name network (how to merge to same collections)
+  net.name <- paste0(n[[i]],'.module.STRING.800')
+  renameNetwork(net.name)
+  # load additional node info
+  loadTableData(cluster.node.table[[i]], data.key.column=c("GeneID"), table.key.column="query term")
+  
+  # use above node info to set visuals for each network
+  setVisualStyle(style.name)
+  }, x=str.query, n=names(str.query))
+```
+
+Use MCL clustering and create subnetworks from each of the networks
+We cluster on STRING score and inflation value of 2
+
+
+```{r}
+
+setNodeShapeDefault("ELLIPSE",  style.name)
+lockNodeDimensions("TRUE",  style.name)
+setNodeSize("65", style.name)
+setNodeColorDefault("#D3D3D3", style.name)
+setNodeBorderWidthDefault("2", style.name)
+setNodeBorderColorDefault("#616060", style.name)
+setNodeLabelMapping("display name", style.name)
+setNodeSizeDefault("65", style.name)
+setNodeFontSizeDefault("15", style.name)
+setEdgeOpacityDefault(140, style.name)
+
+setNodeColorMapping('log2FC', colors=paletteColorBrewerRdBu, style.name=style.name)
+setNodeSizeMapping('Degree', c(1,12),c(60,110), style.name=style.name)
+#setEdgeLineWidthMapping('stringdb::score', c(0.4,1), c(1,3), style.name="avidd.style")
+```
+
+
+Highlight the Hub Nodes; make larger and surround with a boarder
+```{r}
+setVisualStyle(style.name)
+
+setNodeSizeDefault("80", style.name)
+setNodeFontSizeDefault("15", style.name)
+setEdgeOpacityDefault(140, style.name)
+
+#save plots
+exportImage('STRINGnetwork.Overview.800', 'PDF')
+exportImage('STRINGnetwork.Overview.800', 'PNG', zoom=200)
+#setNodeSizeMapping('ME', c(1,12),c(60,110), style.name="avidd.style")
+
+```
+
+Generate more plots of the overall network
+
+```{r}
+setNodeSizeDefault("100", style.name)
+setNodeFontSizeDefault("30", style.name)
+setEdgeOpacityDefault(140, style.name)
+
+#save plots
+exportImage('STRINGnetwork.module11.Overview.800', 'PDF')
+exportImage('STRINGnetwork.module11.Overview.800', 'PNG', zoom=200)
+```
+

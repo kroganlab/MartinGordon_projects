@@ -1,0 +1,170 @@
+---
+title: "102224_CyScapse_PIK3CA"
+author: "Martin Gordon"
+date: "2024-10-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(RCy3)
+library(data.table)
+library(ggplot2)
+library(readxl)
+library(magrittr)
+library(stringr)
+```
+read int he 
+
+```{r}
+ppi.in <- list(
+cal = read_xlsx('docs/science.abf2911_tables_s1_to_s8/science.abf2911_Table_S2.xlsx', sheet=2) %>% as.data.table(),
+het = read_xlsx('docs/science.abf2911_tables_s1_to_s8/science.abf2911_Table_S2.xlsx', sheet=3) %>% as.data.table(),
+scc = read_xlsx('docs/science.abf2911_tables_s1_to_s8/science.abf2911_Table_S2.xlsx', sheet=4) %>% as.data.table())
+```
+
+```{r}
+
+# different baits in different celllines....
+lapply(ppi.in, function(x) x[Bait %like% 'PIK3CA', unique(Bait)])
+ppi.in <-  lapply(ppi.in, function(x) return(x[Bait %like% 'PIK3CA',]))
+lapply(ppi.in, function(x) x[, unique(Prey)])
+
+
+ppi.in <- rbindlist(ppi.in, idcol = 'cell')
+
+ppi.in$Bait %>%  unique()
+
+id.dt <- ppi.in[, .(Bait, firstSite=str_extract(tstrsplit(Bait,'_', keep=2), '[0-9]+')), by=.I]
+
+# prep for overlapping 
+id.dt[, `:=`(start=as.numeric(firstSite),
+             end=as.numeric(firstSite)
+             )]
+
+
+id.dt <- unique(id.dt[,.(Bait, start,end)])
+```
+read in de.dt 
+```{r}
+de.guides.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/101624_annotateGuides_data/2024_10_17_mageck.DEvsT0.mutAnno.csv')
+de.guides.dt <- de.guides.dt[Gene == 'PIK3CA',]
+
+# create a title for subDT
+de.guides.dt[, comparison := gsub('control', 'DMSO', comparison)]
+de.guides.dt[, grp_comparion := gsub('control', 'DMSO', comparison)]
+de.guides.dt[, title := paste(tstrsplit(grp_comparion, '_', keep=1), 'Day', numeratorTimepoint, 'vs Control Day 0', sep=' '), by=.I]
+
+de.guides.dt[mostSevereMutant %in% c('Missense', 'Silent', 'Nonsense'), edit_Position :=sub(';$', '', gsub('[A-Za-z]','', Amino_acid_edits))]
+```
+Find in the edit site is within this comma seperated list
+```{r}
+findEditInterval <- function(interval){
+  
+  if (grepl(';', interval)) {
+    editSet <- strsplit(interval, ';')[[1]]
+    editSet <- sapply(editSet, as.numeric)
+    
+    start <- min(editSet)
+    end <- max(editSet)
+    return(c(start, end))
+    
+  } else {
+     start <- as.numeric(interval)
+     end <- as.numeric(interval)
+     return(c(start,end))
+  }
+}
+
+# get the interval range
+de.guides.dt[, start := findEditInterval(edit_Position)[[1]], by=.I]
+de.guides.dt[, end := findEditInterval(edit_Position)[[2]], by=.I]
+```
+find overlapping sequences int he two
+```{r}
+library(seqinr)
+
+# key for mapping data tables
+setkey(id.dt, start,end)
+
+#rmeoving splice eidts and intron/utr
+overlapping.set <- foverlaps(de.guides.dt[!is.na(start)], id.dt, type="any", nomatch = NULL)
+overlapping.set[,.(sgrna, edit_Position, Amino_acid_edits, Bait)] %>% unique()
+```
+Translate to one letter symbol
+
+```{r}
+overlapping.set[, ]
+library(seqinr) # use to convert to one letter code
+
+
+overlapping.set[, toAA := str_extract(Bait, '[a-z]$')]
+overlapping.set[, fromAA := str_extract(gsub('PIK3CA_', '', Bait), '[a-z]+')]
+overlapping.set[,.(toAA, fromAA, Bait)] %>%  unique()
+
+
+overlapping.set[, `:=`(toAA = aaa(toupper(toAA)),
+                       fromAA = aaa(toupper(fromAA))
+                       )]
+
+
+# just manually scan....
+unique(overlapping.set[,.(Bait, Amino_acid_edits, fromAA, toAA)])
+
+mutants.in.set <- c('PIK3CA_e542k', 'PIK3CA_m1043v', 'PIK3CA_e545k','PIK3CA_e453k','PIK3CA_e726k')
+
+
+overlapping.set
+
+fwrite(overlapping.set[Bait %in% mutants.in.set, ], ScriptAndDatedFileName('ppi.same.mutants.guides.txt'))
+fwrite(overlapping.set, ScriptAndDatedFileName('ppi.same.location.guides.txt'))
+```
+
+
+Maybe quick and dirty look at the clinvar edits
+```{r}
+clinvar.anno.dt <-  fread('/Users/martingordon/Documents/projects/071724_BRabu_CRISPRbe_LibraryDesign/script/base-editor-design-tool/allGuide.output.txt_24-10-16-21-08-54/clinvar_annotations_allGuide.output.txt.txt', sep='\t', fill=T)
+colnames(clinvar.anno.dt) <- gsub(' ', '_', colnames(clinvar.anno.dt))
+
+```
+
+Ok, now lets look at the number of prey for PIK3CA; first consider all PIK3CA variants and WT
+Our scoring threshold: SAINTexpress BFDR =< 0.05, WD percentile by bait >= 0.95, and Z-score percentile by bait >= 0.95
+
+```{r}
+# 17 unique Baits; WT and 16 point mutants
+ppi.in[,unique(Bait)]
+ppi.in[,unique(Bait)] %>%  length()
+
+# how many high conf prey in total?
+# 108
+ppi.in[BFDR <= 0.05 & wd_percentile_perBait >= .95 & z_percentile_perBait >= 0.95, unique(PreyGene)] %>% length()
+
+ppi.in[BFDR <= 0.05 & wd_percentile_perBait >= .95 & z_percentile_perBait >= 0.95, unique(PreyGene)]
+
+# what about just WT
+#25
+ppi.in[Bait == 'PIK3CA_wt' & BFDR <= 0.05 & wd_percentile_perBait >= .95 & z_percentile_perBait >= 0.95, unique(PreyGene)] %>% length()
+
+
+# so seems most have 14-20
+ppi.in[BFDR <= 0.05 & wd_percentile_perBait >= .95 & z_percentile_perBait >= 0.95, .N, by=.(Bait)][,quantile(N)]
+ppi.in[BFDR <= 0.05 & wd_percentile_perBait >= .95 & z_percentile_perBait >= 0.95, .N, by=.(Bait)]
+
+# most of the preygene 
+# 'rare is common and common is rare' most preys unique to a bait.. but I guess this is differential testing of baits?
+ppi.in[BFDR <= 0.05 & wd_percentile_perBait >= .95 & z_percentile_perBait >= 0.95, .N, by=.(PreyGene)][,quantile(N)]
+
+
+ppi.in[BFDR <= 0.05 & wd_percentile_perBait >= .95 & z_percentile_perBait >= 0.95, .N, by=.(PreyGene)]
+
+ppi.in[PreyGene == 'P85B_HUMAN' & BFDR <= 0.05 & wd_percentile_perBait >= .95 & z_percentile_perBait >= 0.95,]
+
+ppi.in[Bait %like% 'PIK3CA_wt']
+fwrite(ppi.in[BFDR <= 0.05 & wd_percentile_perBait >= .95 & z_percentile_perBait >= 0.95, .(prey=unique(Prey))], ScriptAndDatedFileName('PIK3CA.preys.txt'))
+```
+

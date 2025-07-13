@@ -1,0 +1,219 @@
+---
+title: "netprop-rerun"
+author: "Martin Gordon"
+date: "2023-06-29"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Rerun of the network propagation 
+
+For this run, we will apply input heat for the top 500 'features' returned for each dataset.
+## Packages
+
+```{r}
+library("RColorBrewer") 
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+library (ComplexHeatmap)
+library(RcppCNPy) #R/W support to import numpy objects into R
+library(VennDiagram)
+library(pbapply) #apply functions with progress bar
+library(eulerr)
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+# netprop scripts
+source ("../../utils/bp_utils/STRING_db_utils.R")
+source ("../../utils/bp_utils/NetworkPropagation.R")
+```
+
+Read in clean file
+
+```{r}
+rna <- fread('./output/rna_ab.clean.csv.gz')
+rna[, adj.pvalue := p.adjust(pvalue, method='BH')]
+
+p.ab <- fread('output/prot_ab.clean.csv.gz')
+p.ph <-  fread('output/prot_ph.clean.csv.gz')
+
+
+heats.input <- list(rna = rna,
+                    p.ab = p.ab,
+                    p.ph = p.ph)
+```
+
+significance score; control for extreme values in p.adjust in rnaseq dataset
+
+```{r}
+
+HeatScore <- function(log2FC, pvalue){
+  FC <-  abs(log2FC)
+  significance <- -log10(pvalue)
+  significance <- ifelse (significance > FC, FC, significance) # control for extreme values but probably not needed
+  sqrt(FC * significance)
+}
+
+#similiar to above
+magSigScore <- function(log2FC, pvalue, magnitudeScale = 2){
+  magnitude <- magnitudeScale * abs(log2FC)
+  significance <- -log10(pvalue)
+  significance <- ifelse (significance > magnitude, magnitude, significance)
+  sqrt(magnitude * significance)
+}
+# apply heats to the network
+lapply(heats.input, function(x){
+  x[, heat := HeatScore(log2FC, pvalue)]
+})
+
+# add the stringdb information to teh gene
+heats.input[['rna']][, gene_str := GetStringIDMapping.inOrder(gene, stringAliasFile='./data/9606.protein.aliases.v11.5.txt.gz')]
+heats.input[['p.ph']][, gene_str := GetStringIDMapping.inOrder(uniprot, stringAliasFile='./data/9606.protein.aliases.v11.5.txt.gz')]
+heats.input[['p.ab']][, gene_str := GetStringIDMapping.inOrder(uniprot, stringAliasFile='./data/9606.protein.aliases.v11.5.txt.gz')]
+```
+
+remove the multiprots in the ph data; just keep the highest scoring
+
+```{r}
+heats.input[['p.ph']][, uniprot := gsub("_[STY][0-9]+", "", Protein) %>% #strip phosphosite info
+          strsplit (";") %>%  #split multiprots; creates a list of vectors of each element
+          lapply (unique) %>% #removes any duplicate elements in list
+          lapply (paste, collapse = ";") %>% #colapses back to unique prot names
+          unlist]
+
+heats.input[['p.ph']] <- heats.input[['p.ph']] [,uniprot := sub("\\;.*","", uniprot)] #keep only the first protein name instead of dropping these rows
+#omics_list[['prot_ph']] <- omics_list[['prot_ph']][!grepl(";", uniprot),] #only select rows w/o multiuniprots
+
+
+
+#only taking record with max magSig score
+heats.input[['p.ph']] <- heats.input[['p.ph']][!is.na(heat), .(heat = max(heat, na.rm = TRUE)), by = .(Label, uniprot, gene_str)]
+
+# using gene symbols as identifiers
+heats.input[['p.ph']] <- heats.input[['p.ph']][, .(Label, gene = translateUniprot2GeneName(uniprot, species = 'HUMAN'), gene_str,heat, uniprot) ] # or "MOUSE" or "RAT"
+heats.input[['p.ph']] <- heats.input[['p.ph']][!is.na(gene),]
+
+
+
+heats.input[['p.ab']] <- heats.input[['p.ab']][,uniprot := sub("\\;.*","",Protein)] #take only first name with multi uniprots
+#omics_list[['prot_ab']] <- omics_list[['prot_ab']][,!grepl(";", Protein),] #only select rows w/o multiuniprots
+
+
+#only taking record with max magSig score (incase of multiple measurements) - no change
+heats.input[['p.ab']] <- heats.input[['p.ab']][!is.na(heat), .(heat = max(heat, na.rm = TRUE)),by = .(Label, uniprot, gene_str)]
+
+# using gene symbols as identifiers
+heats.input[['p.ab']] <- heats.input[['p.ab']][, .(Label, gene = translateUniprot2GeneName(uniprot), gene_str, heat, uniprot) ] # or "MOUSE" or "RAT"
+heats.input[['p.ph']] <- heats.input[['p.ph']][!is.na(gene),]
+
+```
+
+as the heatscore is geometric mean of log2FC and significance,  rank & take the top 500  and use as input for the network propagation (similiar to netcoloc protocol)
+```{r}
+
+top_n <- lapply(heats.input, function(x, n=500){
+  x <- x[order(-heat),] 
+  x.x <- x[Label == 'EV_IFNg-vs-WT_IFNg',][1:n]
+  x.y <- x[Label == 'WT_IFNg-vs-ND_IFNg',][1:n]
+  
+  y <- rbind(x.x,x.y)
+  return(y)
+  })
+
+topn.genes <- lapply(heats.input, function(x){
+  x[ !is.na(gene), gene,Label]
+})
+  
+topn.g <- rbindlist(topn.genes, idcol='omics')
+
+fwrite(topn.g,  './output/top_n_genes.csv.gz')
+```
+
+
+```{r}
+heats.input <- top_n
+getwd()
+```
+
+We are using RWR with pr=.3 for first run
+
+```{r}
+
+# this is precomputed by a python script NetworkPropagation_Build_S_matrix.py (I modified the input to use latest version of string network)
+#python3 ../../../utils/bp_utils/NetworkPropagation_Build_S_matrix_mg.py
+
+
+#using restart prob=50 for now. Hopefully should keep the network more localised and we can find overlaps
+S_matrix.30 <- LoadNumPyS_matrix(matrixPath = "./data/S_matrix.human.string.pr0.30.npy", 
+                              nodesTablePath = "./data/S_matrix.human.string.pr0.30.nodeNames.csv" )
+
+```
+
+```{r}
+
+#get each unique contrast
+contrast.groups <- c('EV_IFNg-vs-WT_IFNg','WT_IFNg-vs-ND_IFNg')
+
+
+rna.allNP <- pbapply::pblapply(contrast.groups, function(g){
+  
+   NetworkPropagateS_matrix(S_matrix.30,
+                            geneHeats = heats.input[['rna']][Label == g, .(gene = gene_str, heat)], # requires gene and heat column (using string as gene)
+                            networkHeatOnly = TRUE,
+                            permuteOnlyInObserved=TRUE,
+                            numPermutations = 20000)
+  
+})
+
+rna.allNPdt <- rbindlist(rna.allNP, idcol = "Label")
+fwrite (rna.allNPdt,  "./output/AllNetworkPropagation_RNA_STRING_Interactions.rs0.3.n500.csv")
+
+
+p.ab.allNP <- pbapply::pblapply(contrast.groups, function(g){
+  
+   NetworkPropagateS_matrix(S_matrix.30,
+                            geneHeats = heats.input[['p.ab']][Label == g, .(gene = gene_str, heat)], # requires gene and heat column (using string as gene)
+                            networkHeatOnly = TRUE,
+                            permuteOnlyInObserved=TRUE,
+                            numPermutations = 20000)
+  
+})
+
+p.ab.allNPdt <- rbindlist(p.ab.allNP, idcol = "Label")
+fwrite (p.ab.allNPdt,  "./output/AllNetworkPropagation_PROT_AB_STRING_Interactions.rs0.3.n500.csv")
+
+p.ph.allNP <- pbapply::pblapply(contrast.groups, function(g){
+  
+   NetworkPropagateS_matrix(S_matrix.30,
+                            geneHeats = heats.input[['p.ph']][Label == g, .(gene = gene_str, heat)], # requires gene and heat column (using string as gene)
+                            networkHeatOnly = TRUE,
+                            permuteOnlyInObserved=TRUE,
+                            numPermutations = 20000)
+  
+})
+
+p.ph.allNP
+p.ph.allNPdt <- rbindlist(p.ph.allNP, idcol = "Label")
+fwrite (p.ph.allNPdt,  "./output/AllNetworkPropagation_PROT_PH_STRING_Interactions.rs0.3.n500.csv")
+
+
+```
+
+
+
+Review p-values after running the analysis
+
+```{r}
+hist(rna.allNPdt[Label == 1]$pvalue)
+```
+
+

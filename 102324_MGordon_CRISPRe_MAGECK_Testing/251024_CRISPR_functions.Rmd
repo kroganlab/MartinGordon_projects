@@ -1,0 +1,276 @@
+---
+title: "CRISPRFunctions"
+author: "Martin Gordon"
+date: "2024-10-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+```
+
+Functions to 
+
+```{r}
+#fwrite(de.input.dt, ScriptAndDatedFileName('de.testing.input.csv'))
+de.input.dt <- fread('~/Documents/projects/102324_MGordon_CRISPRe_MAGECK_Testing/MAGECK_playground_data/2024_10_25_de.testing.input.csv')
+de.input.dt[, group := relevel(factor(gsub('abe8e[.]|bemax[.]','', group)), ref='Librep.day0')]
+
+pik3ca=fread('../101224_RBabu_CRISPRe_PIK3CA/101524_MAGECKContrasts_firstPass_data/2024_10_16_PWcomparisonsVsLibDay0.firstpass.csv')
+
+pik3ca
+ggplot(pik3ca, aes(control_mean, adj_var)) +
+  geom_point()
+```
+need to add some parsing functions; eg to read files and convert to the correct count tables
+
+```{r}
+
+```
+
+Really weird... the function doesnt actually use a negative binomial model...
+Seems this has been commented out
+
+```{r}
+#
+# assumption here is the count mat will be sgRNNA+Gene~sample, value.var
+
+
+#' Function to model mean variant 
+#' For the MAGECK function I think this only runs on the control set, but we can expand it....
+#' Im confused... mean var fit is very poor and actually better with the OLS vs WLS!! Need to investigate...
+modelMeanVariance <- function(dt, countsCol, rmOutliers=T, method='linear', weights=NULL, diagnostics=T){
+  
+  # get count matrix
+  mat <- dcast(dt, interaction(sgrna,gene)~sample, value.var=countsCol) %>% 
+    as.matrix(rownames=1)
+    
+  
+  # calculate sgRNA means and variances
+  # why does the function calculate median rahter than mean? IF only 4 col doesnt make much sense....
+  rMeans <- apply(mat, 1, mean, na.rm=T)
+  rVariances <- apply(mat, 1, var, na.rm=T)
+  
+  # not sure yet how this is applied... leave as is for now
+  if(rmOutliers){
+    
+   message(paste('Detecting outlier sgRNA from variance estimation....Average read count:', mean(rMeans),', variance:', var(rMeans)))
+   outlier.threshold <- mean(rMeans, na.rm=T) + (4 * sd(rMeans, na.rm=T))
+   
+   outlier.sg <- rMeans[rMeans > outlier.threshold]
+   message(paste('Removing', length(outlier.sg), 'sgRNA from variance calculation..'))
+   message(paste('Removing', paste(names(outlier.sg), collapse=';'),'....'))
+   
+  }
+  # get vals with mean < variance & mean < cut off
+  # just take rows
+  message('Identifying good means below variance cut-off to use in mean-variance modelling')
+  meanFilter <- rMeans < rVariances & rMeans < outlier.threshold
+  
+  if( sum(meanFilter) <= 10){
+    
+    stop(paste('Aborting as only ', sum(meanFilter), 'guides passed quality fitlering'))
+  } else {
+    message(paste('Continuing as', sum(meanFilter),'guides passed filter'))
+  }
+  
+  # taking means that pass filter and mean - variance residual & log transform
+  goodMeans <-log2(rMeans[meanFilter] + 1)
+  goodVar <- log2(rVariances[meanFilter] - rMeans[meanFilter] + 1)
+  
+  
+  if (any(names(goodMeans) != names(goodVar))) {
+    
+    stop('Mismatch between mean and variance set...exiting')
+  }
+#  stopifnot(names(goodMeans == names(goodVar)))
+  
+  meanVar.dt <- data.table(x=goodMeans,
+                           y=goodVar,
+                           z=(2^goodVar)-(2^goodMeans),
+                           weights=2^goodMeans)
+  
+  
+  # correct these later
+  #if (method == 'linear' & weights == 'none'){
+  if (method == 'linear'){
+  #  message('Using OLS lm to model mean variance relationship')
+    message('Using WLS lm to model mean variance relationship')
+    
+    # use reciprocal of mean for weighting.. is this correct?
+    lm.fit <- lm(y~x, weights=1/weights, data=meanVar.dt)
+    print(summary(lm.fit))
+    message(paste("WLS R2: ", round(summary(lm.fit)$r.squared, 3)))
+    
+    k <- coefficients(lm.fit)[1]
+    b <- coefficients(lm.fit)[2]
+    
+    k <- ifelse(k < 1, 1, k); b <- ifelse(b < 0, 0, b)
+    
+    mod.coef <- c(k,b)
+    
+    #lm.ols.fit <- lm(y~x, data=meanVar.dt)
+    #message(paste("OLS R2: ", round(summary(lm.ols.fit)$r.squared, 3)))
+    #k.ols <- coefficients(lm.ols.fit)[1]
+    #b.ols <- coefficients(lm.ols.fit)[2]
+    
+  } else if (method == 'edgeR') {
+    
+    mod.coef  <-  (sum(goodVar) - sum(goodMeans * 2)*1)/length(goodMeans)
+    
+  } else {
+    
+    stop('Unknown method. Please specify either "linear" or "edgeR"')
+  }
+  
+  if (diagnostics & method == 'linear'){
+    
+    g <- ggplot(meanVar.dt, aes(x=x, y=y)) +
+      geom_hex() +
+      geom_abline(intercept=k, slope=b, linetype=2, color='red') +
+  #    geom_abline(intercept=b.ols, slope=k.ols, linetype=1, color='steelblue') +
+      ggtitle('Mean Variance') +
+      xlab('log-transformed mean counts') +
+      ylab('log-transformed variance') +
+      scale_color_viridis(discrete = F, option='D') +
+      theme_bw()
+    
+    print(g)
+  }
+  
+  return(mod.coef)
+
+}
+```
+
+```{r}
+#' Function to calculate the adjusted variance based on coef produced from the lm model
+#' 
+getAdjustedVariance <- function(coef, meanval, method='mageck_manuscript'){
+  
+  k <- coef[1]; b <- coef[2]
+  
+  if (method == 'mageck_manuscript'){
+    
+    # this is the manuscript version.. different to the code base calculation
+    print(meanval + k * (meanval ^ b))
+    return(meanval + k * (meanval ^ b))
+    
+  } else if (method == 'edgeR'){
+    
+    return((meanval^2) * (2^coef) + meanval)
+    
+  } else if (method == 'mageck_code'){
+    
+    return( (meanval^k) * (2 ^ b) + meanval)
+    
+  } else if (method == 'mixed') {
+    
+    # recursive function to calculate both
+    var1 <- getAdjustedVariance(coef, meanval, method='linear')
+    var2 <- getAdjustedVariance(coef[2], meanval, method='edger')
+    
+    # return the output with the largest variance of the two
+    ifelse(var1 > var2, return(var1), return(var2))
+  } else {
+    stop('method must be one of the following: mageck_manuscript, edgeR, mixed, mageck_code')
+  }
+}
+```
+
+Function to parse day0 groups
+
+```{r}
+
+parseTreatmentsfromDay0 <-  function(x){
+  
+  
+  
+}
+
+def magecktest_parsetreatmentsfromday0(args,samplelabelindex):
+  """
+  Reconstruct the groups of treatment and control from --day0-label
+  """
+  samples=[s for s in samplelabelindex.keys()]
+  day0labelstr=args.day0_label
+  args.day0_label=args.day0_label.split(',')
+  for dl in args.day0_label:
+    if dl not in samples:
+      logging.error('Label '+dl+' specified in the --day0-label option does not match count table. Please double check.')
+      sys.exit(-1)
+  nonday0sample=[x for x in samples if x not in args.day0_label]
+  if len(nonday0sample)==0:
+    logging.error('At least 1 non day0-label sample should be specified.')
+    sys.exit(-1)
+  args.treatment_id=nonday0sample
+  args.control_id=[day0labelstr]*len(nonday0sample)
+```
+
+
+Testing....
+
+```{r}
+lm.coef <- modelMeanVariance(de.input.dt[editor == 'bemax',], countsCol = 'counts', method='linear')
+lm.coef
+
+
+# they look similar when log transformed anyway...
+plot(x=log2(getAdjustedVariance(lm.coef, meanval = de.input.dt[editor == 'bemax', counts], method='mageck_code')),
+     y=log2(getAdjustedVariance(lm.coef, meanval = de.input.dt[editor == 'bemax', counts], method='mageck_manuscript')))
+
+
+
+de.input.dt[editor == 'bemax', counts]
+
+getAdjustedVariance(lm.coef, meanval = 58, method='mageck_manuscript')
+
+
+
+test <-  data.table(a=seq(1,10,1), 
+                    b=seq(1,100,10))
+
+
+
+testing.dt <- de.input.dt[, .(meancounts = mean(counts, na.rm=T), 
+                varcounts  =  var(counts, na.rm=T)), by=.(sgrna)]
+
+
+plot(log2(testing.dt$meancounts), log2(testing.dt$varcounts))
+
+testing.dt[, `:=`(logCounts = log2(meancounts +1),
+                  logVar =log2(varcounts +1)
+                  )]
+
+testing.dt
+
+# weights definitely improves the fit, but its still not very good...
+summary(lm(logCounts~logVar, weights=2^logCounts, data=testing.dt))
+
+test.coef <- coefficients(lm(logCounts~logVar, data=testing.dt))
+
+
+ggplot(testing.dt, aes(x=logCounts, logVar)) +
+  geom_point() +
+  geom_abline(slope=test.coef[2], intercept=test.coef[1]) +
+  
+
+
+
+# get intercept and slow
+coefficients(lm(b~a, data=test))[1]
+coefficients(lm(b~a, data=test))[2]
+
+
+```
+
+
+

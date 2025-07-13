@@ -1,0 +1,384 @@
+---
+title: "101024_PCPPerturbSeqComplex_Network"
+author: "Martin Gordon"
+date: "2024-10-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r library}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(RCy3)
+
+source('~/Documents/utils/bp_utils/ManageScriptData.R')
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+```
+
+Read in the 'real' complex network
+
+```{r}
+# start app and check 
+cytoscapePing()
+
+pcp.dt <- fread('./output/PCPout_clusterDB/ComplexReport.txt')
+pcp.random.dt <- fread('./output/PCPout_clusterDB_random/ComplexReport.txt')
+
+net.in <- fread('./output/PCPout_clusterDB/PPIReport.txt')
+
+# add in the perturbSeq clusters and pearson correlations
+pSeq.mat <- fread('./data/Pheno-seq_KOLF2-SrongPerturbation-PearsonCorr.csv') %>% 
+  as.matrix(rownames=1)
+
+pSeq.clusters <- fread('./data/Pheno-seq_KOLF2-SrongPerturbation-Clusters.csv')
+
+# just take the reported set now
+net.in <- net.in[Reported == 'Reported',]
+```
+
+Add info to the edge and node table
+First add the Pearson R score for the two genes, we will use this to weigh theedges
+For node table we 
+```{r}
+pearsonR.dt <- reshape2::melt(pSeq.mat, id.vars=rownames(pSeq.mat)) %>% 
+  as.data.table()
+setnames(pearsonR.dt, new=c('prot1', 'prot2', 'R'))
+
+net.in <- merge(net.in, pearsonR.dt, by.x=c('ProteinA', 'ProteinB'), by.y=c('prot1', 'prot2'), all.x=T)
+
+pearsonR.dt <- pearsonR.dt[prot1 != prot2]
+# takes a long time to run...must be faster way, but gives us a way to easily match the different tables
+# saved to file to reload
+#pearsonR.dt[, genes := paste(sort(c(prot1,prot2)), collapse=';'), by=.I]
+
+#pearsonR.dt <- fread('~/Documents/projects/100324_AForget_PCProphetPipeline/101024_PCPPerturbSeqComplex_Network_data/2024_10_10_pearsonR.cor.csv')
+#fwrite(pearsonR.dt, ScriptAndDatedFileName('pearsonR.cor.csv'))
+
+# want to complex to appear in at least two of the 3 replicates
+net.in[, nRepsDetected := .N, by=.(ProteinA, ProteinB)]
+
+edge.dt <- net.in[, .(source=ProteinA, target=ProteinB, weight=R)] %>% 
+  unique()
+```
+Add some more node info; run enrichment on these clusters and extract the most significant enrichment results
+Actually, lets just take the simplified table and merge
+Take the entire universe as background as not saying anything about the clusters, we just want to id the things in these clusters
+```{r}
+go.bp <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+
+universe <- pSeq.clusters$gene_target
+
+pSeq.clusters[, enrich.grp := as.factor(cluster+1)]
+
+# run GO enrichment on each group seperately
+enrich.dt <- enricherOnGroups(pSeq.clusters, 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene_target", 
+                              term2gene.gmt = go.bp)
+
+
+
+enricherOnGroups()
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                         gmt=go.bp, 
+                                                         groupColumn = 'enrich.grp',
+                                                         max_pAdjust = 0.1)
+
+
+fwrite(enrich.dt, ScriptAndDatedFileName('enrich.go.bp.wholeUniverse.csv'))
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('simplified.enrich.go.bp.wholeUniverse.csv'))
+
+
+# just take top ranking enrichment per group
+go.enrich.dt <- simp.enrich$simplified[, .SD[which.min(p.adjust)], by=enrich.grp] %>% 
+  .[, .(enrich.grp, ID, pvalue, p.adjust)]
+```
+
+Make the node table 
+Check the db for their clustering results 
+----
+```{r}
+node.dt <- data.table(id=c(net.in$ProteinA, net.in$ProteinB))
+
+node.dt <- merge(node.dt, pSeq.clusters[, .(gene_target, cluster=enrich.grp)], by.x='id', by.y='gene_target')
+
+#merge the enrichment results
+node.dt <- merge(node.dt, go.enrich.dt, by.x='cluster', by.y='enrich.grp') %>% 
+  unique()
+# now add the PCP complex results; add corum info??
+# leave out for now\
+```
+
+
+```{r}
+# for now, not adding PCP info on the cluster information
+createNetworkFromDataFrames(node.dt[,.(id, cluster, clusterName=ID)], edge.dt, title='PCProphet network (Perturbseq clusters)')
+```
+Setting a default visual style to start from
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=45)
+
+style.name <-  "PCP-PerturbSeq"
+createVisualStyle(style.name)
+setNodeSizeDefault('90', style.name = style.name)
+setNodeLabelMapping('name', style.name=style.name)
+setNodeFontSizeDefault(22, style.name=style.name)
+#setNodeColorMapping("id", mapping.type='d', colors=paletteColorBrewerSet3,style.name = style.name)
+setNodeColorMapping("cluster", unique(node.dt$cluster), c(col.pal), "d", style.name = style.name)
+setEdgeLineWidthMapping('weight', mapping.type="c", widths=c(1,11),style.name=style.name)
+setVisualStyle(style.name=style.name)
+
+```
+
+Network layout; not as NB when we have smaller nodes like this
+```{r}
+layoutNetwork(paste('force-directed', 
+              'defaultSpringCoefficient=0.00001',
+              'defaultSpringLength=50',
+              'defaultNodeMass=4.7',
+              sep=' '))
+```
+
+
+Also for now, lets filter out the edges between nodes with similarity < 40 say. Any singletons remove
+
+First create a clone of the network and can edit the other
+
+```{r}
+# get SUID & clone 
+getNetworkSuid(title='PCProphet network (Perturbseq clusters)')
+cloneNetwork(34658)
+
+# this is better just create a subnetwork 
+createSubnetwork('all')
+# duplicates the network collection name
+renameNetwork(title='Filtered complexes (R < 0.3)')
+
+# now filter the edges based on weight
+# first create a filter
+createColumnFilter(filter.name='pearson R filter', column='weight', 0.3, type='edge', 'GREATER_THAN', hide=F, apply=T)# remove nodes with no edges; use the degree filtercreateDegreeFilter(filter.name = 'degree.filter', criterion = c(0))
+```
+
+```{r}
+createSubnetwork('all')
+
+renameNetwork(title='Filtered complexes (R < 0.4)')
+
+# now filter the edges based on weight
+# first create a filter
+createColumnFilter(filter.name='pearson R filter', column='weight', 0.4, type='edge', 'LESS_THAN', hide=F, apply=T)# remove nodes with no edges; use the degree filtercreateDegreeFilter(filter.name = 'degree.filter', criterion = c(0))
+```
+Save some plots, run some enrichments
+
+```{r}
+exportImage(filename=paste0(getwd(),'/cy_pSeqCluster_fullNetwork'), type='pdf')
+exportImage(filename=paste0(getwd(),'/cy_pSeqCluster_filtered_R0.3'),type='pdf')
+exportImage(filename=paste0(getwd(),'/cy_pSeqCluster_filtered_R0.4'), type='pdf')
+```
+Run some kind of enrichment on the different clusters
+First create a copy of the subnetwork
+
+```{r}
+getNetworkSuid(title='PCProphet network (Perturbseq clusters)')
+cloneNetwork(34658)
+
+# lets export the network and enrich locally then add back in the enrichment info
+exportNetwork(filename=paste0(getwd(),'/cytoscape.table.sif'), type='graphML')
+```
+
+Now run enrichment on each of these clusters
+
+```{r}
+cyNodes.dt <- fread('./cytoscape.labelledNodes.csv')
+
+cyNodes.dt[is.na(column), `column` := 0]
+
+
+# first lets see what is enriched in our 
+# run GO enrichment on each group seperately against our input into cy
+enrich.dt <- enricherOnGroups(cyNodes.dt[column != 0,], 
+                              groupColumns = 'column', 
+                              geneColumn = "id", 
+                              universe=unique(node.dt$id),
+                              term2gene.gmt = go.bp)
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                         gmt=go.bp, 
+                                                         groupColumn = 'column',
+                                                         max_pAdjust = 0.1)
+
+
+fwrite(enrich.dt, ScriptAndDatedFileName('gp.bp.enrichment.networkBg.csv'))
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('gp.bp.enrichment.simplified.networkBg.csv'))
+
+
+simp.enrich$simplified[,column := paste0('complex ',column)]
+
+# heatmap of the enrihcment results for 
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified,
+                                  groupColumn = 'column', 
+                                  cluster_columns=T,
+                                  topN=3,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6), 
+                                  upperThreshold = 4)
+
+BackupAsPDF(ht, 'PCPcomplex.GOBP.networkBg.heatmap')
+
+
+#enrich with bg of all perturbSeq cluster genes
+
+enrich.dt <- enricherOnGroups(cyNodes.dt[column != 0,], 
+                              groupColumns = 'column', 
+                              geneColumn = "id", 
+                              universe=unique(pSeq.clusters$gene_target),
+                              term2gene.gmt = go.bp)
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                         gmt=go.bp, 
+                                                         groupColumn = 'column',
+                                                         max_pAdjust = 0.1)
+
+
+fwrite(enrich.dt, ScriptAndDatedFileName('gp.bp.enrichment.pSeqBg.csv'))
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('gp.bp.enrichment.simplified.pSeqBg.csv'))
+
+
+simp.enrich$simplified[,column := paste0('complex ',column)]
+
+# heatmap of the enrihcment results for 
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified,
+                                  groupColumn = 'column', 
+                                  cluster_columns=T,
+                                  topN=2,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 6), 
+                                  upperThreshold = 4)
+
+ht
+BackupAsPDF(ht, 'PCPcomplex.GOBP.networkBg.heatmap')
+```
+Share the node and edge table used to generate the network.. can we import this into 
+```{r}
+fwrite(net.in[, .(source=ProteinA, target=ProteinB, PCP_ComplexID=ComplexID, PearsonsR=R)], ScriptAndDatedFileName('edgeTable.forCytoscape.csv'))
+
+```
+
+Look at the data for the 3 replicates, create a function to plot the different genes in each.
+
+```{r}
+pcp.list <- list(ctrl1 = fread('./100324.makePCPFormatFiles_data/2024_10_04_Parental_052324_Report.mat.txt'),
+                 ctrl2 = fread('./100324.makePCPFormatFiles_data/2024_10_04_Parental_091024_Report.mat.txt'),
+                 ctrl3 = fread('./100824.PCP.perturbSeq_data/2024_10_08_Parental_100724_Report.mat.txt')
+                 )
+
+
+pcp.dt <- lapply(pcp.list, function(x){
+  
+  long.dt <- reshape2::melt(x, id.vars=c('GN','ID')) %>% 
+    as.data.table()
+  setnames(long.dt, new=c('gene', 'protein', 'fraction', 'intensity'))
+  long.dt[, fraction := gsub('frac_', '', fraction)]
+  return(long.dt)
+
+}) %>%  rbindlist(idcol='sample')
+
+
+pcp.dt[, ints.max.scaled := intensity/max(intensity, na.rm=T), by=.(sample,protein)]
+pcp.dt[, ints.sum.scaled := intensity/sum(intensity, na.rm=T), by=.(sample,protein)]
+```
+
+I think for now we want our function to i) cycle through the list of complex members
+
+```{r}
+net.in[, complexGenes := tstrsplit(ComplexID, '_', keep=4)]
+
+col.pal <- randomcoloR::distinctColorPalette(k=12)
+
+lapply(genesToplot, function(x){
+  
+  genes <- c(unlist(strsplit(x, ';')))
+  
+  subDT <- pcp.dt[gene %in% genes, ]
+  
+  g <- ggplot(subDT, aes(x=reorder(fraction, as.numeric(fraction)), y=ints.max.scaled, group=gene, color=gene)) +
+    geom_line() +
+    scale_color_manual(values=col.pal) +
+    ggtitle(paste0(x)) +
+    xlab('fraction') +
+    ylab('scaled intensity (ints/max)') +
+    facet_grid(sample~.) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle=90, size=6))
+  
+  BackupAsPDF(g, paste0(x, '.linechart.maxInts'))
+})
+```
+
+
+
+
+Plot Ideas for the PCP
+complex size distribution in the two sets
+Barplot of number of complexes that 'pass' PCP (color by module if possible?)
+
+Read in your data to see if there is some signal 
+
+```{r}
+setEdgeLineWidthMapping(
+  table.column,
+  table.column.values = NULL,
+  widths = NULL,
+  mapping.type = "c",
+  default.width = NULL,
+  style.name = NULL,
+  network = NULL,
+  base.url = .defaultBaseUrl
+)
+
+
+
+```
+
+
+
+ok now start working on the node table
+Now take unique list of nodes, add info about the cluster and the PCP complex they were annotated to
+
+I think we want to draw edges with thickness based pearson cor score/distance and a red edge where the interaction has been validated by PCP
+Wont they be the same? Maybe just thickness matches PCP results
+```{r}
+
+```
+
+
+Points to note; members of the same clusters in their data are very low
+
+Not used...
+```{r}
+
+# lets remove double edges
+pearsonR.dt[, genes := paste(sort(c(prot1,prot2)), collapse=';'), by=.I]
+# now split the two genes into protA and protB; remove duplicate rows
+pearsonR.dt[, c('source', 'target') := tstrsplit(genes, ';')]
+
+# now check for and remove duplicated rows
+pearsonR.dt
+unique(pearsonR.dt)
+```
+
+```{r}
+
+```
+

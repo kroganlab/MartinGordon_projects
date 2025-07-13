@@ -1,0 +1,587 @@
+---
+title: "040125_EditVsNoEditComparison"
+author: "Martin Gordon"
+date: "2025-04-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Goal
+
+Now we have subset to the protein-coding genes, we want to compare the profiles in the edited and non-edited transcripts
+For first pass, we will look at all transcripts, then we can limit comparisons to just the edited transcripts and limit to edited vs unedited reads
+We will use ribowaltz to determine the offset, maybe restrict the size
+
+*notes*
+Seems to be clear differences in the distributions of the codons in edited vs non-edited sites; could this just be a bias for transcripts? Need to subset to the same transcripts in the edited and non-edited version
+
+## libraries
+```{r}
+library(data.table)
+library(Rsamtools)
+library(magrittr)
+library(ggplot2)
+library(devtools)
+library(riboWaltz)
+library(hrbrthemes)
+library(ComplexHeatmap)
+library(viridis)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/bamProcessing.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+```
+
+Read in the edited vs non-edited files as bam format
+
+```{r}
+edits.files <- dir(path='./output/riboseq_bamfiles_firstPass/filtered/riboseq', full.names = T, recursive=T, pattern="*proteinCodingEdits.bam$")
+noedits.files <- dir(path='./output/riboseq_bamfiles_firstPass/filtered/riboseq', full.names = T, recursive=T, pattern="*noEdits.bam$")
+
+edits.list <- lapply(edits.files, BamFile)
+noedits.list <- lapply(noedits.files, BamFile)
+```
+
+read in the ribo bam files; we want to plot histograms of th
+just take a subset of fields for our plots and also look at the flag param
+```{r}
+# set up global params for reading in bam files; subset fields and also only take mapped
+# can just read in the bam 'as is' or if reading many, subset to specific features
+param <- ScanBamParam(what=c('rname', 'qwidth'), flag=scanBamFlag(isUnmappedQuery=FALSE))
+
+edits.list <- lapply(edits.list, function(x) {bamToTable(x)})
+noedits.list <- lapply(noedits.list, function(x) {bamToTable(x)})
+```
+
+Want to remove fields we dont need to reduce file size
+```{r}
+# remove the flags as just too large and the info is contained in flag field 
+cols.noi <- c('mrnm', 'mpos', 'isPaired','isProperPair','isUnmappedQuery', 'hasUnmappedMate', 'isMinusStrand','isMateMinusStrand', 'isFirstMateRead','isSecondMateRead', 'isSecondaryAlignment', 'isNotPassingQualityControls', 'isDuplicate', 'isSupplementaryAlignment')
+
+lapply(edits.list, function(x){
+  x[, (cols.noi):=NULL]
+})
+
+lapply(noedits.list, function(x){
+  x[, (cols.noi):=NULL]
+})
+
+```
+Set names for both sets
+
+```{r}
+names(edits.list) <- gsub('./output/riboseq_bamfiles_firstPass/filtered/riboseq/|_proteinCodingEdits.bam', '', edits.files)
+names(noedits.list) <- gsub('./output/riboseq_bamfiles_firstPass/filtered/riboseq/|_noEdits.bam', '', noedits.files)
+```
+
+
+Want to compare the length distributions of the edited vs non-edited reads
+```{r}
+edits.len <- lapply(edits.list, function(x){
+  
+  x[, .(qwidth, source='edits')]
+}) %>% rbindlist(idcol = 'sample')
+
+noedits.len <- lapply(noedits.list, function(x){
+  
+  x[,.(qwidth,  source='noEdits')]
+}) %>% rbindlist(idcol = 'sample')
+
+len.dt <- rbind(edits.len, noedits.len)
+rm(edits.len); rm(noedits.len)
+```
+
+plot the length distribution
+```{r}
+g <-  ggplot(len.dt, aes(x=qwidth, col=sample)) +
+  geom_density() + 
+  facet_grid(source~., scales='free_y') +
+  customTheme +
+  scale_color_brewer(type='qual')
+
+BackupAsPDF(g, 'lengthDistributions.density', format='png', dimensions = c(10,8))
+```
+plot a facet of the samples also 
+```{r}
+g <-  ggplot(len.dt, aes(x=qwidth, col=sample)) +
+  geom_density() + 
+  facet_grid(sample~source, scales='free_y') +
+  customTheme +
+  scale_color_brewer(type='qual')
+
+BackupAsPDF(g, 'lengthDistributions.sampleFacet.density', format='png', dimensions = c(14,20))
+
+
+# also plot a histogram to check
+g <-  ggplot(len.dt, aes(x=qwidth, fill=sample)) +
+  geom_histogram() + 
+  facet_grid(sample~source, scales='free_y') +
+  customTheme +
+  scale_color_brewer(type='qual')
+
+BackupAsPDF(g, 'lengthDistributions.sampleFacet.histogram', format='png', dimensions = c(14,20))
+
+rm(noedits.list) # remove the no edits se
+```
+
+Look at the distribution of read lengths in both samples; 
+Look similar in edited vs unedited, but the gill samples have this strange bimodal shape in both. Is this biorelevant?
+
+I think for now we can subset to OL 1-3; just compare these conditions as we know there are issues with the gill samples
+Subset to these two
+```{r}
+edits.list <- edits.list[grepl("RIBO_OPTIC_[456]", names(edits.list))]
+noedits.list <- noedits.list[grepl("RIBO_OPTIC_[456]", names(noedits.list))]
+```
+
+Quick first pass of the OL set
+
+Create an annotation file 
+Lets just do a quick first pass of our data as is
+----
+create an annotation file to use for this analysis
+```{r}
+anno.dt <- create_annotation(gtfpath = './docs/dorPea.gtf')
+```
+# get the bam files
+Im pretty sure the reads are already deduplicated (can we try running umitools deduplicate on one of the samples to confirm?)
+```{r}
+reads_list <- bamtolist(bamfolder = "./output/riboseq_bamfiles_firstPass/filtered/riboseq/editTranscriptsSubset", transcript_align = T, annotation = anno.dt)
+# custom names 
+reads_list
+names(reads_list) <- c('altprep_optic_noEdits_1','altprep_optic_Edits_1', 'gill_noEdits_1', 'gill_Edits_1', 'gill_noEdits_2', 'gill_Edits_2', 
+                       'gill_noEdits_3', 'gill_Edits_3','optic_noEdits_1', 'optic_Edits_1', 'optic_noEdits_2', 'optic_Edits_2', 'optic_noEdits_3', 'optic_Edits_3')
+
+rbindlist(reads_list, idcol='sample') %>% 
+  fwrite(., ScriptAndDatedFileName('readlengths.pSiteIdentificationInput.csv.gz'))
+```
+
+```{r}
+# it finds the frame of the reads (derived from the trasncript annotation included in dt..)
+# then groups by read length and filters read lenght by periodicity (should fall into one frame in at least periodicty threshold of reads)
+# looks at both 5' and 3' exteemities, and takes the intersection of the passing set and returns as filtered
+filtered_list <- length_filter(data = reads_list,
+ 				length_filter_mode = "periodicity",
+ 				periodicity_threshold = 60) #lets go with higher threshold 2/3 should fall in one frame
+
+filtered_list[[6]][transcript == 'PAC4GC:38551344']
+lapply(filtered_list, function(x){
+  print(unique(x$length) %>% sort())
+})
+```
+
+
+plot of the filtered list of read distributions 
+
+```{r}
+filtered.dt <- rbindlist(filtered_list, idcol='sample', fill=T)
+filtered.dt[, source := ifelse(grepl('noEdits', sample), 'noEdit', 'Edit')]
+filtered.dt[, condition := gsub('_[no]*Edits', '', sample)]
+
+ggplot(filtered.dt, aes(x=length, color=condition)) +
+  geom_density() +
+  geom_vline(xintercept = 32) +
+  scale_fill_brewer(type='qual') +
+   facet_grid(condition~source, scales='free_y') +
+   customTheme
+```
+
+
+subset the list and filtered list to just the optic lobe set
+
+```{r}
+filtered_list <- filtered_list[!grepl('gill_', names(filtered_list))]
+```
+
+Run riboWaltz to detect p-sites
+
+```{r}
+plotDir <- './040225_EditsVsNoEdits_data/pdfs'
+psite()
+psite_offset <- psite(filtered_list, flanking = 6, extremity = "auto", plot=F, plot_dir = plotDir, plot_format = 'pdf')
+fwrite(psite_offset, ScriptAndDatedFileName('ribowaltz.psiteOccupancy.OL.EditandNoEdit.csv'))
+
+psite_offset <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_01_ribowaltz.psiteOccupancy.OL.EditandNoEdit.csv')
+
+```
+clear indication that reads < 
+```{r}
+psite_offset[, source := ifelse(grepl('noEdit', sample), 'noEdit', 'Edit')]
+psite_offset[, condition := gsub('_[no]*Edits', '', sample)]
+
+g <- ggplot(psite_offset, aes(x=length, y=total_percentage, fill=condition)) +
+  geom_bar(stat='identity') +
+  scale_fill_brewer(type='qual') +
+  facet_grid(source~condition, scales='free') +
+  customTheme
+g
+BackupAsPDF(g, 'readsLength.perce.barplot',dimensions = c(10,8))
+```
+Interesting this short cluster of reads with < 30 len. Only present in one of the library preps... should we remove?
+```{r}
+prop.dt <- lapply(unique(psite_offset$length), function(x){
+  prop.dt <- psite_offset[length <= x, .(length=x, totalProportionofReads=sum(total_percentage)), by=.(source,sample)]
+}) %>% rbindlist()
+
+
+g <- ggplot(prop.dt, aes(x=as.factor(length), y=totalProportionofReads, fill=source)) +
+  geom_bar(stat='Identity') +
+  geom_vline(xintercept='30') +
+  scale_fill_brewer(type='qual') +
+  facet_grid(sample~.) +
+  customTheme 
+g
+```
+
+add info on the psite, asite, esite etc.
+We are providing transcript info, so use that
+```{r}
+help(psite_info)
+
+filtered_list
+
+reads_psite_list <- psite_info(filtered_list,
+                               psite_offset, 
+                               site=c('psite','asite', 'esite'), 
+                               fastapath = './data/wynton_downloads/dpea.pipelineProcessed.genome.transcripts.fa', 
+                               fasta_genome=F)
+
+psite.dt <- rbindlist(reads_psite_list, idcol='sample', fill=T)
+```
+
+codon coverage
+transcript-specific codon coverages: defined as either N p-sites per codon or read footprints per codon (difference?)
+
+For each triplet, the output dt contains: 
+- the transcript id from the annotation
+- its leftmost and rightmost position with respect to the 1st nucleotide of the reference sequence
+- its position with respect to the 1st and the last codon of the annotated CDS of the reference sequence 
+- the region of the transcript (5' UTR, CDS, 3' UTR) it is in
+- the number of read footprints or P-sites falling in that region
+
+*difference between p-site and read footprint*
+I think footprint is across the read, so counts all mapped codons, p-site is just the actively transcribed site
+
+I think best way to think of psite, footprint and cds is different levels of granularity (high to low) as we count mappings zooming out from p-sites to reads/footprints to cds entirely
+```{r}
+
+help(codon_coverage)
+# psite True retunrs number of p-sites per codon, false returns number of read foodprints per codon
+psite.cov <- codon_coverage(reads_psite_list, annotation = anno.dt, psite = T)
+footprint.cov <- codon_coverage(reads_psite_list, annotation = anno.dt, psite = F)
+
+# computes total number of p-sites falling in each transcript CDS
+cds.cov <- cds_coverage(reads_psite_list, anno.dt)
+
+psite.cov[from_cds_start == 0, lapply(.SD, sum), .SDcols = c("altprep_optic_noEdits_1","altprep_optic_Edits_1" ,"optic_noEdits_1", "optic_Edits_1",
+                                                             "optic_noEdits_2", "optic_Edits_2", "optic_noEdits_3", "optic_Edits_3")]
+                                                  
+footprint.cov[from_cds_start == 0, lapply(.SD, sum), .SDcols = c("altprep_optic_noEdits_1","altprep_optic_Edits_1" ,"optic_noEdits_1", "optic_Edits_1",
+                                                             "optic_noEdits_2", "optic_Edits_2", "optic_noEdits_3", "optic_Edits_3")]
+
+# save footprint and psite coverage
+fwrite(psite.cov, ScriptAndDatedFileName('psite.codon.coverage.csv.gz'))
+# save footprint and psite coverage
+fwrite(footprint.cov, ScriptAndDatedFileName('footprint.codon.coverage.csv.gz'))
+fwrite(cds.cov, ScriptAndDatedFileName('cds.coverage.csv.gz'))
+
+```
+read extremity localization
+4 meta heatmaps; displays abundance of 5' and3' extremity of reads  mapping on or close to stop codon of CDS, stratified by length
+Use this plot to identify optimal read extremity and correct the temporary p-site offsets
+
+Clear the default method for p-site offset detection worked well; here it looks like the 5' read extreme and TIS distance (and 5' end extremem and stop codon distance) is very stable across read lengths, while the 3' extremes vary according to length (here the shorter the read, the closer to the TIS), so the 5' end for adjustment seems better
+
+Use this info to correct the p-site offsets,
+```{r}
+g <- rends_heat(reads_psite_list, anno.dt, 
+                sample=names(reads_psite_list),
+                multisamples = 'independent',
+                plot_style = 'split', 
+                cl = 60,
+                utr5l = 30, cdsl = 50, utr3l = 30,
+				        colour = c( "#39827c"))
+
+g[[4]]
+names(g)
+
+for (i in names(g[3:8])){
+  BackupAsPDF(g[[i]], paste0(i, '.readExtremity.tileplot'), dimensions = c(10,6))
+}
+```
+Convert to a heatmap; we want to extract each sample and plot these heatmaps alongside each other for the edited/non-edited
+
+```{r}
+g[[1]][, source := ifelse(grepl('noEdit', sample), 'noEdit', 'Edit')]
+g[[1]][, condition := gsub('_[no]*Edits', '', sample)]
+
+fwrite(g[[1]], ScriptAndDatedFileName('periodicity.csv.gz'))
+
+g[[1]] <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_01_periodicity.csv.gz')
+
+for (i in names(g[3:10])){
+  BackupAsPDF(g[[i]], paste0(i, '.readExtremity.tileplot'), dimensions = c(10,6))
+}
+```
+make heatmaps; iterate over the different reps in the sample group and plot the two heatmaps side by side
+
+We need to tidy this and control the range covered 
+Also, plot the normalized counts
+```{r}
+cond.oi <- g[[1]]$condition %>% 
+  unique()
+
+g[[1]][, region := ifelse(grepl('start', region), 'start', 'stop')]
+
+lapply(cond.oi, function(x){
+  
+  print('getting edit and no edit matrices...')
+  edit.mat <- dcast(g[[1]][condition == x & source == 'Edit',], paste0(end,'__',length)~region+distance, value.var='scaled_count') %>% 
+    as.matrix(rownames=1)
+  
+  
+  print(colnames(edit.mat))
+  
+  noedit.mat <- dcast(g[[1]][condition == x & source == 'noEdit',], paste0(end,'__',length)~region+distance, value.var='scaled_count') %>% 
+    as.matrix(rownames=1)
+  
+  print('getting custom row col labels...')
+  print(colnames(noedit.mat))
+ # row.labs <- gsub(rownames(edit.mat))
+  
+  rowanno <- rowAnnotation(labels=anno_text(gsub("[35]['] end__", "", rownames(edit.mat)), which='row'))
+  # leave as is for now its fine
+  colanno <- HeatmapAnnotation(labels=anno_text(gsub("start_|stop_", "", colnames(edit.mat)), gp=gpar(fontsize=5, col=ifelse(grepl('_0$', colnames(edit.mat)), 'red', 'black'))), which='column')
+  
+  hm1 <- Heatmap(edit.mat, 
+          cluster_rows=F,
+          cluster_row_slices = F,
+          cluster_columns = F,
+          cluster_column_slices = F,
+          border=T,
+          name='Edits\nscaledCounts',
+          col=viridis(100, option='D', direction=1),
+          column_split = ifelse(grepl('start', colnames(edit.mat)), 'Distance from start (nt)', 'Distance from stop (nt)'),
+          show_column_names = F,
+          bottom_annotation = colanno,
+          row_split = factor(gsub('__[0-9]{1,2}','', rownames(edit.mat)), levels=c("5' end", "3' end"))) +
+    rowanno
+  
+  hm2 <- Heatmap(noedit.mat, 
+          cluster_rows=F,
+          cluster_row_slices = F,
+          cluster_columns = F,
+          cluster_column_slices = F,
+          show_row_names = F,
+          border=T,
+          name='noEdits\nscaledCounts',
+          column_split = ifelse(grepl('start', colnames(noedit.mat)), 'Distance from start (nt)', 'Distance from stop (nt)'),
+          show_column_names = F,
+          bottom_annotation = colanno,
+          col=viridis(100, option='A', direction=-1)) +
+    rowanno
+  hmObj <- hm1 + hm2
+  
+  BackupAsPDF(draw(hmObj, column_title=x), paste0(x,'.periodicityFootprint.heatmap'), dimensions = c(16,6))
+})
+```
+```{r}
+
+# lets compare the averqges of the counts
+input_samples <- list("optic_noEdits" = c("optic_noEdits_1","optic_noEdits_2","optic_noEdits_3"),
+                      "optic_Edits" = c("optic_Edits_1","optic_Edits_2","optic_Edits_3"),
+                      "alt_optic_noEdits" = "altprep_optic_noEdits_1",
+                      "alt_optic_Edits" = "altprep_optic_Edits_1")
+
+
+example_psite_per_region <- region_psite(reads_psite_list, anno.dt,
+					 sample = input_samples,
+           multisamples = "average",
+					 cl = 60,
+					 colour = c("#333f50", "gray70", "#39827c"))
+
+
+example_psite_per_region[['count_dt']][, source := ifelse(grepl('noEdit', sample), 'noEdit', 'Edit')]
+example_psite_per_region[['count_dt']][, condition := gsub('_[no]*Edits', '', sample)]
+
+
+g <- ggplot(example_psite_per_region[['count_dt']], aes(x=sample, fill=region, y=scaled_count)) +
+  geom_bar(stat='identity') +
+  scale_fill_manual(values=c("#333f50", "gray70", "#39827c")) +
+  customTheme
+BackupAsPDF(g, 'pSite.featureMapping.barplot')
+
+BackupAsPDF(example_psite_per_region[["plot"]] + customTheme, 'p.sites.perregion.barplot')
+```
+```{r}
+frame_psite <- frame_psite_length(reads_psite_list, 
+                    anno.dt,
+                    sample = input_samples,
+                    multisamples = "average",
+                    plot_style = "facet",
+                    region = "all",
+                    cl = 95, colour = "#333f50")
+
+BackupAsPDF(frame_psite[['plot']], 'psite.frame.tileplot', dimensions=c(10,9))
+```
+*metaplots*
+A visual representation of the trinucleotide periodicity along the coding sequences
+```{r}
+metaprofile <- metaprofile_psite(reads_psite_list, anno.dt,
+					 sample = input_samples,
+					 multisamples = "average",
+					 plot_style = "overlap",
+					 utr5l = 30, cdsl = 50, utr3l = 30,
+					 colour = c("#333f50", "gray70", "#39827c"))
+
+
+metaprofile[['plot']]
+#fwrite(metaprofile$count_dt, ScriptAndDatedFileName('metaprofile.psiteDistancefromFeature.csv.gz'))
+BackupAsPDF(metaprofile[['plot']], 'psite.metaprofile.overlap.linechart', dimensions=c(12,5))
+
+
+metaprofile
+```
+plot p-site, a-site and e-site usage stats
+codon usage p-site normalization from here: https://github.com/LabTranslationalArchitectomics/riboWaltz/issues/7
+
+the codon_usage_psite function returns the average coverage for each of the 64 codons. To do so, the algorithm is divided in three main steps:
+
+count how many times each codon is covered by a P-site (or another ribosome site) in the CDS of all the considered transcripts;
+compute the frequency of each codon in the CDS of all the considered transcripts (exploiting the trinucleotideFrequency function in the Biostring package);
+divide the values from step 1) by the corresponding values from step 2).
+
+
+```{r}
+help(codon_usage_psite)
+
+pSiteUsage <- codon_usage_psite(reads_psite_list,
+                  anno.dt,
+                  site = "psite",
+ 					        sample = input_samples,
+ 					        multisamples = "average",
+ 					        plot_style = "facet",
+ 					        fastapath = './data/wynton_downloads/dpea.pipelineProcessed.genome.transcripts.fa',
+ 					        fasta_genome = FALSE,
+ 					        frequency_normalization = TRUE)
+
+g <- pSiteUsage[['plot']] + 
+  ggtitle('p-site codon usage') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+BackupAsPDF(g, 'pSite.codonusage.barplot', dimensions=c(12,9))
+
+
+aSiteUsage <- codon_usage_psite(reads_psite_list,
+                  anno.dt,
+                  site = "asite",
+ 					        sample = input_samples,
+ 					        multisamples = "average",
+ 					        plot_style = "facet",
+ 					        fastapath = './data/wynton_downloads/dpea.pipelineProcessed.genome.transcripts.fa',
+ 					        fasta_genome = FALSE,
+ 					        frequency_normalization = TRUE)
+
+g <- aSiteUsage[['plot']] + 
+  ggtitle('a-site codon usage') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+BackupAsPDF(g, 'aSite.codonusage.barplot', dimensions=c(12,9))
+
+eSiteUsage <- codon_usage_psite(reads_psite_list,
+                  anno.dt,
+                  site = "esite",
+ 					        sample = input_samples,
+ 					        multisamples = "average",
+ 					        plot_style = "facet",
+ 					        fastapath = './data/wynton_downloads/dpea.pipelineProcessed.genome.transcripts.fa',
+ 					        fasta_genome = FALSE,
+ 					        frequency_normalization = TRUE)
+
+g <- eSiteUsage[['plot']] + 
+  ggtitle('e-site codon usage') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+BackupAsPDF(g, 'eSite.codonusage.barplot', dimensions=c(12,9))
+```
+```{r}
+fwrite(eSiteUsage$count_dt, ScriptAndDatedFileName('esite.codonusage.csv.gz'))
+fwrite(aSiteUsage$count_dt,  ScriptAndDatedFileName('asite.codonusage.csv.gz'))
+fwrite(pSiteUsage$count_dt,  ScriptAndDatedFileName('psite.codonusage.csv.gz'))
+```
+plot the codon usage scatterplots
+```{r}
+codonUsage.wide <- dcast(aSiteUsage$plot_dt, x~sample, value.var = 'y')
+codonUsage.wide[, col := ifelse(x %in% c('UAA','UAG', 'UGA'), 'stop', 'coding')]
+
+g <- ggplot(codonUsage.wide, aes(x=optic_noEdits, y=optic_Edits, label=x, col=col)) +
+  geom_point() +
+  geom_abline(slope=1) +
+  ggrepel::geom_text_repel() +
+  ggtitle('OL a-site codon usage', subtitle = 'edits vs no edit') +
+  labs(x='non-edited transcripts\n(normalized + scaled)', y='edited transcripts\n(normalized + scaled)') +
+  scale_color_manual(values=c('black', 'red')) +
+  theme_bw() +
+  guides(color=guide_legend('codon'))
+
+BackupAsPDF(g, 'aSite.codonUsage.scatterplot')
+
+
+codonUsage.wide <- dcast(pSiteUsage$plot_dt, x~sample, value.var = 'y')
+codonUsage.wide[, col := ifelse(x %in% c('UAA','UAG', 'UGA'), 'stop', 'coding')]
+
+g <- ggplot(codonUsage.wide, aes(x=optic_noEdits, y=optic_Edits, label=x, col=col)) +
+  geom_point() +
+  geom_abline(slope=1) +
+  ggrepel::geom_text_repel() +
+  ggtitle('OL p-site codon usage', subtitle = 'edits vs no edit') +
+  labs(x='non-edited transcripts\n(normalized + scaled)', y='edited transcripts\n(normalized + scaled)') +
+  scale_color_manual(values=c('black', 'red')) +
+  theme_bw() +
+  guides(color=guide_legend('codon'))
+g
+BackupAsPDF(g, 'pSite.codonUsage.scatterplot')
+```
+
+
+## 04-24-25
+Mismatch between the edited and the psite annotations per position; double check the annotations are corredct
+
+```{r}
+psite.dt <- fread('040125_EditVsNoEditComparison_data/2025_04_01_editVsnoedit.annotated.pae.sites.csv.gz')
+
+psite.dt$sample %>% 
+  unique()
+         # pull out the psite info for this 
+suspect.psite <- psite.dt[transcript == 'PAC4GC:38551344' & !grepl('noEdits', sample)][p_site_codon == 'TAG']
+suspect.psite$sample %>% 
+  unique()
+edits.dt[sample == 'RIBO_OPTIC_5' &  Region == 'PAC4GC:38551344']
+suspect.psite
+
+transcript.test <- 'CTCAACTAAATATGGCTGCCCCCACTAAGTTATGACGGAAGGCTAAAACGTTGTTTAGTTATTTTATGAGGTTGAATTGTTCTTTTATCAATTGTTTCCTTTCGGCAGATTGCACGTCTACTTTGTGAATTCCCTAAACAATTCATCAGTAAAGTGGAAAGCCGTGTCTTTCGCCAGCTTCCCGcctgcaatttttttttttctgcctcacGTCTTAATCTGTGCCTACTAAACGTGTCCTGAGCACCATGTTGCGGGAAGTCTTTAAAAACCTGGCTGTAATGATGTCCACTGCAGTGGCCATCCCTTATACAATTGCCATCCTTTGCAATGTTCTATATGGATGGCCAATGTCTCGTGAACGCCTAAAAGATTCACTGAGTGTGAAGAAAGTTTGTGCTCTCAATTTTGCTGTTATccaacaaatgaaactcctcaaATATGTTGCTCTGTACATTCGATGGAAATGTTTCTACAAATATTTTGACTCTTCTCATCTTGTTAAGGATATTTCATTTGGTCGAAATGATAAACATCTGGATGTGTATGTTCCAGCTGGCCGACATCGGCAAGAGTCTCCCAAGCCTGTactgatttatatttttggtggAGGTTGGAGTTCAGGAGATAAAAGCATGTGTGGTTTAGTTTGTTCTCAAATTGCCAATCAATTAGGAGCTGTGGTTTGCTGCCCTAACTATTCACTTTATCCCCAGggTTGTGTTGATGACATGATTCAAGATGTGGTGGACAGCATTAGTTGGGTACACAATAATATCCACACATATGGCGGAGACAAGGAGAAAATAATGCTTGTTGGTCACTCGGCTGGAGCCCACCTCTCTGTCATGGCTGTCCTTGAACTCCTTCATGACCAATTGATGCTCGGTCGAGAAGATTTCTCTCGTCGTCTAGAAGAAAACATGGACAGCAATGCCTTTCATTTTGAAGACAGACACTATGCAGTCGTGTCACAGCCattcgaaggaaagaaagacattgaAGCTGCCGACGGTTTTTGTATTGTGAACTCAGTCAATGTAAATGAAATGGGTCACGAACCAATGGATGTGGACACACCGGAAAGTGACAATGGTCAGGGAATTGGCCACATAGCTGCTACAGAGGCACAGTCTTCACAAATTCATATGGAAGCTGATGGTGAAGATGACTGCTCTGATAATGACTCTGTGGTAACTGTGCGGCCAAAGGATTCTGACACAGGTCCTAGTTTGAGCGACATGTGCAAATCAATTAAGGCAATAATAGGACTTGCTGGAGTCTATCATATTAAGGACCACTATGAACATGAAAAGTTACGGGGTCTAGAAGATGTTAGCTGTATGCATCGAGCTATGTATGGAGATGATCATTTTGGACGATTTTCTCCAACAGTCATCATCATGAGTATGAAAAGGAACATCAAATTACCAAAAATGGTACTTGTGCATGGTACTGAGGATTATGTTGTTCCATTGGTGTCTTCAACTAAATTTGGAGAAGCTCTCAGTGAGATTTTTGCAGATGTAACAGTGCGTGTGATTCCTGACTGTGACCATTATAAGCATCTTCTTGACTTGATGTCCAAGACAGACGTTTACATGAATGTTATCATGGGAATTATTCTTGAAACTGCCAGGCGTGTGTTttagagatttctttctttttttttttttttttctccctaatATCAATAGGAAATAAGCACATTGAAAGAAGACAGTTGTGTTTGTCTTTGttgactttttttaattaaaaaaaaaaaaaaaagagagagagcaaaatttCCATTGTGCAGAGACTGAAATTGGTTGCACATTTGAAAAAACAGAACTTGAGGCTAATCCATAAGTTTCTCATTTCCACTGttataatacgagggtgagtcaaaaagtaatgccattttgtttaggacagatataatt'
+
+unlist(strsplit(transcript.test, ''))[758:760]
+```
+

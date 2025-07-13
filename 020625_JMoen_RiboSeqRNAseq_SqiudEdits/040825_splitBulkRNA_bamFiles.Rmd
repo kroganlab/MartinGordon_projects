@@ -1,0 +1,162 @@
+---
+title: "040825_splitBulkRNA_bamFiles"
+author: "Martin Gordon"
+date: "2025-04-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Similar to the riboseq data. we want to subset the bulk RNAseq bam files to the proteinCoding transcripts, then we want to split our bam files into an edited and unedited set (using same params as the riboseq data)
+
+## 04-21-25
+Returned to the data after working on SEC-MS previous week
+Have rerun REDITOOLS on the RNAseq set; Read into R, get the set of edited reads and subset the aligned bam to these 
+Use this data as input to compare conditions in the RNAseq/RIBOseq and find differential translation
+
+```{r}
+library(data.table)
+library(Rsamtools)
+library(magrittr)
+library(ggplot2)
+library(devtools)
+library(riboWaltz)
+library(hrbrthemes)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/bamProcessing.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+col.pal <- getQualitativePalette(n=13)
+```
+
+Read in the bulk RNAseq bam files
+
+```{r}
+in.tables <- dir(path='./output/reditools/040925_transcriptomeMap_rnaseq', pattern="*outTable", recursive = T, full.names=T)
+
+edits <- lapply(in.tables, fread)
+names(edits)  <- gsub('./output/reditools/040925_transcriptomeMap_rnaseq/|/DnaRna_.+', '', in.tables)
+
+edits.dt <- rbindlist(edits, idcol = 'sample')
+
+ggplot(edits.dt[AllSubs=='AG',.N, by=.(Strand,sample)], aes(x=sample, y=N)) +
+  geom_bar(stat='identity') +
+  facet_wrap(~Strand) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+```
+check the edits; the RNAedits we keep are all mapped to the transcript and are AG edits
+~75k edits in the RNAoptic data
+```{r}
+ggplot(edits.dt[, .N, by=.(sample, Strand, AllSubs)], aes(x=AllSubs, y=N)) + 
+  geom_bar(stat='identity') +
+  facet_wrap(~Strand)
+
+rna.edits <- edits.dt[Strand == '1' & AllSubs == 'AG',]
+#fwrite(rna.edits, ScriptAndDatedFileName('allRNA.edits.csv.gz'))
+
+rna.edits <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040825_splitBulkRNA_bamFiles_data/2025_04_24_allRNA.edits.csv.gz')
+
+ggplot(rna.edits[, .N, by=.(sample, Strand, AllSubs)], aes(x=sample, y=N)) + 
+  geom_bar(stat='identity') +
+  facet_wrap(~Strand)
+```
+First thing to do; look at the breakdown of the edits in the file; if these are balanced across both strands (which they should be) we will neeed to look at our variant calling protcol for the riboseq work
+Looks good; vast majority of our calls are A->G edits
+~50k A->G edits with over 10 high quality reads covering the base
+```{r}
+rna.edits[`Coverage-q30` >= 10 & Frequency >= 0.1, .N, by=.(AllSubs,Strand)]
+
+g <- ggplot(rna.edits[`Coverage-q30` >= 10, .N, by=.(AllSubs, sample,Strand)], aes(x=AllSubs, fill=sample, y=N)) +
+  geom_bar(stat='identity') +
+  facet_grid(.~Strand)
+g
+
+rna.edits[`Coverage-q30` >= 10, .N, by=.(AllSubs, sample,Strand)]
+```
+Use the missing gtf to extract transcripts that are not edited
+```{r}
+missing.transcripts <- fread('./docs/missing_in_fasta.gtf')
+missing.transcripts[, c('tid', 'gid') := tstrsplit(V9, ';', keep=c(1,2))]
+
+cols.oi <- c('tid', 'gid')
+# extract everything in quites
+missing.transcripts[, (cols.oi) :=  lapply(.SD, function(x){
+  stringr::str_extract(x, '(?<=\\s\\")[A-Za-z0-9:.]+')
+}), .SDcols = cols.oi]
+
+transcriptToDrop <- missing.transcripts$tid %>% 
+  unique()
+```
+Find the edited reads, save to file and use this to split our BAM file
+```{r}
+in.reads <- dir(path='./output/reditools/040925_transcriptomeMap_rnaseq', pattern="*outReads", recursive = T, full.names=T)
+edit.reads <- lapply(in.reads, fread, header=F)
+
+names(edit.reads)  <- gsub('./output/reditools/040925_transcriptomeMap_rnaseq/|/DnaRna_.+', '', in.reads)
+
+# combine into one df and keep only read names
+reads.dt <- rbindlist(edit.reads, idcol='sample')
+reads.dt <- reads.dt[grepl('>', V1),]
+
+# drop the non-coding references 
+reads.dt[, c('header', 'ref', 'site') := tstrsplit(V1, '[$]', keep=c(1,2,3))]
+reads.dt$V1 <- NULL
+reads.dt <- reads.dt[!ref %in% transcriptToDrop, ]
+
+
+reads.dt[!grepl('_0', header)]
+reads.dt[, read := tstrsplit(header, '_', keep=2)]
+reads.dt[, header := gsub('>|_[012]$', '',header)]
+```
+Look at the N edits in the riboseq; can we see if these are 
+
+subset to the edited reads; then we also want to take everything but the reads in this group
+How will I treat paired end for this? Consider the transcript edited, so write both reads to file
+```{r}
+samples.oi <- unique(reads.dt$sample)
+
+lapply(samples.oi, function(x){
+  
+  fwrite(reads.dt[sample == x, .(header)], col.names = F, ScriptAndDatedFileName(paste0(x,'.all.editedTranscripts.txt')))
+  fwrite(reads.dt[sample == x & !ref %in% missing.transcripts, .(header)], col.names = F, ScriptAndDatedFileName(paste0(x,'.proteinCoding.editedTranscripts.txt')))
+})
+```
+
+samtools command to extract edited alignments from bam; using the `-U` flag to save the unedited set to another file
+```{bash eval=FALSE}
+for i in ./riboseq_bamfiles_firstPass/rnaseq/*.bam; do SNAME=$(basename ${i/.transcriptome.sorted.bam/}); EDITS="../040825_splitBulkRNA_bamFiles_data/2025_04_21_${SNAME}.proteinCoding.editedTranscripts.txt"; echo $SNAME; echo $EDITS; echo "samtools view -N $EDITS -b $i > ./riboseq_bamfiles_firstPass/filtered/rnaseq/splitBams/${SNAME}_proteinCodingEdits.bam"; samtools view -N $EDITS -U ./riboseq_bamfiles_firstPass/filtered/rnaseq/splitBams/${SNAME}_noEdits.bam -b ${i} > ./riboseq_bamfiles_firstPass/filtered/rnaseq/splitBams/${SNAME}_proteinCodingEdits.bam; done
+```
+
+Sanity check; read in bam, spot check to confirm edited reads in edited and none in non-edited
+
+```{r}
+# read in edited and non-edited sey
+OL4.test <- list(edits=bamToTable('/Users/martingordon/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/output/riboseq_bamfiles_firstPass/filtered/rnaseq/splitBams/RNA_OPTIC_4_proteinCodingEdits.bam'),
+                 noEdits=bamToTable('/Users/martingordon/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/output/riboseq_bamfiles_firstPass/filtered/rnaseq/splitBams/RNA_OPTIC_4_noEdits.bam'))
+
+```
+
+# works great!
+```{r}
+reads.dt[sample == 'RNA_OPTIC_4']
+
+lapply(OL4.test, function(x){
+  
+  x[qname %in% reads.dt[sample == 'RNA_OPTIC_4', header]]
+})
+```
+

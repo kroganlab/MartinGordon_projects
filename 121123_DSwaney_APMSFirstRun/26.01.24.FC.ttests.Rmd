@@ -1,0 +1,794 @@
+---
+title: "26.01.24"
+author: "Martin Gordon"
+date: "2024-01-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+First lets see how data looks when combined
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library(readxl)
+library(MSstats)
+library(circlize)
+library(ggvenn)
+library (emmeans)
+library(stringr)
+library(patchwork) # combine plots
+
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/spectronautFile2ArtMS.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("/Users/martingordon/Documents/utils/bp_utils/LinearModels.R")
+source ("../../utils/bp_utils/MSstats_Helper_Functions.R")
+
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+```
+
+
+## em normalisation first, then 
+-----
+```{r}
+dataDir <- '/Users/martingordon/Documents/projects/121123_DSwaney_APMSFirstRun/data/'
+
+```
+
+run tmp, subtract the column offset for each sample to 'normalise',  then run TMP normalising by global standards
+```{r}
+spec <- fread(paste(dataDir, 'MSstats.csv', sep=''))
+#remove contaminant proteins
+spec <- spec[!ProteinName %like% 'contam_sp',]
+
+spec[, group_subject := paste(Condition, BioReplicate,sep='_')]
+
+# lets create a flag for pre-treatment; will use this to split the datasets
+spec %>%  str()
+spec[, treatment := ifelse(grepl("^[DL]{1}", Condition), 'treatment', 'control') ]
+spec[, condition := sub("^[DL]{1}","",Condition)]
+
+#sanity check
+spec[, .N, by=.(Condition,treatment, condition)]
+```
+seperate the two bait groups into two treatment groups
+
+```{r}
+orf3a.grps <- c('Lorf3aBeta', 'Lorf3aQ57H', 'Lorf3aS171L', 'Lorf3aWT', 
+               'orf3aBeta', 'orf3aQ57H', 'orf3aS171L', 'orf3aWT')
+
+nsp6.gprs <- c('Dnsp6BA1', 'Dnsp6BA2', 'Dnsp6WT', 'Dnsp6XBB',
+               'nsp6BA1', 'nsp6BA2', 'nsp6WT', 'nsp6XBB')
+
+
+spec.orf3a <- spec[Condition %in% orf3a.grps,]
+spec.nsp6 <- spec[Condition %in% nsp6.gprs,]
+
+
+spec.list <-  list(orf3a = spec.orf3a,
+                   nsp6 = spec.nsp6)
+
+```
+
+```{r}
+mssGS.list <-  list(orf3a ='P0DTC3',
+                    nsp6 ='P0DTC1')
+
+
+names(mssGS.list) == names(spec.list)
+```
+
+```{r}
+mssInput.list <- lapply(seq_along(spec.list), function(x,n,i){
+  
+  # iterate through list grp
+  group <- n[[i]]
+  
+  # tidy the protein names
+  dt <- x[[group]][, uniprot := str_extract(ProteinName,'(?<=\\|).+(?=\\|)')]
+  dt[, ProteinName := uniprot]
+
+  # configure for MSstats input
+  dt[, PeptideModifiedSequence := PeptideSequence]
+  mssInput <- specFileToCompleteMSstats(dt)
+  mssInput[, IsotopeLabelType := 'L']
+  
+  return(mssInput)
+},x=spec.list, n=names(spec.list))
+
+names(mssInput.list) <-  names(spec.list)
+
+mssInput.list
+```
+
+```{r}
+lapply(seq_along(mssInput.list),  function(x,n,i){
+g <-  ggplot(x[[i]], aes(x=group_subject, y=log2(Intensity), fill=Condition)) +
+    geom_boxplot() +
+    ggtitle(n[[i]]) +
+    theme(axis.text.x = (element_text(angle=90)))
+    BackupAsPDF(g, paste0(n[[i]], '.raw.intensities.boxplots.'))
+},x=mssInput.list, n=names(mssInput.list))
+```
+
+bait peptide vs global raw intensities
+```{r}
+lapply(seq_along(mssInput.list),  function(x,y,n,i){
+  
+  bait <- n[[i]]
+  dt <- x[[bait]]
+  print(dt)
+  
+  #make new tables
+  bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean_bait']
+   med.bait.dt <- dt[ProteinName == y[[bait]], .(Condition,BioReplicate,Intensity)] %>% 
+  .[, median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median_bait']
+  
+  gl.mean.dt <- dt[ProteinName != y[[bait]], mean(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'mean']
+  gl.med.dt <-dt[ProteinName != y[[bait]], median(Intensity, na.rm=T), by=.(Condition,BioReplicate)] %>% 
+    .[,NAME := 'median']
+  
+  setnames(med.bait.dt, old='V1', new='Intensity')
+  setnames(bait.dt, old='V1', new='Intensity')
+  setnames(gl.mean.dt, old='V1', new='Intensity')
+  setnames(gl.med.dt, old='V1', new='Intensity')
+  
+  p.dt <- rbind(bait.dt,med.bait.dt, gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(paste0(bait, ' raw intensities')) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(bait,'raw.intensities.linechart'))
+},x=mssInput.list, y=mssGS.list, n=names(mssInput.list))
+```
+
+```{r}
+mss.em.list <-  lapply(seq_along(mssInput.list), function(x,i){
+  
+  mss.x <-  dataProcess(x[[i]], 
+                        normalization = 'EQUALIZEMEDIANS', #preran with globalStandards and didnt work well...
+                        summaryMethod="TMP",
+                        remove_uninformative_feature_outlier=TRUE,
+                        featureSubset="highQuality",
+                        MBimpute =  FALSE)
+ return(mss.x)
+  
+}, x=mssInput.list)
+
+names(mss.em.list) <- names(mssInput.list)
+```
+
+```{r}
+
+lapply(seq_along(mss.em.list),  function(x,y,n,i){
+  
+  group <- n[[i]]
+  dt <- setDT(x[[group]]$ProteinLevelData)
+  
+  #make new tables
+  bait.dt <- dt[Protein == y[[group]], .(GROUP,SUBJECT,LogIntensities)] %>% 
+    .[,NAME := 'bait']
+  
+  gl.mean.dt <- dt[Protein != y[[group]], mean(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global_mean']
+  gl.med.dt <-dt[Protein != y[[group]], median(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global_median']
+  
+  setnames(gl.mean.dt, old='V1', new='LogIntensities')
+  setnames(gl.med.dt, old='V1', new='LogIntensities')
+  
+  p.dt <- rbind(bait.dt,gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(paste0(group, ' equilize median normalization')) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(group,'equilizeMedian.intensities.linechart'))
+},x=mss.em.list, y=mssGS.list, n=names(mss.em.list))
+```
+
+now return to the mssInput data.table and run with global standard normalisation
+
+```{r}
+mss.gs.list <-  lapply(seq_along(mssInput.list), function(x,y,i){
+  
+  bait <- y[[i]]
+  
+  mss.x <-  dataProcess(x[[i]], 
+                        normalization = 'globalStandards', #preran with globalStandards and didnt work well...
+                        nameStandards = bait, # name of protein to use for standards
+                        summaryMethod="TMP",
+                        remove_uninformative_feature_outlier=TRUE,
+                        featureSubset="highQuality",
+                        MBimpute =  FALSE)
+ return(mss.x)
+  
+}, x=mssInput.list, y=mssGS.list)
+
+names(mss.gs.list) <-  names(mssInput.list)
+```
+      
+```{r}
+lapply(seq_along(mss.gs.list),  function(x,y,n,i){
+  
+  group <- n[[i]]
+  dt <- setDT(x[[group]]$ProteinLevelData)
+  
+  #make new tables
+  bait.dt <- dt[Protein == y[[group]], .(GROUP,SUBJECT,LogIntensities)] %>% 
+  #.[, LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'bait']
+  
+  gl.mean.dt <- dt[Protein != y[[group]], mean(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global_mean']
+  gl.med.dt <-dt[Protein != y[[group]], median(LogIntensities, na.rm=T), by=.(GROUP,SUBJECT)] %>% 
+    .[,NAME := 'global_median']
+  
+  setnames(gl.mean.dt, old='V1', new='LogIntensities')
+  setnames(gl.med.dt, old='V1', new='LogIntensities')
+  
+  p.dt <- rbind(bait.dt,gl.mean.dt, gl.med.dt)
+  
+  g <-  ggplot(p.dt, aes(x=reorder(interaction(GROUP,SUBJECT)), y=LogIntensities, color=NAME, group=NAME)) +
+    geom_point() +
+    geom_line() +
+    ggtitle(paste0(group, ' global standards (bait) normalization')) +
+    theme_classic() +
+    theme(axis.text.x = (element_text(angle=90)))
+
+  BackupAsPDF(g, paste0(group,'globalStandards.intensities.linechart'))
+},x=mss.gs.list, y=mssGS.list, n=names(mss.gs.list))
+```
+
+
+T-test to assess if FC estimates between each of the conditions
+
+First need to check if the data meets assumptions
+- Are the values (log2FC) normally distributed? Will need to look within each WT-* comparison and SAINT subset
+- Are the variances uniform?
+
+lets just try first with equilizeMedians...
+
+
+read in all data
+
+```{r}
+outdir <-  paste0(getwd(), '/output/')
+
+# equilizemedians
+em.mss.list <- list(orf3a_control = fread(paste0(outdir, '26.01.24.orf3a_control.batch.mss.pwcomparisons.csv')),
+                       orf3a_treatment = fread(paste0(outdir, '26.01.24.orf3a_treatment.batch.mss.pwcomparisons.csv')),
+                       nsp6_control = fread(paste0(outdir, '26.01.24.nsp6_control.batch.mss.pwcomparisons.csv')),
+                       nsp6_treatment =fread(paste0(outdir, '26.01.24.nsp6_treatment.batch.mss.pwcomparisons.csv')) )
+
+# equilizemedians
+gs.mss.list <- list(orf3a_control = fread(paste0(outdir, '26.01.24.orf3a_control.batch.gsnorm.mss.pwcomparisons.csv')),
+                       orf3a_treatment = fread(paste0(outdir, '26.01.24.orf3a_treatment.batch.gsnorm.mss.pwcomparisons.csv')),
+                       nsp6_control = fread(paste0(outdir, '26.01.24.nsp6_control.batch.gsnorm.mss.pwcomparisons.csv')),
+                       nsp6_treatment =fread(paste0(outdir, '26.01.24.nsp6_treatment.batch.gsnorm.mss.pwcomparisons.csv')) )
+
+
+# filter these just to the comparisons we want 
+```
+
+Q. are the log2FC values distributed normally?
+The superset is 
+
+```{r}
+lapply(em.mss.list, function(x){
+  
+  for(i in unique(x$Label)){
+    hist(x[Label == i,log2FC])
+  }
+})
+```
+what about the subset of SAINT interactors?
+-----
+
+Read in SAINT scoring output, we will take all prots passing APMS thresholds and plot
+
+```{r}
+nsp6.spc.saint <-  fread('./output/SAINT.scoring/nsp6.spc.saint.list.txt')
+nsp6.int.saint <-  fread('./output/SAINT.scoring/nsp6.ints.saint.list.txt')
+orf3a.spc.saint <-fread('./output/SAINT.scoring/orf3a.spc.saint.list.txt')
+orf3a.int.saint <-fread('./output/SAINT.scoring/orf3a.ints.saint.list.txt')
+
+saint.list <- list(nsp6.spc = nsp6.spc.saint,
+                   nsp6.int = nsp6.int.saint,
+                   orf3a.spc = orf3a.spc.saint,
+                   orf3a.int = orf3a.int.saint)
+
+
+lapply(saint.list, str)
+
+f.saint.list <- lapply(saint.list, function(x){
+  
+  x.dt <- x[BFDR < 0.1, unique(Prey)]
+  return(x.dt)
+})
+
+nsp6.saint.fdr.01 <- unique(c(f.saint.list[[1]],f.saint.list[[2]]))
+orf3a.saint.fdr.01 <- unique(c(f.saint.list[[3]],f.saint.list[[4]]))
+
+saint.fdr1prc.list <- list(orf3a_control = orf3a.saint.fdr.01,
+                           orf3a_treatment = orf3a.saint.fdr.01,
+                           nsp6_control= nsp6.saint.fdr.01,
+                           nsp6_treatment= nsp6.saint.fdr.01)
+```
+
+subset of label log2FC not normally distributed.. makes sense also with normalisation issues
+
+```{r}
+lapply(seq_along(em.mss.list), function(i, x, y) {
+  for (l in unique(x[[i]]$Label)) {
+      dt <- x[[i]][x[[i]]$Label == l & x[[i]]$Protein %in% y[[i]], ]
+      print(ggplot(dt, aes(log2FC)) +
+        geom_histogram())
+  }
+}, x = em.mss.list, y = saint.fdr1prc.list)
+```
+
+other assumption; need to assess the variance; what does the standard deviation look like for each comparison?
+esitmate SD: SE * sqrt(N)
+add N coefficient estimates to DF
+
+```{r}
+summary(em.mss.list[[1]])
+
+lapply(seq_along(em.mss.list), function(i, x, y) {
+    x[[i]][, N := DF + 4] # N mean estimates
+    x[[i]][, SD :=  SE * sqrt(N)] # N mean estimates
+}, x = em.mss.list, y = saint.fdr1prc.list)
+```
+
+Stack the dts and look at the SDs side by side
+
+```{r}
+em.mss.list[[1]][, status := 'control']
+em.mss.list[[2]][, status := 'treatment']
+em.mss.list[[3]][, status := 'control']
+em.mss.list[[4]][, status := 'treatment']
+
+em.mss.merge <- list(orf3a=rbind(em.mss.list[[1]], em.mss.list[[2]]),
+                     nsp6=rbind(em.mss.list[[3]], em.mss.list[[4]])
+                     )
+
+
+lapply(seq_along(em.mss.list), function(i, x, y) {
+  for (l in unique(x[[i]]$Label)) {
+      dt <- x[[i]][x[[i]]$Label == l & x[[i]]$Protein %in% y[[i]], ]
+      print(ggplot(dt, aes(SD)) +
+        geom_histogram())
+  }
+}, x = em.mss.list, y = saint.fdr1prc.list)
+```
+
+```{r}
+# create a pretreatment col 
+lapply(em.mss.list, function(x){
+  x[, condition   :=  ifelse(grepl("^[LD]{1}", Label), 'treated', 'control')]
+  x[, contrast := sub("^[LD]{1}", "", Label)]
+  x[, contrast := str_replace(contrast, "(?<=-)[LD]", "")]
+})
+
+# view 
+lapply(em.mss.list, function(x){
+  x[,.N,  by=.(Label,condition,contrast)]
+})
+
+# merge the two datatables
+orf3a.dt <- merge(x=em.mss.list[[1]], y=em.mss.list[[2]], by=c('Protein','contrast'), suffixes = c(".ctrl", ".treat"))
+nsp6.dt <-  merge(x=em.mss.list[[3]], y=em.mss.list[[4]], by=c('Protein','contrast'), suffixes = c(".ctrl", ".treat"))
+
+em.list <- list(orf3a = orf3a.dt,
+                nsp6 = nsp6.dt)
+```
+
+
+Following msstatsPTM methodology:
+Now we want to 
+i) subtract the log2FC estimates from each other
+ii) recalculate pooled SE and DF
+iii) delta FC/pooled SE
+iv) compare to Student dist with DF from ii)
+v) multtiple testing correction
+
+```{r}
+lapply(em.list, function(x){
+
+  x[, delta_log2FC := log2FC.treat - log2FC.ctrl]
+  # Assuming that the sources of variation independent..
+  x[, delta_SE := sqrt(SE.treat^2 + SE.ctrl^2)]
+  
+  # satherwaite approximation for DF estimate see msstatsPTM...
+  x[ ,delta_df := (((SE.treat^2) + (SE.ctrl^2))^2) / (((SE.treat^4)/DF.treat) + ((SE.ctrl^4)/DF.ctrl)) ] 
+  
+  x[, delta_tstat := delta_log2FC/delta_SE]
+  x[, delta_pval :=2 * pt(-abs(delta_tstat), delta_df)]
+  x[, delta_fdr := p.adjust(delta_pval, method='BH')]
+})
+
+
+# looks to be many hits, lets see the 
+lapply(em.list, function(x){
+  hist(x$delta_log2FC)
+  hist(x$delta_pval)
+})
+```
+Lets calculate it the other way and compare the results
+
+```{r}
+# dont use; think this m
+lapply(em.list, function(x){
+
+  x[, delta_log2FC := log2FC.treat - log2FC.ctrl]
+  x[, delta2_SE := sqrt(SE.treat^2 / 6 + SE.ctrl^2 / 6)]
+  x[, delta2_DF := 6 + 6 - 2 ]
+  x[, delta2_tstat := delta_log2FC/delta2_SE ]
+  x[, delta2_pval := 2 * pt(-abs(delta2_tstat), delta2_DF) ]
+  x[, delta2_fdr := p.adjust(delta2_pval, method='BH')]
+})
+
+
+lapply(em.list,function(x){
+  
+  ggplot(x, aes(x=delta_pval, y=delta2_pval)) +
+    geom_point()
+})
+
+
+lapply(em.list,function(x){
+  
+
+  x[, sig := 'not']
+  x[, sig2 := 'not']
+  x[abs(delta_log2FC) > 0.58 & delta_pval < 0.005, sig := ifelse(delta_log2FC > 0, 'up', 'down')]
+   x[abs(delta_log2FC) > 0.58 & delta2_fdr < 0.05, sig2 := ifelse(delta_log2FC > 0, 'up', 'down')]
+})
+
+
+lapply(em.list,function(x){
+ x[,.N, by=.(sig)]
+ #x[sig != 'not',.N, by=.(sig,contrast)] 
+ #x[,.N, by=.(sig2)] 
+})
+```
+extract the list of sig hits and lets plot for each heatmap
+Abit difficult to merge dts as processed seperately so scaled differently...  
+only sensible way to visualise is z-scores due to batch issues
+
+```{r}
+p.quant.list <- list(orf3a = rbind(mss.em.list[[1]]$ProteinLevelData),
+                     nsp6 =  rbind(mss.em.list[[2]]$ProteinLevelData))
+
+clusterwNA <- function(x, na.val=0){
+  
+  x[is.na(x)] <- na.val
+  dist(x) %>%  hclust(method='complete')
+}
+
+lapply(seq_along(em.list), function(x,y, n,i){
+  
+   grp <- n[[i]]
+   print(grp)
+   
+   sigProts <- x[[i]][sig != 'not', unique(Protein)]
+   
+   p.mat <-  data.table(y[[i]]$ProteinLevelData) %>% 
+    dcast(., Protein~paste0(GROUP,'.',SUBJECT), value.var = 'LogIntensities') %>% 
+    as.matrix(rownames='Protein')
+   
+   # z scores of heatmap
+   p.mat <-  scale(p.mat)
+   #p.mat <- sweep(p.mat, 1, STATS=apply(p.mat,1,median, na.rm=T))
+   
+   subMat <- p.mat[rownames(p.mat) %in% sigProts,]
+   
+  rownames(subMat) <-  multiUniprots2multiGenes(rownames(subMat))
+   
+  #heatmap annotation 
+  grp <- sub(".[1-6]$", "", colnames(subMat))
+  grp <- sub("^[LD]{1}", "", grp)
+  grp <-  str_replace(grp, "(?<=-)[LD]", "")
+  treat <- ifelse(grepl("^[D|L]{1}", colnames(subMat)), 'treatment', 'control')
+  rep <- sub(".","",str_extract(colnames(subMat), ".[1-3]$"))
+
+  col <-  colorRamp2(c(-3,0,3), c("blue","white","red"))
+  
+  ha <- HeatmapAnnotation(group = grp, rep=rep, col=list(
+                                                                          group=c('orf3aBeta'='red', 'orf3aQ57H'='blue', 'orf3aS171L'='green', 'orf3aWT'='orange',
+                                                                           'nsp6BA1'='yellow', 'nsp6BA2'='purple', 'nsp6XBB'='pink', 'nsp6WT'='darkred'),
+                                                                              rep=c('1'='pink','2'='cyan', '3'='palegreen')))
+  
+  hm <-  Heatmap(subMat, 
+          cluster_rows = clusterwNA(subMat),
+          show_row_names = T,
+          cluster_columns = F,
+          row_names_gp = gpar(fontsize=3),
+          col=col,
+          name = 'z-score (Ints.)',
+          row_title = paste0(nrow(subMat), ' proteins +/- 50% FC & p.val < 0.005'),
+          column_split = ifelse(grepl('^[LD]{1}', colnames(subMat)), 'treatment', 'control'),
+         top_annotation = ha)
+
+
+  BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' DE between treatment groups')), paste0(n[[i]], '.contrastofcontrast.heatmap.'),  dimensions=c(10,11))
+  
+}, x=em.list, y=mss.em.list, n=names(em.list))
+```
+collapse to group mean
+Some issue here with accessing address for the DT?
+
+```{r}
+lapply(p.quant.list,str)
+
+lapply(p.quant.list, function(x){
+  return(setDT(x))
+})
+
+p.quant.list <- lapply(p.quant.list, function(x,i){
+  # calculate z-score per sample
+  x[, z.score := (LogIntensities - mean(LogIntensities))/sd(LogIntensities), by=.(GROUP,SUBJECT) ]
+  #now calculate avg z-score per condition
+  x[, avg.z.score := mean(z.score), by=.(GROUP,Protein)]
+
+})
+
+p.mat.list <- lapply(seq_along(p.quant.list), function(x,i){
+  p.mat <- dcast(x[[i]][SUBJECT == 1,], Protein~GROUP, value.var = 'avg.z.score') %>% 
+    as.matrix(rownames='Protein')
+}, x=p.quant.list)
+
+names(p.mat.list) <- names(p.quant.list)
+```
+plot the average z score
+
+```{r}
+lapply(seq_along(em.list), function(x,y, n,i){
+  
+   grp <- n[[i]]
+   print(grp)
+   
+   sigProts <- x[[i]][sig != 'not', unique(Protein)]
+   
+   p.mat <-  y[[i]]
+   
+   # z scores of heatmap
+   p.mat <-  scale(p.mat)
+   #p.mat <- sweep(p.mat, 1, STATS=apply(p.mat,1,median, na.rm=T))
+   
+  subMat <- p.mat[rownames(p.mat) %in% sigProts,]
+  rownames(subMat) <- multiUniprots2multiGenes(rownames(subMat))
+   
+  #heatmap annotation 
+  #grp <- sub(".[1-6]$", "", colnames(subMat))
+  #grp <- sub("^[LD]{1}", "", grp)
+  #grp <-  str_replace(grp, "(?<=-)[LD]", "")
+  treat <- ifelse(grepl("^[D|L]{1}", colnames(subMat)), 'treatment', 'control')
+  rep <- sub(".","",str_extract(colnames(subMat), ".[1-3]$"))
+
+  col <-  colorRamp2(c(-3,0,3), c("blue","white","red"))
+  
+  ha <- HeatmapAnnotation(treatment=treat,  col=list(treatment=c('treatment'='red', 'control'='blue'),
+                                                                          group=c('orf3aBeta'='red', 'orf3aQ57H'='blue', 'orf3aS171L'='green', 'orf3aWT'='orange',
+                                                                           'nsp6BA1'='yellow', 'nsp6BA2'='purple', 'nsp6XBB'='pink', 'nsp6WT'='darkred', 'nsp6B'='lightblue'
+                                                                             )) )
+  hm <-  Heatmap(subMat, 
+          cluster_rows = clusterwNA(subMat),
+          show_row_names = T,
+          row_names_gp = gpar(fontsize=3),
+          col=col,
+          name = 'mean z-score (Ints.)',
+          row_title = sprintf('%s proteins', nrow(subMat)),
+          column_split = ifelse(grepl('^[LD]{1}', colnames(subMat)), 'treatment', 'control'),
+         top_annotation = ha)
+
+
+  #BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' DE between treatment groups')), paste0(n[[i]], '.contrastofcontrast.collapsed.heatmap.'),  dimensions=c(8,13))
+  
+}, x=em.list, y=p.mat.list, n=names(em.list))
+
+
+p.mat.list
+```
+now loop through each of the contrasts
+
+```{r}
+lapply(seq_along(em.list), function(x,y, n,i){
+  
+   grp <- n[[i]]
+
+   
+   for (lab in unique(x[[grp]]$contrast)){
+     print(lab)
+    
+     sigProts <- x[[i]][sig != 'not' & contrast == lab, unique(Protein)]
+     #print(sigProts)
+   
+      p.mat <-  data.table(y[[i]]$ProteinLevelData) %>% 
+        dcast(., Protein~paste0(GROUP,'.',SUBJECT), value.var = 'LogIntensities') %>% 
+        as.matrix(rownames='Protein')
+   
+      # z scores of heatmap
+      p.mat <-  scale(p.mat)
+      #p.mat <- sweep(p.mat, 1, STATS=apply(p.mat,1,median, na.rm=T))
+   
+    subMat <- p.mat[rownames(p.mat) %in% sigProts,]
+    
+    rownames(subMat) <-  multiUniprots2multiGenes(rownames(subMat))
+   
+  #heatmap annotation 
+  grp <- sub(".[1-6]$", "", colnames(subMat))
+  grp <- sub("^[LD]{1}", "", grp)
+  grp <-  str_replace(grp, "(?<=-)[LD]", "")
+  treat <- ifelse(grepl("^[D|L]{1}", colnames(subMat)), 'treatment', 'control')
+  rep <- sub(".","",str_extract(colnames(subMat), ".[1-3]$"))
+
+  col <-  colorRamp2(c(-3,0,3), c("blue","white","red"))
+  
+  ha <- HeatmapAnnotation(group = grp, col=list(
+                                                                          group=c('orf3aBeta'='red', 'orf3aQ57H'='blue', 'orf3aS171L'='green', 'orf3aWT'='orange',
+                                                                           'nsp6BA1'='yellow', 'nsp6BA2'='purple', 'nsp6XBB'='pink', 'nsp6WT'='darkred')))
+  
+  hm <-  Heatmap(subMat, 
+          cluster_rows = clusterwNA(subMat),
+          cluster_columns = F,
+          show_row_names = T,
+          row_names_gp = gpar(fontsize=3),
+          col=col,
+          name = 'z-score (Ints.)',
+          row_title = sprintf('%s proteins', nrow(subMat)),
+          column_split = ifelse(grepl('^[LD]{1}', colnames(subMat)), 'treatment', 'control'),
+         top_annotation = ha)
+  
+ draw(hm, column_title=paste0(lab))
+BackupAsPDF(draw(hm, column_title=paste0(lab)), paste0(n[[i]], '.', lab, '.contrastofcontrast.collapsed.heatmap.'),  dimensions=c(9,11))
+
+}
+  
+}, x=em.list, y=mss.em.list, n=names(em.list))
+```
+
+now collapse each of these to the mean z-score per group
+
+```{r}
+lapply(seq_along(em.list), function(x,y, z,n,i){
+  
+   grp <- n[[i]]
+
+   
+   for (lab in unique(x[[grp]]$contrast)){
+     print(lab)
+    
+     sigProts <- x[[grp]][sig != 'not' & contrast == lab, unique(Protein)]
+     #print(sigProts)
+      p.mat <- p.mat.list[[grp]]
+   
+      # z scores of heatmap
+      p.mat <-  scale(p.mat)
+      #p.mat <- sweep(p.mat, 1, STATS=apply(p.mat,1,median, na.rm=T))
+   
+    subMat <- p.mat[rownames(p.mat) %in% sigProts,]
+    
+    rownames(subMat) <-  multiUniprots2multiGenes(rownames(subMat))
+   
+  #heatmap annotation 
+ # grp <- sub(".[1-6]$", "", colnames(subMat))
+#  grp <- sub("^[LD]{1}", "", grp)
+ # grp <-  str_replace(grp, "(?<=-)[LD]", "")
+#  treat <- ifelse(grepl("^[D|L]{1}", colnames(subMat)), 'treatment', 'control')
+#  rep <- sub(".","",str_extract(colnames(subMat), ".[1-3]$"))
+
+  col <-  colorRamp2(c(-3,0,3), c("blue","white","red"))
+  
+  ha <- HeatmapAnnotation(group = grp, col=list(
+                                                                          group=c('orf3aBeta'='red', 'orf3aQ57H'='blue', 'orf3aS171L'='green', 'orf3aWT'='orange',
+                                                                           'nsp6BA1'='yellow', 'nsp6BA2'='purple', 'nsp6XBB'='pink', 'nsp6WT'='darkred')))
+  
+  hm <-  Heatmap(subMat, 
+          cluster_rows = clusterwNA(subMat),
+          cluster_columns = F,
+          show_row_names = T,
+          row_names_gp = gpar(fontsize=3),
+          col=col,
+          name = 'z-score (Ints.)',
+          row_title = paste0(nrow(subMat), ' proteins +/- 50% FC & p.val < 0.005'),
+          column_split = ifelse(grepl('^[LD]{1}', colnames(subMat)), 'treatment', 'control')) 
+       #  top_annotation = ha)
+  
+ draw(hm, column_title=paste0(lab))
+ BackupAsPDF(draw(hm, column_title=paste0(lab)), paste0(n[[i]], '.', lab, '.contrastofcontrast.collapsed.heatmap.'),  dimensions=c(9,11))
+
+}
+  
+}, x=em.list, y=mss.em.list, z=p.mat.list, n=names(em.list))
+```
+ok now tidy output for both and write out table
+```{r}
+em.list %>%  names()
+
+lapply(seq_along(em.list), function(x,n,i){
+  print(head(x[[i]]))
+  x.dt <-  dcast(x[[i]], Protein+gene.ctrl~contrast, value.var = c('delta_log2FC','delta_pval', 'delta_fdr'))
+  print(head(x.dt))
+  setnames(x.dt, old=c('gene.ctrl'), new=c('gene'))
+  
+  fwrite(x.dt, paste0('./output/29.01.24.', n[[i]], '.treatmentstatus.contrasts.wide.csv'))
+},x=em.list, n=names(em.list))
+```
+
+
+```{r}
+lapply(seq_along(em.list), function(x,y, z,n,i){
+  
+   grp <- n[[i]]
+
+   
+   for (lab in unique(x[[grp]]$contrast)){
+     print(lab)
+    
+     sigProts <- x[[grp]][sig != 'not' & contrast == lab, unique(Protein)]
+     #print(sigProts)
+      p.mat <- p.mat.list[[grp]]
+   
+      # z scores of heatmap
+      p.mat <-  scale(p.mat)
+      #p.mat <- sweep(p.mat, 1, STATS=apply(p.mat,1,median, na.rm=T))
+   
+    subMat <- p.mat[rownames(p.mat) %in% sigProts,]
+    
+    rownames(subMat) <-  multiUniprots2multiGenes(rownames(subMat))
+   
+  #heatmap annotation 
+ # grp <- sub(".[1-6]$", "", colnames(subMat))
+#  grp <- sub("^[LD]{1}", "", grp)
+ # grp <-  str_replace(grp, "(?<=-)[LD]", "")
+#  treat <- ifelse(grepl("^[D|L]{1}", colnames(subMat)), 'treatment', 'control')
+#  rep <- sub(".","",str_extract(colnames(subMat), ".[1-3]$"))
+
+  col <-  colorRamp2(c(-3,0,3), c("blue","white","red"))
+  
+  ha <- HeatmapAnnotation(group = grp, col=list(
+                                                                          group=c('orf3aBeta'='red', 'orf3aQ57H'='blue', 'orf3aS171L'='green', 'orf3aWT'='orange',
+                                                                           'nsp6BA1'='yellow', 'nsp6BA2'='purple', 'nsp6XBB'='pink', 'nsp6WT'='darkred')))
+  
+ # hm <-  Heatmap(subMat, 
+ #         cluster_rows = clusterwNA(subMat),
+#          cluster_columns = F,
+#          show_row_names = T,
+#          row_names_gp = gpar(fontsize=3),
+#          col=col,
+##          name = 'z-score (Ints.)',
+#          row_title = paste0(nrow(subMat), ' proteins +/- 50% FC & p.val < 0.005'),
+#          column_split = ifelse(grepl('^[LD]{1}', colnames(subMat)), 'treatment', 'control')) 
+       #  top_annotation = ha)
+  
+# draw(hm, column_title=paste0(lab))
+# BackupAsPDF(draw(hm, column_title=paste0(lab)), paste0(n[[i]], '.', lab, '.contrastofcontrast.collapsed.heatmap.'),  dimensions=c(9,11))
+
+#}
+  
+}, x=em.list, y=mss.em.list, z=p.mat.list, n=names(em.list))
+```

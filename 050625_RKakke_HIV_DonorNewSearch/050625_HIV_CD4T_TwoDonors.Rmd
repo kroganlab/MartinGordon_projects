@@ -1,0 +1,644 @@
+---
+title: "050625_HIV_CD4T_TwoDonors"
+author: "Martin Gordon"
+date: "2025-05-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+**Overview**
+SEC_MS data of HIV-infected CD4-Tcells; compare these infected to challenged and uninfected
+Donor 2 samples now processed and available on Box; 
+First reprocess donor1; see if our viral protein recovery is better, then look at donor2
+As there is time pressure to prepare this for Wednesday/Thursday, stick with the protein level quantification for now
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+library(magick)
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+# flag consec proteins
+source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+```
+
+Metadata; use this to plot the differences between uninfected and infected
+
+```{r}
+meta.dt <- data.table(readxl::read_xlsx('../040825_MMuralidharan_PCProphet_HIV_CD4Tcells/data/Data_Visualize_SECHIV_2ndTab_Sundayevening.xlsx', sheet=2))
+setnames(meta.dt, old=c('Map Category 1', 'Info', 'PG.ProteinAccessions', 'Genes'), new=c('group', 'info', 'protein', 'gene'))
+
+# just keep the character colnames
+meta.dt <- meta.dt[, (.SD), .SDcols = c(sapply(meta.dt, function(x) is.character(x)))]
+fwrite(meta.dt, ScriptAndDatedFileName('robyn.complexes.csv'))
+
+changingComplexes <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_robyn.complexes.csv')
+
+meta.dt <- data.table(readxl::read_xlsx('../040825_MMuralidharan_PCProphet_HIV_CD4Tcells/data/Data_Visualize_SECHIV_2ndTab_Sundayevening.xlsx', sheet=3, skip=1))
+meta.dt <- meta.dt[, (.SD), .SDcols = c(sapply(meta.dt, function(x) is.character(x)))]
+
+setnames(meta.dt, old=c('Mwt (Da)', 'PG.ProteinAccessions', 'Genes', 'Descriptions', 'Info', 'Map Category 1'), new=c('mw', 'protein', 'gene', 'description', 'info', 'complex_label'))
+fwrite(meta.dt, ScriptAndDatedFileName('robyn.complexesToMap.csv'))
+```
+
+Read in the 3, perform differential expression and don't filter out peaks (can judge quality by images)
+What comparisons do we want? Virus vs uninfected, or virus vs challenged/uninfected?
+
+Need to do some QC on this data; how many fractions in each? N proteins in each? etc
+
+```{r}
+sec.list <- list(cd4_infected_1 = fread('./data/Donor-1-032825/D1-Challenged-Infected-Plasmid-Library/20250429_183001_D1_Challenged-Infected_Plasmid-lib_042325_Protein_Report.tsv', header = T),
+                 cd4_challenged_1 = fread('data/Donor-1-032825/D1-Challenged-Uninfected-Plasmid-Library/20250424_112234_D1_Challenged_Uninfected_Plasmid_Lib_032825_Protein_Report.tsv', header = T),
+                 cd4_uninfected_1 = fread('./data/Donor-1-032825/D1-Mock-Uninfected-Plasmid-Library/20250430_155438_D1_Unchallenged_032825_Plasmid_Lib_Protein_Report.tsv', header = T),
+                 cd4_infected_2 = fread('./data/Donor-2-041725/D2-Challenged-Infected-Plasmid-Library/20250505_174034_D2-Challenged-Infected-041125_Plasmid_Lib_Protein_Report.tsv', header = T),
+                 cd4_challenged_2 = fread('./data/Donor-2-041725/D2-Challenged-Uninfected-Plasmid-Library/20250506_101239_D2-Challenged-Uninfected-Plasmid-Lib-041125_Protein_Report.tsv', header=T)
+                 )
+
+donor1.uninfected <- fread('data/Donor-1-032825/D1-Challenged-Uninfected-Plasmid-Library/20250424_164006_D1_Challenged_Uninfected_Fr5-6_0325425_Protein_Report.tsv')
+
+
+cols.noi <- c('PG.MolecularWeight', )
+donor1.uninfected
+fract56.long <- setDT(reshape2::melt(donor1.uninfected, id.vars = c('PG.MolecularWeight', 'PG.ProteinAccessions', 'PG.Genes', 'PG.Organisms', 'PG.ProteinDescriptions')))
+fract56.long[!is.nan(value),.N, by=variable] # no longwr
+```
+Check if the colnames are in correct order; yes seem to be correct
+```{r}
+lapply(sec.list, function(x){
+  # check to ensure the colnames are in order
+  colvec <- colnames(x)[6:ncol(x)]
+  
+  firstNumber  <- str_extract(colvec,  '([0-9]{1,2})')
+  secondNumber <- str_extract(colvec, '[0-9]{1,2}(?=[.]PG)')
+  
+  # seems there is a match between the values in the bracket and first numeric set
+  #looks good
+  colvec[firstNumber != secondNumber] %>% 
+    print()
+  
+  setnames(x, old=colvec, new=firstNumber)
+  return(x)
+})
+```
+n cols in the data all seem to have 72 fractions; looks ok
+```{r}
+lapply(sec.list, function(x){
+  print(length(colnames(x))) - 5
+})
+```
+
+
+```{r}
+sec.long <- fread('./050625_HIV_CD4T_TwoDonors_data/2025_05_06_hiv.cd4t.sec.long.csv.gz')
+
+sec.long$sample %>% unique()
+sec.long[, sample := factor(sample, levels=c("cd4_uninfected_1",  "cd4_challenged_1", "cd4_challenged_2", "cd4_infected_1","cd4_infected_2"))]
+```
+
+Looks like a lot more proteins recovered in the second replicate samples and also some issues with individual runs
+```{r nproteins, fig.width=8, fig.height=6}
+qc.dt <- qcSummaryTable(sec.long)
+qcPlotProteinCount(qc.dt)
+# number of protiens eluting looks good
+
+BackupAsPDF(qcPlotProteinCount(qc.dt), 'Nproteins.linechart') +
+  theme_classic()
+```
+
+```{r medpolish, fig.width=8, fig.height=6}
+g <- qcPlotMedianInt(qc.dt) +
+  theme_bw()
+g
+BackupAsPDF(g, 'medianPolish.linechart')
+```
+plot intensity heatmap with all proteins;
+This heatmap looks awful; could be how the different samples are plotted 
+
+```{r, heatmaps, fig.width=8, fig.height=6}
+intMats <- scaledIntensityMatrices(sec.long)
+BackupAsPDF(intensityHeatmaps(intMats), 'filtered.prots.heatmap')
+```
+drop the proteins that are zero across all samples
+
+```{r}
+sec.long[, c('status', 'donor') :=  tstrsplit(sample, '_', keep=c(2,3))]
+
+# convert back to character as throws off function
+sec.long[, sample := as.character(sample)]
+intDonor1 <- scaledIntensityMatrices(sec.long[donor == '1'])
+intDonor2 <- scaledIntensityMatrices(sec.long[donor == '2'])
+
+BackupAsPDF(intensityHeatmaps(intDonor1), 'totalInts.donor1.heatmap') 
+BackupAsPDF(intensityHeatmaps(intDonor2), 'totalInts.donor2.heatmap') 
+```
+These heatmaps look terrible; find the set of proteins missing ina ll the samples and filter out from further analysis
+
+```{r}
+# why is there nearly 2k genes missing from the analysis in all samples; why do we report intensities for these?
+allmissing <- sec.long[is.na(intensity), .N, by=gene][N == 72 * sec.long[,length(unique(sample))], unique(gene)]
+```
+
+```{r}
+#fwrite(sec.long[!gene %in% allmissing,], ScriptAndDatedFileName('hiv.cd4t.sec.long.filtered.csv.gz'))
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_hiv.cd4t.sec.long.filtered.csv.gz')
+```
+
+```{r}
+# donor1 matrices
+d1set <- grepl('_1$', names(intsMats))
+intsMats <- scaledIntensityMatrices(sec.long)
+
+BackupAsPDF(intensityHeatmaps(intsMats[d1set]), 'totalInts.donor1.filtered.heatmap')
+BackupAsPDF(intensityHeatmaps(intsMats[!d1set]), 'totalInts.donor2.filtered.heatmap')
+```
+
+Heatmap of the viral proteins; how do these look in each of the different datasets 
+
+```{r}
+
+viral.prots <- sec.long[org != 'Homo sapiens', unique(protein)]
+```
+
+plot the heatmap of the viral proteins; maybe cleaner to see than the linechart
+heatmap of protein detections in each dataset; looks noisier than the earlier analysis... also we detect something like 1k more proteins... maybe plot each of these heatmaps individually
+
+To try tidy the heatmap, loop through them and plot them indiviudally
+```{r}
+lapply(unique(sec.long$sample), function(x){
+  
+  subdt <- sec.long[sample == x,]
+  intsMats <- scaledIntensityMatrices(subdt)
+  
+  BackupAsPDF(intensityHeatmaps(intsMats), paste0(x,'scaled.ints.heatmaps'))
+})
+```
+To impute missing fractions, per protein, lets just join the dots between the flanking fractions
+Fast fix for now... need to move on and return results relatively quickly
+```{r}
+allFits <- fitLocalCubics(qc.dt, window = 15, sampleTerm = "additive")
+labelOutliers(qc.dt , allFits, threshold = 2) 
+
+
+qc.dt
+p <-plotNormAndOutlierFits(qc.dt , allFits)
+
+p
+BackupAsPDF(p, 'localRegression.window15.linechart')
+```
+```{r}
+normalizeByResiduals(secLong.dt = sec.long, qc.dt)
+```
+
+replot the normalized heatmaps for the 3 conditions
+
+```{r}
+lapply(unique(sec.long$sample), function(x){
+  
+  subdt <- sec.long[sample == x,]
+  intsMats <- scaledIntensityMatrices(subdt)
+  
+  BackupAsPDF(intensityHeatmaps(intsMats), paste0(x,'scaled.ints.normalized.heatmaps'))
+})
+```
+## 06-05-25 
+Tuesday evening; for now process the different SEC_MS samples, QC them and (maybe) run the differential analysis... may need to check with Ben what the alignment will look like.
+Might be best to run differential analysis for each donor and find the proteins that are differential in both sets and focus on those?
+
+```{r}
+cd4_infected_1 = fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/data/Donor-1-032825/D1-Challenged-Infected-Plasmid-Library/20250429_183001_D1_Challenged-Infected_Plasmid-lib_042325_MSStat-Report.tsv', header = T)
+cd4_challenged_1 = fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/data/Donor-1-032825/D1-Challenged-Uninfected-Plasmid-Library/20250430_093927_D1_Challenged_Uninfected_Plasmid_Lib_032825_MSStats_Report.tsv', header = T)
+cd4_uninfected_1 = fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/data/Donor-1-032825/D1-Mock-Uninfected-Plasmid-Library/20250430_155438_D1_Unchallenged_032825_Plasmid_Lib_MSStats_Report.tsv', header = T)
+cd4_infected_2 = fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/data/Donor-2-041725/D2-Challenged-Infected-Plasmid-Library/20250505_174034_D2-Challenged-Infected-041125_Plasmid_Lib_MSStats-Report.tsv', header = T)
+cd4_challenged_2 = fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/data/Donor-2-041725/D2-Challenged-Uninfected-Plasmid-Library/20250505_194825_D2-Challenged-Uninfected-Plasmid-Lib-041125_MSStats_Report.tsv', header=T)
+cd4_uninfected_2 = fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/data/Donor-2-041725/D2-Mock-Uninfected-Plasmid-Library/20250506_102206_D2-Uninfected-Plasmid-Lib_041125_MSStats_Report.tsv', header=T)
+
+
+
+
+cd4_uninfected_2[ProteinName %in% viral.prots,.N, by=.(ProteinName, Run)][N > 1][, length(unique(ProteinName))]
+cd4_uninfected_2[ProteinName %in% viral.prots,.N, by=.(ProteinName, Run)]
+                
+cd4_uninfected_2[!is.na(Intensity) & ProteinName =='Q8AC42' & Run == 7,]         
+
+
+mss.list <- list(cd4_uninfected_1, 
+                 cd4_challenged_1,
+                 cd4_infected_1, 
+                 cd4_uninfected_2,
+                 cd4_challenged_2,
+                 cd4_infected_2)
+names(mss.list) <- c('cd4_uninfected_1', 'cd4_challenged_1', 'cd4_infected_1', 'cd4_uninfected_2', 'cd4_challenged_2', 'cd4_infected_2')
+
+
+
+# ignore, just impute NA for the missing fractions
+#missing.fracts <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/data/Donor-1-032825/D1-Challenged-Uninfected-Plasmid-Library/20250424_164006_D1_Challenged_Uninfected_Fr5-6_0325425_Protein_Report.tsv', header=T)
+```
+
+Filter and remove the proteins identified by one unique peptide only; leave these as is 
+Remove all proteins without at least 2 unique peptides per sample (done)
+Keep only proteins that have 5 consecutive fractions at least (leave for now)
+'Fix' outlier fractions; just impute values between fractions (todo for my sample)
+
+Using this list of files, identify the proteins identified by more than two peptides and read these into file
+```{r}
+# cd4_challenged_1 missing fraction 5 and 6
+mss.dt <- rbindlist(mss.list, idcol='sample' , fill=TRUE)
+
+# every feature has a unique count
+mss.dt[,.N, by=.(sample, Run, BioReplicate, ProteinName,PeptideSequence, PrecursorCharge)][N==1]
+
+#summarize the featrues intensity to per sample, plot the histogram
+mss.dt[, sumInts := sum(Intensity, na.rm=T), .(sample,PeptideSequence)]
+
+# we want a per feature intensity per sec run
+collapse.dt <- mss.dt[, .(sumInts = sum(Intensity, na.rm=T)), by=.(sample,ProteinName, PeptideSequence, PrecursorCharge)]
+hist(log2(collapse.dt$sumInts)+1)
+
+ggplot(collapse.dt, aes(x=log2(sumInts+1), fill=sample)) +
+  geom_histogram() +
+  facet_wrap(~sample)
+
+# 7.56k to 8k per sample; what is there in the others after removing na
+
+filtered.list <- lapply(mss.list, function(x){
+  goodprots <- x[!is.nan(Intensity), .(length(unique(PeptideSequence))), by=.(ProteinName)][V1 > 1]$ProteinName
+  filtered.dt <- x[ProteinName %in% goodprots,]
+  return(filtered.dt)
+})
+
+#fwrite(rbindlist(filtered.list, idcol = 'sample', fill=T), ScriptAndDatedFileName('msstats.input.singleProtein.filtered.donor1donor2.csv.gz'))
+goodProteins <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_msstats.input.singleProtein.filtered.donor1donor2.csv.gz')
+goodProteins$sample %>% unique()
+goodProteins <- goodProteins[, .(sample, protein=ProteinName)]
+
+# rev is dropped from the good protein list 
+goodProteins[ProteinName == 'Q8ADQ7']
+```
+read in the protein matrices for sample `cd_infected_2` and the orignal `sec.long` set
+```{r}
+# read in the orignal seclong dataset and repeat the interpolation
+sec.long <- fread('./050625_HIV_CD4T_TwoDonors_data/2025_05_06_hiv.cd4t.sec.long.csv.gz')
+sec.long[, donor := as.character(donor)]
+
+uninf_2 <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/data/Donor-2-041725/D2-Mock-Uninfected-Plasmid-Library/20250506_102206_D2-Uninfected-Plasmid-Lib_041125_Protein_Report.tsv')
+setnames(uninf_2, old=c('PG.MolecularWeight', 'PG.ProteinAccessions', 'PG.Genes', 'PG.Organisms'), new=c('mw', 'protein', 'gene', 'org'))
+uninf_2$PG.ProteinDescriptions <- NULL
+
+uninf_2.long <- setDT(reshape2::melt(uninf_2, idvars=c('mw', 'protein', 'gene', 'org')))
+uninf_2.long[, fraction := as.integer(str_extract(variable, '[0-9]{1,2}(?=[.]PG)'))]
+uninf_2.long[,.N, by=.(fraction, variable)] # looks good; check after filing out na pepides
+uninf_2.long$variable <- NULL
+setnames(uninf_2.long, old='value', new='intensity')
+uninf_2.long[, sample := 'cd4_uninfected_2']
+uninf_2.long[, c('status', 'donor') := tstrsplit(sample, '_', keep=c(2,3))]
+
+# rbind the two datasets and save the file. Use this as input for the interpolation
+colorder <- colnames(sec.long)
+sec.long <- rbind(sec.long, uninf_2.long[,..colorder])
+#fwrite(sec.long, ScriptAndDatedFileName('sec.ms.donor1donor2.csv.gz'))
+```
+Read in `sec.long`, filter out the single peptide set, impute fractions that are missing 
+
+```{r}
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.ms.donor1donor2.csv.gz')
+sec.long[!is.na(intensity) & org != 'Homo sapiens',.N,by=sample] # alot of proteins here mapping to uninfected also.... single peptide IDs??
+
+# may need to paste these back in....
+viral.records <- sec.long[org != 'Homo sapiens']
+```
+
+Take the set of good proteins, only keep rows that match these
+```{r}
+sec.goodProts <- goodProteins[sec.long, on=c('sample', 'protein'), nomatch = NULL] # keep proteins with at least two peptides per sample
+
+# filtered out like 15% of proteins... leave as is for now, but definitely still seems like a lot of proteins...
+nrow(sec.goodProts)/nrow(sec.long)
+```
+Detect and keep only peptides with at least 5 measurements in a row 
+```{r}
+# filter for proteins with at least 5 consecutive measurements per row
+consec.dt <- FlagLowQualityPeptides(sec.goodProts, idcol = 'protein', intsCol = 'intensity')
+consec.dt[, c('status', 'donor') := tstrsplit(sample, '_', keep=c(2,3))]
+
+# adds col for filtering and n consecutive runs
+filterPeptides(sec.goodProts, consec.dt, idcol='protein')
+#fwrite(sec.goodProts[passThreshold == TRUE], ScriptAndDatedFileName('sec.long.donor1donor2.filteredSingleProtsAndLowConsecRuns.csv.gz'))
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.donor1donor2.filteredSingleProtsAndLowConsecRuns.csv.gz')
+```
+
+**standard QC plots**
+
+```{r nproteins, fig.width=8, fig.height=6}
+qc.dt <- qcSummaryTable(sec.long)
+
+qcPlotProteinCount(qc.dt)
+
+sampleorder <- c("cd4_uninfected_1", "cd4_challenged_1", "cd4_infected_1",
+                 "cd4_uninfected_2", "cd4_challenged_2","cd4_infected_2")
+
+
+qc.dt[, sample := factor(sample, levels=sampleorder)]
+# number of protiens eluting looks good
+BackupAsPDF(qcPlotProteinCount(qc.dt), 'Nproteins.linechart')
+```
+
+```{r medpolish, fig.width=8, fig.height=6}
+g <- qcPlotMedianInt(qc.dt) +
+  theme_bw()
+g
+BackupAsPDF(g, 'medianPolish.linechart')
+```
+plot the intensity matrices
+```{r, scaled-ints, fig.height=6, fig.width=11}
+intMats <- scaledIntensityMatrices(sec.long)
+intensityHeatmaps(intMats)
+BackupAsPDF(intensityHeatmaps(intMats, border=T), 'goodProts.donor1donor2.heatmap')
+```
+
+**Normalization**
+Fit loess to each sample (fit an additive model; should we allow donor interaction term?)
+```{r}
+allFits <- fitLocalCubics(qc.dt, window = 15, sampleTerm = "additive")
+labelOutliers(qc.dt, allFits, threshold = 2) 
+
+p <-plotNormAndOutlierFits(qc.dt , allFits)
+BackupAsPDF(p, 'localRegression.window15.linechart')
+```
+```{r}
+normalizeByResiduals(secLong.dt = sec.long, qc.dt)
+#fwrite(sec.long, ScriptAndDatedFileName('sec.long.donor1donor2.filteredSingleProtsAndLowConsecRuns.normalized.csv.gz'))
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.donor1donor2.filteredSingleProtsAndLowConsecRuns.normalized.csv.gz')
+```
+
+*interpolation*
+Now we just interpolate missing fractions;
+First, convert our long format data.tables to matrix
+```{r}
+qc.dt[sample == 'cd4_uninfected_1' & isOutlier == T]
+```
+
+Now, run the normalization on the data, and then return to this and interpolate the values for the missing fractions;
+I would like to understand better how it interpolates
+
+```{r}
+# testing; looks good!
+test <- sec.long[sample =='cd4_uninfected_1' & gene == 'ESYT2', intensity]
+tes2 <- sec.long[sample =='cd4_infected_1' & gene == 'NDUFAF1', intensity]
+
+# we want to interpolate every protein seperately; 
+# this looks really good; we just dont remove NA and set the maxgap to 1 (option to set to 2?)
+sec.long[, normInts := intensity]
+sec.long[, interpInts := zoo::na.approx(object=normInts, na.rm=F, maxgap=1), by=.(sample, protein)]
+sec.long[, intensity := interpInts]
+
+#fwrite(sec.long, ScriptAndDatedFileName('sec.long.donor1donor2.normalized.interpolated.csv.gz'))
+```
+Rerun the QC on this data to generate the QC plots; then proceed at a decent pace for the differential analysis
+```{r}
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.donor1donor2.normalized.interpolated.csv.gz')
+```
+Rerun the QC to view the interpolated data
+
+```{r nproteins, fig.width=8, fig.height=6}
+qc.dt <- qcSummaryTable(sec.long)
+
+qcPlotProteinCount(qc.dt)
+
+sampleorder <- c("cd4_uninfected_1", "cd4_challenged_1", "cd4_infected_1",
+                 "cd4_uninfected_2", "cd4_challenged_2","cd4_infected_2")
+
+
+qc.dt[, sample := factor(sample, levels=sampleorder)]
+# number of protiens eluting looks good
+BackupAsPDF(qcPlotProteinCount(qc.dt), 'Nproteins.cleanData.linechart')
+```
+
+```{r medpolish, fig.width=8, fig.height=6}
+g <- qcPlotMedianInt(qc.dt) +
+  theme_bw()
+g
+BackupAsPDF(g, 'medianPolish.cleanData.linechart')
+```
+Finally, plot the heatmaps of the normalized, interpolated data
+Data looks great! 
+Save to file 
+```{r, scaled-ints, fig.height=6, fig.width=11}
+sec.long$intensity_totalScaled <- NULL
+
+intMats <- scaledIntensityMatrices(sec.long)
+BackupAsPDF(intensityHeatmaps(intMats, border=T), 'goodProts.cleanData.donor1donor2.heatmap')
+
+#fwrite(sec.long, ScriptAndDatedFileName('sec.long.donor1donor2.normalized.interpolated.scaled.csv.gz'))
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.donor1donor2.normalized.interpolated.scaled.csv.gz')
+```
+Can we look at the expression of our viral proteins in the data
+```{r, fig.width=11}
+intMats <- scaledIntensityMatrices(sec.long[protein %in% viral.prots,])
+BackupAsPDF(intensityHeatmaps(intMats, border=T), 'viralProteins.cleanData.donor1donor2.heatmap')
+```
+**Interpolation practise**
+Looks good 
+One issue with the interpolation, is we dont want to impute peaks that dont exist; limit this to fractions we identify as 'missing/outlier' fractions, and then take the flanking bases either side (try leading and trailing) and run the NA imputation on this, or, we can just flag the imputed values with a column, so we can zero these out before peak picking 
+```{r}
+set.seed(1)
+vec <- rnorm(n=20, mean=10, sd=5)
+vec[c(1, 3,4, 6,10)] <- NA
+vec
+zoo::na.approx(vec, maxgap=1, na.rm=F)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+**not used**
+I think for now, I should go forward with this filtered list 
+filter out proteins with at least two unique identifiers
+```{r}
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_hiv.cd4t.sec.long.filtered.csv.gz')
+filtered.dt <- goodQualProteins[sec.long, on=c('sample', 'protein'), nomatch = NULL]
+
+goodProteins[,]
+filtered.dt
+filtered.dt <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.singlepeptidesRM.csv.gz')
+```
+
+
+filter out proteins from each run that is power
+```{r}
+# adds col for filtering and n consecutive runs
+filterPeptides(filtered.dt, consec.dt, idcol='protein')
+
+#fwrite(filtered.dt[passThreshold == TRUE], ScriptAndDatedFileName('sec.long.filteredSingleProtsAndLowConsecRuns.csv.gz'))
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.filteredSingleProtsAndLowConsecRuns.csv.gz')
+```
+
+Now, take this set of filtered proteins and rerun the QC work to decide on fractions to impute
+```{r}
+qc.dt <- qcSummaryTable(sec.long)
+qcPlotProteinCount(qc.dt)
+# number of protiens eluting looks good
+BackupAsPDF(qcPlotProteinCount(qc.dt), 'Nproteins.filtered..linechart')
+```
+```{r}
+qcPlotMedianInt(qc.dt)
+BackupAsPDF(qcPlotMedianInt(qc.dt), 'medianPolish.linechart')
+```
+```{r, scaled-ints, fig.height=6, fig.width=10}
+intMats <- scaledIntensityMatrices(sec.long)
+intensityHeatmaps(intMats)
+BackupAsPDF(intensityHeatmaps(intMats), 'filtered.prots.heatmap')
+```
+This is the scaled intensity data, but we still need to normalize this data
+```{r}
+allFits <- fitLocalCubics(qc.dt, window = 15, sampleTerm = "additive")
+
+labelOutliers(qc.dt , allFits, threshold = 2) 
+
+p <-plotNormAndOutlierFits(qc.dt , allFits)
+BackupAsPDF(p, 'localRegression.window15.linechart')
+```
+Normalize the counts from the different runs 
+
+```{r}
+normalizeByResiduals(sec.long, qc.dt)
+
+#fwrite(sec.long, ScriptAndDatedFileName('sec.long.filtered.singleProtAndConsecRuns.csv.gz'))
+sec.long <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_HIV_CD4T_TwoDonors_data/2025_05_06_sec.long.filtered.singleProtAndConsecRuns.csv.gz')
+```
+plot the normalized intensity matrices
+```{r, norm-mat, fig.height=6, fig.width=10}
+# this scales the normalized intensity values
+normMatrices <- scaledIntensityMatrices(sec.long)
+hm <- intensityHeatmaps(normMatrices)
+
+BackupAsPDF(hm, 'normalized.mat.heatmap')
+```
+Function to interpolate missing fractions; take outlier set from QC.dt 
+
+```{r}
+interpolateMissingFractions <- function(sec.long, qc.dt, idcol='protein', intsCol='intensity', ignoreFlankingFractions=9){
+  
+  stopifnot(all(sec.long$sample %in% qc.dt$sample))
+  
+  .oneMatrix <- function(sub.dt){
+    mat <- dcast(sub.dt, sub.dt[[idcol]]~fraction, value.var = intsCol) %>% 
+      as.matrix(rownames = 1)
+    mat[is.na(mat)] <- 0.0
+    mat[order(rownames(mat)),]
+  }
+  
+  .outlierCols <- function(mat, sample){
+    fractionRange <- seq(ignoreFlankingFractions, max(qc.dt[sample == sample, fraction])-ignoreFlankingFractions, 1)
+    isOutlier <- colnames(mat) %in% qc.dt[sample == sample & isOutlier == T & fraction > ignoreFlankingFractions & fraction < (max(fraction) - ignoreFlankingFractions), fraction]
+    print(colnames(mat))
+    print(isOutlier)
+  }
+  
+  mats.list <- lapply(split(sec.long, sec.long$sample), function(s){.oneMatrix(s) })
+  outlier.list <- lapply(names(mats.list), function(x){print(x); .outlierCols(mats.list[[x]], x)})
+  
+  print(colnames(mats.list[[1]]))
+  print(outlier.list)
+}
+
+
+qc.dt[isOutlier == TRUE]
+
+interpolateMissingFraction
+
+
+qc.dt[sample == 'cd4_challenged_2' & isOutlier == T,]
+
+
+
+sec.long[,length(unique(fraction)), by=sample]
+interpolateMissingFractions(sec.long = sec.long, qc.dt = qc.dt)
+
+
+names(intDonor1[1])
+```
+
+
+# remove this challenged donor 
+
+
+Take the allFits output, and use this table to flag outlier samples
+```{r}
+# run rle on this set and see ift here is a consecutive run of values; if the consecutive run is 3 or greater, dont impute
+diff(qc.dt[isOutlier == TRUE, .(sample, fraction, prevfraction = fraction-1, nextfraction=fraction+1)]$fraction)
+
+test <- sec.long[sample =='cd4_uninfected_1']
+test
+dcast(test, protein~fraction, value.var=')
+
+
+qc.dt[isOutlier == TRUE,.(sample, fraction, toImpute=ifelse(diff(fraction) > 2, 'yes', 'no'))]
+
+
+
+filtered.dt[,length(unique(fraction)), by=sample]
+  
+
+toImpute <- qc.dt[,.(sample, fraction, isOutlier)] %>% 
+  .[, `:=`(prevFrac = fraction - 1,
+           nextFrac = fraction + 1)
+           ]
+
+
+toImpute[isOutlier == TRUE & c(prevFrac, nextFrac) %in% fraction, by=sample]
+qc.dt[sample=='cd4_infected_1' & fraction > 68]
+
+  .[, fractionToImpute := ifelse(isOutlier == FALSE[fraction == (fraction -1)] && isOutlier == FALSE[fraction == (fraction +1)] && isOutlier == TRUE, 'yes', 'no'), by=.I]
+
+qc.dt[isOutlier == TRUE, .(sample, fraction, consecRun=ifelse(diff(fraction) == 1, 'yes', 'no'))] %>% 
+  .[, fractionToImpute := ifelse(isOutlier == FALSE[fraction == (fraction -1)] && isOutlier == FALSE[fraction == (fraction +1)] && isOutlier == TRUE, 'yes', 'no'),]
+
+
+impute.dt <- qc.dt[isOutlier == TRUE, .(sample, fraction, prevfraction = fraction-1, nextfraction=fraction+1)] %>% 
+ .[prevfraction != 0, toImpute := ifelse(all(c(fraction, prevfraction, nextfraction) %in% fraction), 'yes', 'no'), by=.(sample, fraction)]
+
+
+
+DT = data.table(year=rep(2010:2011, each=3), v1=1:6)
+DT[, c("lag1", "lag2") := shift(.SD, 1:2), by=year]
+DT
+```
+
+impute missing valuesl; 
+To do this; search for fraction with missing values and ensure it is present in flanking fractions
+Want to define missingFraction: maybe we want 90% missingness, or an absolute 
+
+```{r}
+qc.dt
+```
+
+

@@ -1,0 +1,256 @@
+---
+title: "SACSdomains_AF"
+author: "Martin Gordon"
+date: "2024-04-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Introduction
+---
+Out of 208 jobs in total, we have 5 models produced for 192 inteactions
+Seems most of these are not scoring well, although there are a handful of high scorers
+
+
+packages
+```{r}
+library(data.table)
+library(ggplot2)
+library(stringr)
+library(magrittr)
+library(ComplexHeatmap)
+library(circlize)
+
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("../../utils/bp_utils/manageScriptData.R")
+```
+
+read in the data
+
+```{r}
+scores.dt <- fread('./data/allScores.csv')
+setnames(scores.dt, new=c('file', 'ptm', 'iptm'))
+
+scores.dt[, pair := tstrsplit(file, '[/]', keep=2)]
+scores.dt[pair %like% "HEPN", pair := sub('HEPN_', 'HEPN-', pair)]
+
+scores.dt[, model :=  sub("model_","", str_extract(file, 'model_[1-5]'))]
+scores.dt[, c('Bait', 'Prey') :=  tstrsplit(pair, '__', keep=c(1,2))]
+
+
+scores.dt[, c('Protein', 'Domain') :=  tstrsplit(Bait, '_', keep=c(1,2))]
+# fix the domain name
+scores.dt[is.na(Domain), Domain := 'fullProtein']
+
+
+scores.dt$Domain %>%  unique()
+```
+
+Get gene names 
+```{r}
+scores.dt[, Bait_gene := multiUniprots2multiGenes('Q9NZJ4', species='HUMAN')]
+scores.dt[, Prey_gene := multiUniprots2multiGenes(Prey, species='HUMAN')]
+
+
+scores.dt$Domain %>%  unique()
+
+scores.dt[, gene_pair := ifelse(Domain == 'fullProtein', paste0(Bait_gene, '__', Prey_gene), 
+                                paste0(Bait_gene, '_', Domain, "__", Prey_gene)) ]
+
+scores.dt[, mean.iptm := mean(iptm), by=pair]
+scores.dt[, above.threshold := ifelse(iptm > .5, 'yes', 'no')]
+```
+
+## plots of the domain interactions
+
+```{r}
+g <- ggplot(scores.dt[Domain != 'fullProtein',], aes(x=gene_pair, y=iptm, color=above.threshold)) +
+  #geom_boxplot(alpha=0.4, color='darkgrey') +
+  geom_point(alpha=0.8) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer GPCR-GProtein pair scores') +
+  ylim(c(0,1)) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.boxplot', dimensions=c(16,10))
+```
+Again, looks like not an awful lot of these proteins are scoring very well consistently
+
+we have 192 different interactions modelled
+```{r}
+scores.dt[Domain != 'fullProtein',.N, by=.(gene_pair)]
+```
+Order by mean IPTM
+
+```{r}
+g <- ggplot(scores.dt[Domain != 'fullProtein',], aes(x=reorder(gene_pair, -mean.iptm), y=iptm, color=above.threshold)) +
+  #geom_boxplot(alpha=0.4, color='darkgrey') +
+  geom_point(alpha=0.8) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer pair scores') +
+  ylim(c(0,1)) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.ordered.boxplot', dimensions=c(14,10))
+```
+How many of each of the domains created a full model
+
+```{r}
+scores.dt[Domain != 'fullProtein' & model ==5,.N, by=Domain]
+```
+
+plot and facet by domain
+
+```{r}
+g <- ggplot(scores.dt[Domain != 'fullProtein',], aes(x=reorder(gene_pair, -mean.iptm), y=iptm, color=above.threshold)) +
+  #geom_boxplot(alpha=0.4, color='darkgrey') +
+  geom_point(alpha=0.8) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer Sacsin Prey Score Distributions') +
+  ylim(c(0,1)) +
+  facet_wrap(~Domain, scales='free_x', ncol=2) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.ordered.boxplot.faceted', dimensions=c(10,16))
+
+
+scores.dt[gene_pair %like% 'SACS_HEPN-S',]
+```
+prey gene facet
+```{r}
+scores.dt$Prey_gene
+
+g <- ggplot(scores.dt[Domain != 'fullProtein',], aes(x=reorder(gene_pair, -mean.iptm), y=iptm, color=above.threshold)) +
+  #geom_boxplot(alpha=0.4, color='darkgrey') +
+  geom_point(alpha=0.8) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer Sacsin Prey Score Distributions') +
+  ylim(c(0,1)) +
+  facet_wrap(~Prey_gene, scales='free_x') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.ordered.boxplot.preyfaceted', dimensions=c(10,16))
+```
+
+Barplots of mean IPTM scores
+
+Barplot of mean IPTM scores
+
+```{r}
+dt <- scores.dt[,.(above.threshold = ifelse(mean.iptm > 0.5, 'yes', 'no'), gene_pair, mean.iptm, Bait_gene, Domain, Prey_gene)] %>% 
+  unique()
+
+
+g <- ggplot(dt, aes(x=reorder(gene_pair,-mean.iptm), y=mean.iptm, fill=above.threshold)) +
+  geom_bar(alpha=0.8, stat='Identity') +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_fill_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer pair scores barplots') +
+  ylim(c(0,1)) +
+  facet_wrap(~Prey_gene,scales = 'free_x') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.Preyfacet.barplot', dimensions=c(14,14))
+
+g <- ggplot(dt, aes(x=reorder(gene_pair,-mean.iptm), y=mean.iptm, fill=above.threshold)) +
+  geom_bar(alpha=0.8, stat='Identity') +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.4) +
+  scale_fill_manual(values=c('no'='black', 'yes'='red')) +
+  labs(title='AF-multimer pair scores barplots') +
+  ylim(c(0,1)) +
+  facet_wrap(~Domain,scales = 'free_x', ncol=2) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90, size=5))
+
+g
+BackupAsPDF(g, 'AFscores.SacsinDomainfacet.barplot', dimensions=c(14,16))
+```
+Plot a heatmap of the results so we can see clustering of mean iPTM
+```{r}
+scores.dt[Domain != 'fullProtein', .(Bait_Domain = paste0(Bait_gene, '_', Domain), Prey_gene,iptm)][, unique(Bait_Domain)]
+
+# just get the mean iptm from each of the groups
+scores.mat <- dcast(scores.dt[Domain != 'fullProtein', .(Bait_Domain = paste0(Bait_gene, '_', Domain), Prey_gene,iptm)], Prey_gene~Bait_Domain, value.var = 'iptm', fun.aggregate=mean) %>% 
+  as.matrix(., rownames='Prey_gene')
+
+
+# draw heatmap
+hm <- Heatmap(scores.mat, 
+              cluster_rows=T,
+              show_row_names = T,
+              cluster_columns = T, 
+             # top_annotation = colAnn, 
+              name='Mean iPTM')
+hm
+
+BackupAsPDF(hm, 'mean.iPTM.heatmap')
+```
+
+is there any kind of row/column effect? Ie do we expect higher scores with certain Proteins and/or domains?
+Barplots of average iPTM scores per domain/protein
+
+```{r}
+g <- ggplot(scores.dt[Domain != 'fullProtein',], aes(x=Prey_gene, y=iptm, fill=Prey_gene)) +
+  geom_boxplot() +
+  ggtitle('Distributions of iPTM scores') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'Prey.iPTM.distributions.boxplots.')
+
+g <- ggplot(scores.dt[Domain != 'fullProtein'], aes(x=Domain, y=iptm, fill=Domain)) +
+  geom_boxplot() +
+  ggtitle('Distributions of iPTM scores') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90))
+g 
+BackupAsPDF(g, 'SACS.domains.Distributions.boxplots.')
+```
+Lets try the TMP proceedure to iteratively subtract row and column effects and see if something stands out
+Residual heatmap suggests that for GNG5 and LRCH2, there is some interaction that is not explained by either the column (domain) or row (Protein prey) factor levels; this could indicate a meaningful interaction
+
+```{r}
+
+colorRamp2()
+tmp.out <- medpolish(scores.mat)
+tmp.out$residuals %>% str()
+
+# draw heatmap
+hm <- Heatmap(tmp.out$residuals, 
+              cluster_rows=T,
+              show_row_names = T,
+              cluster_columns = T, 
+              name='TMP residuals')
+
+BackupAsPDF(hm, 'TMP.residuals.heatmap')
+```
+trends in data? Dont want to see anything obvious (want normally distributed residuals..)
+```{r}
+plot(tmp.out)
+```
+Maybe we should investigate and view the models for the two tables
+For now leave as is. Can share the modesl this evening for any of interest
+
+
+Llets look at the full protein breakdown and see if we see any of these interesting domain interactions also score highly
+```{r}
+scores.dt[Domain == 'fullProtein' & !Bait %like% 'SUB',]
+```
+

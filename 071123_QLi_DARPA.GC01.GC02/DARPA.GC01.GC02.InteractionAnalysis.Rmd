@@ -1,0 +1,259 @@
+---
+title: "DARPA.GC01.GC02.InteractionAnalysis"
+author: "Martin Gordon"
+date: "2023-11-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Interaction Analysis
+Question: how does the addition of PTX/YM (the Gprotein inhibitors impact the expression profile of the data?)
+
+SO want to compare (ZC05-ZC00) - (ZC05_YM/PTX - ZC00_YM/PTX) etc
+Need to recode the data table for this 
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library (emmeans)
+library(stringr)
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+
+```
+
+read in the protein quant data 
+For now, just proceed with the one round normalised data... speak to Ben
+```{r}
+MRX2.dp  <- readRDS('./output/MRX2.rds') 
+QRFPR.dp <- readRDS('./output/QRFPR.rds') 
+
+
+MRX2 <- data.table(MRX2.dp$ProteinLevelData)
+QRFPR <-data.table(QRFPR.dp$ProteinLevelData)
+
+p.quant.list <-  list(MRX2 = MRX2,
+                      QRFPR = QRFPR)
+
+#p.quant.list$QRFPR <- fread('./output/QRFPR.ProteinlvlData.tmpNormalized.csv.gz')
+```
+
+Create new dummy variables
+```{r}
+
+lapply(p.quant.list, function(x){
+  
+  x[ !GROUP %like% "_", GROUP := paste0(GROUP,'_CTRL')] %>% 
+  .[, batch := paste0('batch.',SUBJECT)] %>% 
+  .[, receptor := ifelse(GROUP %like%  'ZC', 'MRX2', 'QRFPR')] %>% 
+  .[, pretreat := str_extract(GROUP, 'PTX|CTRL|YM')] %>% 
+  .[, timeStr := sub('RF|ZC','', str_extract(GROUP, 'ZC[0-9]{2}|RF[0-9]{2}'))]
+})
+
+
+lapply(p.quant.list, str)
+```
+For now, leave the contrasts as is
+w/o running second round of correction, all terms are significant
+```{r}
+
+lapply(p.quant.list, function(x){
+  
+ model <- aov(LogIntensities ~ batch+pretreat+timeStr+pretreat:timeStr, data=x)  
+ summary(model)
+})
+```
+Interaction analysis check how pretreatment impacts response
+```{r}
+
+# linearModelsAllProteins can this function which computes statistic for a contrast of two different log2FC
+# how does the treatment effect change per antagonist level? basically compare treatment effect within each antagonist level
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~timeStr|pretreat){  # how does response overe time change with pretreatment status
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+# postProcessFunction = emmeans.contrastOfContrasts tells it to use the function above after doing anova.
+# it is optional, adds significant time to the computation (~5x), but is nice to
+# put a magnitude and p value on specific differences of differences
+#
+# cl = 6 parameter says to use 6 processes.  Set to NULL if multiprocess is failing, or higher or lower as you wish.
+# Numbers near the number of processors available in your machine is probably counterproductive.
+
+lm.out <- lapply(p.quant.list, function(x){
+  
+  # Numbers near the number of processors available in your machine is probably counterproductive.
+  x.lm <- linearModelsAllProteins(x, 
+                                  formulaList = list(full   = LogIntensities~batch + timeStr + pretreat + pretreat:timeStr), # full model; 4 way ANOV
+                                  splitColumn = "Protein", postProcessFunction = emmeans.contrastOfContrasts, cl = 6) |> suppressWarnings()
+  
+  return(x.lm)
+  
+})
+
+```
+```{r}
+lapply(seq_along(lm.out), function(x,n,i){
+
+  dt <- x[[i]][['anova']]
+  str(dt)
+
+ g <- ggplot(dt, aes(x=dt$p.value)) +
+   geom_histogram(boundary=0.0, binwidth = 0.005) +
+   xlim(c(0,0.05)) +
+   facet_wrap(~dt$term)
+ 
+ #BackupAsPDF(g, paste0(n[[i]], '.aov.term.pval.historgrams'))
+ 
+},x=lm.out, n=names(lm.out))
+
+```
+## adjust pvalues 
+
+```{r}
+lapply(lm.out, function(x){
+  
+  x[['anova']][, fdr := p.adjust(p.value, method = "BH"), by= term]
+  
+})
+
+```
+Write out files to dir
+```{r}
+lapply(seq_along(lm.out), function(x,n,i){
+  
+  fwrite(x[[i]][['anova']], paste0('./output/',n[[i]], '.anova.contrasts.csv.gz'))
+  
+},x=lm.out, n=names(lm.out))
+
+```
+
+plot the interaction effects
+
+## interaction effects
+different response given pretreatment
+
+```{r}
+clusterwNA <- function(x, na.val=0){
+  
+  x[is.na(x)] <- na.val
+  dist(x) %>%  hclust(method='complete')
+}
+
+#play with thresholds here
+lapply(seq_along(lm.out), function(x,n,i){
+  dt <- x[[i]][['anova']]
+  
+  receptor <- n[[i]]
+  
+  p.quant <- p.quant.list[[receptor]]
+  
+  sigProtein <- dt[term %in% c("timeStr:pretreat") & p.value < 0.001,] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+ 
+
+  # filter just to our data
+   prot.mat <- dcast (p.quant[Protein %in% sigProtein,], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+
+
+  rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  # vector for col splitting
+  column.vec <- sub('_[1-6]$', '', colnames(prot.mat))
+  
+  hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'log Ints/Median',
+                cluster_rows = clusterwNA(prot.mat),
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = column.vec,
+              column_title_gp = gpar(fontsize=7))
+  
+#BackupAsPDF(hm, paste0(n[[i]], '.npff:cm101.pval<0.001.heatmap'), dimensions = c(8,9))
+  BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' PTX/YM pretreat interaction')), paste0(n[[i]], '.ptx.ym.response.pval<0.001.heatmap'), dimensions = c(8,6))
+  
+},x=lm.out, n=names(lm.out))
+```
+contrast of contrast
+----
+emmeans package allows us to extract a magnitude change and a pvalue for the specific contrast per protein
+magnitude difficult to interpret in interaction analysis; 
+
+```{r}
+# pick out the contrassts we are interested in basically CTRL vs YM/PTX treat
+contrasts.oi <- c( "(timeStr00 - timeStr05 CTRL) - (timeStr00 - timeStr05 YM)", "(timeStr00 - timeStr05 CTRL) - (timeStr00 - timeStr05 PTX)", 
+                   "(timeStr00 - timeStr10 CTRL) - (timeStr00 - timeStr10 YM)", "(timeStr00 - timeStr10 CTRL) - (timeStr00 - timeStr10 PTX)", 
+                   "(timeStr05 - timeStr10 CTRL) - (timeStr05 - timeStr10 YM)", "(timeStr05 - timeStr10 CTRL) - (timeStr05 - timeStr10 PTX)")
+
+contrasts.list <- lapply(seq_along(lm.out), function(x,n,i){
+  dt <- x[[i]][['postProcess']]
+  print(dt[contrast %in% contrasts.oi,]) }, x=lm.out, n=names(lm.out))
+
+names(contrasts.list) <-  names(lm.out)
+
+lapply(seq_along(contrasts.list), function(x,n,i){
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.emmeans.contrasts.oi.csv'))
+},x=contrasts.list, n=names(contrasts.list))
+
+
+lapply(contrasts.list, print)
+```
+Value here is we can require a magnitude of difference. 
+Signs are confusing here because the loss of a negative effect will show as  a positive effect, and vice versa. 
+Just plot all the sig movers 
+
+```{r}
+
+#play with thresholds here
+lapply(seq_along(contrasts.list), function(x,n,i){
+  dt <- x[[i]]
+
+  receptor <- n[[i]]
+  
+  p.quant <- p.quant.list[[receptor]]
+  
+  sigProtein <- dt[contrast %in% contrasts.oi & p.value < 0.001,] %>% 
+    .[,unique(Protein)]
+  
+  print(sigProtein)
+ 
+  # filter just to our data
+   prot.mat <- dcast (p.quant[Protein %in% sigProtein,], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+
+
+  rownames(prot.mat) <- multiUniprots2multiGenes(rownames(prot.mat), species = "HUMAN")
+  
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  # vector for col splitting
+  column.vec <- sub('_[1-6]$', '', colnames(prot.mat))
+  
+  hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'log Ints/Median',
+                cluster_rows = clusterwNA(prot.mat),
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = column.vec,
+              column_title_gp = gpar(fontsize=7))
+  
+  BackupAsPDF(draw(hm, column_title=paste0(n[[i]], ' PTX/YM pretreat interaction')), paste0(n[[i]], '.ptx.ym.emmeans.contrastofcontrasts.pval<0.001.heatmap'), dimensions = c(9,8))
+  
+},x=contrasts.list, n=names(contrasts.list))
+```

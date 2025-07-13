@@ -1,0 +1,285 @@
+---
+title: "viralProtein_comparisons"
+author: "Martin Gordon"
+date: "2024-06-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Todo
+----
+Ask Adrian about the level
+
+packages
+
+```{r packages}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(viridis)
+library(ggvenn)
+library(hrbrthemes)
+library(viridis)
+library(ggbeeswarm)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj
+library(scales)
+library(seqinr)
+library(scales)
+library(RColorBrewer)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+read in the fasta
+```{r}
+search.fa <- seqinr::read.fasta('./docs/SARS_Cov_2_Mpro.fasta', seqtype = 'AA', as.string = T)
+
+prots.oi <- names(search.fa)
+prots.oi <- gsub('sp[|]', '', prots.oi)
+prots.oi <- gsub('[|]SARS_CoV_2_[A-Za-z0-9]+$','', prots.oi)
+prots.oi
+```
+
+```{r}
+p.quant <-  fread('~/Documents/projects/052924_ARichards_AViDD_Murine/AViDD_AB_murine_DE_data/2024_05_31_AB.ProteinLevelData.tmpNormNewCol.csv')
+smooth.dt <- fread('~/Documents/projects/052924_ARichards_AViDD_Murine/PC1_batchRemoval_data/2024_06_04_ProteinLevelQuant.PC1SmoothedValues.csv')
+
+exp.dt <- merge(x=smooth.dt, y=p.quant[, .(sample, Protein, RUN,originalRUN, TotalGroupMeasurements, NumMeasuredFeature, MissingPercentage, more50missing, NumImputedFeature)], by=c('sample','Protein'),  all.x=T) 
+
+exp.dt[Protein %like% "sp|nsp1|SARS_CoV_2_nsp1" ]
+```
+
+Now finding the viral proteins in quant data... plot this against our RNAseq 
+
+```{r}
+viral.ab <- p.quant[Protein %in% prots.oi,]
+viral.ab$GROUP %>%  unique()
+```
+
+Read in the RNAseq and reformat like AB 
+
+```{r}
+rna.dt <- fread('./data/StringTie-TPM.RemDupGenes.GeneName.table')
+
+rna.long.dt <- setDT(reshape2::melt(rna.dt, value.name = 'TPM'))
+setnames(rna.long.dt, new=c('gene', 'sample', 'TPM'))
+
+# get the file names
+rna.long.dt[, sample := sub('S[0-9]{2}_','', sample)]
+rna.long.dt[, timepoint := str_extract(sample, '[247]d')]
+rna.long.dt[, GROUP := sub('_[0-9]{1}$', '', sample)]
+rna.long.dt[, SUBJECT := str_extract(sample, '[0-9]$')]
+
+rna.long.dt[, GROUP := ifelse(GROUP %like% "Nirmatrelvir_", sub("Nirmatrelvir_", 'Nirm_', GROUP), GROUP)]
+rna.long.dt[, GROUP := ifelse(GROUP %like% "AVI4516_", sub("AVI4516_", 'x4516_', GROUP), GROUP)]
+rna.long.dt[, GROUP := ifelse(GROUP %like% "AVI4673_", sub("AVI4673_", 'x4673_', GROUP), GROUP)]
+rna.long.dt[, GROUP := ifelse(GROUP %like% "Mock_4d", sub("Mock_4d", 'Mock', GROUP), GROUP)]
+```
+
+```{r}
+viral.rna <- rna.long.dt[grep('SARS', gene, ignore.case = T)]
+
+ggplot(viral.rna, aes(x=paste0(GROUP,'.', SUBJECT), y=TPM, fill=GROUP)) +
+  geom_bar(stat='Identity') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+viral.rna[sample %like% 'Mock']
+```
+
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(viral.rna$GROUP)))
+
+sum.ab <- viral.ab[, .(Protein='Sars', medianLogInts = median(newLogIntensities, na.rm=T), RUN,GROUP,SUBJECT), by=.(sample)]
+
+g <- ggplot(viral.ab[Protein == 'N' & GROUP %in% grep('2d', GROUP, value=T),], aes(x=paste0(GROUP,'.', SUBJECT), y=newLogIntensities, fill=GROUP)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('SARS-CoV2 N protein expression') +
+  theme_bw() +
+  xlab('sample') +
+  ylab('LogIntensities') +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'sars.Nprot.barplot')
+
+ggplot(viral.rna, aes(x=paste0(GROUP,'.', SUBJECT), y=TPM, fill=GROUP)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~gene) +
+  scale_fill_manual(values=col.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+```
+```{r}
+viral.mat <- dcast(viral.ab, Protein~paste0(GROUP,'.',SUBJECT), value.var = 'newLogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+hm <- Heatmap(viral.mat, 
+        cluster_rows = clusterWNA(viral.mat), 
+        column_split=gsub('[.][1-6]{1}$', '', colnames(viral.mat)),
+        column_names_gp= gpar(fontsize=6),
+        column_title_gp = gpar(fontsize=7),
+        name='LogIntensity',
+        cluster_columns = F)
+
+BackupAsPDF(hm, 'viralProts.heatmap', dimensions=c(11,6))
+
+
+subMat <- sweep(viral.mat, 1, apply(viral.mat, 1, median, na.rm=T))
+
+hm <- Heatmap(subMat, 
+        cluster_rows = clusterWNA(subMat), 
+        column_split=gsub('[.][1-6]{1}$', '', colnames(subMat)),
+        column_names_gp= gpar(fontsize=6),
+        column_title_gp = gpar(fontsize=8),
+        name='LogIntensity/Median',
+        cluster_columns = F)
+
+BackupAsPDF(hm, 'viralProts.medianSweep.heatmap', dimensions=c(12,6))
+```
+Do a boxplot of the expression of each of the viral proteins in the groups
+
+```{r}
+viral.ab[, treatment := gsub('_.+','',GROUP)]
+viral.ab[, timepoint := str_extract(GROUP,'[247]d')]
+
+g <- ggplot(viral.ab, aes(x=GROUP, y=newLogIntensities, fill=GROUP)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(size=1, alpha=0.6) +
+  #coord_flip() +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~Protein, ncol=5) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+BackupAsPDF(g, 'viralProt.expression.boxplot', dimensions = c(14,4))
+
+g <- ggplot(viral.ab, aes(x=GROUP, y=newLogIntensities, fill=treatment)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(size=1, alpha=0.6) +
+  #coord_flip() +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~Protein, ncol=5) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+BackupAsPDF(g, 'viralProt.expression.boxplot', dimensions = c(14,4))
+```
+
+```{r}
+g <- ggplot(viral.ab[GROUP != 'Mock',], aes(x=GROUP, y=newLogIntensities, fill=treatment)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_point(size=1, alpha=0.6) +
+  #coord_flip() +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('Distribution of viral proteins') +
+  facet_wrap(~timepoint, scales='free') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+g
+BackupAsPDF(g, 'all.viralProt.timepoint.boxplot', dimensions = c(8,5))
+```
+Ok now look at correlation of each viral prot to the RNAseq data
+Look at proportion of reads mapped to viral and contaminant genome
+
+quick plot; looks like not many have mapped reads
+Subset to the day2 samples for the correlations
+```{r}
+contam.dt <- setDT(readxl::read_excel('./docs/Sample_stats.xlsx', sheet=2))
+
+#lets tidy naming to match the proteomics data
+# get the file names
+contam.dt[, sample := sub('S[0-9]{2}_','', name)]
+contam.dt[, timepoint := str_extract(sample, '[247]d')]
+contam.dt[, GROUP := sub('_[0-9]{1}$', '', sample)]
+contam.dt[, SUBJECT := str_extract(sample, '[0-9]$')]
+
+contam.dt[, GROUP := ifelse(GROUP %like% "Nirmatrelvir_", sub("Nirmatrelvir_", 'Nirm_', GROUP), GROUP)]
+contam.dt[, GROUP := ifelse(GROUP %like% "AVI4516_", sub("AVI4516_", 'x4516_', GROUP), GROUP)]
+contam.dt[, GROUP := ifelse(GROUP %like% "AVI4673_", sub("AVI4673_", 'x4673_', GROUP), GROUP)]
+contam.dt[, GROUP := ifelse(GROUP %like% "Mock_4d", sub("Mock_4d", 'Mock', GROUP), GROUP)]
+```
+subset to day2 samples for the correlation
+```{r}
+g <- ggplot(contam.dt, aes(x=paste0(GROUP,'.',SUBJECT), y=`SARS-CoV-2`)) +
+  geom_bar(stat='Identity') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+g <- ggplot(subdt, aes(x=paste0(GROUP,'.',SUBJECT), y=`SARS-CoV-2`)) +
+  geom_bar(stat='Identity') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+g
+```
+plot the viral samples vs the protein samples for each
+
+```{r}
+sub.ab <- dcast(viral.ab[grep('_2d', sample),], sample~Protein, value.var = 'newLogIntensities')
+
+
+# subset to d2 as we have values
+sub.rna <- contam.dt[grepl('2d_', name)]
+sub.rna <- sub.rna[, .(sample = paste0(GROUP,'_',SUBJECT), viralRNA=`SARS-CoV-2`)]
+
+# sanity check
+(sub.rna$sample) %in% (sub.ab$sample)
+
+sort(sub.rna$sample)
+sort(sub.ab$sample)
+
+omic.mat <- merge(x=sub.ab, y=sub.rna, by='sample') %>% 
+  as.matrix(rownames='sample')
+
+
+hm <- Heatmap(cor(x=omic.mat, use='pairwise.complete.obs', method='pearson'),
+              name="Pearson r",
+              column_title = 'All-by-all Day2 viral protein correlations')
+hm
+BackupAsPDF(hm, 'sampleCorrelations.viralprot.heatmap')
+
+
+g <- ggplot(omic.mat, aes(x=viralRNA, y=N)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  ggtitle('Total viral RNA vs N protein') +
+  theme_bw()
+
+BackupAsPDF(g, 'protN.vs.totalRNA.scatterplot')
+
+
+g <- ggplot(omic.mat, aes(x=viralRNA, y=orf9b)) +
+  geom_point() +
+  geom_smooth(method='lm') +
+  ggtitle('Total viral RNA vs N protein') +
+  theme_bw()
+g
+BackupAsPDF(g, 'orf9b.vs.totalRNA.scatterplot')
+
+```
+

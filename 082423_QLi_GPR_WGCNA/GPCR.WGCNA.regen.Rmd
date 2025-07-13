@@ -1,0 +1,523 @@
+---
+title: "WGCNA.clusters.regen"
+author: "Martin Gordon"
+date: "2023-10-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Regenerating WGCNA clusters with the detrended data (1st) and the whole dataset with NA values removed
+
+```{r}
+
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(WGCNA)
+library(magrittr)
+library(preprocessCore) # quantile normalisation
+library(stringr)
+library(matrixStats)
+library(simplifyEnrichment)
+library(fmsb)
+library(readxl)
+library(ggbeeswarm)
+library(ggrepel)
+
+library(limma)
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+```
+
+
+## WGCNA GPCR proteins
+
+```{r}
+# read in exp data
+p.quant <- fread('data/2022_08_17_ProteinLevelData.lib.csv.gz')
+
+# read in DEA results for filtering
+mss <- fread('data/2022_08_31_NiceFitsPower3.csv')
+
+p.quant$GROUP %>%  unique()
+```
+
+```{r}
+str(p.quant)
+```
+
+```{r}
+
+# fix the groups with an underscore in them MOR_LG and MOR_DAMGO to MOR.DAMGO
+p.quant[, GROUP := gsub ("_([A-Z])", ".\\1", GROUP)]
+# add some new identifier cols
+p.quant[, `:=`(timeStr = str_extract(GROUP,'[0-9]{2}$'),
+               receptor = gsub("_[0-9]{2}$", '', p.quant$GROUP)
+               )]
+```
+
+clean up names
+
+```{r}
+group.noi <- p.quant[!GROUP %like% c("DOR|KOR|MOR|MRX2|MRX4|NK1R|NPFFR1|NPY1R|PTGER1|PTGER4|QRFPR|DOR"),unique(GROUP)]
+
+p.quant <- p.quant[!GROUP %in% group.noi, ]
+p.quant <- p.quant[!GROUP %like% "MOR.LG94",]
+
+p.quant$GROUP %>%  unique()
+
+p.quant[GROUP %like% "MOR", GROUP := gsub(".DAMGO", "", GROUP)]
+p.quant$GROUP %>%  unique()
+
+p.quant[, receptor := gsub('_[0-9]{2}', '', GROUP)]
+```
+
+
+
+```{r}
+g <- ggplot(p.quant, aes(x=interaction(GROUP,SUBJECT), y=LogIntensities, fill=receptor)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90))
+g
+
+
+p.quant
+```
+# run a lm to check for covariates impacting expression
+```{r}
+lm.out <- lm(LogIntensities~SUBJECT+receptor+GROUP, data=p.quant)
+anova(lm.out)
+```
+Looking at heatmap there is a clear batch effect.. will need to correct this, but perhaps due to insufficient normalisation?
+```{r}
+p.mat <- dcast(p.quant, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>%  as.matrix(rownames="Protein")
+
+
+#subMat <- p.mat[complete.cases(p.mat),]
+subMat <- p.mat[sample.int(p.mat, 2000),]
+sample.int()
+
+clusterwNa <- function(mat, na.val=0, ...){
+  
+  mat[is.na(mat)] <- na.val
+  return(hclust(dist(mat)))
+}
+
+
+batch <- str_extract(colnames(p.mat), 'batch.*')
+receptor <- gsub('_batch.[0-9]{2}', '', colnames(p.mat))
+timeStr <- str_extract(colnames(p.mat), '00|30|05|01|10')
+  
+HA <- HeatmapAnnotation(batch = batch, receptor = receptor, time = timeStr)
+
+ComplexHeatmap::Heatmap(p.mat, 
+                        cluster_rows = clusterwNa(p.mat),
+                        cluster_columns = T,
+                        show_row_names = F,
+                        top_annotation = HA)
+
+
+```
+Additional round of normalisation first; run TMP 
+
+```{r}
+
+#perform tmp normalisation
+tmp <- medpolish(p.mat, na.rm = TRUE) #iteratively subtract row and col median values 
+tmp.dt <- data.table(offset = tmp$col, group_subject = names(tmp$col))
+
+
+p.quant[, group_subject := paste0(GROUP,'_', SUBJECT)]
+p.quant[tmp.dt, normalize.offset := i.offset, on = "group_subject"]
+p.quant[, adj.LogIntensities := LogIntensities - normalize.offset]
+
+colnames(p.mat)
+
+```
+Look at a boxplot of these intensities 
+These look much better; write out the adjusted values for now
+
+```{r}
+ggplot(p.quant, aes(x=interaction(GROUP,SUBJECT), y=adj.LogIntensities, fill=receptor)) +
+  geom_boxplot()
+
+
+p.quant[, LogIntensities := adj.LogIntensities ]
+p.quant[, adj.LogIntensities := NULL]
+
+#fwrite(p.quant, 'data/2022_08_17_ProteinLevelData.lib.tmpNormalized.csv.gz')
+
+p.quant <- fread('data/2022_08_17_ProteinLevelData.lib.tmpNormalized.csv.gz')
+```
+
+
+Now that the data looks better normalised, rerun clustering and heatmap to observe the correlations
+
+```{r}
+p.mat <- dcast(p.quant, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>%  as.matrix(rownames="Protein")
+
+#subMat<- p.mat[complete.cases(p.mat),]
+#subMat <- p.mat[sample.int(nrow(p.mat), 2000),]
+
+batch <- str_extract(colnames(p.mat), 'batch.*')
+receptor <- gsub('_[0-9]{2}_batch.[0-9]{2}', '', colnames(p.mat))
+timeStr <- str_extract(colnames(p.mat), '00|30|05|01|10')
+  
+HA <- HeatmapAnnotation(batch = batch, receptor = receptor, time = timeStr)
+
+hm <- ComplexHeatmap::Heatmap(p.mat, 
+                        cluster_rows = clusterwNa(p.mat),
+                        cluster_columns = T,
+                        show_row_names = F,
+                        column_names_gp = gpar(fontsize=4),
+                        top_annotation = HA)
+
+hm
+BackupAsPDF(draw(ha, column_title='all features tmp norm'), '11recept.tmpnorm.heatmap')
+
+```
+
+
+
+
+Look at PCA to assess batch effects; seems samples primarily seperate by receptor. May not need to adjust
+
+```{r}
+subMat <- p.mat[complete.cases(p.mat),]
+
+# transpose as want to use genes 
+pcaOut <- prcomp(t(subMat))
+
+colInfo <- data.table(colname = colnames(subMat))
+colInfo[,c("receptor", "time", "batch") := tstrsplit(colname, "[_]", keep = c(1,2,3)) ] # v useful fucntion
+
+title <- "PCA"
+
+colInfo
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color=batch, shape=time)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=receptor), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut)))
+p
+BackupAsPDF(p, "PCA.complete.proteins.batch")
+
+
+#plot first two components
+# looks like PC5 might respond to batch. enough to worry about removign?
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color=receptor, shape=time)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=receptor), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut)))
+p
+BackupAsPDF(p, "PCA.complete.proteins.receptor")
+```
+Ok so it seems receptor is the biggest driver of  maybe its a lot of the missin values that seem to be driving batch, by removing these we are tec
+
+```{r}
+subMat<- p.mat[complete.cases(p.mat),]
+#subMat <- p.mat[sample.int(nrow(p.mat), 2000),]
+
+batch <- str_extract(colnames(subMat), 'batch.*')
+receptor <- gsub('_[0-9]{2}_batch.[0-9]{2}', '', colnames(subMat))
+timeStr <- str_extract(colnames(subMat), '00|30|05|01|10')
+  
+HA <- HeatmapAnnotation(batch = batch, receptor = receptor, time = timeStr)
+
+hm <- ComplexHeatmap::Heatmap(subMat, 
+                        cluster_rows = clusterwNa(subMat),
+                        cluster_columns = T,
+                        show_row_names = F,
+                        column_names_gp = gpar(fontsize=4),
+                        top_annotation = HA)
+
+hm
+BackupAsPDF(draw(ha, column_title='complete features tmp norm'), '11recept.tmpnorm.noNAs.heatmap')
+```
+
+For testing, lets look at batch correction for the data 
+Using limma:removebatcheffects to subtract batch cov from the matrix 
+batch 6,9,11 not estimated; are all treatments contained within these batches? seems like they are confounded...
+
+```{r}
+# use all measured prots to best estimate batch coef
+batch <- str_extract(colnames(p.mat), '[0-9]{2}$') %>%  as.factor()
+
+batch
+receptor <- gsub('_[0-9]{2}_batch.[0-9]{2}', '', colnames(p.mat)) 
+timeStr <- str_extract(colnames(p.mat), '00|30|05|01|10')
+condition <- gsub('_batch.[0-9]{2}', '', colnames(p.mat))
+
+# our experimental design mat
+design <- model.matrix(~receptor+timeStr)
+
+test.mat <- limma::removeBatchEffect(p.mat, batch=batch,  design=design)
+```
+
+plot the heatmap
+
+```{r}
+subMat <- test.mat[complete.cases(test.mat),]
+
+# transpose as want to use genes 
+pcaOut <- prcomp(t(subMat))
+
+colInfo <- data.table(colname = colnames(subMat))
+colInfo[,c("receptor", "time", "batch") := tstrsplit(colname, "[_]", keep = c(1,2,3)) ] # v useful fucntion
+
+title <- "PCA"
+
+colInfo
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color=batch, shape=time)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=receptor), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut)))
+p
+BackupAsPDF(p, "PCA.complete.proteins.batch.batchcorrected")
+
+
+#plot first two components
+# looks like PC5 might respond to batch. enough to worry about removign?
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color=receptor, shape=time)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=receptor), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut)))
+p
+BackupAsPDF(p, "PCA.complete.proteins.receptor.batchcorrected")
+```
+
+
+plot the batch corrected results
+Looks like better seperation of samples.. check out the heatmap
+
+```{r}
+receptor.pal <- randomcoloR::distinctColorPalette(length(unique(receptor)))
+
+batch <- str_extract(colnames(subMat), 'batch.*')
+receptor <- gsub('_[0-9]{2}_batch.[0-9]{2}', '', colnames(subMat))
+timeStr <- str_extract(colnames(subMat), '00|30|05|01|10')
+  
+
+HA <- HeatmapAnnotation(batch = batch, receptor = receptor, time = timeStr, 
+                        col=list(receptor = c("DOR"=receptor.pal[1], 'KOR'=receptor.pal[2], 'MOR'=receptor.pal[3],
+                                                       'MRX2'=receptor.pal[4], 'MRX4'=receptor.pal[5], 'NK1R'=receptor.pal[6], 
+                                                       'NPFFR1'=receptor.pal[7], 'NPY1R'=receptor.pal[8],'PTGER1'=receptor.pal[9], 
+                                                       'PTGER4'=receptor.pal[10], 'QRFPR'=receptor.pal[11])))
+
+hm <- ComplexHeatmap::Heatmap(subMat, 
+                        cluster_rows = clusterwNa(subMat),
+                        cluster_columns = T,
+                        show_row_names = F,
+                        column_names_gp = gpar(fontsize=4),
+                        top_annotation = HA)
+
+BackupAsPDF(draw(hm, column_title='batch corrected complete features'), '11recept.tmpnorm.noNAs.batchcorrected.heatmap')
+```
+Try entire matrix including missing vals
+
+```{r}
+receptor.pal <- randomcoloR::distinctColorPalette(length(unique(receptor)))
+#batch.pal <- randomcoloR::distinctColorPalette(length(unique(batch)))
+
+batch <- str_extract(colnames(test.mat), 'batch.*')
+receptor <- gsub('_[0-9]{2}_batch.[0-9]{2}', '', colnames(test.mat))
+timeStr <- str_extract(colnames(test.mat), '00|30|05|01|10')
+  
+
+HA <- HeatmapAnnotation(batch = batch, receptor = receptor, time = timeStr, 
+                        col=list(receptor = c("DOR"=receptor.pal[1], 'KOR'=receptor.pal[2], 'MOR'=receptor.pal[3],
+                                                       'MRX2'=receptor.pal[4], 'MRX4'=receptor.pal[5], 'NK1R'=receptor.pal[6], 
+                                                       'NPFFR1'=receptor.pal[7], 'NPY1R'=receptor.pal[8],'PTGER1'=receptor.pal[9], 
+                                                       'PTGER4'=receptor.pal[10], 'QRFPR'=receptor.pal[11])))
+
+hm <- ComplexHeatmap::Heatmap(test.mat, 
+                        cluster_rows = clusterwNa(test.mat),
+                        cluster_columns = T,
+                        show_row_names = F,
+                        column_names_gp = gpar(fontsize=4),
+                        top_annotation = HA)
+
+hm
+
+BackupAsPDF(draw(hm,column_title='batch corrected all features'), '11recept.tmpnorm.batchcorrected.heatmap')
+```
+Using the batch-corrected data moving forward to construct the expression matrix; to avoid garbage in our modules, I only want to use proteins with at least 80% completeness across all
+- what about biologically relevant missing values? maybe keep proteins missing in all sample/timepoints?
+
+Feature selection
+-----
+
+First need to handle missing values... if we just use complete.cases, we lose 45% of our data
+Keep prots with 90% completeness
+
+```{r}
+# 45% lost with 'full set'
+nrow(test.mat)
+nrow(test.mat[complete.cases(test.mat),])
+
+# remove rows with more than 33% missing values
+p.mat.f <- test.mat[which(rowMeans(!is.na(test.mat)) > 0.90), ] # only keep prots present in 2/3 of the dataset
+
+dim(p.mat.f)
+
+hm <- ComplexHeatmap::Heatmap(p.mat.f, 
+                        cluster_rows = clusterwNa(p.mat.f),
+                        cluster_columns = T,
+                        show_row_names = F,
+                        row_title = sprintf('%d proteins', nrow(p.mat.f)),
+                        column_names_gp = gpar(fontsize=4),
+                        top_annotation = HA)
+hm
+BackupAsPDF(draw(hm,column_title='wgcna input (batch corrected)'), '11recept.tmpnorm.batchcorrected.wgcna.input.heatmap')
+
+```
+
+WGCNA: 
+---
+Use the same input params as used previously, enrich output and se what is recovered
+
+
+input genes look good
+```{r}
+p.mat <- p.mat.f
+
+gsg <- goodSamplesGenes(t(p.mat))
+summary(gsg)
+gsg$allOK
+```
+r ^6 - ^7- ^8 looks good
+```{r}
+net.in <- t(p.mat)
+
+s.thres <- data.table(pickSoftThreshold(net.in)$fitIndices)
+
+s.thres %>%  
+  ggplot(aes(x=Power, y=SFT.R.sq)) + 
+  geom_point() +
+  geom_hline(yintercept = 0.9, color='darkred') +
+  labs(y="Scale Free Topology Model Fit, signed R^2") +
+  theme_classic()
+
+s.thres %>%  
+  ggplot(aes(x=Power, y=mean.k.)) + 
+  geom_point() +
+  labs(y='Mean Connectivity') +
+  theme_classic() 
+
+s.thres
+```
+use a power of 7
+
+```{r}
+softPower = 7 ##R^2 of .9 and highest connectivity,
+adj.mat = adjacency(net.in, power = softPower, corFnc = 'bicor', type = "signed") #Calculating the adjacency matrix
+#help(adjacency )
+
+dim(adj.mat)
+```
+Define the topological overlap matrix
+
+```{r}
+TOM <- TOMsimilarity(adj.mat)
+```
+Generate heatmaps of both modules before proceeding 
+
+```{r}
+Heatmap(adj.mat[1:2000,1:2000], cluster_rows = T, cluster_columns=T, column_title = 'adjacency matrix', row_title=sprintf('%s proteins', nrow(p.mat.f)), show_row_names = F, show_column_names = F)
+#BackupAsPDF(hm, 'adj.mat.st7.')
+Heatmap(TOM[1:2000,1:2000], cluster_rows = T, cluster_columns=T, column_title = 'TOM similiary', row_title=sprintf('%s proteins', nrow(p.mat.f)), show_row_names = F, show_column_names = F)
+#BackupAsPDF(hm, 'tom.mat.st7.')
+```
+Generate the modules
+
+```{r}
+TOM.dissimilarity <- 1-TOM
+adj.dissimilarity <- 1-adj.mat
+
+#creating the dendrogram 
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average") 
+
+Modules <- cutreeDynamic(dendro = geneTree, distM =TOM.dissimilarity, deepSplit = 2, pamRespectsDendro = FALSE, minClusterSize = 30)
+table(Modules)
+
+```
+```{r}
+modules.tom <- as.character(Modules)
+```
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(length(unique(Modules)))
+col.pal
+names(col.pal) <- seq(1,20,by=1) %>%  as.character()
+# add wgcna module annotation
+row_ha <- rowAnnotation(wgcna.modules=modules.tom, col=list(wgcna.modules = col.pal))
+
+length(split)
+
+seq(1,20,by=1) %>%  as.character()
+# add split order
+split <- factor(modules.tom, levels=seq(1,20,by=1) %>%  as.character())
+split
+
+hm <- Heatmap(p.mat.f, cluster_columns = FALSE, 
+         #show_row_names = FALSE,
+         split = split,
+         right_annotation = row_ha,
+         #name = "log2(intensity)",
+         column_split = tstrsplit(colnames(p.mat), "[_]")[[1]],
+         na_col = 'darkgrey',
+         row_title =sprintf("%d Proteins",
+                            nrow(prot.mat)),
+         row_names_gp = gpar (fontsize= 1),
+         column_names_gp = gpar (fontsize= 3),
+         cluster_row_slices = F,
+         column_title_gp = gpar (fontsize= 7))
+hm
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+
+#BackupAsPDF(hm, 'heatmap.wgcna.modules.ordered')
+```
+Hard to see the trends here, so plot the vsT0 values (just take this list of proteins from p.quant and calculate) to assess
+If looks good; check out the enrichment analysis; if oversplitting, adjst the parameters and rerun the analysis
+
+```{r}
+
+```
+
+
+
+
+

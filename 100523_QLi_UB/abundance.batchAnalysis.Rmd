@@ -1,0 +1,282 @@
+---
+title: "NP06.abundance.batchAnalysis"
+author: "Martin Gordon"
+date: "2023-11-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Packages
+```{r}
+library(data.table)
+library(ggplot2)
+library(MSstats)
+library(ComplexHeatmap)
+library(magrittr)
+library(stringr)
+library(randomcoloR)
+library(limma)
+library(sva) # for combat batch correction
+library(bladderbatch)
+
+
+# scripts for PTM analysis
+source('../../utils/bp_utils/MSstats_Helper_Functions.R')
+source('../../utils/bp_utils/LocatePeptidePtmInProteins.R')
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+
+rotate.x.axis.text <-  theme(
+    axis.text.x = element_text(angle=90, size=7))
+
+# cluster with missing values
+clusterwNA <- function(x, na.val=0){
+  x[is.na(x)] <- 0
+  hclust(dist(x))
+}
+```
+
+
+## NP06 Abundance batch analysis
+
+Previous analysis of NP06 data indicated significant batch effects between the metabatches 1 & 2 
+We want to identify what are the largest movers in this group and enrich these targets
+
+For now, load the normalised abundance data and run a lm using batch as a coefficient
+- looking at the boxplots it seems that the second batch have a longer tail, what about trying a tmp normalisation?
+
+load the data from abundance and set up a new metabatch contrast 
+
+
+read in data 
+```{r}
+spec <- fread('./data/AB/20231019_093712_NP06_R1_R5_dirDIA_cEX_AB_MSStatsFormatReport.tsv')
+
+spec[,ID := paste0(Condition,'.',BioReplicate)]
+spec[, .N, by=.(Condition,BioReplicate,ID)]
+```
+
+```{r}
+# check for multi-measurements
+any(spec[, .N, by = .(Run, PeptideSequence, PrecursorCharge)]$N) > 1
+
+ggplot(data=spec, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+
+spec <- spec[Intensity > 2^4,]
+
+ggplot(data=spec, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+```
+
+```{r}
+p <- ggplot(spec, aes(x=paste0(Condition,'_',BioReplicate), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=90, size=7))
+p
+```
+
+
+```{r}
+mssInput <- specFileToCompleteMSstats(spec)
+mssInput[, IsotopeLabelType := 'L']
+```
+
+maybe try two normalisation approahces
+equilizeMedians is the default - find a global median 
+```{r}
+dp.out<- MSstats::dataProcess(mssInput, 
+                              MBimpute =  FALSE, 
+                              featureSubset = "highQuality", 
+                              remove_uninformative_feature_outlier = TRUE)
+
+#saveRDS(dp.out, './output/dp.out.std.RDS')
+dp.out <- readRDS('./output/dp.out.std.RDS')
+```
+
+
+```{r}
+ggplot(p.quant, aes(x=interaction(GROUP, SUBJECT), y=LogIntensities, fill=GROUP)) + geom_boxplot() + theme(axis.text.x = element_text(angle=90))
+```
+
+Run the differential expression analysis for the two batch levels
+Adjust GROUP
+
+```{r}
+p.quant <- fread( "./output/AB.ProteinLevelData.tmpNorm.csv")
+
+# create a metaabtch factor
+p.quant[, metabatch := ifelse(SUBJECT %in% c(1,2,3), 'metaBatch.1', 'metaBatch.2')]
+
+# change the group to metabatch
+p.quant[, old.GROUP := GROUP]
+p.quant[, GROUP := metabatch]
+
+# adjsut subject, basically just saying that the measurements in the groups 1-5 are linked and use this to estimate batch
+p.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+p.quant$SUBJECT %>%  unique()
+
+
+# write to dp.out
+dp.out$ProteinLevelData <- p.quant
+```
+
+create the batch design matrix to do the comparion
+
+```{r}
+mat.dimnames <- list(rnames='metaBatch.1.vs.metaBatch.2',  
+                     cnames=c("metaBatch.1","metaBatch.2"))
+
+
+dp.contrasts <- matrix(data= c(1,-1), nrow = 1, dimnames=mat.dimnames)
+```
+
+Run the PW contrast for batch, and control for differences in subbatch
+```{r}
+# run msstats correcting for batch 
+mss <- groupComparison(contrast.matrix=dp.contrasts, data=dp.out)
+mss.dt <- setDT(mss$ComparisonResult)
+```
+1524 things differentially expressed between the two batches out of 7151 proteins...
+
+Identify sig features; we only want things that are significant movers as so many things 
+filtering on a log2FC > 1 and plot these 569 
+```{r}
+
+mss.dt <-  mss.dt[, sig := 'not'] %>% 
+  .[, p.adj := p.adjust(pvalue, method='BH')] %>% 
+  .[!issue %in% c('oneConditionMissing'),] %>% 
+  .[abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+fwrite(mss.dt, './output/mss.contrasts.metabatchContrasts.csv')
+
+# maybe reason we use our own p.adj value is it seems to return NA instead of 0, so easier to filter out results (achieve this by filtering on issue col also)
+mss.dt[issue %in% c('oneConditionMissing'), .N]
+```
+
+histogram of the pvalues
+
+```{r}
+ggplot(mss.dt, aes(x=pvalue)) + geom_histogram() + xlim(0,0.05)
+
+g <- ggplot(mss.dt, aes(x=pvalue)) + 
+  geom_histogram() +
+  theme_classic()
+
+BackupAsPDF(g, 'metabatch.pval.histogram.')
+
+
+# how many are deg? 4385 things difference in means between the groups, controlling at first level of batch
+mss.dt[pvalue < 0.05, .N]
+```
+
+lets create a heatmap of the most significant movers (log2FC > 1)
+look at in both the normalised datasets
+```{r}
+sigProts <- mss.dt[p.adj < 0.01 & abs(log2FC) > 1, Protein]
+
+p.mat <-  p.quant %>%  
+  dcast(Protein~interaction(old.GROUP,SUBJECT), value.var = 'LogIntensities') %>%  
+  as.matrix(rownames='Protein')
+
+
+subMat <-  sweep(p.mat, MARGIN=1, FUN="-", STATS = apply(p.mat,1, median, na.rm=T))
+
+subMat <-  subMat[rownames(subMat) %in% sigProts,]
+
+rownames(subMat) <-  multiUniprots2multiGenes(rownames(subMat))
+
+hm <- Heatmap(subMat, 
+        cluster_rows = clusterwNA(subMat),
+        row_title=str_glue('{nrow(subMat)} Prots @ p.adj 0.01 & abs(log2FC) > 1'),
+        row_names_gp=gpar(fontsize=2.5),
+        column_split = ifelse(grepl('batch.[123]', colnames(subMat)), 'metaBatch.1', 'metaBatch.2'),
+        column_names_gp = gpar(fontsize=6))
+
+BackupAsPDF(draw(hm, column_title='(meta)batch contrast'), 'metaBatch.FC1.adj.pval0.01.heatmap.', dimensions = c(8,14))
+```
+
+Run enrichment analysis of the metabatch groups
+G protein stuff, but 1/5 of the entire dataset is being tested vs bg..
+
+```{r}
+
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "UNIPROT")
+
+mss.dt[,enrich_grp := interaction(Label,sig)]
+## remove the UB site from the Protein name for enrichmenbt
+
+universe <- mss.dt$Protein %>%  unique()
+  
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not',], groupColumns = 'enrich_grp', geneColumn = "Protein", term2gene.gmt = gmt.go, universe = universe)
+  
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+  
+hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 10,
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 5), upperThreshold = 8) 
+
+BackupAsPDF(hm, 'metbatch.allSig.GOenrichment.')
+```
+lets look at the heatmap of the strongest movers, the ones with log2FC > 1 and adj.pval < 0.01
+10% of top movers involed in transcription activity, still enrichment is quite weak
+
+```{r}
+# adjust the sig threshold
+mss.dt[, sig := 'not']
+mss.dt[p.adj < 0.01 & abs(log2FC) > 1, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+
+mss.dt[,enrich_grp := interaction(Label,sig)]
+
+## remove the UB site from the Protein name for enrichmenbt
+  
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not',], groupColumns = 'enrich_grp', geneColumn = "Protein", term2gene.gmt = gmt.go, universe = universe)
+  
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+  
+hm <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 10,
+                                  negCols=unique(simp.enrich$simplified$enrich_grp[grep('down', simp.enrich$simplified$enrich_grp)]), 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 5), upperThreshold = 8) 
+
+BackupAsPDF(hm, 'metbatch.FC1.adj.pval0.01.GOenrichment.')
+```
+
+
+
+TODO
+-----
+
+try to normalize using quantile normalization
+```{r}
+dp.out.quantile <- MSstats::dataProcess(mssInput, 
+                              MBimpute =  FALSE,
+                              normalization = 'quantile',
+                              featureSubset = "highQuality", 
+                              remove_uninformative_feature_outlier = TRUE)
+
+saveRDS(dp.out.quantile, './output/dp.out.quantile.RDS')
+```
+
+```{r}
+
+```
+
+DO batch first then try this
+plot the two normalized quantiles
+The quantile normalisation
+
+create list and calculate vals for each factor level
+```{r}
+ggplot(dp.out.quantile$ProteinLevelData, aes(x=interaction(GROUP, '.', SUBJECT), y=LogIntensities, fill=GROUP)) + geom_boxplot()
+ggplot(dp.out$ProteinLevelData, aes(x=interaction(GROUP, '.', SUBJECT), y=LogIntensities, fill=GROUP)) + geom_boxplot()
+
+```
+

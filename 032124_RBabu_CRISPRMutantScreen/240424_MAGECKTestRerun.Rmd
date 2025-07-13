@@ -1,0 +1,544 @@
+---
+title: "240424_MAGECKTestRerun"
+author: "Martin Gordon"
+date: "2024-04-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+ 09-08-24 Notes
+ ----
+ Even after normalizing by sgRNA counts, many sgRNA are significantly changing in the different comparisons... why is this the case?
+ I think normalisation is ok... most of our genes are not changing between conditions.. pval histograms suggest a good distribution.. 
+ Even in the noBE condition comparisons, most things changing are overexpressed in the treated group... this doesnt make sense..
+ Recheck the MAGECK test command; 
+
+## R Markdown
+
+Some quesitons that need to be addressed; how do our differential expression tests look vs control (not DMSO treated?);
+Compare the conditions vs the library, and conditions vs plasmid
+
+Todo
+---
+1. Redo the count, could we try normalise by using the non-targeting controls (probably best for )
+Run the contrasts vs the Lib control (D0); we would expect to see many more proteins downregulated: see more but vastly outnumbered by upregulated things..
+Check our input to MAGECK Count
+
+```{r}
+
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(ggrepel)
+library(ggridges) # ridgeline plots
+library(eulerr) # for venn diagram plots
+library(ggvenn)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+1. Using sgRNA control normalization
+------
+Read in the data and lets look at the count distributions and how things look
+
+
+```{r}
+raw.dt <- fread('./output/mageck_count_comb_sgRNA/240424_RBabu_CRISPRe.count.txt')
+norm.dt <- fread('./output/mageck_count_comb_sgRNA/240424_RBabu_CRISPRe.count_normalized.txt')
+
+# summary datatable
+summary.dt <- fread('./output/mageck_count_comb_sgRNA/240424_RBabu_CRISPRe.countsummary.txt')
+
+# add the two dts to a list 
+mat.list <- list('raw' = raw.dt,
+                 'norm' = norm.dt)
+```
+
+Convert to long format
+
+```{r}
+lapply(mat.list, colnames)
+
+mat.long <- lapply(mat.list, function(x){
+  dt.long <- melt(x, id.vars=c('sgRNA', 'Gene'))
+  setnames(dt.long, old=c('variable', 'value'), new=c('Label', 'count'))
+  return(dt.long)
+})
+```
+
+First lets look at the summary stats and do a quick QC:
+1- N mapped reads per sample
+2 - Prop mapped reads per sample
+3 - Read count correlation per sample
+4 - Gini Index per sample
+5 - N mapped sgRNAs with zero mapped reads
+6 - Replicate correlation
+
+
+```{r}
+# define hte nbumber of groups in each dt
+
+lapply(mat.long, function(dt){
+  
+  dt[, cas9 := ifelse(grepl('Abe8e|Bemax', Label), str_extract(Label, 'Abe8e|Bemax'), 'Ctrl')]
+  dt[, group := sub("_[0-9]{1,2}$","", Label)]
+  
+  # fix some of the labels
+  dt[group %like% 'Bemax_Lib', group := 'Bemax_Lib']
+  dt[group %like% 'Abe8e_Lib', group := 'Abe8e_Lib']
+
+  dt[, sample_no := str_extract(Label, "[0-9]{1,2}$")]
+  dt[, treatment := sub("Abe8e_|Bemax_|Abe8eDMSO_|Abe8eSerum_|BemaxDMSO_|BemaxSerum_", "", group)]
+})
+
+# lets print out the new values and see how they look
+# lok good 
+lapply(mat.long, function(x){
+  x$group %>%  unique() %>%  print()
+  x$treatment %>%  unique() %>%  print()
+})
+
+```
+Gini Index
+Read depth evenness
+A high Gini index suggests that the sgRNA read count is unevenly distributed across the target genes.
+Ideally below 0.1 (lower better; would like similiar GIni index for the replicates)
+
+```{r}
+col.pal <-  distinctColorPalette(k=length(unique(mat.long[[1]]$treatment)))
+
+lapply(seq_along(mat.long), function(x,n,i){
+  
+  g <- ggplot(x[[i]], aes(x=reorder(interaction(group, sample_no), as.numeric(factor(group))), y=count, fill=treatment)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~cas9, scales='free') +
+  labs(title=paste0(n[[i]], ' Read Count Distributions')) +
+  xlab('Sample') + 
+  ylab('Log2 Count + 1 ') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+g
+  #BackupAsPDF(g, paste0(n[[i]], '.readCounts.boxplot'))
+},x=mat.long, n=names(mat.long))
+
+```
+Look at the sample Gini Indexes
+
+```{r}
+summary.dt %>%  str()
+
+g <- ggplot(summary.dt, aes(x=Label, y=GiniIndex)) +
+  geom_bar(stat='Identity') +
+  geom_hline(yintercept = 0.1, color='red') +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+BackupAsPDF(g, 'giniIndex.barplot')
+```
+Lets look at the (unnormalised) read count correlations between samples
+```{r}
+lapply(seq_along(mat.long), function(x,n,i){
+  
+  dt <- x[[i]]
+  count.mat <- dcast(dt[, .(sgRNA_Gene = paste0(sgRNA, '_', Gene),Label, count)], sgRNA_Gene~Label, value.var='count') %>% 
+    as.matrix(rownames='sgRNA_Gene')
+  
+  # grab a subset of the rows for visualising
+  submat <- count.mat[sample(rownames(count.mat), 2000),]
+  submat <- log2(submat +1)
+  
+  # median scale
+  submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+  
+  # create annotation
+  ann <- data.table(group=str_extract(colnames(submat), 'BAFA1|Lib|DOXO|CTRL[123]|STARVE|TORIN|GPN|plasmid_BE|gRNA_noBE'),
+                  cas9=ifelse(grepl('Abe8e|Bemax', colnames(submat)), str_extract(colnames(submat), 'Abe8e|Bemax'), 'Ctrl'))
+
+  colours <- list('cas9' = c('Abe8e' = '#4477AA', 'Bemax'="#228833", 'Ctrl'="#CCBB44"),
+                'group' =c('BAFA1' = col.pal[1], 'Lib'=col.pal[2], 'DOXO'=col.pal[3], 'CTRL1'=col.pal[4], 'CTRL2'=col.pal[5], 'CTRL3'=col.pal[6],
+                           'STARVE' = col.pal[7], 'TORIN'=col.pal[8], 'GPN'=col.pal[9], 'plasmid_BE'=col.pal[10], 'gRNA_noBE'=col.pal[11]))
+  
+  colAnn <- HeatmapAnnotation(df = ann, col = colours)
+
+  hm <- Heatmap(submat, cluster_rows=T, 
+              show_row_names = F, 
+              cluster_columns = T, 
+              top_annotation = colAnn, 
+              name='Log2(Counts+1)/Median',  
+              column_names_gp = gpar(fontsize=6))
+  hm
+  BackupAsPDF(hm, paste0(n[[i]], '.heatmap.medianScaled.heatmap'))
+},x=mat.long, n=names(mat.long))
+
+```
+I wonder if we split the heatmaps by cas9 and cluster seperately? These are likely very different, so perhaps grouping together is an issue and driving the clusteting..
+
+```{r}
+lapply(seq_along(mat.long), function(x,n,i){
+  
+  dt <- x[[i]]
+  count.mat <- dcast(dt[, .(sgRNA_Gene = paste0(sgRNA, '_', Gene),Label, count)], sgRNA_Gene~Label, value.var='count') %>% 
+    as.matrix(rownames='sgRNA_Gene')
+  
+  # grab a subset of the rows for visualising
+  submat <- count.mat[sample(rownames(count.mat), 2000), ]
+  submat <- log2(submat +1)
+  
+  # split into the two groups
+  
+  bemax.mat <- submat[, grepl('Bemax', colnames(count.mat))]
+  abe8e.mat <- submat[, grepl('Abe8e', colnames(count.mat))]
+  
+  # median sweep
+  bemax.sub <- sweep(bemax.mat, 1, apply(bemax.mat, 1, median, na.rm=T))
+  abe8e.sub <- sweep(abe8e.mat, 1, apply(abe8e.mat, 1, median, na.rm=T))
+  
+  # create annotation
+  ann <- data.table(group=str_extract(colnames(submat), 'BAFA1|Lib|DOXO|CTRL[123]|STARVE|TORIN|GPN|plasmid_BE|gRNA_noBE'),
+                  cas9=ifelse(grepl('Abe8e|Bemax', colnames(submat)), str_extract(colnames(submat), 'Abe8e|Bemax'), 'Ctrl'))
+
+  colours <- list('cas9' = c('Abe8e' = '#4477AA', 'Bemax'="#228833", 'Ctrl'="#CCBB44"),
+                'group' =c('BAFA1' = col.pal[1], 'Lib'=col.pal[2], 'DOXO'=col.pal[3], 'CTRL1'=col.pal[4], 'CTRL2'=col.pal[5], 'CTRL3'=col.pal[6],
+                           'STARVE' = col.pal[7], 'TORIN'=col.pal[8], 'GPN'=col.pal[9], 'plasmid_BE'=col.pal[10], 'gRNA_noBE'=col.pal[11]))
+
+  hm <- Heatmap(bemax.sub, cluster_rows=T, 
+              show_row_names = F, 
+              cluster_columns = T, 
+              top_annotation = HeatmapAnnotation(df = ann[cas9=='Bemax',], col = colours), 
+              name='Log2(Counts+1)/Median',  
+              column_names_gp = gpar(fontsize=6)) +
+      Heatmap(abe8e.sub, cluster_rows=T, 
+              show_row_names = F, 
+              cluster_columns = T, 
+              top_annotation = HeatmapAnnotation(df = ann[cas9=='Abe8e',], col = colours),
+              name='Log2(Counts+1)/Median',  
+              column_names_gp = gpar(fontsize=6)) 
+    
+  hm
+  BackupAsPDF(hm, paste0(n[[i]], '.heatmap.medianScaled.cas9split.heatmap'))
+},x=mat.long, n=names(mat.long))
+```
+Now, we will need to split up these samples and perform the DE testing on each matrix individually
+
+First extract the normalized matrix 
+
+```{r}
+norm.mat <- dcast(mat.long[['norm']], sgRNA+Gene~Label, value.var = 'count')
+norm.mat %>%  colnames()
+
+
+norm.mat[, grepl()]
+
+
+nrow(norm.mat)
+```
+```{r}
+# modified this to make order safer;
+# order is important as want controls (denom) in the first two cols
+selectCols <- function(dt, idCols=c('sgRNA', 'Gene'), denominator='Abe8eDMSO_CTRL2', numerator='Abe8eSerum'){
+  
+  denom.dt <- grep(paste(c(idCols, denominator), collapse='|'), colnames(dt), value=T)
+  num.dt <- grep(paste(c(idCols, numerator), collapse='|'), colnames(dt), value=T)
+  
+  return(merge(x=dt[, ..num.dt], y=dt[, ..denom.dt], by=idCols))
+}
+
+selectCols(norm.mat, idCols = c('sgRNA', 'Gene'), denominator = 'Bemax_Lib', numerator = 'BemaxDMSO_CTRL2')
+
+
+grep(paste(c('sgRNA', 'Gene'),'Abe8eDMSO_CTRL2', collapse = '|'), colnames(norm.mat), value = T)
+
+paste(c('sgRNA', 'Gene'),'Abe8eDMSO_CTRL2', collapse = '|')
+
+c(c('sgRNA', 'Gene'),'Abe8eDMSO_CTRL2') %>% paste(collapse='|')
+```
+
+# we are basically going to do all the comparisons
+```{r}
+
+# first grp is fitness analysis after base editing
+cols.oi <- list(c('sgRNA', 'Gene', 'Bemax_Lib', 'BemaxDMSO_CTRL2'),
+                c('sgRNA', 'Gene', 'Abe8e_Lib', 'Abe8eDMSO_CTRL2'),
+                # drug sensitivity analysis
+                #bemax set
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL2', 'Bemax_TORIN'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL2', 'Bemax_BAFA1'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL2', 'BemaxSerum_STARVE'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL2', 'Bemax_GPN'),
+                c('sgRNA', 'Gene', 'BemaxDMSO_CTRL3', 'Bemax_DOXO'),
+                #abe8e set
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL2', 'Abe8e_TORIN'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL2', 'Abe8e_BAFA1'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL2', 'Abe8eSerum_STARVE'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL2', 'Abe8e_GPN'),
+                c('sgRNA', 'Gene', 'Abe8eDMSO_CTRL3', 'Abe8e_DOXO'),
+                
+                #negative ctrl set: compare to the initial library Lib
+                c('sgRNA', 'Gene', 'Bemax_Lib', 'Bemax_TORIN'),
+                c('sgRNA', 'Gene', 'Bemax_Lib', 'Bemax_BAFA1'),
+                c('sgRNA', 'Gene', 'Bemax_Lib', 'BemaxSerum_STARVE'),
+                c('sgRNA', 'Gene', 'Bemax_Lib', 'Bemax_GPN'),
+                c('sgRNA', 'Gene', 'Bemax_Lib', 'Bemax_DOXO'),
+                #abe8e set vs iniital library lib
+                c('sgRNA', 'Gene', 'Abe8e_Lib', 'Abe8e_TORIN'),
+                c('sgRNA', 'Gene', 'Abe8e_Lib', 'Abe8e_BAFA1'),
+                c('sgRNA', 'Gene', 'Abe8e_Lib', 'Abe8eSerum_STARVE'),
+                c('sgRNA', 'Gene', 'Abe8e_Lib', 'Abe8e_GPN'),
+                c('sgRNA', 'Gene', 'Abe8e_Lib', 'Abe8e_DOXO'),
+                #conditions vs guide RNA with no base editor
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Bemax_Lib'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'BemaxDMSO_CTRL2'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Bemax_TORIN'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Bemax_BAFA1'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'BemaxSerum_STARVE'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Bemax_GPN'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Bemax_DOXO'),
+                # abe8e
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Abe8e_Lib'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Abe8eDMSO_CTRL2'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Abe8e_TORIN'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Abe8e_BAFA1'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Abe8eSerum_STARVE'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Abe8e_GPN'),
+                c('sgRNA', 'Gene', 'gRNA_noBE_37', 'Abe8e_DOXO'),
+                # plasmid library representaiton before introducing to the cell
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Bemax_Lib'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'BemaxDMSO_CTRL2'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Bemax_TORIN'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Bemax_BAFA1'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'BemaxSerum_STARVE'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Bemax_GPN'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Bemax_DOXO'),
+                # abe8e
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Abe8e_Lib'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Abe8eDMSO_CTRL2'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Abe8e_TORIN'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Abe8e_BAFA1'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Abe8eSerum_STARVE'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Abe8e_GPN'),
+                c('sgRNA', 'Gene', 'plasmid_BE_38', 'Abe8e_DOXO'))             
+                
+
+comparisons.list <- lapply(cols.oi, function(x){
+  selectCols(dt=norm.mat, idCols = x[1:2], denominator = x[3], numerator = x[4])
+})
+
+names(comparisons.list) <- lapply(cols.oi, function(x){ paste(x[c(3:4)], collapse='-')  })
+
+names(comparisons.list)
+comparisons.list
+```
+
+
+```{r}
+lapply(comparisons.list, function(x){
+  x[Gene =='non-targeting']
+})
+
+# wrrite the datatables to file
+lapply(seq_along(comparisons.list), function(x,n,i){
+  fwrite(x[[i]], paste0('./output/sgCtrlNorm_matrices/', n[[i]], '.count.tsv'), sep='\t')
+}, x=comparisons.list, n=names(comparisons.list))
+
+```
+
+
+Differential testing
+----
+
+
+
+```{r}
+de.sgRNA.meta <- dir(path='./output/mageck_test/250424_sgRNANorm', pattern='*.sgrna_summary.txt', full.names = T, recursive = F) %>% 
+  as.data.table()
+de.gene.meta <- dir(path='./output/mageck_test/250424_sgRNANorm', pattern='*.gene_summary.txt', full.names = T, recursive =F) %>% 
+  as.data.table()
+
+de.sgRNA.meta[, contrast := sub('.sgrna_summary.txt', '', sub('./output/mageck_test/250424_sgRNANorm/', '', .)) ]
+de.sgRNA.meta[, c('numerator', 'denominator') :=  tstrsplit(contrast, '-', keep=c(1,2))]
+
+de.gene.meta[, contrast := sub('.sgrna_summary.txt', '', sub('./output/mageck_test/250424_sgRNANorm/', '', .)) ]
+de.gene.meta[, c('numerator', 'denominator') :=  tstrsplit(contrast, '-', keep=c(1,2))]
+```
+
+read in the output results and bind the DTs together
+
+```{r}
+de.sgRNA.list <- lapply(de.sgRNA.meta$., fread)
+names(de.sgRNA.list) <- de.sgRNA.meta$contrast
+
+
+# ok the results look good, bind and lets visualise hits
+sgRNA.dt <- rbindlist(de.sgRNA.list, idcol = 'contrast')
+sgRNA.dt[, c('Treatment', 'Control') := tstrsplit(contrast, '-', keep=c(1,2))]
+
+
+# subset to the cols we want 
+sgRNA.dt <- sgRNA.dt[, c("contrast","sgrna","Gene","Control", "Treatment", "control_count","treatment_count","control_mean","treat_mean","LFC","control_var",
+             "adj_var","score","p.low","p.high","p.twosided","FDR","high_in_treatment")]
+
+sgRNA.wide <- dcast(sgRNA.dt, sgrna+Gene~contrast, value.var = c('LFC', 'p.low', 'p.high', 'p.twosided', 'FDR', 'control_count', 'treatment_count'))
+#fwrite(sgRNA.wide, ScriptAndDatedFileName('sgRNA.mageck.test.redoWDMSOCtrl2.wideformat.csv'))
+```
+
+```{r}
+# add a sig title
+sgRNA.dt[,sig := 'not']
+sgRNA.dt[abs(LFC) >= 1 & FDR < 0.05, sig := ifelse(LFC > 0, 'up', 'down')]
+
+sgRNA.dt[, cas9 := ifelse(grepl('Abe8e', contrast), 'Abe8e', 'Bemax')]
+sgRNA.dt[, grp_comparison := paste0(sub('Abe8e[_]{0,1}|Bemax[_]{0,1}', '', Treatment), '-vs-', sub('Abe8e[_]{0,1}|Bemax[_]{0,1}', '', Control))]
+```
+
+First; bar plots of sig hits per contrast
+Again, suggests most of our things moving are upregulated... this does not make sense as we expect most edits to be downregulated
+
+```{r}
+# breakdown by contrast
+g <- ggplot(sgRNA.dt[,.N, by=.(sig,grp_comparison, cas9)][sig != 'not'], aes(x=cas9, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~grp_comparison) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & p.adjust < 0.05)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+
+BackupAsPDF(g, 'sgRNA.sigHits.breakdownbyContrast', dimensions=c(10,12))
+```
+
+```{r}
+# breakdown by contrast and gene
+g <- ggplot(sgRNA.dt[,.N, by=.(sig,grp_comparison,Gene, cas9)][sig != 'not',], aes(x=cas9, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_grid(Gene~grp_comparison) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & p.adjust < 0.05)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        strip.text.x = element_text(size=7))
+g
+
+BackupAsPDF(g, 'sgRNA.sigHits.breakdownbyGeneandContrast', dimensions=c(11,14))
+```
+
+Breakdown by gene
+
+```{r}
+# breakdown by  and gene
+g <- ggplot(sgRNA.dt[,.N, by=.(sig,Gene, cas9)][sig != 'not',], aes(x=cas9, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~Gene) +
+  ggtitle('Significant sgRNA (Log2FC >= 1 & p.adjust < 0.05)') +
+  scale_fill_manual(values=c('up'='#990033', 'down'='#336699')) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'sgRNA.sigHits.breakdownbyGene', dimensions=c(11,14))
+```
+Volcanoplots of the significant hits
+
+```{r}
+
+lapply(unique(sgRNA.dt$contrast), function(x){
+  
+  subdt <- sgRNA.dt[contrast == x,]
+  
+  g <- ggplot(subdt, aes(x=LFC, y=-log10(FDR), color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not'], show.legend = F, size=2, max.overlaps = 20) +
+  facet_wrap(~Gene, ncol=3, scales='free_y') +
+  ggtitle(x) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+  #BackupAsPDF(g, paste0('volcanoplots_individual/genomic_location/',x ,'.volcanoplots'), dimensions=c(12,14))
+})
+
+
+lapply(unique(sgRNA.dt$contrast), function(x){
+  
+  subdt <- sgRNA.dt[contrast == x,]
+  subdt[, adj.pval := -log10(FDR)]
+  subdt[ adj.pval > 20, adj.pval := 20 ]
+  
+  g <- ggplot(subdt, aes(x=LFC, y=adj.pval, color=sig, label=sgrna)) +
+  geom_point() +
+  geom_vline(xintercept = c(-1,1), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  geom_text_repel(data=subdt[sig !='not'], show.legend = F, size=2, max.overlaps = 20) +
+  facet_wrap(~Gene, ncol=3) +
+  ggtitle(x) +
+  ylab('-log10 adjusted p-value') +
+  xlab('Log Fold Change') +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  theme_classic() 
+  
+  #BackupAsPDF(g, paste0('volcanoplots_individual/genomic_location_fixedYaxis/',x ,'.volcanoplots'), dimensions=c(12,14))
+})
+```
+
+plot histograms of the pval; what does the distribution look like?
+Distributions look fine; most things not changing with a peak at 0.05, so many 'true' changes found...
+
+```{r}
+
+sgRNA.dt
+
+lapply(unique(sgRNA.dt$contrast), function(x){
+  
+  subdt <- sgRNA.dt[contrast == x,]
+  
+  g <- ggplot(subdt, aes(x=p.twosided)) +
+    geom_histogram() +
+    facet_grid(cas9~grp_comparison)
+  #BackupAsPDF(g, paste0('volcanoplots_individual/genomic_location_fixedYaxis/',x ,'.volcanoplots'), dimensions=c(12,14))
+})
+```
+
+ok lets look at proportions then; how many genes exceed log2FC threshold and are they also up or downregulated? (maybe its something to do with the variance calculation in control?)
+
+DOesnt explain why with no base editor, many of these genes are being upregulated in the treatment? this cant be correct...
+```{r}
+sgRNA.dt[, FC_direction := ifelse(LFC > 0, 'up', 'down')]
+
+ggplot(sgRNA.dt[abs(LFC) > 1,.N, by=.(sig,grp_comparison, FC_direction, cas9)], aes(x=cas9, y=N, fill=FC_direction)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~grp_comparison) +
+  scale_fill_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))
+
+
+ggplot(sgRNA.dt[abs(LFC) > 1,.N, by=.(sig,grp_comparison, FC_direction, cas9)], aes(x=cas9, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  facet_wrap(~grp_comparison) +
+  scale_fill_manual(values=c('not'='grey', 'up'='red', 'down'='blue'))
+```
+
+
+```{r}
+
+```
+

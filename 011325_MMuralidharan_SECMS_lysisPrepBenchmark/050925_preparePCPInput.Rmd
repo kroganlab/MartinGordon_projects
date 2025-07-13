@@ -1,0 +1,204 @@
+---
+title: "050925_preparePCPInput"
+author: "Martin Gordon"
+date: "2025-05-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+For benchmarking our SEC_MS pipeline, lets compare it to CCprofiler performance and to PCprophet
+PCprophet expects as input a protein matrix; read in this data (see if its alreay been prepared) and submit it to the pipeline on Wynton
+We just want to feed these tools the raw data; no preprocessing/smoothing as this is not what is expected by the tool. Confirm this is how the matrix has been supplied previously
+
+```{r}
+library(MSstats)
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+
+
+# useful utility scripts
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+read in the protein data
+```{r}
+lysisPrep.list <- list('sonic'=fread('./data/050925_newBoxFolder/2025_02_SEC_Lysis_Test/Spectronaut/2.\ NP40-Lysis\ buffer\ +\ Sonication/20241227_104957_MM_Sonic_Lysis_122724_PG_Report.tsv'),
+                       'FT'=fread('./data/050925_newBoxFolder/2025_02_SEC_Lysis_Test/Spectronaut/3.\ NP40-Lysis\ buffer\ +\ Freeze-Thaw/20241227_104610_MM_FT_Lysis_122724_PG_Report.tsv'),
+                       'CL'=fread('./data/050925_newBoxFolder/2025_02_SEC_Lysis_Test/Spectronaut/1.\ CellLytic\ M\ Lysis\ buffer/20241227_104259_MM_CL_Lysis_122724_PG_Report.tsv')
+                       )
+```
+
+Functions
+
+First split the matrix into two samples
+
+
+```{r}
+rmSpectronautCols <- function(dt, cols.noi=c("PG.MolecularWeight", "PG.ProteinDescriptions")){
+  return(dt[, !..cols.noi])
+}
+
+checkSpectronautCols <- function(dt, colpattern='\\[[0-9]{1,2}]'){
+  fractionCols <- grep(colpattern, colnames(dt), value=T)
+  print(fractionCols)
+  fractID <-  stringr::str_extract(fractionCols,'(?<=Frac-)[0-9]{1,2}')
+  print(fractID)
+  leadingID <-  str_extract(fractionCols,"(?<=[)[0-9]{1,2}(?=<])")
+  print(leadingID)
+}
+
+lysisPrep.list <- lapply(lysisPrep.list, rmSpectronautCols)
+
+# split out the rep 1 and rep2 cols
+# could write. a niceer function to do this but ignore for now
+lysisSplit.list <- list('sonic_1'=lysisPrep.list[['sonic']][, .SD, .SDcols = patterns('^PG.|Sonic-1')],
+                        'sonic_2'=lysisPrep.list[['sonic']][, .SD, .SDcols = patterns('^PG.|Sonic-2')],
+                        'FT_1'=lysisPrep.list[['FT']][, .SD, .SDcols = patterns('^PG.|FT-1')],
+                        'FT_2'=lysisPrep.list[['FT']][, .SD, .SDcols = patterns('^PG.|FT-2')],
+                        'CL_1'=lysisPrep.list[['CL']][, .SD, .SDcols = patterns('^PG.|CL-1')],
+                        'CL_2'=lysisPrep.list[['CL']][, .SD, .SDcols = patterns('^PG.|CL-2')]
+                       )
+
+# looks good
+lapply(lysisSplit.list, colnames)
+```
+
+```{r}
+# confirm we have 1-72 in columns
+checkSpectronautCols <- function(dt, colpattern="(?<=Frac-)[0-9]{1,3}"){
+  
+  
+  fractionCols <- grep(colpattern, colnames(dt), perl=T, value=T)
+  print(length(fractionCols))
+  # dont use this as the replicates were searched together
+  leadingID <-  str_extract(fractionCols,"(?<=\\[)[0-9]{1,3}(?=\\])")
+  fractID <-  stringr::str_extract(fractionCols, colpattern)
+  print(fractID == as.character(seq(1,72,1)))
+  print(all(fractID == as.character(seq(1,72,1))))
+}
+
+```
+
+```{r}
+lapply(lysisSplit.list, checkSpectronautCols)
+```
+
+Coonvert to matrix, upload to Wynton and run
+
+```{r}
+convertToPCprophetMatrix <- function(dt, colpattern="(?<=Frac-)[0-9]{1,3}"){
+  
+  fractionCols <- grep(colpattern, colnames(dt), perl=T, value=T)
+  fractID <-  stringr::str_extract(fractionCols, colpattern)
+  fractID <- as.character(order(as.numeric(fractID))) # ensure order is numeric
+  
+  stopifnot(all(as.numeric(fractID) == seq(1,72,1)))
+  colorder <- c('GN', 'ID', fractID)
+  setnames(dt, old=c('PG.ProteinAccessions', 'PG.Genes', fractionCols), new=c('ID', 'GN', fractID)) 
+  
+  message('converting to matrix and removing zeros')
+  dt[, matID := paste0(GN, '__', ID)]
+  mat <- as.matrix(dt[, -c('GN','ID')], rownames='matID')
+  mat[is.na(mat)] <- 0
+  
+  # convert bsck to DT
+  dt.mat <- as.data.table(mat, keep.rownames = T)
+  dt.mat[, c('GN', 'ID') := tstrsplit(rn, '__', keep=c(1,2))]
+  dt.mat[, rn := NULL]
+  return(dt.mat[,..colorder])
+}
+
+```
+
+```{r}
+pcp.list <- lapply(lysisSplit.list, convertToPCprophetMatrix)
+
+```
+
+Inspect, if looks good upload and run. Do the same prep for the Donor data and then try CCprofiler
+
+```{r}
+lapply(names(pcp.list), function(x){
+  
+  fwrite(pcp.list[[x]], sep ='\t', ScriptAndDatedFileName(paste0(x, '.spectronautPG.pcpinput.txt')))
+})
+```
+```{r}
+fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/050925_preparePCPInput_data/2025_05_09_sonic_2.spectronautPG.pcpinput.txt', col.names=T) %>% 
+  colnames() #looks fine double chekc one or two vs what is on the Box folder
+```
+
+
+**not used**
+
+```{r}
+
+
+lysisPrep.list[[1]][, .SD, .SDcols=patterns('Sonic-1|PG')]
+paste0(names(lysisPrep.list), '-1')
+
+splitSamples <- function(dt, pattern=paste0('PG.|',paste0(names(lysisPrep.list), '-1'))){
+  rep1Cols <- pattern
+  rep2Cols <- gsub('-1', '-2', pattern)
+                      
+  return(list('1'=dt[, .SD, .SDcols=rep1Cols],
+              '2'=dt[, .SD, .SDcols=rep2Cols]))
+
+}
+
+
+splitSamples(lysisPrep.list[[1]])
+
+lysisPrep.list
+checkSpectronautCols <- function(dt, colpattern='\\[[0-9]{1,2}]'){
+  
+  fractionCols <- grep(colpattern, colnames(dt), value=T)
+  print(fractionCols)
+  fractID <-  stringr::str_extract(fractionCols,'(?<=Frac-)[0-9]{1,2}')
+  print(fractID
+  leadingID <-  str_extract(fractionCols,"(?<=[)[0-9]{1,2}(?=<])")
+  print(leadingID)
+  
+  
+  #print(leadingID); print(fractID)
+  
+}
+```
+
+the takes are combined... why?
+```{r}
+
+lysisPrep.list[['sonic']] %>% colnames()
+cols.oi <- 
+  
+
+  
+lysisPrep.list[['sonic_1']] <- lysisPrep.list[['sonic']][]
+```
+

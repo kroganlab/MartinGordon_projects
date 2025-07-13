@@ -1,0 +1,225 @@
+---
+title: "msstats-tutorial-neu2022"
+author: "Martin Gordon"
+date: "2023-05-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r packages}
+library(data.table)
+library(stringr)
+library(purrr)
+library(MSstats)
+library(ggplot2)
+```
+
+## MSStats Tutorial North Eastern University orkshop 2022
+
+Using MSstats for DIA workflow
+Analyse data produced by Skline peptide identification/quantification tool
+Benchmark dataset Selevsek et al 2015
+All (Selevsek-all; quantify everything) vs refined dataset (Selevsek-reps; replicate data) vs high-qual (Selevsek-lowcv; detectable and repeatable)
+Remember how refined datasets improve the signal to noise ratio
+
+
+MSStats Annotation emplate
+------
+Needs three cols: Conditon, Bioreplicate, Run
+For time course, bioreplicates need to be repeated, but must be distinct for simple comparisons to model sample independence correctly
+For MSstats need output from the processing tools and then the metadata file
+
+MSStats Key Functions
+-----
+- Import command: preprocessing for MSStats input
+- dataProcess function: transformation, normalisation, imputation and normalisation *this step has NB influence on output
+- groupComparison: inference & hypthesis testing
+- designSampleSize: info on experimental power and sample size requirements for future experiments
+
+
+MSStats Statistical Inference
+---
+For statistical inference, MSStats is quite restrictive compared to other tools and essentially assigns a model based on the Annotation table input
+Basially belong to case-control design or time-study design; assignment belongs to bioreplicate assignment
+*Important to assign the correct linear model*
+For timecourse, MSStats uses a linear mixed model fit by REML, for case-control, uses a linear model
+
+Design Future Experiment
+---
+Can either look at power or sample size; what sample size do you need to achieve X power?
+What power does a sample size of x give you?
+
+MSStats Preprocessing
+----
+Important step
+Equilizemedian; default make medians for all peptides equal
+Quantile; make intensity distributions the same, maybe more appropriate for genomics as proteomics v skewed at lower abundance and will remove much of this data which is important for determining LOD and imputation; especially not suited to DDA
+Global standards; give specific peptide that should be same across runs (spike-ins) and use this to control
+Features used; for DIA lots of features detected, but maybe many low quality and not very computationally efficient so can select top N features
+*Normalisation step NB* EquilizeMedians assumes you are globally profiling, you should have a lot of data and most features should not change. Not suitable eg for targeted approaches!
+
+Missing values:
+How do we treat this? Tools treat missing values differently (NAs or 0s) so handle differently
+For this workflow, maybe NA are randomly missing, while censored are v low values so they can be imputed
+
+Imputaion:
+What imputation approach to use? We use none at Krogan
+
+Summarisation:
+Uses Tukey median polish method. Can also select to drop runs ith 50% NA values
+If you are curious about the values you are basing your summarisation on, you can generate profile plots using code below(grey features/peptides, redline is summarised proteins)
+
+Remember MSStats cuts off low qual values (< 3rd percentile)
+
+Questions
+- MSStats not v flexible 
+- Batch effects? Recommended to use MSstats up to dataprocessing then import to Limma to deal with batch effects
+- Is a tool available for DIA-NN import?
+
+Workflow
+----
+
+Preprocessing Output
+----
+Protein level summarisation headers:
+Protein; protein id (UNIprot??)
+TotalgroupMeasurements; no of measured feature across the group. 
+NumMeasuredFeatures; features measured in that biorep;
+MissingPercentage;number of features with missing values
+
+```{r}
+#input files
+path <- getwd()
+files <- data.table(path=dir(path = path, recursive=T, full.names=F, pattern= "./*plus*.csv"))
+
+files[, f_name:=str_extract(path, "Selevsek-.*?(?=/)")] #matches "Selevsek-" at the beginning of the input, .*?" matches any character (except newline) lazily, meaning it matches as few characters as possible (?=/)" is a lookahead assertion that checks if the next character is a forward slash (/)
+
+#read in files
+input_list <- Map(fread, files$path)
+names(input_list) <- files$f_name
+```
+
+Prepare annotation dt
+----
+
+```{r}
+annotation_list <- input_list %>% 
+  map( ~{
+    unique(.x[,  c('Condition', 'BioReplicate', 'FileName')])
+  })
+
+```
+
+Import Skyline data to MSStats format
+----
+
+```{r}
+quant_list <- input_list %>% 
+  map( ~{
+    SkylinetoMSstatsFormat(.x,
+                          filter_with_Qvalue = TRUE, ## same as default
+                          qvalue_cutoff = 0.01, ## same as default
+                          fewMeasurements="remove", ## same as default
+                          removeProtein_with1Feature = TRUE)
+  })
+
+```
+
+EDA
+---
+Plot histograms of the data to inspect the visual quality
+No peak in low abundance proteins; already filtered?
+```{r}
+quant_list %>% 
+  map( ~{
+    ggplot(data = .x, mapping=aes(x=log10(Intensity))) +
+    geom_histogram()
+  })
+```
+
+Raw (log2) normalised plots. Much better quality than our runs but it is a benchmark dataset!
+
+```{r}
+quant_list %>% 
+  map( ~{
+    ggplot(data = .x, mapping=aes(x=paste0(Condition, "_", BioReplicate), y=log2(Intensity), color=Condition)) +
+    geom_boxplot()
+  })
+```
+
+Also barplot of raw intensities; looks like high quality filtered dataset
+```{r}
+
+quant_list %>% 
+  map( ~{
+    ggplot(data = .x, mapping=aes(x=paste0(Condition, "_", BioReplicate), fill=Condition)) +
+    geom_bar()
+  })
+```
+
+MSStats data process function
+-----
+
+```{r}
+quant_list <- quant_list %>% 
+  map( ~{
+   dataProcess(.x,
+              normalization = 'equalizeMedians',
+              summaryMethod="TMP",
+              featureSubset = "highQuality", #optional; flags uninformative features/outliers
+              remove_uninformative_feature_outlier = TRUE, #if above set need this to remove flagged features
+              MBimpute=FALSE,
+              censoredInt="0", #Skyline censors using 0
+              maxQuantileforCensored=0.999)#default
+    
+  })
+
+MSstatsContrastMatrix(contrasts, conditions, labels = NULL)
+```
+
+Quality Inspection -seems good
+
+```{r}
+
+quant_list %>% 
+  map( ~{
+    ggplot(data = .x$ProteinLevelData, mapping=aes(x=paste0(GROUP, "_", SUBJECT), y=LogIntensities, fill=GROUP)) +
+    geom_boxplot()
+  })
+```
+
+Profile Plot Code below - can use to inspect the summarizarion (not run)
+
+```{r eval=FALSE}
+## featureName option
+dataProcessPlots(processed.quant, type="Profileplot", 
+                 ylimDown=0, 
+                 which.Protein = 'YKL096W',
+                 featureName = 'Peptide',
+                 originalPlot = TRUE,
+                 summaryPlot = TRUE,
+                 width=7, height=7,  
+                 address="Selevsek2015_DIA_Skyline_all_YKL096W_peptide_")
+
+dataProcessPlots(processed.quant, type="Profileplot", 
+                 ylimDown=0, 
+                 which.Protein = 'YKL096W',
+                 featureName = 'Transition',
+                 originalPlot = TRUE,
+                 summaryPlot = TRUE,
+                 width=7, height=7,  
+                 address="Selevsek2015_DIA_Skyline_all_YKL096W_feature_")
+```
+
+Model-based comparison + adjust p-value
+---
+- Generate contrast matrix
+- Perform groupcomparson
+- Can generate volcano plots, comparison plots etc.
+
+
+

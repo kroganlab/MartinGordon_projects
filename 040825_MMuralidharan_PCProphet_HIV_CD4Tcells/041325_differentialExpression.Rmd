@@ -1,0 +1,1017 @@
+---
+title: "041325_differentialExpression"
+author: "Martin Gordon"
+date: "2025-04-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(viridis)
+library(pracma) # needed for the peak finding algorithm
+#library(UniProt.ws) #cant load this packge; get naming conventions another way
+
+# source Bens scripts so we can do a quick QC assessment of the input data before running
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+Metadata; use this to plot the differences between uninfected and infected
+
+```{r}
+meta.dt <- data.table(readxl::read_xlsx('./data/Data_Visualize_SECHIV_2ndTab_Sundayevening.xlsx', sheet=2))
+setnames(meta.dt, old=c('Map Category 1', 'Info', 'PG.ProteinAccessions', 'Genes'), new=c('group', 'info', 'protein', 'gene'))
+```
+
+
+Read in the 3, perform differential expression and don't filter out peaks (can judge quality by images)
+What comparisons do we want? Virus vs uninfected, or virus vs challenged/uninfected?
+
+Read in all 3 normalize and lets proceed
+```{r}
+sec.list <- list(cd4_infected_1 = fread('./data/HIV_Infection_CD4T_cells/Donor-1-032625/PCprophet/CD4_Infected_032825_D1.csv', header = T),
+                 cd4_uninfected_1 = fread('./data/CD4T_MM_D1_Uninfected_032625.csv', header = T),
+                 cd4_challenged_1 = fread('./data/CD4T_MM_D1_Challenged-Uninfected-032625.csv', header = T))
+
+```
+
+```{r}
+# headers match
+lapply(sec.list, function(x){
+  # check to ensure the colnames are in order
+  all(colnames(x)[6:ncol(x)] == as.character(seq(1,72,1)))
+})
+
+lapply(sec.list, colnames)
+```
+tidy the different fractions
+```{r}
+# drop these columns
+cols.oi <- c("PG.ProteinAccessions","PG.Genes","PG.Organisms", as.character(seq(1,72,1)))
+
+sec.dt <- lapply(sec.list, function(x){
+  
+  dt.wide <- x[, ..cols.oi]
+  dt.long <- setDT(reshape2::melt(dt.wide, id.vars=c('PG.ProteinAccessions','PG.Genes','PG.Organisms')))
+  dt.long <- dt.long[, .(protein=PG.ProteinAccessions, gene=PG.Genes, org=PG.Organisms, fraction=variable, intensity=value)]
+}) %>% rbindlist(idcol='sample')
+
+# add treatment col
+sec.dt[, treatment := str_extract(sample, '(?<=_)[un]{0,2}infected|challenged')]
+sec.dt[, replicate := factor(1)]
+sec.dt[, sample := factor(sample, levels=c("cd4_uninfected_1","cd4_challenged_1","cd4_infected_1"))]
+sec.dt[, fraction := factor(fraction)]
+
+
+#fwrite(sec.dt, ScriptAndDatedFileName('cd4t.hiv.dataset.csv.gz'))
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_13_cd4t.hiv.dataset.csv.gz')
+```
+
+handle the protein mapping 
+```{r}
+mapping.dt <- fread('./040825_preparePCProphetInput_data/2025_04_11_StringGeneProtein.idMapper.csv.gz')
+mapping.dt[, simplifiedGene := gsub('[.].+', '', gene)]
+
+multi2single <- data.table(multi = unique(sec.dt$protein))[, .(protein = unlist(strsplit(multi, ";"))), by = multi]
+multi2single <- merge(multi2single, mapping.dt,  by='protein', all.x=T)
+```
+
+```{r, fig.width = 10, fig.height = 5}
+intMats <- scaledIntensityMatrices(sec.dt)
+BackupAsPDF(intensityHeatmaps(intMats, border=T), 'raw.ints.heatmaps')
+```
+
+Need to reorder some of the columns; clear issues 
+
+```{r}
+qc.sum <-  qcSummaryTable(sec.dt)
+```
+
+
+```{r}
+p <- qcPlotMedianInt(qc.sum) +
+  theme_bw()
+BackupAsPDF(p, 'median.ints.raw.linechart')
+
+qc.sum[sample == 'cd4_uninfected_1' & numProteins < 2000, unique(fraction)]
+```
+```{r}
+p <- qcPlotProteinCount(qc.sum) +
+  theme_bw()
+
+BackupAsPDF(p, 'nProteins.linechart')
+```
+
+Uninfected looks v noisy; rearrange the cols to match what reported in Slack
+For unchallenged; drop one column and take average of flanking 
+
+# fraction 24 is the issue.. for now
+
+Go back to the SEC list to fix the uninf and challenged
+
+```{r}
+# take the average of the two flanking cols for col24
+sec.list[['cd4_challenged_1']]$`24` <- (sec.list[['cd4_challenged_1']]$`23` + sec.list[['cd4_challenged_1']]$`25`)/2
+
+sec.list[['cd4_uninfected_1']][, real_50 := `72`]
+cols.oi <- seq(50,71,1)
+setnames(sec.list[['cd4_uninfected_1']], old=as.character(cols.oi), new=as.character(cols.oi+1))
+
+cols.oi <- c("PG.MolecularWeight","PG.ProteinAccessions","PG.Genes","PG.Organisms","PG.ProteinDescriptions", as.character(seq(1,72,1)))
+setnames(sec.list[['cd4_uninfected_1']], old='real_50', new='50')
+sec.list[['cd4_uninfected_1']] <- sec.list[['cd4_uninfected_1']][, ..cols.oi]
+
+# take the average of the two flanking cols for col24
+#39 #44 $51 #65
+sec.list[['cd4_uninfected_1']]$`39` <- (sec.list[['cd4_uninfected_1']]$`38` + sec.list[['cd4_uninfected_1']]$`40`)/2
+sec.list[['cd4_uninfected_1']]$`44` <- (sec.list[['cd4_uninfected_1']]$`43` + sec.list[['cd4_uninfected_1']]$`45`)/2
+sec.list[['cd4_uninfected_1']]$`52` <- (sec.list[['cd4_uninfected_1']]$`51` + sec.list[['cd4_uninfected_1']]$`53`)/2
+sec.list[['cd4_uninfected_1']]$`66` <- (sec.list[['cd4_uninfected_1']]$`65` + sec.list[['cd4_uninfected_1']]$`67`)/2
+```
+
+```{r}
+cols.oi <- c("PG.ProteinAccessions","PG.Genes","PG.Organisms", as.character(seq(1,72,1)))
+
+sec.dt <- lapply(sec.list, function(x){
+  
+  dt.wide <- x[, ..cols.oi]
+  dt.long <- setDT(reshape2::melt(dt.wide, id.vars=c('PG.ProteinAccessions','PG.Genes','PG.Organisms')))
+  dt.long <- dt.long[, .(protein=PG.ProteinAccessions, gene=PG.Genes, org=PG.Organisms, fraction=variable, intensity=value)]
+}) %>% rbindlist(idcol='sample')
+
+# add treatment col
+sec.dt[, treatment := str_extract(sample, '(?<=_)[un]{0,2}infected|challenged')]
+sec.dt[, replicate := factor(1)]
+sec.dt[, sample := factor(sample, levels=c("cd4_uninfected_1","cd4_challenged_1","cd4_infected_1"))]
+sec.dt[, fraction := factor(fraction)]
+
+#fwrite(sec.dt, ScriptAndDatedFileName('cd4t.hiv.dataset.fixFractions.csv.gz'))
+new.sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_13_cd4t.hiv.dataset.fixFractions.csv.gz')
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_13_cd4t.hiv.dataset.csv.gz')
+```
+
+
+```{r}
+ggplot(sec.dt[sample == 'cd4_challenged_1',], aes(x=as.factor(fraction), y=log2(intensity))) +
+         geom_boxplot()
+
+ggplot(new.sec.dt[sample == 'cd4_challenged_1',], aes(x=as.factor(fraction), y=log2(intensity))) +
+         geom_boxplot()
+```
+ok, these now look better
+```{r}
+ggplot(sec.dt[sample == 'cd4_uninfected_1',], aes(x=as.factor(fraction), y=log2(intensity))) +
+         geom_boxplot()
+
+ggplot(new.sec.dt[sample == 'cd4_uninfected_1',], aes(x=as.factor(fraction), y=log2(intensity))) +
+         geom_boxplot()
+```
+```{r}
+ggplot(sec.dt[sample == 'cd4_infected_1',], aes(x=as.factor(fraction), y=log2(intensity))) +
+         geom_boxplot()
+
+ggplot(new.sec.dt[sample == 'cd4_infected_1',], aes(x=as.factor(fraction), y=log2(intensity))) +
+         geom_boxplot()
+
+```
+
+
+```{r}
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_13_cd4t.hiv.dataset.fixFractions.csv.gz')
+
+# find missing proteins across all runs and remove
+# missing in all 3 runs 
+all.missing <- sec.dt[intensity == 0,.N, by=.(protein,sample)][N == 72][,.N, by=protein][N == 3, protein]
+length(all.missing)
+# remove proteins missing in all 3 runs
+sec.dt <- sec.dt[!protein %in% all.missing,]
+
+#  proteins are missing in one condition but not another; keep in for now but ask Ben for adivce
+#sec.dt[intensity == 0, .N, by=.(protein,sample)][N== 72][,.N, by=sample]
+fwrite(sec.dt, ScriptAndDatedFileName('cd4t.hiv.dataset.allMissingRemoved.csv.gz'))
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_13_cd4t.hiv.dataset.allMissingRemoved.csv.gz')
+#sec.dt[,fraction := as.character(fraction)]
+sec.dt[, sample := factor(sample, levels=c('cd4_uninfected_1','cd4_challenged_1', 'cd4_infected_1'))]
+```
+
+
+# redo the plotting for the tidied data
+
+```{r, fig.width = 10, fig.height = 5}
+intMats <- scaledIntensityMatrices(sec.dt)
+BackupAsPDF(intensityHeatmaps(intMats, border=T), 'tidy.ints.heatmaps')
+```
+
+Need to reorder some of the columns; clear issues 
+
+```{r}
+qc.sum <-  qcSummaryTable(sec.dt)
+```
+
+
+```{r}
+p <- qcPlotMedianInt(qc.sum) +
+  theme_bw()
+BackupAsPDF(p, 'median.ints.tidy.linechart')
+```
+```{r}
+p <- qcPlotProteinCount(qc.sum) +
+  theme_bw()
+
+BackupAsPDF(p, 'nProteins.tidy.linechart')
+```
+# normalize
+
+This fits sliding local curves through the qc data using robust linear regression (insensitive to outliers)
+to enable automated identification of fractions that don't move smoothly between their neighbors, and how far
+out of expected they are.
+```{r}
+View(fitLocalCubics)
+allFits <- fitLocalCubics(qc.sum, window = 10, sampleTerm = "additive") %>% 
+  suppressWarnings()
+
+
+# identifies outliers based on some median residual threshold to the curves. 
+labelOutliers(qc.sum , allFits, threshold = 2) 
+
+p <-plotNormAndOutlierFits (qc.sum , allFits)
+p
+BackupAsPDF(p, 'normalized.ints.tidy.linechart')
+```
+## heatmaps after normalization
+Clear issues with a couple of uninfected fractions; we can take the average of flanking (doubt its possible if these are hust missing?)
+```{r, fig.width = 10, fig.height = 6}
+normIntMats <-  scaledIntensityMatrices(sec.dt)
+
+BackupAsPDF(intensityHeatmaps(intMats, border=T), 'tidy.norm.ints.heatmaps')
+```
+look at the expression of the viral proteins across all groups
+Why are we recovering some viral proteins in this set?
+```{r}
+viral.mat <- scaledIntensityMatrices(sec.dt[protein %in% viral.prots,])
+BackupAsPDF(intensityHeatmaps(viral.mat, border=T), 'viralprotein.heatmaps')
+```
+
+# peak detection
+```{r}
+# if we normalized, we have to catch the post-normalization matrices
+normInt.mats <- scaledIntensityMatrices(sec.dt)
+
+peakTables <- lapply (normInt.mats, goodPeaksTableFromIntensityMatrix, minCV = -Inf)
+
+allPeaks <- rbindlist(peakTables, idcol = "sample")
+#fwrite(allPeaks, ScriptAndDatedFileName('allPeaks.aligned.noFilter.csv.gz'))
+allPeaks <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_14_allPeaks.aligned.noFilter.csv.gz')
+```
+
+```{r, fig.width = 5, fig.height = 4}
+# udpate height for more samples
+p <- ggplot(allPeaks, aes(x= peakLocation, fill = goodPeak)) + 
+  geom_bar() + 
+  facet_grid(sample~.) +
+  labs(title='no peak filtering') +
+  theme_bw()
+p
+BackupAsPDF(p, "peaksPerfraction.barchart")
+```
+Save for plotting later (maybe a later one once the fractions are aligned)
+```{r}
+#mat.list <- scaledIntensityMatrices(sec.dt, scaleDenom = 'max')
+#saveRDS(mat.list, ScriptAndDatedFileName('unaligned.cd4.maxScaled.mat.list.rds'))
+#rm(mat.list)
+```
+
+
+Im going to skip the peak standardisation, as dont have replicates, so what are we standardising to?
+I think proceed as is for now.. we jsut need some things fro plotting dont over-stress. Ask BP tomorrow
+Im going to skip standardisation for now and proceed
+
+```{r, eval=FALSE}
+standardizeAllPeakTablesToStandard(peakTables, 
+                                   sec.dt, 
+                                   standardIdx = "cd4_uninfected_1", 
+                                   fitPortion = 0.65, 
+                                   minPeaksPerFraction = 45, 
+                                   startFitAtPeak = 20)
+```
+infected gets a little wonky on the later fractions, but likely not going to pull many peaks from there anyway consider MW standards... 
+I think for now, just keep working with the unaligned data; its a little problematic at later fractions in cd4 uninfected
+```{r}
+lapply(peakTables, function(x){
+  ggplot(x, aes(x=cofmN, y=cofmN.standardized)) +
+    geom_point() +
+    geom_abline(slope=1)
+  
+  })
+```
+
+ask BP tomorrow for guidance on selecting peaks 
+```{r}
+fwrite(rbindlist(peakTables, idcol='sample'), ScriptAndDatedFileName('allPeaks.aligned.noFilter.csv.gz'))
+```
+
+Check protein elution agrees with our mw standards
+Idea is we seperate based on size, so can predict the mw of proteins at the eluted fraction
+```{r}
+mw.standards <- fread('./data/HIV_Infection_CD4T_cells/Donor-1-032625/PCprophet/cal_SRT.txt')
+setnames(mw.standards, new=c('fraction', 'mw'))
+# want the standards in daltons (right?)
+mw.standards[, mw := mw*1000]
+mc <- calculateFractionMassConverters(mw.standards)
+```
+
+Read in the table of protein molecular weight;
+```{r}
+# created my own uniprot id
+mw.dt <- fread('./data/idmapping_2025_04_10.tsv.gz')
+mw.dt <- mw.dt[, .(protein=From, mw=Mass)]
+setkey(mw.dt, protein)
+```
+
+
+```{r}
+# label fractions by mass, and fraction/proteins by mass ratio, aka log2MassNumber
+sec.dt[, fractionMass := mc$fraction2Mass(fraction)] # get predicted mw for a protein eluting at a given fraction
+sec.dt[, log2MassNumber := log2(fractionMass/mw.dt[protein, .(mw), on = "protein"])] # dividing fraction mass by mw of the protein
+# just add Mw to the table too
+sec.dt[mw.dt, on='protein']
+
+# write out this 'final' table for use 
+fwrite(sec.dt, ScriptAndDatedFileName("sec.ms.DEanalysisInput.csv"))
+sec.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_14_sec.ms.DEanalysisInput.csv')
+```
+## DE analysis
+Lets see how peaks look after filtering 
+
+```{r}
+allPeaks.noFilter <- rbindlist(peakTables, idcol = "sample")
+
+allPeaks <- rbindlist(peakTables, idcol = "sample")
+
+# pay attention to which cofmX.XXXX is used below: cofmN.standardized
+scorePeakByMassShift <- function(peak.dt, mw){
+  # the 150% fraction
+  peak.dt[mw.dt, fiftyPCFraction := mc$mass2Fraction(1.2 * mw), on = "protein"]
+  peak.dt[!is.na(fiftyPCFraction), goodPeak := goodPeak & cofmN.standardized < fiftyPCFraction]
+  peak.dt
+}
+
+# returns updated peak table
+purrr::walk(peakTables, scorePeakByMassShift, mw)
+```
+
+# plot the filtered peaks before deciding whether to proceed 
+
+```{r, fig.width = 5, fig.height = 4}
+allPeaks <- rbindlist(peakTables, idcol = "sample", fill = TRUE)
+
+p <- ggplot(allPeaks, aes(x= peakLocation, fill = goodPeak)) + 
+  geom_bar() + 
+  labs(title='filtered peaks') +
+  facet_grid(sample~.)
+p
+BackupAsPDF(p, 'filteredPeaksperfraction.barchart')
+
+
+# save the filteed set but use the fill
+#fwrite(allPeaks, ScriptAndDatedFileName('allPeaks.monomerFiltered.csv.gz'))
+```
+```{r, fig.height=7,fig.width=9}
+
+#allPeaks <- merge(allPeaks, mw.dt, by='protein', all.x = T)
+
+g <- ggplot (allPeaks[ , .SD[which.max(peakHeight)], by = .(protein, sample)], aes( x  = as.factor(sprintf("%02d", as.integer(peakLocation))), y = mw, color = log10(mw))) + 
+  #geom_density_2d() + 
+  scale_y_log10() +
+  geom_boxplot(outlier.shape = NA) + 
+  ggforce::geom_sina(shape = ".",scale = "area")+
+  geom_point(data = mw.standards[,.(peakLocation=fraction, mw)], color = "red") + 
+  rotate.x.axis.text +
+  scale_color_viridis_c() + 
+  facet_wrap(~sample, ncol = 2) + 
+  ggtitle("Protein Peaks")
+g
+BackupAsPDF(g, 'proteinPeaksVsMWstandards.boxplots')
+```
+Leave out the alignment and the peak filtering for now; just consider all can refine with later with more samples
+
+```{r}
+allPeaks <- fread(ScriptAndDatedFileName('allPeaks.aligned.noFilter.csv.gz'))
+peakTables <- split(allPeaks, allPeaks$sample)
+peakTables <- peakTables[names(normInt.mats)] # reorder to amtch matciress
+```
+
+## GS set t
+```{r}
+hu.string.dt <- fread('~/Documents/utils/mg_utils/data/stringDB/9606.protein.aliases.v12.0.txt.gz')
+huString.mapper <- hu.string.dt[source == 'Ensembl_UniProt', .(protein=alias, stringID=`#string_protein_id`)]
+
+gs.interactors <- goldStandardPairs(huString.mapper[protein %in% sec.dt$protein, unique(stringID)], 
+                                    corum.path = NULL,
+                                    string.links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                                    string.info.path =  NULL,
+                                    stringCombinedScoreThreshold = 250)
+
+gs.decoys <- decoysFromString(huString.mapper[protein %in% sec.dt$protein, unique(stringID)], 
+                              links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                              info.path =  NULL)
+
+# this the is combined set of IDs
+idmapper <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/040825_preparePCProphetInput_data/2025_04_11_StringGeneProtein.idMapper.csv.gz')
+idmapper[, simplifiedGene := gsub('[.].+','', gene)]
+```
+
+## all-by-all peak correlations
+
+```{r}
+peakMatrices <- purrr::map2(normInt.mats, peakTables, goodPeaksMatFromPeaksTable)
+#corPeaks6 <- windowedCorrelation(npc1Mat, peaksMatrix, outerRadius = 6)
+corPeaks.ls <- purrr::map2(normInt.mats, peakMatrices, windowedCorrelation, outerRadius = 6)
+```
+annotate and save the file 
+```{r}
+allPeakCorrs <- rbindlist(purrr::map(corPeaks.ls, "cor"), idcol = "sample")
+
+allPeakCorrs[idmapper, gene1 := i.stringID, on = c(protein1 = "protein")]
+allPeakCorrs[idmapper, gene2 := i.stringID, on = c(protein2 = "protein")]
+allPeakCorrs[idmapper, alias1 := i.simplifiedGene, on = c(protein1 = "protein")]
+allPeakCorrs[idmapper, alias2 := i.simplifiedGene, on = c(protein2 = "protein")]
+
+# for now use protein as gene for the NA gene
+allPeakCorrs[is.na(gene1), gene1 := protein1]
+allPeakCorrs[is.na(alias1), alias1 := protein1]
+allPeakCorrs[is.na(gene2), gene2 := protein2]
+allPeakCorrs[is.na(alias2), alias2 := protein1]
+
+fwrite(allPeakCorrs, ScriptAndDatedFileName('allbyallPeakCorrelations.annotated.csv.gz'))
+allPeakCorrs <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_14_allbyallPeakCorrelations.annotated.csv.gz')
+```
+
+label with genesets 
+```{r}
+allPeakCorrs[, gs := "unknown"]
+allPeakCorrs[gs.interactors ,gs := "interactor" , on = c("gene1", "gene2")]
+allPeakCorrs[gs.decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+```
+
+I think based on this we neeed to use the filtered set to select good peaks; too many FPs here
+```{r}
+g <- ggplot(allPeakCorrs[gene1 < gene2 & gs != 'unknown'], aes(x = sample, fill = gs)) +
+  geom_bar() + 
+  labs(title='Breakdown of detected interactors') +
+  theme_bw() + 
+  scale_fill_brewer(type = "qual", palette = "Set2")
+g
+BackupAsPDF(g, 'breakdownOfInteractors.allPeaks.barplot')
+
+# just to compare with later to assess recovery
+fwrite(allPeakCorrs[gene1 < gene2 & gs != 'unknown',.N, by=.(gs,sample)], ScriptAndDatedFileName('peakDetection.IntvsDecoy.csv.gz'))
+```
+Our FP detection is very high...lets rerun this and filter out the monomers; see if our TP/FP recovery is better
+```{r}
+allPeaks <- fread(ScriptAndDatedFileName('allPeaks.monomerFiltered.csv.gz'))
+peakTables <- split(allPeaks, allPeaks$sample)
+peakTables <- peakTables[names(normInt.mats)] # reorder to amtch matciress
+```
+
+## all-by-all peak correlations
+
+```{r}
+peakMatrices <- purrr::map2(normInt.mats, peakTables, goodPeaksMatFromPeaksTable)
+#corPeaks6 <- windowedCorrelation(npc1Mat, peaksMatrix, outerRadius = 6)
+corPeaks.ls <- purrr::map2(normInt.mats, peakMatrices, windowedCorrelation, outerRadius = 6)
+```
+
+```{r}
+allPeakCorrs <- rbindlist(purrr::map(corPeaks.ls, "cor"), idcol = "sample")
+
+allPeakCorrs[idmapper, gene1 := i.stringID, on = c(protein1 = "protein")]
+allPeakCorrs[idmapper, gene2 := i.stringID, on = c(protein2 = "protein")]
+allPeakCorrs[idmapper, alias1 := i.simplifiedGene, on = c(protein1 = "protein")]
+allPeakCorrs[idmapper, alias2 := i.simplifiedGene, on = c(protein2 = "protein")]
+
+# for now use protein as gene for the NA gene
+allPeakCorrs[is.na(gene1), gene1 := protein1]
+allPeakCorrs[is.na(alias1), alias1 := protein1]
+allPeakCorrs[is.na(gene2), gene2 := protein2]
+allPeakCorrs[is.na(alias2), alias2 := protein1]
+
+fwrite(allPeakCorrs, ScriptAndDatedFileName('allbyallPeakCorrelations.annotated.filteredSet.csv.gz'))
+allPeakCorrs <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_14_allbyallPeakCorrelations.annotated.filteredSet.csv.gz')
+```
+
+label with genesets 
+```{r}
+allPeakCorrs[, gs := "unknown"]
+allPeakCorrs[gs.interactors ,gs := "interactor" , on = c("gene1", "gene2")]
+allPeakCorrs[gs.decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+```
+
+I think based on this we neeed to use the filtered set to select good peaks; too many FPs here
+```{r}
+g <- ggplot(allPeakCorrs[gene1 < gene2 & gs != 'unknown'], aes(x = sample, fill = gs)) +
+  geom_bar() + 
+  labs(title='Breakdown of detected interactors') +
+  theme_bw() + 
+  scale_fill_brewer(type = "qual", palette = "Set2")
+g
+BackupAsPDF(g, 'breakdownOfInteractors.allPeaks.barplot')
+
+# just to compare with later to assess recovery
+fwrite(allPeakCorrs[gene1 < gene2 & gs != 'unknown',.N, by=.(gs,sample)], ScriptAndDatedFileName('peakDetection.IntvsDecoy.filtered.csv.gz'))
+
+# uninfected samples are really awful; even after filtering we recover more FP than TP.. focus on challenged vs infected instead and take the filtered set forward
+fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_14_peakDetection.IntvsDecoy.csv.gz')[, .(ratio = N[gs=='interactor']/N[gs=='decoy']), by=sample]
+fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_14_peakDetection.IntvsDecoy.filtered.csv.gz')[, .(ratio = N[gs=='interactor']/N[gs=='decoy']), by=sample]
+```
+
+Use the filtered set to move forward with 
+
+```{r}
+allGenes <- idmapper$stringID |> unique()
+denomInteractor <- nrow(gs.interactors[gene1 %in% allGenes & gene2 %in% allGenes])
+denomDecoy <- nrow(gs.decoys[gene1 %in% allGenes & gene2 %in% allGenes])
+```
+
+
+```{r}
+scoreByGS(allPeakCorrs, denomDecoy, denomInteractor, column = "corScore", groupByVariable = c("sample", "start"))
+```
+plot of log likelihood ratios; the central fractions are the most informative
+```{r}
+p <-  ggplot (allPeakCorrs, aes(x = corScore, y = log10RateRatioID, color = start)) + geom_hline(yintercept = 0.0, lty = "dotted") +  geom_line(aes(group = start)) + facet_wrap(~sample) + scale_color_viridis_c(option = "H", name = "fraction") + theme_bw()
+p
+```
+
+# summarization peak sim to protein sim
+# summarize to protein pair
+
+```{r}
+stoichDevThreshold <- log2(1 + 0.2)
+
+setorder(allPeakCorrs, sample, -log10RateRatioID )
+
+summary <- allPeakCorrs[, .SD[1], by= .(sample, protein1, protein2, gene1, gene2, prot1Peak, prot2Peak, gs) # best correlation per pair of peaks
+                          ][, .(sumLLRatio = sum(log10RateRatioID[abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold]), # only sum peaks that are within 20% of the first
+                                numPeaks = .N,
+                                numSameStoichPeaks  = sum (abs(log2Ratio - log2Ratio[1]) < stoichDevThreshold)),
+                            by = .(sample, protein1, protein2, gene1, gene2, gs)
+                            ]
+setorder(summary, sample, -sumLLRatio)
+
+fwrite(summary[gene1 < gene2], ScriptAndDatedFileName("peakSimilarityScores.filteredSet.csv.gz"))
+```
+# differential peak analysis
+
+```{r}
+allPeaks <- fread(ScriptAndDatedFileName('allPeaks.monomerFiltered.csv.gz'))
+
+# per protein, join peaks across runs into clusters
+allPeaks[goodPeak == TRUE, proteinPeakCluster := clusterPeaks(cofmN.standardized, maxDistance = 2.5), by = protein]
+
+# per peak cluster (per protein), summarize to a center (and height etc, but most important is center)
+peakClusters <- allPeaks[!is.na(proteinPeakCluster), 
+                         .(.N, meanPeakHeight  = mean(peakHeight), center = mean(cofmN.standardized)),
+                         keyby = .(protein, proteinPeakCluster)]
+
+# split data into single-protein chunks
+# peaks in the protein
+peakClusters.subTables <- split(peakClusters, by = "protein")
+peakClusters.subTables[[1]]
+
+
+# sec data per protein (only those in above table)
+allProteins <- names(peakClusters.subTables)
+sec.subTables <- split(sec.dt[protein %in% allProteins], by = "protein" )
+
+View(anovaPeaksInOneProtein)
+
+anovaPeaksInOneProtein(sec.subTables[[1]], peakClusters.subTables[[1]], radius = 5)
+
+# testing 
+list(test1=anovaPeaksInOneProtein(sec.subTables[[1]], peakClusters.subTables[[1]], radius = 5),
+     test2=anovaPeaksInOneProtein(sec.subTables[[3]], peakClusters.subTables[[3]], radius = 5)) %>% 
+  rbindlist(idcol='protein', fill=T, use.names = T)
+
+
+sec.subTables[[1]]
+
+# iterate over proteins
+names(allProteins) <- allProteins
+anova.ls <- pbapply::pblapply(allProteins, function(proteinOI) anovaPeaksInOneProtein(sec.subTables[[proteinOI]], peakClusters.subTables[[proteinOI]], radius = 5))
+# format output
+anova.dt <- rbindlist(anova.ls, use.names = TRUE, fill = TRUE, idcol = "protein")
+
+# flag error to BP tomorrow
+anova(lm( log2_intensity_totalScaled~ poly(standardFraction, 4)+treatment, sec.subTables[[2]])) %>% as.data.frame() %>% as.data.table(keep.rownames=T)
+# friendly names
+setnames(anova.dt,
+         old = c( "rn",        "Sum.Sq",     "Mean.Sq",    "F.value", "Pr..F."), # anova col names to change
+         #old = c( "rn",        "Sum Sq",     "Mean Sq",    "F value", "Pr(>F)"),
+         new = c( "modelTerm", "SumSquares", "MeanSquare", "F",       "p.F"))
+
+
+peakClusters[anova.dt[modelTerm == "poly(standardFraction, 4):treatment"], treatmentDiff.p := i.p.F]
+peakClusters[anova.dt[modelTerm == "treatment"], treatmentIntensity.p := i.p.F]
+
+# term we are interested in: what peak profiles change in response to treatment?
+anova.dt
+
+peakClusters[anova.dt[modelTerm == "poly(standardFraction, 4):treatment"], treatmentDiff.p := i.p.F] #is the elution significantly different dependent on treatment
+peakClusters[anova.dt[modelTerm == "treatment"], treatmentIntensity.p := i.p.F] #is the intensity significantly differnet 
+
+setorder(peakClusters, treatmentDiff.p, na.last = T)
+fwrite(peakClusters, ScriptAndDatedFileName('anova.results.csv.gz'))
+peakClusters <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041325_differentialExpression_data/2025_04_14_anova.results.csv.gz')
+```
+
+```{r}
+peakClusters[, treatmentDiff.padj := p.adjust(treatmentDiff.p, method='BH')]
+peakClusters[, treatmentIntensity.padj := p.adjust(treatmentIntensity.p, method='BH')]
+
+peakClusters <- merge(peakClusters, unique(sec.dt[, .(protein, gene, org)]), by='protein', all.x=T)
+fwrite(peakClusters, ScriptAndDatedFileName('anova.results.csv.gz'))
+
+# nearly 1.2k proteins different across each of the conditions...
+peakClusters[treatmentDiff.padj < 0.05, unique(protein)] %>% length()
+```
+
+# now, need to map these to human complexes and the possibly changing set and share
+```{r}
+complexes.dt <- data.table(readxl::read_xlsx('./data/Data_Visualize_SECHIV_2ndTab_Sundayevening.xlsx', sheet=3, skip=1))
+cols.oi <- c("Mwt (Da)","PG.ProteinAccessions","Genes","Descriptions",'Map Category 1','Info')
+complexes.dt <- complexes.dt[, ..cols.oi]
+setnames(complexes.dt, old=c('PG.ProteinAccessions', 'Genes', 'Map Category 1', 'Info'), new=c('protein', 'gene', 'group', 'info'))
+
+
+peakClusters <- merge(peakClusters[treatmentDiff.padj < 0.05 | treatmentIntensity.padj < 0.05,], complexes.dt, by='protein', all.x=T)
+peakClusters[, gene := gene.x]
+peakClusters[, c('gene.y', 'gene.x') := NULL]      
+
+summaryHits <- peakClusters[!is.na(info) & treatmentDiff.padj < 0.05, .(NsigProteins=.N,
+                                                         protein=paste(protein, collapse=','),
+                                                         gene=paste(gene, collapse=',')), by=.(group, info)]
+
+fwrite(summaryHits, ScriptAndDatedFileName('sigHits.inClusters.csv.gz'))
+
+```
+Ok, leave as is for now and lets see if we can map the sig moving hits to CORUM to find complexes, and identify which complexes are changing across conditions
+
+```{r}
+source ("../../bp_utils/enrichmentTestFunctions.R")
+
+geneSets.dt <- fread('~/Documents/utils/mg_utils/data/stringDB/9606.protein.enrichment.terms.v12.0.txt.gz')
+# merge this with our data
+geneSets.dt[idmapper, protein := i.protein, on = c(`#string_protein_id` = "stringID")]
+
+
+go <- geneSets.dt[grep ("Gene Ontology", category)][, .(description,  stringID = `#string_protein_id`)]
+# subset to minimal size
+smallish <- go[, .N, by= description][ N< 100, description]
+go <- go[description %in% smallish]
+
+```
+
+```{r}
+allContrasts <- peakClusters[,contrast := "all"]
+allContrasts[idmapper, stringID := i.stringID, on = c(protein = "protein")]
+setorder(allContrasts, treatmentDiff.p, na.last = TRUE)
+contrast.singleProt <- allContrasts[, .SD[1], by= .(gene, contrast) ] # taking hte top scoring peak per protein
+contrast.singleProt[, diffScore := -log10(treatmentDiff.p)]
+
+contrasts <- contrast.singleProt$contrast %>% 
+  unique()
+names(contrasts) <- contrasts
+
+allsea <- lapply(contrasts, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(go$stringID, go$description),
+                                           contrast.singleProt[contrast == contOI][diffScore > 0, setNames(diffScore, stringID)],
+                                           scoreType = "pos")
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) |> rbindlist(idcol = "contrast")
+
+allsea
+```
+Get the top enriched complexes and plot them
+
+```{r, fig.width = 10, fig.height = 5}
+# merge the contrast scores with a subset of enriched corum
+sigPathways  <- allsea[size > 1 & padj < 0.05, unique(pathway)]
+shortComplexLength = 80
+
+# subset enrichment table
+sigEnrichedPathways <- allsea[pathway %in% sigPathways]
+# join with corum to get full genes
+genesInEnrichedPathways <- go[sigEnrichedPathways,, on = c(description = "pathway")]
+ 
+# join with contrast protein scores
+genesWDiffScores <- contrast.singleProt[genesInEnrichedPathways,,on = c("contrast", stringID = "stringID")]
+
+genesWDiffScores[, diffScore := -log10(treatmentDiff.p)]
+
+# add total as a 'total' complex
+genesWDiffScores <- rbind(genesWDiffScores, contrast.singleProt, fill = TRUE)
+genesWDiffScores[is.na(description), description := "total"]
+setorder(genesWDiffScores, pval, na.last = TRUE) # order by SEA score
+genesWDiffScores[, description := factor(description, levels = rev(unique(genesWDiffScores$description))  )]
+
+genesWDiffScores
+
+
+
+p <- ggplot(genesWDiffScores[!is.na(diffScore)] , aes(y = description, x = diffScore, color = pval < 0.001, shape = description == "total")) +
+  ggforce::geom_sina(scale = "width",   show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #ggforce::geom_sina(data = genesWDiffScores[complex == "total"], shape = ".", scale = "count", show.legend = FALSE) +
+  facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched:") +
+  #scale_color_viridis_d(option = "H") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+ # ggrepel::geom_text_repel(data  = genesWDiffScores[, .SD[order (-diffScore)][1:4], by = .(description, contrast)], show.legend = FALSE, size = 2, direction = "y", box.padding = 0) +
+  theme_bw() +
+  # uncomment to get shortened names in y axis
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle = "") +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+p
+
+BackupAsPDF(p, format = "png")
+
+-log10(1)
+```
+enrich vs corum
+```{r}
+corum.db<- fread('/Users/martingordon/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/docs/corum.hs.5.1.txt') %>% 
+  .[, .(protein=unlist(strsplit(subunits_uniprot_id, ';'))), by=complex_name]
+
+setorder(allContrasts, treatmentDiff.p, na.last = TRUE)
+contrast.singleProt <- allContrasts[, .SD[1], by= .(protein, contrast)] # taking hte top scoring peak per protein
+contrast.singleProt[, diffScore := -log10(treatmentDiff.p)]
+
+contrasts <- contrast.singleProt$contrast %>% 
+  unique()
+names(contrasts) <- contrasts
+
+corum.allsea <- lapply(contrasts, 
+       function(contOI){
+         sea.out <- fgsea::fgseaMultilevel(pathways = split(corum.db$protein, corum.db$complex_name),
+                                           contrast.singleProt[contrast == contOI][diffScore > 0, setNames(diffScore, protein)],
+                                           scoreType = "pos")
+         
+         setorder(sea.out, pval)
+         sea.out
+       }) |> rbindlist(idcol = "contrast")
+```
+```{r, fig.width=10, fig.height = 5}
+# merge the contrast scores with a subset of enriched corum
+sigPathways  <- corum.allsea[size > 1 & pval < 0.001, unique(pathway)]
+shortComplexLength = 80
+
+# subset enrichment table
+sigEnrichedPathways <- corum.allsea[pathway %in% sigPathways]
+
+genesInEnrichedPathways <- go[sigEnrichedPathways,, on = c(description = "pathway")]
+genesInEnrichedPathways[,.N, by=complex_name]
+
+# what are we doiung here? basically joinging all corum db to our sig pathways based onpathways key (join to get individual gene names)
+genesInEnrichedPathways <- corum.db[sigEnrichedPathways,,  on = c(complex_name = "pathway")]
+
+# join with contrast protein scores
+genesWDiffScores <- contrast.singleProt[genesInEnrichedPathways,,on = c("contrast", protein = "protein")]
+genesWDiffScores[, diffScore := -log10(treatmentDiff.p)]
+
+# add total as a 'total' complex
+genesWDiffScores <- rbind(genesWDiffScores, contrast.singleProt, fill = TRUE)
+genesWDiffScores[is.na(complex_name), complex_name := "total"]
+setorder(genesWDiffScores, pval, na.last = TRUE) # order by SEA score
+genesWDiffScores[, complex_name := factor(complex_name, levels = rev(unique(genesWDiffScores$complex_name))  )]
+```
+
+
+```{r, fig.width=10, fig.height = 5}
+genesWDiffScores[idmapper, gene := i.gene, on='protein']
+genesWDiffScores[, simplifiedGene := gsub('[.].+','', gene)]
+
+plot.dt <- genesWDiffScores[!is.na(diffScore)][,.(protein, simplifiedGene, contrast, diffScore, complex_name, pval, padj, ES, NES, size)] %>% 
+  unique()
+
+plot.dt[simplifiedGene == 'RPS26']
+genesWDiffScores[simplifiedGene == 'RPS26']
+
+p <- ggplot(plot.dt[!is.na(diffScore)] , aes(y = complex_name, x = diffScore, color = pval < 0.001, label=simplifiedGene, shape = complex_name == "total")) +
+  ggforce::geom_sina(scale = "width", show.legend = TRUE, alpha = 0.5, maxwidth = 0.4) +
+  #facet_wrap(~contrast ) +
+  scale_color_manual(values = c(`TRUE` = "firebrick", `FALSE` = "gray"), name = "Enriched:") +
+  scale_shape_manual(values = c(`TRUE` = 46, `FALSE` = 20)) +
+  ggrepel::geom_text_repel(data  = plot.dt[, .SD[order (-diffScore)][1:4], by = .(complex_name, contrast)], show.legend = FALSE, size = 2, direction = "y", box.padding = 0) +
+  theme_bw() +
+  scale_y_discrete( labels = function(x)substr(x, 1, shortComplexLength)) + 
+  labs(subtitle = "") +
+  guides(shape = FALSE) +
+  theme(legend.position="bottom")
+BackupAsPDF(p, 'enriched.corum.complexes.dotplot')
+
+
+
+```
+
+
+
+**Abundance analysis of the proteins across conditions**
+Questions about analyzing abundance as well as elution profile
+Just take the max; maybe filter out proteins with intensities in only one or two fraction (or report a columm with intensities in one or two fractions)
+```{r}
+mat.list <- split(sec.dt, sec.dt$sample) %>% 
+  lapply(., function(x){
+    dcast(x, paste0(protein,'__',gene)~fraction, value.var='intensity') %>% 
+      as.matrix(rownames=1)
+  })
+
+
+# function to detect the number of fractions per protein
+
+nFractionsDetected <- function(x){
+  return(sum(x != 0))
+}
+
+nFrac.list
+nFrac <- lapply(mat.list, function(x){
+  nFract <- apply(x, 1, nFractionsDetected)
+  nfrac.dt <- data.table(id=names(nFract), nFactions=nFract)
+})  %>% 
+  rbindlist(idcol='sample')
+nFrac <- dcast(nFrac, id~sample)
+
+nFrac
+intensityTable <- lapply(mat.list, function(x){ 
+  protSums <- apply(x, 1, sum, na.rm=T)
+  nfrac.dt <- data.table(id=names(protSums), sumIntensity=protSums)
+  }) %>% 
+  rbindlist(idcol='sample')
+
+
+# unifected seems globally higher; normalize across samples and take the fold changes
+ggplot(intensityTable, aes(x=sample, y=log2(sumIntensity))) +
+  geom_boxplot()
+
+intensityTable[, LogIntensities := log2(sumIntensity)]
+intensityTable <- intensityTable[nFrac, on='id'] # add the N peaks detected
+
+
+# normalize the log intensities
+intsMat <- dcast(intensityTable, id~sample, value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='id')
+
+intsMat[is.infinite(intsMat)] <- 0
+
+tmp <- medpolish(intsMat, na.rm=T)
+tmp.dt <- data.table(sample=names(tmp$col), offSet=tmp$col)
+tmp.dt
+# take the col offsets and subtract those (as on log scale)
+# offset is tiny, so just use the unnormalized values
+intensityTable <- merge(intensityTable, tmp.dt, by='sample')
+intensityTable[, normLogIntensities := LogIntensities - offSet]
+
+# check if works
+intensityTable[, infected_vs_uninfected := (LogIntensities[sample == 'cd4_infected_1'] - LogIntensities[sample == 'cd4_uninfected_1']), by=id]
+intensityTable[id == 'A0A024RBG1__NUDT4B',.(id, sample, LogIntensities, infected_vs_uninfected)]
+intensityTable
+
+FC.table <- intensityTable[, .(
+                   infected_vs_uninfected  = (LogIntensities[sample == 'cd4_infected_1'] - LogIntensities[sample == 'cd4_uninfected_1']),
+                   infected_vs_challenged  = (LogIntensities[sample == 'cd4_infected_1'] - LogIntensities[sample == 'cd4_challenged_1']),
+                   challenged_vs_uninfected = (LogIntensities[sample == 'cd4_challenged_1'] - LogIntensities[sample == 'cd4_uninfected_1'])
+                   ), by=.(id)]
+
+
+FC.table[, c('protein', 'gene') := tstrsplit(id, '__', keep=c(1,2))]
+FC.table$id <- NULL
+fwrite(FC.table, ScriptAndDatedFileName('proteinSums.foldchanges.csv.gz'))
+```
+```{r}
+setnames(intensityTable, old=c('cd4_challenged_1', 'cd4_infected_1', 'cd4_uninfected_1'), new=c('nFractions_cd4_challenged_1', 'nFractions_cd4_infected_1', 'nFractions_cd4_uninfected_1'))
+intensity.wide <- dcast(intensityTable, id+nFractions_cd4_uninfected_1+nFractions_cd4_challenged_1+nFractions_cd4_infected_1~sample, value.var = 'LogIntensities')
+intensity.wide[, c('protein', 'gene') := tstrsplit(id, '__', keep=c(1,2))]
+comb.dt %>% colnames()
+comb.dt <- merge(FC.table, intensity.wide[,.(protein, gene,nFractions_cd4_uninfected_1, nFractions_cd4_challenged_1, nFractions_cd4_infected_1, cd4_challenged_1, cd4_infected_1, cd4_uninfected_1)], by=c('protein', 'gene'))
+setnames(comb.dt, old=c("cd4_challenged_1", "cd4_infected_1","cd4_uninfected_1"), new=c("sumLogIntensities_cd4_challenged_1","sumLogIntensities_cd4_infected_1","sumLogIntensities_cd4_uninfected_1" ))
+
+fwrite(comb.dt, ScriptAndDatedFileName('sumIntensitiesAndFoldChanges.csv.gz'))
+```
+
+annotate the proteins with Robyns groups; see if we can see what host proteins abundance is changing in the different groups
+
+```{r}
+# annotate with Robyns complexes
+comb.dt <- merge(comb.dt, complexes.dt, by=c('protein', 'gene'), all.x=T)
+# convert to long ofmat for plotting
+comb.long <- melt(comb.dt, id.vars = c('protein', 'gene', 'Mwt (Da)', 'Descriptions', 'nFractions_cd4_uninfected_1','nFractions_cd4_challenged_1', 
+                                       'sumLogIntensities_cd4_challenged_1', 'sumLogIntensities_cd4_infected_1',   'sumLogIntensities_cd4_uninfected_1', 'nFractions_cd4_infected_1', 'group', 'info'))
+
+
+setnames(comb.long, old=c('variable', 'value'), new=c('comparison', 'log2foldchange'))
+```
+
+This is not a bad idea, but I think we need to enrich for each of the FC and see what geneSets come out
+What about, just take a log2 Fold change of 1 (double/half) and see what falls out this way? Then for the sig hits highlight these on our set
+```{r}
+comb.long[, rankedFC := rank(log2foldchange), by=comparison]
+comb.long$comparison %>% unique()
+
+g <- ggplot(comb.long, aes(x=rankedFC, y=log2foldchange)) +
+  geom_point(shape='.', color='grey70') +
+  geom_point(data=comb.long[!is.na(group)],  aes(x=rankedFC, color=group, y=log2foldchange)) +
+  scale_color_manual(values=col.pal) +
+  #scale_color_manual(values=c('gold1', 'grey')) +
+  ggrepel::geom_text_repel(data=comb.long[!is.na(group)], aes(label=gene), max.overlaps = 40, size=2, color='black', linetype=2, segment.alpha=0.3) +
+  geom_hline(yintercept = 0, linetype=2) +
+  facet_grid(comparison~.) +
+  labs(x='gene pair (rank order)', y='Log2 FC (sum intensity)') +
+  theme_bw() +
+  theme(axis.text.x=element_blank())
+
+g
+```
+
+enrichment of the large fold changes
+```{r}
+fc.dt <- comb.long[, .(protein, gene, comparison, log2foldchange)]
+fc.dt[, sig := 'not']
+fc.dt[abs(log2foldchange) > 1, sig := ifelse(log2foldchange > 0, 'up', 'down')]
+
+g <- ggplot(fc.dt[sig != 'not',.N, by=.(sig, comparison)], aes(x=comparison, y=N, fill=factor(sig, levels=c('up', 'down', 'not')))) +
+  geom_bar(stat='identity') +
+  labs(title='Protein fold-changes across conditions') +
+  scale_fill_manual(values=c('down'=col.pal[1], 'up'=col.pal[2])) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90)) +
+  guides(fill=guide_legend('LFC'))
+  
+g
+BackupAsPDF(g, 'proteinFoldChanges.nProteins.barchart')
+```
+
+Enrichment on the set of proteins changing
+```{r}
+
+comb.dt
+gmt.go <- loadGmtFromBioconductor(ontology = 'ALL', keyType ='SYMBOL')
+
+fc.dt[, enrich.grp := paste0(comparison, '.', sig)]
+
+enrich.dt <- enricherOnGroups(fc.dt[sig != 'not',],
+                              term2gene.gmt = gmt.go,
+                              universe=unique(comb.dt$gene),
+                              groupColumns = 'enrich.grp',
+                              geneColumn = 'gene')
+
+#fwrite(enrich.dt, ScriptAndDatedFileName('go.all.enrichments.csv.gz'))
+enrich.dt <- fread('~/Documents/projects/040825_MMuralidharan_PCProphet_HIV_CD4Tcells/041125_preparePlots_data/2025_04_14_go.all.enrichments.csv.gz')
+```
+
+simplify enrichment and generate both plots 
+```{r, fig.height=6, fig.width=8}
+simp.dt <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, group='enrich.grp')
+fwrite(simp.dt$simplified, ScriptAndDatedFileName('go.all.enrichments.simplified.csv.gz'))
+
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.dt$simplified, 
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO term enrichment', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.dt$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 7), 
+                                upperThreshold = 8)
+ht
+BackupAsPDF(ht, 'go.all.enrichment.heamtmap')
+```
+
+We also want to map the uniprot ids for the enrichment terms 
+```{r}
+# function to get gene name from uniprot
+backMapToUniprot <- function(x){
+  geneVec <- strsplit(x, '/')[[1]]
+  protVec <- comb.dt[match(geneVec, gene), protein]
+  return(paste(protVec, collapse='/'))
+}
+#backMapToUniprot('RPS17/RPSA/RPS2/RPS4Y1/RPS3/RPS12/RPS19/RPS9/RPS5/RPS10/RPS20/RPS3A/RPS7/RPS8/RPS15A/RPS16/RPS14/RPS23/RPS29/RPS13/RPS11/RPS4X/RPS6/RPS15/RPS24/RPS25/RPS26/RPS28/FAU')
+
+simp.dt$simplified[, uniprotID := backMapToUniprot(geneID), by=.I]
+simp.dt$simplified
+
+fwrite(simp.dt$simplified, ScriptAndDatedFileName('simplified.enrichment.wUNiprots.csv.gz'))
+```

@@ -1,0 +1,224 @@
+---
+title: "module1Analysis"
+author: "Martin Gordon"
+date: "2023-11-14"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Module 1 Analysis WGCNA
+
+Seems from the inital WGCNA clustering that we see two subclusters in the WGCNA module 1
+Lets try clustering submodule and see if we can define subgroups and enrich
+
+Maybe then plot linecharts of the data
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(WGCNA)
+library(magrittr)
+library(stringr)
+library(ggbeeswarm)
+library(ggrepel)
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+source("/Users/martingordon/Documents/utils/mg_utils/HelperFunctions.R")
+
+clust.genes <- extractClustersfromHeatmap(hm, prot.mat) %>% rbindlist()
+clust.genes[,.N, by=Cluster]
+
+```
+
+read in the data 
+```{r}
+# exp mat
+receptor.exp.mat <- readRDS('./output/gpcr.11.receptors.exp.mat.Rdata')
+
+# assignment of WGCNA modules
+wgcna.clusters <- fread('./output/wgcna.clustergenes.adjmat.csv')
+
+```
+
+extract module 1 submat
+```{r}
+clust.oi <-  wgcna.clusters[Cluster == 'cluster1', GeneID]
+rownames(receptor.exp.mat) <-  multiUniprots2multiGenes(rownames(receptor.exp.mat))
+
+subMat <-  receptor.exp.mat[rownames(receptor.exp.mat) %in% clust.oi, ]
+dim(subMat)
+```
+
+clustering of module 1
+```{r}
+clusterWNA <- function(x,na.val=0){
+  
+  x[is.na(x)] <- na.val
+  return( hclust(dist(x)) )
+  
+}
+
+hm <- Heatmap(subMat, cluster_columns = FALSE, 
+         name = "log2(intensity/\nmean(timeZero))",
+         column_split = tstrsplit(colnames(subMat), "[_.]")[[1]],
+         na_col = 'darkgrey',
+         row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 3),
+         column_names_gp = gpar (fontsize= 3),
+         cluster_row_slices = F,
+         show_row_names = T,
+         column_title_gp = gpar (fontsize= 9))
+
+hm
+```
+kmeans clustering to identify subclusters in the data 
+
+
+convert NA values to 0 (small offset)
+```{r}
+subMat.rmNA <- subMat
+subMat.rmNA[is.na(subMat.rmNA)] <- 1e-10
+
+km.out <- kmeans(subMat.rmNA, iter.max = 10, centers=2)
+
+km.dt <-  data.table(gene=names(km.out$cluster), 
+                     km.cluster=km.out$cluster)
+```
+
+replot the heatmap with the output of the kmm clustering algorithm
+
+```{r}
+hm <- Heatmap(subMat, cluster_columns = FALSE, 
+         name = "log2(intensity/\nmean(timeZero))",
+         column_split = tstrsplit(colnames(subMat), "[_.]")[[1]],
+         na_col = 'darkgrey',
+         row_split = paste0("k.means.", km.dt$km.cluster),
+        # row_title =sprintf("%d Proteins",
+        #                    nrow(subMat)),
+         row_names_gp = gpar (fontsize= 5),
+         column_names_gp = gpar (fontsize= 3),
+         cluster_row_slices = F,
+         show_row_names = T,
+         column_title_gp = gpar (fontsize= 9))
+
+hm <-  draw(hm)
+BackupAsPDF(draw(hm, column_title='Module 1 (Endosome Trafficking)'), 'module1.kmeansclustering.heatmap.', dimensions=c(8,8))
+```
+Nicely captures the two subclusters; lets extract the cluster genes and run enrichment to identify GO BP processes
+Background will be 
+
+```{r}
+subclust.genes <- extractClustersfromHeatmap(hm, subMat)
+
+# sanity check
+identical(km.dt[order(gene)]$km.cluster,subclust.genes[order(feature)]$cluster)
+
+subclust.genes <-  subclust.genes[, cluster := paste0('k.means.',cluster)] %>% 
+  .[, cluster := factor(cluster, levels=c('k.means.1', 'k.means.2'))]
+
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# our background? only genes used for WGCNA analysis
+universe <- rownames(receptor.exp.mat)
+
+enrich.dt <- enricherOnGroups(subclust.genes, groupColumns = 'cluster', geneColumn = "feature", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'cluster')
+
+enrich.dt %>%  View()
+#custom ordering
+enrich.dt[, cluster := factor(cluster, levels=c('k.means.1', 'k.means.2'))]
+
+simp.enrich$simplified
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, groupColumn = 'cluster.x', topN = 12, title='Module 1 (Endosome Trafficking) subcluster enrichment', 
+                                row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 8, cluster_columns =F)
+
+BackupAsPDF(ht, 'go.enrichment.module1.subclusters', dimensions=c(8,8))
+```
+plot linecharts of the median expression profiles per receptor
+label according to dominant terms
+
+read in the p.quant data 
+```{r}
+# read in exp data
+p.quant <- fread('data/2022_08_17_ProteinLevelData.lib.csv.gz')
+
+p.quant[, gene := multiUniprots2multiGenes(Protein)]
+# fix the groups with an underscore in them MOR_LG and MOR_DAMGO to MOR.DAMGO
+p.quant[, GROUP := gsub ("_([A-Z])", ".\\1", GROUP)]
+p.quant[GROUP %like% "DAMGO", GROUP := sub(".DAMGO","", GROUP)]
+
+# add some new identifier cols
+p.quant[, `:=`(timeStr = str_extract(GROUP,'[0-9]{2}$'),
+               receptor = gsub("_[0-9]{2}$", '', p.quant$GROUP)
+               )]
+
+group.noi <- p.quant[!GROUP %like% c("DOR|KOR|MOR|MRX2|MRX4|NK1R|NPFFR1|NPY1R|PTGER1|PTGER4|QRFPR|DOR"),unique(GROUP)]
+
+p.quant <- p.quant[!GROUP %in% group.noi, ]
+p.quant <- p.quant[!GROUP %like% "MOR.LG94",]
+#rm DAMGO flag
+
+p.quant[, batchControlled := LogIntensities - median(LogIntensities, na.rm = TRUE), by = .(Protein, receptor, SUBJECT)]
+p.quant[, vsTimeZero := batchControlled - mean(batchControlled[timeStr == timeStr[!is.na(batchControlled)][1] ]), by = .(Protein, receptor)]
+```
+
+calculate median by subcluster/receptor combo and plot; do these profiles distinguish the two groups
+
+```{r}
+p.quant.df <- p.quant[subclust.genes, cluster := i.cluster, on=c('gene','gene')] %>%
+  .[, medianVsTimeZero := median(vsTimeZero, na.rm=T), by=.(gene, receptor, cluster)] %>% 
+  .[!is.na(cluster),]
+
+# define a useful color pallette
+col.pal <- randomcoloR::distinctColorPalette(length(unique(p.quant.df$receptor)))
+
+
+g <- ggplot(p.quant.df, aes(x=timeStr, y=vsTimeZero, group=cluster, color=cluster)) +
+  stat_summary(fun = "median", geom = "line") +
+  #stat_summary(fun.data = "mean_cl_normal", geom = "errorbar", width = .2) +
+  scale_color_manual(values = col.pal) + 
+  ggtitle('Module 1 (Endosome Trafficking) subcluster trends') +
+  labs(x='timepoint (mins)', y="Median Intensity vs T0(log2)") +
+  facet_wrap(~receptor, scales='free_y', ncol=3) +
+  scale_x_discrete(expand=c(0,0)) +
+  theme_bw() +
+  theme(
+   strip.text = element_text(size = 6))
+g
+
+BackupAsPDF(g, 'module1.subclusters.linechart')
+
+```
+
+looks really just to be a change in magnitude
+```{r}
+
+g <- ggplot(p.quant.df, aes(x=timeStr, y=vsTimeZero, group=receptor, color=receptor)) +
+  stat_summary(fun = "median", geom = "line") +
+  #stat_summary(fun.data = "mean_cl_normal", geom = "errorbar", width = .2) +
+  scale_color_manual(values = col.pal) + 
+  ggtitle('Module 1 (Endosome Trafficking) subcluster trends') +
+  labs(x='timepoint (mins)', y="Median Intensity vs T0(log2)") +
+  facet_wrap(~cluster, scales='free_y', ncol=3) +
+  scale_x_discrete(expand=c(0,0)) +
+  theme_bw() +
+  theme(
+   strip.text = element_text(size = 6))
+g
+
+BackupAsPDF(g, 'module1.subclusters.receptors.linechart.')
+```
+To do 
+---
+Maybe label the subclusters by GO enrichment results
+Discuss with BP tomorrow

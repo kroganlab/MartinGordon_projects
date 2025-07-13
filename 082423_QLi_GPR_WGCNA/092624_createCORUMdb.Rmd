@@ -1,0 +1,139 @@
+---
+title: "092624_CORUMDBPreparartionForCytoscape"
+author: "Martin Gordon"
+date: "2024-09-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Prepare a node and edge table for cytoscape from the CORUM database
+
+```{r cars}
+library(data.table)
+library(magrittr)
+
+
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+```
+
+
+```{r}
+corum.dt <- fread('~/Downloads/corum_humanComplexes.txt')
+```
+# want to iterate through the complexes, generate an all by all mapping of each component to the other
+
+```{r}
+getEdgeTablefromCorum <- function(corum_database=corum.dt, bidirectional=F){
+  
+  corum.edge.list <- lapply(corum_database$complex_id, function(x){
+    
+    if (bidirectional){ message('Warning bidirectional edges will be included in the final output. To remove use the option bidirectional=F') }
+  
+    subDT <- corum_database[complex_id == x,]
+    
+    #message(paste0('Extracting uniprot IDs for members of ', subDT[complex_id == x,]$complex_name))
+    subunits <- unlist(tstrsplit(subDT$subunits_uniprot_id, '[;]'))
+
+  
+    if (length(subunits) > 1){
+    
+     # message(paste0('Creating edge table for ', paste(subunits, collapse = ', '))) 
+    
+      if (!bidirectional){
+        connections <- as.data.table(t(combn(subunits,2)))
+        setnames(connections, new=c('source', 'target'))
+        }  else {
+        connections <- data.table(expand.grid(source=subunits, target=subunits))
+      }
+    
+      # removing self-links
+      connections[source != target,]
+      connections[, `:=`(complex_id = x,
+                         complex_name = subDT[complex_id == x,]$complex_name,
+                         proteins = paste(subunits, collapse=',')
+                     )]
+   
+    return(connections) } else {
+    
+      message(paste0('Skipping ',  subDT[complex_id == x,]$complex_name, ' as only ', length(subunits), ' members')) 
+    
+    } 
+  })
+  
+  message(paste0('Found ', length(corum.edge.list), ' complexes'))
+  return(rbindlist(corum.edge.list))
+}
+
+corum.edge.dt <- getEdgeTablefromCorum()
+```
+test on tbales with one
+```{r}
+corum.edge.dt[, `:=`(source_gene = multiUniprots2multiGenes(source, species='HUMAN'),
+                     target_gene = multiUniprots2multiGenes(target, species='HUMAN'))]
+
+
+#fwrite(corum.edge.dt[,.(source, source_gene, target, target_gene, complex_id, complex_name, proteins)], ScriptAndDatedFileName('corumHumanEdgetable.csv'))
+
+# read in the edge table and 
+edge.table <- fread('~/Documents/projects/082423_QLi_GPR_WGCNA/092624_createCORUMdb_data/2024_09_26_corumHumanEdgetable.csv')
+
+geneList <- fread('./092624_createCORUMdb_data/Figure5_networkNodeTable_09262024.csv')
+# map to uniprot and use that
+geneList[name != '', uniprot := translateGeneName2Uniprot(name)]
+
+subset.edge <- edge.table[ (source_gene %in% geneList$name & target_gene %in% geneList$name), ]
+#fwrite(subset.edge, ScriptAndDatedFileName('gpcr.corum.interactors.csv'))
+fread('~/Documents/projects/082423_QLi_GPR_WGCNA/092624_createCORUMdb_data/2024_09_26_gpcr.corum.interactors.csv')
+```
+
+
+# look at output of node table
+```{r}
+corum <- read.table(file ='~/Downloads/corum_and_inverse.txt', header = T, sep = "\t", stringsAsFactors = F)
+
+unisplit <- function(v) {
+  trimws(unlist(strsplit(v, split = "_")))
+}
+unilist <- lapply(corum$PPI.code, unisplit)
+
+search_corum <- function(x) {
+  out <- list()
+  out2 <- c()
+  complex_df <- NULL
+  # loop through vectors of complexes
+  for(i in 1:length(unilist)) {
+    v <- sort(intersect(x, unilist[[i]])); if (length(v) == 0) next
+
+    for (k1 in 1:length(v)) {
+      for (k2 in 1:length(v)) {
+        if (k2>k1) {
+          n <- paste(v[k1], v[k2], sep=".")
+          out[[n]] <- c(v[k1], v[k2], corum$complex_id[i], corum$complex_name[i], paste(v, collapse=" "))
+        }
+      }
+    }
+  }
+  return(out)
+}
+
+
+corum_list
+
+corum_list <- search_corum(c('O60244', 'O43513', 'P24863'))
+corumdf <- t(as.data.frame(corum_list))
+colnames(corumdf) <- c("source","target", "corum_id", "corum_name", "protein_list")
+corumdf <- data.frame(corumdf, interaction = "corum")
+rownames(corumdf) <- NULL
+
+corumdf
+```
+
+Think its called inverse as want both directions
+```{r}
+fread('~/Downloads/corum_and_inverse.txt')
+```
+

@@ -1,0 +1,455 @@
+---
+title: "050925_CCprofiler_testRun"
+author: "Martin Gordon"
+date: "2025-05-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview 
+
+For the benchmark work, look at the different SEC_MS tools and run on our lysis data; 
+We don't yet have a good method of benchmarking this data (what is a'gold set' of complexes?)
+So maybe for now, we just look at number of CORUM complexes recovered by each tool above a passing threshold
+
+
+**Questions**
+Why do we include the decoy set in the analysis?
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(CCprofiler)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+```
+
+create custom lo-format DB
+```{r}
+corum.dt <- fread('~/Documents/utils/mg_utils/data/corum_humanComplexes.txt')
+corum.long <- corum.dt[, .(complex_name, protein_id=unlist(strsplit(subunits_uniprot_id, ';'))), by=complex_id]
+
+fwrite(corum.long, ScriptAndDatedFileName('corum.5.1.hsComplexes.long.csv.gz'))
+corum.dt <- fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/050925_CCprofiler_testRun_data/2025_05_12_corum.5.1.hsComplexes.long.csv.gz')
+```
+
+test data
+longformat protein, peptide, filename and intensity
+Also a keys file with filename mapping to fraction
+```{r, input data}
+pcpData <- examplePCPdataLong
+pcpData[,.N, by=filename]
+head(pcpData, n = 2)
+
+
+fractionAnnotation <- exampleFractionAnnotation
+head(fractionAnnotation, n = 2)
+
+# calibration table
+calibrationTable <- exampleCalibrationTable
+calibrationTable #weights in kDa and elution fractions
+calibration = calibrateMW(calibrationTable) # also fits an lm to the table
+# feature ID already summarized
+
+pcpData[,length(unique(peptide_id)), by=.(protein_id, peptide_id, filename)][V1 > 1,]
+```
+
+# Standard analysis workflow
+## Import of elution profiles to traces object
+The first step in any analysis with *CCprofiler* is the import of a quantitative peptide- or protein-level matrix in long or wide format that is converted to an object of class "traces". The traces data structure is a list containing four items:
+
+* A traces data.table containing quantitative profiles of the peptides or proteins. Each row represents a peptide or protein while the columns are the consecutive fractions. The final, last column specifies the identifiers of the row (peptide or protein ids). 
+* A trace_type character specifying whether the quantitative profiles (traces)  are of type "peptide" or "protein".
+* A trace_annotation data.table containing additional information for each peptide or protein, e.g. the molecular weight of a protein.
+* A fraction annotation data.table containing additional information for each fraction (column of the traces data.table), e.g. the raw MS filename of each fraction.
+
+The trace annotation can be extended with additional information from databases such as UniProt (```exampleTraceAnnotation```). Finally each fraction can be mapped to its estimated molecular weight as determined by a calibration function. Although helpful for biological interpretation of the results, the general functionalities of *CCprofiler* do not depend on the additional trace and molecular weight annotation steps.
+
+```{r, eval=TRUE, message=FALSE}
+
+pcpData
+## Import quantitative PCP data into a traces object; cant seem to find the intensites?
+pepTraces <- importPCPdata(input_data = pcpData,
+                           fraction_annotation = fractionAnnotation,
+                           rm_decoys = FALSE)
+
+# this is the matrix object
+pepTraces$traces
+
+
+## Trace annotation table
+traceAnnotation <- exampleTraceAnnotation
+head(traceAnnotation, n = 2)
+
+## Annotate traces with information from uniprot
+pepTraces <- annotateTraces(traces = pepTraces,
+                            trace_annotation = traceAnnotation,
+                            traces_id_column = "protein_id",
+                            trace_annotation_id_column = "Entry",
+                            trace_annotation_mass_column = "Mass",
+                            uniprot_mass_format = TRUE,
+                            replace_whitespace = TRUE)
+
+pepTraces
+pepTraces[grepl('[.]', peptide_id)]
+## Annotate traces with molecular weight calibration (if applicable)
+pepTraces <- annotateMolecularWeight(examplePeptideTraces, 
+                                     calibration)
+
+## Inspect resulting annotated traces object
+# now we have a predicted molecular weight column for each of the fractions taken from the standards
+
+
+# how dies it know the decoys? 
+# also the umber of proteins/peptides looks low?
+summary(pepTraces)
+grep("REV", pepTraces$traces[, 82]$id, ignore.case = T) 
+
+# so the decoys are the NA records
+pepTraces$trace_annotation[,.N, by=Status]
+pepTraces$trace_annotation[is.na(Status)]
+```
+
+```{r}
+# so the decoys are the NA records
+pepTraces$trace_annotation[,.N, by=Status]
+pepTraces$trace_annotation[is.na(Status)]
+```
+
+## Quality control and filtering
+*CCprofiler* includes several options to filter for low-quality data points and noisy traces in the data. 
+The first option is to filter the data points within a peptide trace based on consecutive identifications. A minimum stretch length of 3 means that intensity values that are not embedded in a row of at least 3 consecutive identifications are removed (i.e. set to zero).
+A second filter based on sibling peptide correlation calculates the mean sibling peptide correlation of each peptide to its sibling peptides. 
+Peptides with a low sibling peptide correlation can be removed either by a fixed cutoff or by selecting an FDR cutoff that should be reached after the filtering.
+Do a mean sibling peptide correlation histogram per sample; do we then just filter out the peptides that dont pass?
+
+
+**we probably dont need these are we are doing a robust summarization to protein-level, so outliers should be handled? Interesting*
+*interesting they kill signal without at least 3 consecutive measurements... tidier peaks but issues?*
+*No harm to try, its interesting...*
+```{r, eval=TRUE, fig.show='hold'}
+## Convert to zero measurments that arent in a run of 3.. check the code; weird pythonic programming
+## filter empty rows... this is done at the peptide level
+pepTraces_cons <- filterConsecutiveIdStretches(traces = pepTraces, 
+                                               min_stretch_length = 3)
+
+
+# basically calculate the average correlation with each peptide to all its sister peptides, filter those < .2, or a threshold set on the number of decoy that will pass
+## Filter by 0.2 sibling peptide correlation
+## Note that instead of a fixed "absolute_spcCutoff" an fdr cutoff can be specified. 
+## The sibling peptide correlation cutoff will then be chosen to result in the specified 
+## FDR as estimated by decoy counting; controlled by setting FDR or use an abs correlation score
+
+pepTraces_cons_sib <- filterBySibPepCorr(traces = pepTraces_cons,
+                                         fdr_cutoff = NULL, 
+                                         absolute_spcCutoff = 0.2, 
+                                         plot = TRUE)
+```
+
+## Protein quantification
+The peptide traces can be used to infer protein-level traces. *CCprofiler* implements a topN strategy for summarizing peptides to a protein trace. Decoys should typically be removed at this stage.
+
+**Think we can improve on this using robust summarization** notice no use of imputation; use as is
+*No normalization??*
+```{r, eval=TRUE}
+protTraces <- proteinQuantification(pepTraces_cons_sib, 
+                                    topN = 2,
+                                    keep_less = FALSE,
+                                    rm_decoys = TRUE)
+summary(protTraces)
+saveRDS(protTraces, ScriptAndDatedFileName('protTraces.example.rds'))
+saveRDS(pepTraces, ScriptAndDatedFileName('pepTraces.example.rds'))
+```
+
+## Protein feature finding
+*Protein level summarization is not used for the peak finsing in the vignette?*
+
+*CCprofiler* can be employed to automatically detect protein elution peaks along the SEC dimension. 
+Protein features are detected based on local correlation among the proteolytic peptides’ quantitative profiles. Peptides are grouped by parent protein identifier; no external prior knowledge is required. Protein feature finding consists of two consecutive steps: (i) co-elution signal detection followed by (ii) statistical scoring, FDR estimation and filtering. 
+To support basic control for random effects, decoy protein queries with randomized peptide-protein mapping are employed. 
+
+### Protein-centric detection of protein elution features
+Protein features are determined by a sliding window strategy, where all peptides of a protein are tested for local profile correlation. If a subset of the peptides within a protein correlate better then the specified cutoff, a protein feature is initiated, followed by peak detection within the regions of high correlation. Here we perform the protein feature finding only on a subset of all proteins because this can take some time. In order to be able to estimate an error-rate, protein decoys can be generated on the fly during the feature detection step by randomly assigning peptides to a protein decoy (```useRandomDecoyModel = TRUE```).
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+testProteins = unique(pepTraces_cons_sib$trace_annotation$protein_id)[1:20]
+testProteins
+
+# subset is cool works, seems to be an inbuilt method for traces
+peptideTracesSubset = subset(pepTraces_cons_sib,
+                             trace_subset_ids = testProteins, 
+                             trace_subset_type = "protein_id")
+
+
+subset(pepTraces_cons_sib,
+                             trace_subset_ids = testProteins, 
+                             trace_subset_type = "protein_id")
+```
+Its peak finding is pretty slow single threaded works at the peptide level
+*Seems to recover co-eulting peptides per protein? Is this a safer method/more robust?*
+Not really sure on the output;  we see protien ids, subsunts (peptides) asisgned to the protein, number of subuints detected (I think peak called??), the peak apex, boundary etc and peak mw and the peak correlation
+*Im a little confused if this correlation is with the other peptides to derive just the protein features?* 
+*I think what it does is it uses the peptide info to see where the peaks for the protein are, and then comparing this to the monomer mw, it decides if it is in complex or not* Key line:
+`ProteinFeatures$in_complex[which(ProteinFeatures$apex_mw > 2*ProteinFeatures$monomer_mw)] = TRUE`
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE, cache=FALSE}
+proteinFeatures <- findProteinFeatures(traces = peptideTracesSubset,
+                                       collapse_method = 'apex_only',
+                                       useRandomDecoyModel = TRUE)
+```
+
+Note: On a full dataset, protein elution feature finding is a high computational effort. Therefore, we implemented parallelization of this step to speed up processing.
+```{r, eval=FALSE, message=FALSE, warning=FALSE, cache=FALSE, results='hide'}
+proteinFeatures <- findProteinFeatures(traces = peptideTracesSubset,
+                                       useRandomDecoyModel = TRUE, 
+                                       collapse_method = 'apex_only',
+                                       n_cores = 10, 
+                                       parallelized = TRUE)
+
+
+peptideTracesSubset
+protein
+# summarized protein?
+proteinFeatures <- findProteinFeatures(traces = protTraces,
+                                       useRandomDecoyModel = FALSE, 
+                                       collapse_method = 'apex_only',
+                                       n_cores = 10, 
+                                       parallelized = TRUE)
+```
+**Review thses details**
+### Statistical scoring, FDR estimation and filtering
+Scored at the peptide level; how can we implement at 
+
+The resulting protein features can be scored based on the co-elution characteristics (average peptide correlation) of the peptides within each protein feature. The co-elution score is further statistcally corrected for the number of correlating peptides out of all the MS detectable peptides. 
+The statistically corrected co-elution score can be used to estimate q-values for each protein peak group. Filtering the protein peak groups based on a specified q-value cutoff then achieves a final result table at specified FDR (a q-value cutoff of 0.05 results in a final table with 5% FDR). 
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE, cache=FALSE, fig.width=6, fig.align='center'}
+proteinFeaturesScored <- calculateCoelutionScore(proteinFeatures)
+hist(proteinFeaturesScored$coelution_score)
+
+qvalueProteinFeaturesScored <- calculateQvalue(proteinFeaturesScored)
+qvalueProteinFeaturesScoredStats <- qvaluePositivesPlot(qvalueProteinFeaturesScored)
+# this is still the protein level information
+proteinFeaturesFiltered <- subset(qvalueProteinFeaturesScored, qvalue <= 0.05)
+summarizeFeatures(proteinFeaturesFiltered)
+```
+**second workflow**
+## Complex feature finding
+
+Complex feature finding represents the central step of complex-centric analysis using *CCprofiler*. Based on prior protein interaction data and quantitative fractionation profiles, CCprofiler detects groups or subgroups of locally co-eluting proteins, indicating the presence of protein-protein complexes in the biological sample. Target complex queries are supplemented with decoy complex queries to support error control of the reported results. The result is a table summarizing the presence and composition of protein-protein complexes in the biological sample analyzed.
+
+### Complex query generation
+In general the complex feature detection is very similar to the protein feature detection with the difference that complex hypotheses have to be generated at the beginning. This includes both target and decoy complex hypotheses for error estimation. 
+
+#### Preparing target complex queries
+There are two options for protein complex target generation in *CCprofiler*: (i) loading of full complex models for direct use as queries (2 or more subunits, e.g. from CORUM) or (ii) loading a protein-protein interaction network from which target complex hypotheses can be extracted. The use of concrete complex hypotheses requires loading a complex query table in the following format:
+
+Basically load corum in long format
+```{r,eval=TRUE}
+# this is just a table subset
+complexHypotheses <- exampleComplexHypotheses
+complexHypotheses
+head(complexHypotheses)
+
+# we will use corum. 5.1
+corum.dt[, complex_id := as.character(complex_id)]
+complexHypotheses[,.N, by=complex_id]
+
+# remove homodimers
+corum.f.dt <- corum.dt[complex_id %in%corum.dt[,.N, by=complex_id][N>1, complex_id]]
+```
+
+Convert the complex db to binary matrix, get path lengths between interactors, and then 
+```{r,eval=TRUE}
+# just converts all complexes to pairwise format
+binaryHypotheses <- generateBinaryNetwork(corum.f.dt)
+pathLength <- calculatePathlength(binaryHypotheses) # just the number of hops between proteins; 0 when a=b
+
+# generating corum complex + decoys 
+corumTargetsPlusDecoys <- generateComplexDecoys(target_hypotheses=corum.f.dt,
+                                                dist_info=pathLength,
+                                                min_distance = 2,
+                                                append=TRUE)
+
+```
+
+
+Finding complex features in our data
+```{r}
+complexFeatures <- findComplexFeatures(traces=protTraces,
+                                       complex_hypothesis = corumTargetsPlusDecoys)
+```
+
+After calculating FDR we can filter the data to retain only significant complexes
+```{r}
+complexFeaturesScored <- calculateCoelutionScore(complexFeatures)
+qvalueComplexFeaturesScored <- calculateQvalue(complexFeaturesScored)
+qvalueComplexFeaturesScoredStats <- qvaluePositivesPlot(qvalueComplexFeaturesScored)
+complexFeaturesFiltered <- subset(qvalueComplexFeaturesScored, qvalue <= 0.05)
+complexFeaturesFiltered # nothing passes filtering? maybe too many 
+```
+
+Plots and visualization
+The summary function provides an overview of detected protein complexes
+
+```{r}
+summarizeFeatures(complexFeatures)
+```
+```{r}
+# plot 26S proteasome 193 or 112;33
+plotFeatures(feature_table = complexFeatures,
+             traces = protTraces,
+             feature_id = "10",
+             annotation_label="Entry_name",
+             peak_area = TRUE)
+```
+
+Not sure why nothing is passing significance... multiple-testing burden?
+Reevaluate with the test set
+```{r,eval=TRUE}
+# just converts all complexes to pairwise format
+binaryHypotheses <- generateBinaryNetwork(complexHypotheses)
+pathLength <- calculatePathlength(binaryHypotheses) # just the number of hops between proteins; 0 when a=b
+
+# generating corum complex + decoys 
+corumTargetsPlusDecoys <- generateComplexDecoys(target_hypotheses=complexHypotheses,
+                                                dist_info=pathLength,
+                                                min_distance = 2,
+                                                append=TRUE)
+
+```
+
+
+Finding complex features in our data
+```{r}
+complexFeatures <- findComplexFeatures(traces=protTraces,
+                                       complex_hypothesis = corumTargetsPlusDecoys)
+```
+
+After calculating FDR we can filter the data to retain only significant complexes
+```{r}
+complexFeaturesScored <- calculateCoelutionScore(complexFeatures)
+qvalueComplexFeaturesScored <- calculateQvalue(complexFeaturesScored)
+qvalueComplexFeaturesScoredStats <- qvaluePositivesPlot(qvalueComplexFeaturesScored)
+complexFeaturesFiltered <- subset(qvalueComplexFeaturesScored, qvalue <= 0.05)
+complexFeaturesFiltered # nothing passes filtering? maybe too many 
+complexFeaturesFiltered
+```
+
+Plots and visualization
+The summary function provides an overview of detected protein complexes
+
+```{r}
+summarizeFeatures(complexFeaturesFiltered)
+```
+```{r}
+# plot 26S proteasome 193 or 112;33
+plotFeatures(feature_table = complexFeatures,
+             traces = protTraces,
+             feature_id = "153",
+             annotation_label="Entry_name",
+             peak_area = TRUE)
+```
+
+
+
+
+
+CCprofiler allows fast plotting of all protein complexes with built in functions
+
+# plot 26S proteasome 193 or 112;33
+plotFeatures(feature_table = complexFeaturesFiltered,
+             traces = protTraces,
+             feature_id = "193",
+             annotation_label="Entry_name",
+             calibration = calibration_new,
+             peak_area = TRUE)
+
+
+
+
+Alternatively target complex hypotheses can be generated from a binary protein interaction network by grouping each proteins with their neighbors. In this example, we first generate a binary interaction network from the example complexes included with the package generated above. In a real world example users could for example load data from Bioplex or StringDB. The distance between any protein pair in the network is then calculated and used for generating network-based targets.
+
+
+#### Preparing decoy complex queries
+
+Decoy complex queries are generated based on the target complex query set and its underlying network structure. The minimum distance specifies the minimal number of edges between any two proteins within any generated decoy complex query. It is important that the interacton network based on the targets is large enough to generate a random decoy set that does not overlap with the target complex queries. We recommend complex query sets of at least 1000 targets for the decoy based approach. 
+
+```{r,eval=FALSE}
+corumTargetsPlusDecoys <- generateComplexDecoys(target_hypotheses=corumComplexHypotheses,
+                                                dist_info=pathLength,
+                                                min_distance = 2,
+                                                append=TRUE)
+```
+
+### Complex-centric detection of protein co-elution features
+
+Protein complex features are determined similar to the protein features described above. First, a sliding window strategy is applied, where all proteins of a protein complex hypothesis are tested for local profile correlation. If a subset of the proteins within a protein complex hypothesis correlate better then the specified cutoff, a protein complex feature is initiated, followed by peak detection within the regions of high correlation. 
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE, cache=FALSE, results='hide',fig.width=6, fig.align='center'}
+complexFeatures <- findComplexFeatures(traces=protTraces,
+                                       complex_hypothesis = complexHypotheses)
+```
+
+Sometimes it might is beneficial to only report the 'best' (largest numer of co-eluting protein subunits) detected complex co-elution peak group. 
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE, cache=FALSE}
+complexFeaturesBest <- getBestFeatures(complexFeatures)
+```
+
+Additionally, complex (and also protein) feature results can be filtered by different criteria. For example, if information abount the molecular weight of each measured fraction is available, one can filter out complex features that elute at a molecular weight that is lower than a certain threshold with respect to the expected monomer elution fraction (based on the molecular weights of the protein monomer molecular weights).
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE, cache=FALSE}
+complexFeaturesFilteredMW <- filterFeatures(complexFeatures,
+                                            complex_ids = NULL,
+                                            protein_ids = NULL,
+                                            min_feature_completeness = NULL,
+                                            min_hypothesis_completeness = NULL,
+                                            min_subunits = NULL,
+                                            min_peak_corr = NULL,
+                                            min_monomer_distance_factor = 2
+                                            )
+```
+
+### Statistical scoring, FDR estimation and filtering
+
+The resulting protein complex features can be scored based on the co-elution characteristics (average protein subunit correlation) of the proteins within each protein complex feature. The co-elution score is further statistcally corrected for the number of correlating proteins out of all the proteins in the protein complex hypothesis. The statistically corrected co-elution score can be used to estimate q-values for each protein complex peak group. Filtering the protein complex peak groups based on a specified q-value cutoff then achieves a final result table at specified FDR (a q-value cutoff of 0.05 results in a final table with 5% FDR). 
+
+```{r, eval=TRUE, message=FALSE, warning=FALSE, cache=FALSE, fig.width=6, fig.align='center'}
+complexFeaturesScored <- calculateCoelutionScore(complexFeatures)
+
+undebug(calculateCoelutionScore)
+qvalueComplexFeaturesScored <- calculateQvalue(complexFeaturesScored)
+head(qvalueComplexFeaturesScored, n = 2)
+qvalueComplexFeaturesScoredStats <- qvaluePositivesPlot(qvalueComplexFeaturesScored)
+complexFeaturesFiltered <- subset(qvalueComplexFeaturesScored, qvalue <= 0.05)
+summarizeFeatures(complexFeaturesFiltered)
+
+
+complexFeaturesFiltered
+```
+
+### Complex feature collapsing
+
+Notably, *CCprofiler* is able to retrieve co-elution evidence from full protein complex queries but also subsets thereof. Due to partial overlap of the protein sets grouped as complex queries, the same co-elution signal can be retrieved as evidence for multiple diﬀerent queries. Thus, we collapse the initial results to truly unique signals with regard to (i), subunit composition and (ii), resolution in the chromatographic dimension.
+
+```{r,eval=TRUE}
+complexFeaturesUnique <- getUniqueFeatureGroups(complexFeaturesFiltered,
+                                                rt_height = 0,
+                                                distance_cutoff = 1.25)
+complexFeaturesCollapsed <- callapseByUniqueFeatureGroups(complexFeaturesUnique,
+                                                          rm_decoys = TRUE)
+```
+
+This was building our own DB... took an age to run
+
+```{r}
+# this took so long to run...
+#fwrite(networkTargets, ScriptAndDatedFileName('networkTargets.out.csv.gz'))
+fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/050925_CCprofiler_testRun_data/2025_05_12_networkTargets.out.csv.gz')
+```
+

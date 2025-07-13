@@ -1,0 +1,516 @@
+---
+title: "NP06 new contrasts"
+author: "Martin Gordon"
+date: "2023-08-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Notes
+---
+
+BT00 and BT02 
+
+Question is:
+Is the efficacy/impact of NPFF treatment impacted by addition of CM101? ie. "(NP00 - NP30 CM00) - (NP00 - NP30 CM15)"
+Main effects we are looking at tell us impact of NPFF treatment alone without considering CM101 treatment, so we want to assess the 'difference between the difference'
+A significant interaction contrast tells us that NPFF resposne varies by CM treatment status, so we can identify UB sites
+
+The filtered heatmaps are with no proteins that were significantly upregulated in the 'uninteresting' contrasts
+When filtering for 'significant' results found in the interesting contrast, only 3 significant hits were found for BT02 set
+Serious issues here with data quality; batch 2 many missing values
+
+
+With new contrasts, now correcting for many more tests with the addiitonal contrasts; using raw p-val instead of FDR as not directly comparable between msstat runs
+Consider log2FC of  50% and pvalue of 0.01 as significant (first tried 0.001)
+First plots are the sig different responses for genes that are not differentially expressed in CM+/CM- TO samples ( filtered out this sig results at above threhold)
+
+Combined all sig results from mss run excluding those of the uninteresting contrasts, and looked for overlap with sig results from contrast of contrasts: none found. 
+
+
+Why are our sig hits not in the individual contrasts?
+---------
+MT issues as mentioned... are sig results real? problem on both level of individual contrasts and interaciton contrasts
+our FC/pval thresholds: what does 'significance' mean for this comparison? 
+sample size/data type
+batch effects/other factors
+
+Considerations
+---
+Data is very noisy; so few sig results (at raw pval < 0.001) between uniteresting contrasts w/wo CM treatment 
+at pval < 0.001 49 proteins changing at NP00 BT00 CM- vs CM+ (not interesting sites); 71 changing at NP00 BT02 CM- vs CM+ (not interesting sites)
+Dropped pval thres for significance in PW contrasts to 0.01 - multiple testing issue...
+
+When using other contrasts to find things that are significant in at least one of the 'interesting' contrasts, no hits found
+```{r}
+
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(MSstats)
+library(ComplexHeatmap)
+library(stringr)
+library(limma)
+library("ggvenn")
+
+
+# scripts for PTM analysis
+source('../../utils/bp_utils/LocatePeptidePtmInProteins.R')
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+```
+
+```{r}
+spec <- fread('./data/NP06/20230624_115821_NP06_EXc_dirDIA_UB_MSStatsFormatReport.tsv')
+keys <- fread('./data/NP06/NP06_EXc_dirDIA_UB_ConditionSetup.tsv')
+```
+
+
+Preprocess the spec data 
+
+```{r}
+#add semicolon if required 
+spec[, ProteinName := gsub ("(?<![_>])PAC", ";PAC", ProteinName, perl = TRUE)] #uses perl regex v with negative lookbehind to negate -/> characters 
+
+#emove those:
+spec[, ProteinName := gsub (">", "", ProteinName)]
+
+# apply Condition, BioReplicate from keys to spec
+spec[keys , Condition := i.Condition , on = c(Run = "Run Label")] #overwrite condition col w values from keys file, match run col in spec to rawfile col in keys
+spec[keys , BioeReplicate := i.Replicate , on = c(Run = "Run Label")]
+
+
+# generate an ID col
+spec[order(Condition), ID := .GRP, by=.(Condition,BioReplicate)]
+spec[, Replicate := BioReplicate]
+#spec[, BioReplicate := ID]
+
+
+# required column for MSstats
+spec[, IsotopeLabelType := "L"]
+
+```
+
+```{r}
+# check for multi-measurements
+any(spec[, .N, by = .(Run, PeptideSequence, PrecursorCharge)]$N) > 1
+
+ggplot(data=spec, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+
+spec <- spec[Intensity > 2^4,]
+
+ggplot(data=spec, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+
+```
+
+```{r}
+fa <- '~/Documents/utils/mg_utils/data/human_all_proteins_canonical_uniprot-proteome_UP000005640.fasta.gz'
+
+# detect ub sites inn the data
+sitifyProteins_SpectronautFile(spec, fastaFile = fa, site = "UB")
+```
+
+```{r}
+# drop sites where no UB PTM found
+spec <- spec[!is.na(spec$oldProteinName)]
+
+# approximately 30k UB sites found
+ggplot(data=spec, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+```
+
+summarise to the protein level
+
+```{r}
+dp.out <- MSstats::dataProcess(spec,
+                               MBimpute = FALSE, 
+                               featureSubset = "highQuality",
+                               remove_uninformative_feature_outlier = TRUE)
+
+bck.dp <- dp.out
+```
+
+Update contrasts
+----
+We need to update the contrasts performed here to include CM treatment status; not interested now in comparing BT00 and BT02
+
+```{r}
+
+mat.dimnames <- list(rnames='NP30_CM00_BT00 vs NP00_CM00_BT00',
+                     cnames=c("NP00_CM00_BT00","NP00_CM00_BT02","NP00_CM15_BT00","NP00_CM15_BT02","NP30_CM00_BT00","NP30_CM00_BT02","NP30_CM15_BT00","NP30_CM15_BT02"))
+
+
+dp.contrasts <- matrix(data= c(-1,0,0,0,1,0,0,0), nrow = 1, dimnames=mat.dimnames)
+dp.contrasts <- rbind(dp.contrasts, c(0, -1,0,0,0,1,0,0))
+rownames(dp.contrasts)[2] <- 'NP30_CM00_BT02 vs NP00_CM00_BT02'
+dp.contrasts <- rbind(dp.contrasts, c(-1, 0,1,0,0,0,0,0))
+rownames(dp.contrasts)[3] <- 'NP00_CM15_BT00 vs NP00_CM00_BT00'
+dp.contrasts <- rbind(dp.contrasts, c(0, -1,0,1,0,0,0,0))
+rownames(dp.contrasts)[4] <- 'NP00_CM15_BT02 vs NP00_CM00_BT02'
+dp.contrasts <- rbind(dp.contrasts, c(0, 0,0,0,-1,0,1,0))
+rownames(dp.contrasts)[5] <- 'NP30_CM15_BT00 vs NP30_CM00_BT00'
+dp.contrasts <- rbind(dp.contrasts, c(0,0,0,0,0,-1,0,1))
+rownames(dp.contrasts)[6] <- 'NP30_CM15_BT02 vs NP30_CM00_BT02'
+
+```
+
+No sig results.. check with old contrasts
+Using old contrast matrix 
+
+```{r}
+
+mat.dimnames <- list(rnames='NP30_CM00_BT00 vs NP00_CM00_BT00',
+                     cnames=c("NP00_CM00_BT00","NP00_CM00_BT02","NP00_CM15_BT00","NP00_CM15_BT02","NP30_CM00_BT00","NP30_CM00_BT02","NP30_CM15_BT00","NP30_CM15_BT02"))
+
+
+
+old.dp.contrasts <- matrix(data= c(-1,0,0,0,1,0,0,0), nrow = 1, dimnames=mat.dimnames)
+old.dp.contrasts <- rbind(old.dp.contrasts, c(0, -1,0,0,0,1,0,0))
+rownames(old.dp.contrasts)[2] <- 'NP30_CM00_BT02 vs NP00_CM00_BT02'
+old.dp.contrasts <- rbind(old.dp.contrasts, c(0, 0,0,0,-1,1,0,0))
+rownames(old.dp.contrasts)[3] <- 'NP30_CM00_BT02 vs NP30_CM00_BT00'
+old.dp.contrasts <- rbind(old.dp.contrasts, c(-1, 1,0,0,0,0,0,0))
+rownames(old.dp.contrasts)[4] <- 'NP00_CM00_BT02 vs NP00_CM00_BT00'
+```
+Run MSstats, correcting for batch
+
+```{r}
+# modify these subject lines
+f.quant <- as.data.table(dp.out$FeatureLevelData)
+p.quant <- as.data.table(dp.out$ProteinLevelData)
+
+# add batch to SUBJECT header and include in the design matrix
+p.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+f.quant[, SUBJECT := paste0('batch.',SUBJECT)]
+
+dp.out$FeatureLevelData <- f.quant
+dp.out$ProteinLevelData <- p.quant
+
+# run msstats correcting  batch only at the sample level
+test.mss.sp <- groupComparison(contrast.matrix=dp.contrasts, data=dp.out)
+test.mss <- setDT(test.mss.sp$ComparisonResult)
+
+#fwrite(test.mss, './output/24.08.23.new.cmZ.contrasts.csv.gz')
+
+```
+
+Just take any with pvalue < 0.001 as significant (same as used for contrast of contrasts)
+*Note* now considering anyhting with raw pval < 0.01 as 'significant'
+```{r}
+test.mss <- fread('./output/24.08.23.new.cmZ.contrasts.csv.gz')
+
+test.mss[, fdr:= p.adjust(pvalue, method='BH')]
+test.mss[, sig := "not"]
+test.mss[pvalue < 0.01 & abs(log2FC) > 0.58, sig := ifelse (log2FC  > 0, "up", "down")]
+test.mss[pvalue < 0.01 & abs(log2FC) > 0.58, .N, by=.(sig,Label)]
+```
+
+Now, take sites that are: 
+i) not significant in NP00_CM15_BT00 vs NP00_CM00_BT00
+ii) not significant in NP00_CM15_BT02 vs NP00_CM00_BT02
+
+```{r}
+bt00.t0.changing <- test.mss[Label == 'NP00_CM15_BT00 vs NP00_CM00_BT00' & sig != 'not']$Protein
+bt02.t0.changing <- test.mss[Label == 'NP00_CM15_BT02 vs NP00_CM00_BT02' & sig != 'not']$Protein
+```
+
+Take the sites that are significant: from all other contrasts
+now we have this list of sites that are differentially expressed, but not different response to CM treatment at time0
+
+
+Now want to do contrast of contrast for these sites? Maybe makes sense as reduces multiple testing correction
+Could also filter the results we already have for these sites.. If 
+
+
+Lets read in the anova contrasts and first filter by these genes
+
+```{r}
+BT00.anova <- fread('./BT00.anova.contrasts.csv.gz')
+BT00.postProcess <- fread('./BT00.postProcess.contrasts.csv.gz')
+
+BT02.anova <- fread('./BT02.anova.contrasts.csv.gz')
+BT02.postProcess <- fread('./BT02.postProcess.contrasts.csv.gz')
+```
+
+# before repeating contrasts of contrasts, lets look at filtering out what is singificant from the previous interaction terms
+
+```{r}
+# including the dropped sample for now
+protQuant <- fread ("/Users/martingordon/Documents/projects//071823_QLi_NPo6/NPO6.all.samples.protein.lvl.quant.csv.gz")
+
+
+# parse GROUP names to define the actual columns that the linear models will work on
+# this work depends on how your columsn are defined
+protQuant[, np.status :=  as.factor(str_extract(GROUP,"NP[0-9]{2}"))]
+protQuant[, cm.status  := as.factor(str_extract(GROUP,"CM[0-9]{2}"))]
+protQuant[, bt.status  := as.factor(str_extract(GROUP,"BT[0-9]{2}"))]
+protQuant[, batch      := as.factor(SUBJECT)]
+
+```
+
+
+
+## interaction effects
+(different response to NPFF treatment, given CM101 treatment status)
+
+BT00 first
+2 proteins removed
+None of the proteins detected are significantly changing between CM+/CM- conditions at NP00 at (pval < 0.001)
+```{r}
+sigProtein <- BT00.anova[term %in% c( "np.status:cm.status") & p.value < 0.001 & !Protein %in% bt00.t0.changing ] %>% 
+    .[,unique(Protein)]
+
+# filter just to our data
+prot.mat <- dcast (protQuant[Protein %in% sigProtein & bt.status == 'BT00', ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'npff:cm101 Ints/Median',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list(ifelse(grepl("NP00", colnames(prot.mat)), "NP00", "NP30"),
+                                ifelse(grepl("CM00", colnames(prot.mat)), "CM00", "CM15")))
+
+hm
+  
+BackupAsPDF(hm,'bt00.npff-cm101.interaction.filtered.pval<0.001.heatmap', dimensions = c(8,9))
+```
+
+BT02
+Removed 3 proteins..
+Also, none of these proteins are significantly changing between CM-/CM+ at NP00 (at pval = 0.001)
+
+```{r}
+sigProtein <- BT02.anova[term %in% c( "np.status:cm.status") & p.value < 0.001 & !Protein %in% bt02.t0.changing ] %>%
+    .[,unique(Protein)]
+  
+any(sigProtein %in% bt02.t0.changing)
+
+# filter just to our data
+prot.mat <- dcast (protQuant[Protein %in% sigProtein & bt.status == 'BT02', ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'npff:cm101 Ints/Median',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list(ifelse(grepl("NP00", colnames(prot.mat)), "NP00", "NP30"),
+                                ifelse(grepl("CM00", colnames(prot.mat)), "CM00", "CM15")))
+
+hm
+
+#BackupAsPDF(hm,'bt02.npff-cm101.interaction.filtered.pval<0.001.heatmap', dimensions = c(8,9))
+
+```
+
+## interaction effects observed in contrast of contrasts
+
+Value here is we can require a magnitude of difference. 
+Signs are confusing here because the loss of a negative effect will show as  a positive effect, and vice versa.
+
+Plot BT00 contrast of contrasts
+No overlap in sig results
+
+Plot BT02
+
+```{r}
+
+sigProtein <- BT02.postProcess[contrast == "(NP00 - NP30 CM00) - (NP00 - NP30 CM15)" & p.value < 0.001 & abs(estimate) > 1 & !Protein %in% bt02.t0.changing, Protein]# %>% 
+  
+# filter just to our data
+prot.mat <- dcast (protQuant[Protein %in% sigProtein & bt.status == 'BT02', ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+hm <- Heatmap(prot.mat, cluster_columns = FALSE,
+                name = 'npff:cm101 Ints/Median',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 7),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list(
+                                ifelse(grepl("CM00", colnames(prot.mat)), "CM-", "CM+")))
+
+BackupAsPDF(hm, 'bt02.npff-cm101.contrastofcontrasts.filtered.heatmap', dimensions = c(8,9))
+#},x
+```
+
+Generate plot for BT00
+
+```{r}
+
+sigProtein <- BT00.postProcess[contrast == "(NP00 - NP30 CM00) - (NP00 - NP30 CM15)" & p.value < 0.001 & abs(estimate) > 1 & !Protein %in% bt00.t0.changing, Protein]# %>% 
+  
+# filter just to our data
+prot.mat <- dcast (protQuant[Protein %in% sigProtein & bt.status == 'BT00', ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+hm <- Heatmap(prot.mat, cluster_columns = FALSE,
+                name = 'npff:cm101 Ints/Median',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 7),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list(
+                                ifelse(grepl("CM00", colnames(prot.mat)), "CM-", "CM+")))
+hm
+#BackupAsPDF(hm, 'bt00.npff:cm101.contrastofcontrasts.filtered.pval<0.001.heatmap', dimensions = c(8,9))
+#},x
+```
+
+Maybe just generate dot plots of the significant results we have
+
+```{r}
+BT00.postProcess[, gene:=multiUniprotSites2multiGeneSites(Protein)]
+BT02.postProcess[, gene:=multiUniprotSites2multiGeneSites(Protein)]
+# sig sites for NP00; 
+sigProtein <- BT00.postProcess[contrast == "(NP00 - NP30 CM00) - (NP00 - NP30 CM15)" & p.value < 0.001 & abs(estimate) > 1 & !Protein %in% bt00.t0.changing, Protein]
+sigGene <- multiUniprotSites2multiGeneSites(sigProtein)
+
+protQuant[, gene := multiUniprotSites2multiGeneSites(Protein)]
+
+g <- ggplot(data=protQuant[gene %in% sigGene & bt.status == 'BT00',], aes(x=interaction(GROUP), y=LogIntensities, color=GROUP)) +
+         geom_point() +
+         facet_wrap(~gene) + 
+         stat_summary(fun.y = 'mean', colour = "black", alpha=0.3) +
+         stat_summary(fun.data = 'mean_se', geom = 'errorbar', color="black", alpha=0.3) +
+         theme_bw() +
+         theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'BT00.dotplots.sig.genes.pval<0.001.', dimensions=c(8,10))
+
+
+# sig sites for BT02; 
+sigProtein <- BT02.postProcess[contrast == "(NP00 - NP30 CM00) - (NP00 - NP30 CM15)" & p.value < 0.001 & abs(estimate) > 1 & !Protein %in% bt02.t0.changing, Protein]
+sigGene <- multiUniprotSites2multiGeneSites(sigProtein)
+
+g <- ggplot(data=protQuant[gene %in% sigGene & bt.status == 'BT02',], aes(x=interaction(GROUP), y=LogIntensities, color=GROUP)) +
+         geom_point() +
+         facet_wrap(~gene) + 
+         stat_summary(fun.y = 'mean', colour = "black", alpha=0.3) +
+         stat_summary(fun.data = 'mean_se', geom = 'errorbar', color="black", alpha=0.3) +
+         theme_bw() +
+         theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'BT02.dotplots.sig.genes.pval<0.001.', dimensions=c(8,10))
+
+```
+Sites to investigate that looked like difference in CM treatment status:
+
+Q9Y5B9_K792 BT02
+Q7Z2W9_K146 BT02
+Q7Z6Z7_K469 BT02
+O43674_K131 BT02
+P45974_K553 BT00
+O15371_K3 BT00
+P62826_K167 BT00
+
+Look at the msstats out pairwise contrasts to inspect these results for respective contrasts
+
+```{r}
+test.mss[, gene := multiUniprotSites2multiGeneSites(Protein)]
+test.mss[Label == 'NP00_CM15_BT00 vs NP00_CM00_BT00' & gene %in% c('USP5_K553'),]
+bt02.t0.changing <- test.mss[Label == 'NP00_CM15_BT02 vs NP00_CM00_BT02' & sig != 'not']$Protein
+```
+
+Next identify sites that are differential  in the interesting conditions Qiongyu supplied, but not the CM+/CM- conditions
+
+```{r}
+# get sig results not in these two labels
+labels.noi <- c('NP00_CM15_BT00 vs NP00_CM00_BT00', 'NP00_CM15_BT02 vs NP00_CM00_BT02')
+
+BT02.ms.sig <- test.mss[Label %like% 'BT02' & !Label %in% labels.noi & sig != 'not' & !Protein %in% bt02.t0.changing,]
+BT00.ms.sig <- test.mss[Label %like% 'BT00' & !Label %in% labels.noi & sig != 'not' & !Protein %in% bt00.t0.changing,]
+```
+
+## interaction effects
+(different response to NPFF treatment, given CM101 treatment status)
+
+
+```{r}
+# none found for BT00
+#sigProtein <- BT00.anova[term %in% c( "np.status:cm.status")  & p.value < 0.001 & Protein %in% BT00.ms.sig$Protein]$Protein
+
+#sigProtein <- BT02.anova[term %in% c( "np.status:cm.status")  & p.value < 0.001 & Protein %in% BT02.ms.sig$Protein]$Protein
+
+protQuant[,gene := multiUniprotSites2multiGeneSites(Protein)]
+
+sigProtein <- BT02.postProcess[contrast == "(NP00 - NP30 CM00) - (NP00 - NP30 CM15)" & p.value < 0.001 & abs(estimate) > 1 & Protein %in% BT02.ms.sig$Protein]$Protein 
+
+g <- ggplot(data=protQuant[Protein %in% sigProtein & bt.status == 'BT02',], aes(x=interaction(GROUP), y=LogIntensities, color=GROUP)) +
+         geom_point() +
+         facet_wrap(~gene) + 
+         stat_summary(fun.y = 'mean', colour = "black", alpha=0.3) +
+         stat_summary(fun.data = 'mean_se', geom = 'errorbar', color="black", alpha=0.3) +
+         theme_bw() +
+         theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'BT02.sig.oi.dotplot.', dimensions=c(8,10))
+
+```
+
+Contrast of contrast results
+None of these look 'real'...
+
+```{r}
+sigProtein <- BT02.postProcess[contrast == "(NP00 - NP30 CM00) - (NP00 - NP30 CM15)" & p.value < 0.001 & abs(estimate) > 1 & Protein %in% BT02.ms.sig$Protein]$Protein 
+
+# filter just to our data
+prot.mat <- dcast (protQuant[Protein %in% sigProtein & bt.status == 'BT00', ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+hm <- Heatmap(prot.mat, cluster_columns = FALSE,
+                name = 'npff:cm101 Ints/Median',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 7),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list(
+                                ifelse(grepl("CM00", colnames(prot.mat)), "CM-", "CM+")))
+hm
+```
+
+
+```{r}
+
+BT00.postProcess[Protein == 'EHMT2_K1164',]
+
+BT00.postProcess[,gene := multiUniprotSites2multiGeneSites(Protein)]
+ggplot(BT00.an[gene == 'EHMT2_K1164',], aes(x=GROUP, y=LogIntensity, fill=GROUP)) + geom_point()
+BT00.postProcess
+```
+```{r}
+protQuant[,gene := multiUniprotSites2multiGeneSites(Protein)]
+
+protQuant
+protQuant[gene ==  'EHMT2_K1164' & GROUP %like% 'BT00',] %>% 
+  ggplot(aes(x=GROUP, y=LogIntensities, color=GROUP)) + geom_point() + 
+         stat_summary(fun.y = 'mean', colour = "black", alpha=0.3) +
+         stat_summary(fun.data = 'mean_se', geom = 'errorbar', color="black", alpha=0.3) +
+         theme_bw() +
+         theme(axis.text.x = element_text(angle=90))
+
+protQuant[gene ==  'EHMT2_K1164' & GROUP %like% 'BT00',]
+```
+
+

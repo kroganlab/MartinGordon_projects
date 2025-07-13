@@ -1,0 +1,173 @@
+---
+title: "sig.featrures.in.db"
+author: "Martin Gordon"
+date: "2023-07-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r packages}
+library("RColorBrewer") 
+library(data.table)
+library(stringr) #str_extract function 
+library(magrittr)
+library(ggplot2)
+
+library(openxlsx)
+
+# load bens util scripts for the analysis
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+```
+
+## Identify sdignificant overlaps in the SAINT and ADPr databases.
+
+
+Read in sig exp and np results
+
+```{r}
+exp.sig.genes <- fread('./output/sig-genes/experimental-omics-sig-genes.csv') %>% 
+  split(.$Label)
+  
+np.sig.genes <- fread('./output/sig-genes/netprop-omics-sig-genes.csv') %>% 
+  split(.$Label)
+
+```
+
+Read in the databases. Lets see how these look:
+```{r}
+saint.db <- read.xlsx('./data/SAINT_Results.xlsx', sheet=1) %>% 
+  .[, unique('PreyGene')]
+
+adpr.db <- fread('./data/ADPr_Database_v2.csv') %>% 
+  .[, unique(GeneName)] 
+
+#remove empty strings
+adpr.db[adpr.db == ''] <- NA
+adpr.db <- adpr.db[complete.cases(adpr.db)]
+
+#read in stringdb as the universe for the NP tests
+S_matrix.30 <- LoadNumPyS_matrix(matrixPath = "./data/S_matrix.human.string.pr0.30.npy", 
+                              nodesTablePath = "./data/S_matrix.human.string.pr0.30.nodeNames.csv" )
+
+uni <- rownames(S_matrix.30) %>% 
+  unique() %>% 
+  translateString2Gene(species= "HUMAN")
+```
+
+test the genesets for over representation
+
+## see here for hypergeometric set-up from clusterprofiler author: https://www.biostars.org/p/485827/#9483835
+
+```{r}
+
+# loop through the conditions in each and run a hypergeometric test for both conditions
+lapply(seq_along(np.sig.genes), function(x,n,i){
+
+  #get intersect with pathway & deg
+  deg = x[[i]][, unique(gene)]
+  intsec = intersect(deg, adpr.db)
+
+  
+  # run hypergeometric test for enrichmet (lower.tail=F)
+   print(paste0('testing ',n[[i]], ' for enrichment vs ADPR genes' ))
+   
+ adp <- phyper(q=length(intsec), #size of intersect of genes in pathway & deg genes
+       m=length(adpr.db), #genes in pathway/db
+       n=length(uni) - length(adpr.db), #universe - genes in db
+       k=length(deg), #n degs
+       lower.tail = F) #look for enrichment rather than depletion
+  
+ 
+ print(adp)
+ 
+ print(paste0('testing ',n[[i]], ' for enrichment vs SAINT genes' ))
+ intsec = intersect(deg, saint.db)
+ 
+  saint <- phyper(q=length(intsec), #size of intersect of genes in pathway & deg
+       m=length(saint.db), #genes in pathway/db
+       n=length(uni) - length(saint.db), #universe - genes in db
+       k=length(deg), #n degs
+       lower.tail = F) #look for enrichment rather than depletion
+ 
+  print(saint)
+},x=np.sig.genes, n=names(np.sig.genes))
+
+```
+
+output for NP results:
+[1] "testing EV_IFNg-vs-WT_IFNg for enrichment vs ADPR genes"
+[1] 0.1770627
+[1] "testing EV_IFNg-vs-WT_IFNg for enrichment vs SAINT genes"
+[1] 0.00419192
+[1] "testing WT_IFNg-vs-ND_IFNg for enrichment vs ADPR genes"
+[1] 0.1004477
+[1] "testing WT_IFNg-vs-ND_IFNg for enrichment vs SAINT genes"
+[1] 0.001469973
+
+
+Repeat the test for the experimental results:
+
+Taking all significant genes for both conditions
+Background will be all genes detected in any of the prot or rna experiments
+```{r}
+# read in the clean omics files
+rna.ab.clean <- fread('./output/rna_ab.clean.csv.gz') %>% 
+  .[, unique(gene)]
+prot.ab.clean <- fread('./output/prot_ab.clean.csv.gz') %>% 
+  .[, unique(gene)]
+
+uni <- unique(union(rna.ab.clean, prot.ab.clean))
+```
+
+```{r}
+# loop through the conditions in each and run a hypergeometric test for both conditions
+lapply(seq_along(exp.sig.genes), function(x,n,i){
+
+  #get intersect with pathway & deg
+  deg = x[[i]][, unique(gene)]
+  intsec = intersect(deg, adpr.db)
+
+  
+  # run hypergeometric test for enrichmet (lower.tail=F)
+   print(paste0('testing ',n[[i]], ' for enrichment vs ADPR genes' ))
+   
+ adp <- phyper(q=length(intsec), #size of intersect of genes in pathway & deg
+       m=length(adpr.db), #genes in pathway/db
+       n=length(uni) - length(adpr.db), #universe - genes in db
+       k=length(deg), #n degs
+       lower.tail = F) #look for enrichment rather than depletion
+  
+ 
+ print(adp)
+ 
+ print(paste0('testing ',n[[i]], ' for enrichment vs SAINT genes' ))
+ intsec = intersect(deg, saint.db)
+ 
+  saint <- phyper(q=length(intsec), #size of intersect of genes in pathway & deg
+       m=length(saint.db), #genes in pathway/db
+       n=length(uni) - length(saint.db), #universe - genes in db
+       k=length(deg), #n degs
+       lower.tail = F) #look for enrichment rather than depletion
+ 
+  print(saint)
+},x=exp.sig.genes, n=names(exp.sig.genes))
+
+```
+output for the experimentally significant genes:
+
+[1] "testing EV_IFNg-vs-WT_IFNg for enrichment vs ADPR genes"
+[1] 0.3782759
+[1] "testing EV_IFNg-vs-WT_IFNg for enrichment vs SAINT genes"
+[1] 0.0006523889
+[1] "testing WT_IFNg-vs-ND_IFNg for enrichment vs ADPR genes"
+[1] 0.172597
+[1] "testing WT_IFNg-vs-ND_IFNg for enrichment vs SAINT genes"
+[1] 3.715225e-05

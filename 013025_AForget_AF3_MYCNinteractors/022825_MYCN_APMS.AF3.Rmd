@@ -1,0 +1,150 @@
+---
+title: "022825_MYCN_APMS.AF3"
+author: "Martin Gordon"
+date: "2025-02-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(seqinr)
+library(readxl)
+library(tidymodels)
+library(ggridges)
+library(RColorBrewer)
+
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R")
+
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+```
+
+AF3 models 
+```{r}
+af.summary.dt <- fread('./output/022825_mycn.af3.secondset.summaryScores.csv')
+
+af.summary.dt[, ppi := gsub('[.]seed.+$', '', model)]
+af.summary.dt[, c('proteinA', 'proteinB') := tstrsplit(toupper(ppi), '__', keep=c(1,2))]
+af.summary.dt[, c('geneA', 'geneB') := .(multiUniprots2multiGenes(proteinA, species='HUMAN'), multiUniprots2multiGenes(proteinB, species='HUMAN'))]
+af.summary.dt[, gene_ppi := paste(geneA, geneB, sep='__')]
+
+```
+
+```{r}
+af.summary.dt[, c('median_iptm', 'mean_iptm', 'sd_iptm', 'median_ptm', 'mean_ptm', 'sd_ptm') := .(median(iptm, na.rm=T), mean(iptm, na.rm=T), sd(iptm, na.rm=T),median(ptm, na.rm=T), mean(ptm, na.rm=T), sd(ptm, na.rm=T)), by=.(gene_ppi)]
+
+# 486 runs completed (all models; can we check how many others some models completed?)
+```
+
+```{r}
+summary.dt <- af.summary.dt[, .(mean_ptm=mean(ptm, na.rm=T), mean_iptm=mean(iptm, na.rm=T), 
+                                median_ptm=median(ptm, na.rm=T), median_iptm=median(iptm, na.rm=T), 
+                                sd_ptm=sd(ptm, na.rm=T), sd_iptm=sd(iptm, na.rm=T)), by=.(ppi, gene_ppi, proteinA, proteinB, geneA, geneB)]
+
+
+fwrite(summary.dt, ScriptAndDatedFileName('.mycn.apms.secondSet.csv'))
+```
+
+some basic summary plots
+```{r}
+
+af.summary.dt[, lab := '< 0.6 iPTM']
+af.summary.dt[iptm > 0.6, lab := '> 0.6 iPTM']
+
+af.summary.dt[, sig := '< 0.6 PTM']
+af.summary.dt[ptm > 0.6, sig := '> 0.6 PTM']
+
+
+g <- ggplot(af.summary.dt, aes(x=reorder(gene_ppi, mean_iptm), y=iptm, color=lab)) +
+  geom_point() +
+  geom_hline(yintercept=0.6, linetype=2, alpha=0.4) +
+  ggtitle('AF3 MYCN interactors iPTM scores') +
+  labs(x='ppi') +
+  scale_color_manual(values=c('< 0.6 iPTM'='black', '> 0.6 iPTM' = 'cornflowerblue')) +
+  customTheme +
+  theme(axis.text.x = element_text(size=5))
+
+g
+BackupAsPDF(g, 'AF3.iptmScores.idotplot', dimensions=c(26,10), format='png')
+```
+
+look at distribution of scores
+
+```{r}
+g <- ggplot(af.summary.dt, aes(x=iptm)) +
+  geom_histogram(bins=60) +
+  geom_vline(xintercept=0.6, linetype=1, alpha=0.8, color=col.pal[2]) +
+  ggtitle('AF3 MYCN interactors iPTM scores') +
+  scale_color_manual(values=c('< 0.6 iPTM'='black', '> 0.6 iPTM' = 'cornflowerblue')) +
+  customTheme +
+  theme(axis.text.x = element_text(size=4.5))
+
+g
+BackupAsPDF(g, 'AF3.iPTM.distributions.histogram', format='png')
+```
+
+Plot the number of models for each ppi that pass the threshold
+```{r}
+g <- ggplot(af.summary.dt[iptm > 0.6,.(nModels=.N, propModels=.N/25), by=.(gene_ppi)], aes(x=reorder(gene_ppi, -propModels), y=propModels)) +
+  geom_bar(stat='identity', fill='cornflowerblue') +
+  ggtitle('Proportion of models passing iPTM thresholds', subtitle = 'n=25 per PPI') +
+  labs(x='PPI', y='Proportion > 0.6 iPTM') +
+  customTheme
+
+BackupAsPDF(g, 'AF3.iPTM.propAboveThresholds', format='png', dimensions=c(6,6))
+
+summary.dt
+```
+
+```{r}
+fwrite(summary.dt, ScriptAndDatedFileName('mycn.apms.secondSet.summaryTable.csv'))
+
+fread('~/Documents/projects/013025_AForget_AF3_MYCNinteractors/022825_MYCN_APMS.AF3_data/2025_02_28_mycn.apms.secondSet.summaryTable.csv')
+```
+

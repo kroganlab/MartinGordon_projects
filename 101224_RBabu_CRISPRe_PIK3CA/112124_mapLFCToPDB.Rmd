@@ -1,0 +1,191 @@
+---
+title: "112224_readINPDBfiles"
+author: "Martin Gordon"
+date: "2024-11-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+Ask BP about PDB structures; what is the best structure to use?
+Using alphafold models for comparability to PPI and also as no MTOR PDB available
+
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(bio3d)
+library(magrittr)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+source ("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+source("../../utils/mg_utils/r_utils/CRISPR_Functions.R")
+```
+
+Reading in the alphafold pdb list 
+```{r}
+fpaths <- dir('./data', pattern = "*.pdb", full.names = T)
+
+pdb.list <- lapply(fpaths, function(x){
+  bio3d::read.pdb(x)
+  })
+
+names(pdb.list) <- c('AKT1', 'PIK3CA', 'MTOR', 'PTEN')
+
+af.pdb.list <- pdb.list
+
+```
+
+
+Read in the DESeq2 results
+```{r}
+de.dt <- fread('~/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/112124_mutantHotspots_data/2024_11_22_deseq2.pwcomparisons.wAnnotations.csv')
+```
+Map the log2FC to the structures for each contrast 
+```{r}
+de.dt[!gene %in% c('NON-TARGETING','INTERGENIC'),.N, by=.(gene, peptide_position, contrast)][order(-N)]
+
+# check whyy some are returning NA and others nothing
+de.dt[!gene %in% c('NON-TARGETING','INTERGENIC') & peptide_position == '']
+de.dt[!gene %in% c('NON-TARGETING','INTERGENIC') & grepl('NA', peptide_position)]
+```
+Good treshold for log2FC? 
+Left align the peptide positions (take first residue), calculate the geometric mean and take the average geometric mean of each site
+```{r}
+de.dt[, gm_lfc.pval := (-log10(pvalue) * abs(log2FoldChange))/2]
+```
+
+# take the average of the geometric mean per site contrast
+```{r}
+de.dt[, average_gm := mean(gm_lfc.pval, na.rm=T), by=.(contrast, gene, first_peptide_idx)]
+
+de.dt[, any_sig := ifelse(any(sig != 'not'), 'sig', 'no'), by=.(contrast, gene, first_peptide_idx)]
+
+lapply(unique(de.dt$contrast), function(x){
+  
+  subdt  <-de.dt[contrast == x,]
+  ggplot(subdt, aes(x=first_peptide_idx, y=average_gm, col=any_sig)) +
+    geom_point() +
+    facet_wrap(~gene, scales='free') +
+    coord_cartesian(ylim=c(0,10))
+    
+})
+```
+
+Now create a data.table that runs from the length of 1 : len(gene) per gene/contrast
+
+```{r}
+gene.idx <- list(MTOR = data.table(peptide_position=seq(1,2549, 1)),
+     PIK3CA = data.table(peptide_position=seq(1,1068, 1)),
+     AKT1 = data.table(peptide_positon = seq(1,480, 1)),
+     PTEN = data.table(peptide_position=seq(1,403, 1))) %>% 
+  rbindlist(idcol='gene')
+
+# create a list of contrast lfcs with the position
+
+LFCs.list <- lapply(unique(de.dt$contrast), function(x){
+  
+  subdt <- de.dt[!gene %in% c('NON-TARGETING','INTERGENIC') & contrast == x & !is.na(first_peptide_idx),] %>% 
+    .[, .(gene, contrast=x, peptide_idx=first_peptide_idx, residue_GM=average_gm ,any_sig)] %>% 
+      .[order(peptide_idx)] %>% 
+      unique()
+    
+    #merge with the index info 
+   merge(subdt, gene.idx, by.x=c('gene', 'peptide_idx'), by.y=c('gene', 'peptide_position'), all.x=T, all.y=T)
+})
+
+```
+
+So now we merge this info to the PDB; want to create mutliple PDBs 
+bioseq only writes out PDB files so write out one at a time
+
+```{r}
+names(LFCs.list) <- unique(de.dt$contrast)
+
+
+de.dt[average_gm == 0,]
+```
+
+
+# overwrite the plDDT score for each of the structures with the geom mean values for each site. O means no evidence of change (not distinguishing no score vs no evidence)
+
+# just look at the proteins for specific contrasts that may have interesting FCs 
+```{r}
+lapply(names(LFCs.list), function(x){
+  
+  message('Working on contrast ', x)
+  LFC.subset <- LFCs.list[[x]]
+
+  message('Setting missing resiudes to 0... ')
+  LFC.subset[is.na(residue_GM), residue_GM := 0]
+  
+  lapply(names(af.pdb.list), function(y){
+    
+      gene.pdb <- af.pdb.list[[y]]
+      # get the pdb structure as a dt
+      gene.pdb.dt <- as.data.table(gene.pdb$atom)
+      # get the correct cols 
+      cols.oi <- colnames(gene.pdb.dt)
+      
+      # safer merge as only considers overlpaping resiudes
+      gene.pdb.dt <- merge(gene.pdb.dt, LFC.subset[gene == y, .(resno=peptide_idx, residue_GM)], by='resno', all.x=T)
+      gene.pdb.dt[, `:=`(b=residue_GM, old.b = b)]
+      gene.pdb.dt <- gene.pdb.dt[, ..cols.oi]
+      
+      # save the new b-factor scores
+      gene.pdb$atom <- gene.pdb.dt
+      
+      # write out the modified pdb
+      bio3d::write.pdb(gene.pdb, file=paste0('/Users/martingordon/Documents/projects/101224_RBabu_CRISPRe_PIK3CA/output/pdbs/', interaction(y,x), '.geommean_lfcpval.scores.pdb'))
+      
+  })
+})
+```
+
+How do the LFCs overlap with the contact regions?
+
+```{r}
+
+```
+
+
+
+*some work using the bio3d package*
+
+Use `attributes` to pull out the attributes of the PDB
+Focusing on working with the carbon atom residues
+```{r}
+# list all attirbutes
+lapply(af.pdb.list, attributes)
+
+# pull out individual attributes
+lapply(af.pdb.list, function(x) print(x$atom))
+
+# this is just a binary checking if the atom is a Ca carbon alpha atom
+
+lapply(af.pdb.list, function(x) head(x$calpha, n=10))
+
+
+#plotting the plddt score along the length of the residues
+# here we are only plotting the carbon atoms (why is this??)
+lapply(af.pdb.list, function(x) plot.bio3d(x$atom, type='l', ylab="B-factor"))
+```
+Can align PDBs
+Strcutre based superimposition only here:
+Need MUSCLE installed for this to work...
+```{r}
+# Align and superpose two or more structures
+pdbs <- pdbaln(c("4q21", "521p"), fit=TRUE)
+
+attributes(pdbs)
+```
+
+

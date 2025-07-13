@@ -1,0 +1,341 @@
+---
+title: "NP06_contrastofcontrasts"
+author: "Martin Gordon"
+date: "2023-08-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Running contrast of contrast analysis
+
+#Two way ANOVA: assess effect of two predictor vs one (continuous) outcome variable
+
+Here we are investigating how compound 101 treatment (blocks FBXW11) x NPFF treatment affect expression per gene
+3 variables of interest, BT CM, NP, but not comparing BT groups
+Samples are treated with compound 101 a FBXW11 blocker and then treated +/- NPFF (00 vs 30)
+Must also control for batch effects
+BT is the proteomose inhibitor
+
+# A two-way ANOVA test reveals the results of two independent variables on a dependent variable. ANOVA test results can then be used in an F-test, a statistical test used to determine whether two populations with normal distributions share variances or a standard deviation, on the significance of the regression formula overall.
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library (emmeans)
+library(stringr)
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+Prepare the data 
+```{r}
+# including the dropped sample for now
+protQuant <- fread ("/Users/martingordon/Documents/projects//071823_QLi_NPo6/NPO6.all.samples.protein.lvl.quant.csv.gz")
+
+
+# parse GROUP names to define the actual columns that the linear models will work on
+# this work depends on how your columsn are defined
+protQuant[, np.status :=  as.factor(str_extract(GROUP,"NP[0-9]{2}"))]
+protQuant[, cm.status  := as.factor(str_extract(GROUP,"CM[0-9]{2}"))]
+protQuant[, bt.status  := as.factor(str_extract(GROUP,"BT[0-9]{2}"))]
+protQuant[, batch      := as.factor(SUBJECT)]
+
+```
+
+First perform an three-way ANOVA
+(cm status as is does not seem to have a significant effect on expression)
+there is a significant interaction between cm status and np status
+```{r}
+model <- aov(LogIntensities ~ batch + np.status + cm.status +np.status:cm.status, data=protQuant)
+summary(model)
+```
+Analyse the BT00 and BT02 separately as we know this data is quite different
+
+```{r}
+protQuant.bt00 <- protQuant[bt.status == 'BT00',]
+protQuant.bt02 <- protQuant[bt.status == 'BT02',]
+
+protQuant.list <- list(BT00 = protQuant.bt00,
+                       BT02 = protQuant.bt02)
+
+```
+
+contrast formula:
+
+```{r}
+
+
+# linearModelsAllProteins can this function which computes statistic for a contrast of two different log2FC
+#emmeans.contrastOfContrasts <- function (l, factorFormula = ~status|ant){  # how does the treatment effect change per antagonist level? basically compare treatment effect within each antagonist level
+emmeans.contrastOfContrasts <- function (l, factorFormula = ~np.status|cm.status){  # how does the NPFF treatment effect change with CM101 treatment status
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- pairs(emm)
+  contrast2 <- pairs(contrast1, by = NULL, adjust = "none")
+  return (as.data.table(contrast2))
+}
+
+# postProcessFunction = emmeans.contrastOfContrasts tells it to use the function above after doing anova.
+# it is optional, adds significant time to the computation (~5x), but is nice to
+# put a magnitude and p value on specific differences of differences
+#
+# cl = 6 parameter says to use 6 processes.  Set to NULL if multiprocess is failing, or higher or lower as you wish.
+# Numbers near the number of processors available in your machine is probably counterproductive.
+
+lm.out <- lapply(protQuant.list, function(x){
+  
+  # Numbers near the number of processors available in your machine is probably counterproductive.
+  x.lm <- linearModelsAllProteins(x, 
+                                  formulaList = list(full   = LogIntensities~batch + np.status + cm.status + cm.status:np.status), # full model; 4 way ANOV
+                                  splitColumn = "Protein", postProcessFunction = emmeans.contrastOfContrasts, cl = 6) |> suppressWarnings()
+  
+  
+  return(x.lm)
+  
+})
+
+
+lm.out$BT00$anova
+```
+
+
+# inspect anova p values per term
+V strong batch effect in the data and little evidence of interaction between NP and CM
+```{r}
+
+lapply(seq_along(lm.out), function(x,n,i){
+
+  dt <- x[[i]][['anova']]
+  str(dt)
+
+ g <- ggplot(dt, aes(x=dt$p.value)) +
+   geom_histogram(boundary=0.0, binwidth = 0.005) +
+   facet_wrap(~dt$term)
+ 
+ BackupAsPDF(g, paste0(n[[i]], '.aov.term.pval.historgrams'))
+ 
+},x=lm.out, n=names(lm.out))
+
+
+```
+Looks like there is very few significant hits here except for batch. Zooming in at the 0-0.05 range this also appears to be the case
+
+```{r}
+lapply(seq_along(lm.out), function(x,n,i){
+
+  dt <- x[[i]][['anova']]
+  str(dt)
+
+ g <- ggplot(dt, aes(x=dt$p.value)) +
+   geom_histogram(boundary=0.0) +
+   xlim(0, 0.05) +
+   facet_wrap(~dt$term) 
+   
+ 
+ BackupAsPDF(g, paste0(n[[i]], '.aov.term.pval0-pval0.05.historgrams'))
+ 
+},x=lm.out, n=names(lm.out))
+
+```
+
+
+## adjust pvalues 
+
+```{r}
+lapply(lm.out, function(x){
+  
+  x[['anova']][, fdr := p.adjust(p.value, method = "BH"), by= term]
+  
+})
+
+```
+Write out files to dir
+```{r}
+setwd("/Users/martingordon/Documents/projects/071823_QLi_Npo6")
+
+lapply(seq_along(lm.out), function(x,n,i){
+  
+  fwrite(x[[i]][['anova']], paste0(n[[i]], '.anova.contrasts.csv.gz'))
+  
+},x=lm.out, n=names(lm.out))
+```
+
+
+# CM101 treatment effects
+No significant results at FDR < 0.05
+Take genes significant at pval < 0.001 
+
+```{r}
+setwd("/Users/martingordon/Documents/projects/071823_QLi_Npo6")
+
+#play with thresholds here
+lapply(seq_along(lm.out), function(x,n,i){
+  dt <- x[[i]][['anova']]
+  
+  sigProtein <- dt[term %in% c( "cm.status") & p.value < 0.001,] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+
+  # filter just to our data
+   prot.mat <- dcast (protQuant[Protein %in% sigProtein & bt.status == n[[i]], ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+
+
+  rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'cm101 log2 Ints/Median',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("NP00", colnames(prot.mat)), "NP00", "NP30"),
+                                ifelse(grepl("CM00", colnames(prot.mat)), "CM00", "CM15")))
+  
+ BackupAsPDF(hm, paste0(n[[i]], '.cm101.pval<0.001.heatmap'), dimensions = c(8,7))
+  
+},x=lm.out, n=names(lm.out))
+
+```
+# NPFF effects
+
+```{r}
+setwd("/Users/martingordon/Documents/projects/071823_QLi_Npo6")
+
+#play with thresholds here
+lapply(seq_along(lm.out), function(x,n,i){
+  dt <- x[[i]][['anova']]
+  
+  sigProtein <- dt[term %in% c( "np.status") & p.value < 0.001,] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+  
+  print(sigProtein)
+
+  # filter just to our data
+   prot.mat <- dcast (protQuant[Protein %in% sigProtein & bt.status == n[[i]], ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+
+
+  rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'npff log2 Ints/Median',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("NP00", colnames(prot.mat)), "NP00", "NP30"),
+                                ifelse(grepl("CM00", colnames(prot.mat)), "CM00", "CM15")))
+  
+ BackupAsPDF(hm, paste0(n[[i]], '.npff.pval<0.001.heatmap'), dimensions = c(8,9))
+  
+},x=lm.out, n=names(lm.out))
+```
+## interaction effects
+(different response to NPFF treatment, given CM101 treatment status)
+
+
+
+```{r}
+
+setwd("/Users/martingordon/Documents/projects/071823_QLi_Npo6")
+
+#play with thresholds here
+lapply(seq_along(lm.out), function(x,n,i){
+  dt <- x[[i]][['anova']]
+  
+  sigProtein <- dt[term %in% c( "np.status:cm.status") & p.value < 0.001,] %>% 
+   #  .[order(p.value), head(.SD, 100), .SDcols = c('p.value', 'Protein')] %>% 
+    .[,unique(Protein)]
+  
+  print(sigProtein)
+
+  # filter just to our data
+   prot.mat <- dcast (protQuant[Protein %in% sigProtein & bt.status == n[[i]], ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+
+
+  rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+  
+  hm <- Heatmap(prot.mat, cluster_columns = FALSE, 
+                name = 'npff:cm101 Ints/Median',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list(ifelse(grepl("NP00", colnames(prot.mat)), "NP00", "NP30"),
+                                ifelse(grepl("CM00", colnames(prot.mat)), "CM00", "CM15")))
+  
+ BackupAsPDF(hm, paste0(n[[i]], '.npff:cm101.pval<0.001.heatmap'), dimensions = c(8,9))
+  
+},x=lm.out, n=names(lm.out))
+```
+## interaction effects observed in contrast of contrasts
+
+Value here is we can require a magnitude of difference. 
+Signs are confusing here because the loss of a negative effect will show as  a positive effect, and vice versa. 
+
+```{r, fig.width = 8, fig.height = 8}
+
+#play with thresholds here
+lapply(seq_along(lm.out), function(x,n,i){
+  dt <- x[[i]][['postProcess']]
+  head(dt)
+  
+   sigProtein <- dt[contrast == "(NP00 - NP30 CM00) - (NP00 - NP30 CM15)" & p.value < 0.001 & abs(estimate) > 1, Protein]# %>% 
+  
+
+  # filter just to our data
+  prot.mat <- dcast (protQuant[Protein %in% sigProtein & bt.status == n[[i]], ], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+
+
+  rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+  
+  prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+  hm <- Heatmap(prot.mat, cluster_columns = FALSE,
+                name = 'npff:cm101 Ints/Median',
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (p.val < 0.001)', nrow(prot.mat)),
+              row_names_gp = gpar(fontsize = 7),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list(
+                                ifelse(grepl("CM00", colnames(prot.mat)), "CM-", "CM+")))
+
+ BackupAsPDF(hm, paste0(n[[i]], '.npff:cm101.contrastofcontrasts.pval<0.001.heatmap'), dimensions = c(8,9))
+hm
+},x=lm.out, n=names(lm.out))
+
+
+lm.out$postProcess
+#play with thresholds here
+# there weren't many hits by fdr, so use a strong p.value
+sigProtein <- lm.out$postProcess[ p.value < 0.001 & abs(estimate) > 0.5, Protein]
+
+prot.mat <- dcast (protQuant[Protein %in% sigProtein], Protein~GROUP+SUBJECT, value.var = "LogIntensities") |> as.matrix(rownames = "Protein")
+rownames(prot.mat) <- multiUniprotSites2multiGeneSites(rownames(prot.mat), species = "HUMAN")
+
+prot.mat <- sweep(prot.mat, 1, apply(prot.mat, 1, median, na.rm = TRUE))
+
+
+Heatmap (prot.mat, cluster_columns = FALSE, 
+         column_split = list (column_split = list (str_extract(colnames(prot.mat),"AT[0-9]{2}"),
+                              str_extract(colnames(prot.mat),"PGE[0-9]{2}"))))
+
+View(lm.out$BT00$postProcess)
+```

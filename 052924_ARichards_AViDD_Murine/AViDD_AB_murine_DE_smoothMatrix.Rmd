@@ -1,0 +1,1008 @@
+---
+title: "AB_murine_DE_smoothExpMatrix"
+author: "Martin Gordon"
+date: "2024-06-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## AViDD DE analysis
+
+Murine AB samples 
+Repeat of the DE analysis with the smooth (PC1 removed matrix) 
+
+## overview of the data
+So we have 66 murine samples, 13 conditions
+Treatments: Mock, Nirm, Vehicle, x4516, x4673
+Timepoints: 2, 4, 7 days
+I think we need to use lm and interactions to assess this correctly and idsentangle treatment vs timepoint effect
+Also, I think we have enough timepoints here to look at some clustering (perhaps WGCNA or k-NN methods)
+
+*Notes/Questions*
+All these plots are produced from equilizeMedians.. We performed the smoothing on this data.. lets try a second round of normalization.. looks good, but would it be better to implement normalization first then batch correction?
+No SARS Cov2 proteins found... what fa was used in the search?
+Do we need to analyse the other SARS-CoV2 groups?
+Need to also double check if there is some label mix-ups on my end...why does the first compound at tp2 vs Mock behave so differently to the others? (check out the vs Mock heatmap)
+
+## R Markdown
+
+```{r packages}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(viridis)
+library(ggvenn)
+library(hrbrthemes)
+library(viridis)
+library(ggbeeswarm)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj
+library(scales)
+library(seqinr)
+library(scales)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+
+
+
+Read in the original expression data and the 'cleaned' data
+
+```{r}
+p.quant <-  fread('~/Documents/projects/052924_ARichards_AViDD_Murine/AViDD_AB_murine_DE_data/2024_05_31_AB.ProteinLevelData.tmpNormNewCol.csv')
+
+prot.mat <- dcast(p.quant, Protein~paste0(GROUP,'.',SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+prot.mat <- prot.mat[complete.cases(prot.mat),]
+```
+
+Check for SARS proteins in the data..
+Viral proteins not found in the protein summarised data.. lets try searching the spec output to see if it was filtered out
+
+```{r}
+library(seqinr)
+
+# fa file taken from uniprot
+db.fa <- read.fasta('./docs/uniprotkb_taxonomy_id_2697049_AND_revie_2024_06_06.fasta', seqtype='AA', as.string = T) 
+
+fa.dt <- data.table(prot = names(db.fa),
+                    sequence = unlist(seqinr::getSequence(db.fa, seqtype='AA', as.string=T))
+                    )
+
+fa.dt[, uniprot := tidyUniProtNames(prot)]
+
+prot.regx <- paste(fa.dt$uniprot, collapse='|')
+prot.regx #"P0DTC1|P0DTC2|P0DTC3|P0DTC4|P0DTC5|P0DTC6|P0DTC7|P0DTC8|P0DTC9|P0DTD1|P0DTD2|P0DTD8|P0DTD3|A0A663DJA2|P0DTF1|P0DTG0|P0DTG1"
+p.quant[grep(prot.regx, Protein),] # no proteins found
+
+# checking evidence file... not found either
+spec <-  fread('data/MPro_Lung_052324/evidence.txt')
+spec[grep(prot.regx, Proteins),]
+spec[grep('P', Proteins),]
+spec[grep('SARS', Proteins),]
+```
+
+Read in the smooth data
+```{r}
+smooth.dt <- fread('~/Documents/projects/052924_ARichards_AViDD_Murine/PC1_batchRemoval_data/2024_06_04_ProteinLevelQuant.PC1SmoothedValues.csv')
+smooth.mat <- dcast(smooth.dt, Protein~sample, value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+subMat <- sweep(smooth.mat,1, STAT=apply(smooth.mat, 1, median,na.rm=T))
+
+hm <- Heatmap(subMat,
+        column_split = gsub('.[1-6]$','', colnames(subMat)),
+        show_row_names = F)
+```
+Clear from previous PCA that there are two samples that look troublesome...x4516_7d.1 and Nirm_4d.1
+Drop these samples from our expression matrix and merge necessary cols from p.quant into our new matrix
+Also drop Vehicle_7d.4 and Vehicle_4d.5 as clear outliers..
+
+```{r}
+sub.dt <- smooth.dt[!sample %in% c('x4516_7d.1', 'Nirm_4d.1')]
+
+p.quant[, sample := interaction(GROUP,SUBJECT)]
+
+exp.dt <- merge(x=sub.dt, y=p.quant[, .(sample, Protein, RUN,originalRUN, TotalGroupMeasurements, NumMeasuredFeature, MissingPercentage, more50missing, NumImputedFeature)], by=c('sample','Protein'),  all.x=T) 
+```
+plot some QC plots of the adjused data
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(exp.dt$GROUP)))
+
+g <- ggplot(exp.dt, aes(x=paste0(GROUP,'.',SUBJECT), y=LogIntensities, fill=GROUP)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'smooth.prot.ints.boxplots')
+```
+Check out heatmaps before deciding on what other samples to remove
+
+```{r}
+p.mat <- dcast(exp.dt, Protein~interaction(GROUP,SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+
+submat <-  sweep(p.mat, 1, STATS = apply(p.mat, 1, median, na.rm=T))
+hm <- Heatmap(submat, 
+              cluster_rows = T, 
+              cluster_columns = F,
+              name='Ints vs Median',
+              border = T,
+              na_col = 'darkgrey',
+              column_split = gsub('.[0-9]+$', '', colnames(submat)), 
+              row_title=sprintf('%s proteins', nrow(submat)), 
+              show_row_names = F, 
+              column_names_gp = gpar(fontsize=5), 
+              column_title_gp = gpar(fontsize = 8))
+
+hm
+BackupAsPDF(draw(hm, column_title='WGCNA input'), 'wgcna.input.mat')
+```
+Remove vehicle 7d_4 and Vehicle 4d_5
+```{r}
+hm <- Heatmap(submat, 
+              cluster_rows = T, 
+              name='Ints vs Median',
+              border = T,
+              na_col = 'darkgrey',
+              row_title=sprintf('%s proteins', nrow(submat)), 
+              show_row_names = F, 
+              column_names_gp = gpar(fontsize=5), 
+              column_title_gp = gpar(fontsize = 8))
+
+hm
+```
+```{r}
+exp.dt <- exp.dt[!sample %in% c("Vehicle_7d.4","Vehicle_4d.5"),]
+
+p.mat <- dcast(exp.dt, Protein~interaction(GROUP,SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+submat <-  sweep(p.mat, 1, STATS = apply(p.mat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+              cluster_rows = T, 
+              cluster_columns = F,
+              name='Ints vs Median',
+              border = T,
+              na_col = 'darkgrey',
+              column_split = gsub('.[0-9]+$', '', colnames(submat)), 
+              row_title=sprintf('%s proteins', nrow(submat)), 
+              show_row_names = F, 
+              column_names_gp = gpar(fontsize=5), 
+              column_title_gp = gpar(fontsize = 8))
+
+hm
+BackupAsPDF(hm, 'smoothMat.rmOutliers.heatmap', dimensions=c(14,18))
+```
+Differential Expression
+----
+Ok, lets try running the differential expression with what we have
+If fails, try the PC reduction using the first pass of normalization, and then renormalize here using TMP
+
+Make a contrast matrix for the comparisons
+
+```{r}
+contrasts.txt <- fread('./data/MPro_Lung_052324/contrast.txt', sep='-', header=F)
+contrasts.txt[grep('V_', V1), V1 := gsub('V_',"Vehicle_", V1)]
+contrasts.txt[grep('V_', V2), V2 := gsub('V_',"Vehicle_", V2)]
+contrasts.txt[grep('mock', V1), V1 := gsub('mock',"Mock", V1)]
+contrasts.txt[grep('mock', V2), V2 := gsub('mock',"Mock", V2)]
+
+contrasts.list <- split(contrasts.txt, seq(nrow(contrasts.txt)))
+names(contrasts.list) <- apply(contrasts.txt, 1, function(x){ paste(x[1], x[2], sep='-') }) 
+
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(exp.dt$GROUP),
+                               labels = names(contrasts.list))
+```
+
+
+Read in the MSproc data and replace the p.quant with the cleaned exp
+
+```{r}
+dp.out <-  readRDS('AViDD_AB_murine_DE_data/2024_05_30_dp.out.rds')
+```
+
+```{r}
+contrasts.list <- split(contrasts.txt, seq(nrow(contrasts.txt)))
+names(contrasts.list) <- apply(contrasts.txt, 1, function(x){ paste(x[1], x[2], sep='-') }) 
+
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(dp.out$ProteinLevelData$GROUP),
+                               labels = names(contrasts.list))
+
+
+
+f.quant <- setDT(dp.out$FeatureLevelData)
+p.quant <- exp.dt
+  
+p.quant[, SUBJECT := interaction(GROUP,SUBJECT)]
+f.quant[, SUBJECT := interaction(GROUP,SUBJECT)]
+  
+dp.out$FeatureLevelData <- f.quant
+dp.out$ProteinLevelData <- p.quant
+```
+
+Run MSStats
+```{r}
+# run msstats correcting for batch 
+mss <- groupComparison(contrast.matrix=contrasts.mat, data=dp.out)
+mss.dt <- setDT(mss$ComparisonResult)
+```
+
+Write out the raw results
+```{r}
+# write out raw results
+mss.dt[, gene := multiUniprots2multiGenes(as.character(Protein), species = 'MOUSE')]
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+
+fwrite(mss.dt, ScriptAndDatedFileName('mss.pwcontrasts.cleanDat.csv'))
+
+mss.dt.wide <- dcast(mss.dt, gene+Protein~Label, value.var = c('log2FC','pvalue', 'p.adj'))
+fwrite(mss.dt.wide, ScriptAndDatedFileName('mss.pwcontrasts.cleanDat.wide.csv'))
+```
+
+```{r}
+mss.dt <- mss.dt[!is.infinite(abs(log2FC)) & !issue %in% c("oneConditionMissing","completeMissing"), ] %>% 
+  .[, sig := 'not'] %>% 
+  .[abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+```
+
+Lets plot the number of sig hits per comparison
+```{r}
+g <- ggplot(mss.dt[sig != 'not', .N, by=.(sig,Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N significant hits per contrast') +
+  scale_fill_manual(values=c('down'=muted('blue'), 'up'=muted('red'))) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+BackupAsPDF(g, 'N.sigHits.barplots')
+```
+
+Volcanoplots of each of the groups
+```{r}
+
+g <- ggplot(mss.dt, aes(x=log2FC, y=-log10(adj.pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & sig != 'not'], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  facet_wrap(~Label, ncol=2) +
+  theme_bw()
+g
+BackupAsPDF(g, 'combined.volcano', dimensions=c(18,22))
+```
+Plot vs vehicle and vs Mock seeprately to see if we see trends
+
+```{r}
+contrasts.oi <- grep('-Mock',unique(mss.dt$Label), value = T)
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi,], aes(x=log2FC, y=-log10(adj.pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & sig != 'not'], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum()
+g
+BackupAsPDF(g, 'vsMock.volcano', dimensions=c(18,16))
+```
+
+```{r}
+contrasts.oi <- grep('-Vehicle',unique(mss.dt$Label), value = T)
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi,], aes(x=log2FC, y=-log10(adj.pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & sig != 'not'], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum()
+g
+BackupAsPDF(g, 'vsVehicle.volcano', dimensions=c(18,16))
+```
+
+GO enrichment of the DEG results
+FGSEA instead? would need to run on each column of a matrix and then rbind the results, but would then have an input for the GSEA heatmap..
+Lets just go with GO enrichment for now. 
+
+```{r}
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(dbName = 'org.Mm.eg.db', ontology = "ALL", keyType = "SYMBOL")
+```
+
+Define universe and perform the enrichment
+Background? I think it makes sense to just use the filtered set as others not considered for DE
+```{r}
+exp.dt[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+
+# define the universe, the total set of identified genes in our study
+universe <- unique(exp.dt$gene)
+
+# now want to run enrichment on each 
+mss.dt[, enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not',], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('GOenrichments.smoothData.csv'))
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('GOenrichments.smoothData.simplified.csv'))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, 
+                                groupColumn = 'enrich.grp', 
+                                topN = 5,
+                                title='GO term enrichment', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+
+ht
+BackupAsPDF(ht, 'GO.enrich.heatmap', dimensions = c(13,10))
+```
+Plot the vsMock and vsVehicle subgroups
+
+```{r}
+simp.enrich$simplified
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified[grep('-Mock', enrich.grp), ], 
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO term enrichment comparisons vs Mock', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp[grep('-Mock', simp.enrich$simplified$enrich.grp)], value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+
+ht
+BackupAsPDF(ht, 'GO.enrich.vsMock.heatmap', dimensions = c(13,10))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified[grep('-Vehicle', enrich.grp), ], 
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO term enrichment comparisons vs Vehicle', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp[grep('-Vehicle', simp.enrich$simplified$enrich.grp)], value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+
+ht
+BackupAsPDF(ht, 'GO.enrich.vsVehicle.heatmap', dimensions = c(13,10))
+```
+Write out the files 
+```{r}
+#fwrite(mss.dt[,-c('enrich.grp')], ScriptAndDatedFileName('mss.out.annotated.csv'))
+#fwrite(dcast(mss.dt, gene+Protein~Label, value.var = c('log2FC', 'pvalue', 'p.adj', 'sig')), ScriptAndDatedFileName('mss.out.annotated.wide.csv'))
+
+```
+
+Ok, now generate heatmaps of the results, annotated with interesting GO terms
+
+```{r}
+prots.oi <- mss.dt[sig != 'not', unique(Protein)]
+
+exp.mat <- dcast(exp.dt, Protein~sample, value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+subMat <- exp.mat[rownames(exp.mat) %in% prots.oi,]
+
+subMat <- sweep(subMat, 1, STATS = apply(subMat, 1, median, na.rm=T))
+
+hm <- Heatmap(subMat, 
+        border=T,
+        name='Ints. vs Median',
+        cluster_columns = F,
+        show_row_names = F,
+        row_title=sprintf('%s proteins FC +/- 50%% & p.adj < 0.05', nrow(subMat)),
+        column_title_gp = gpar(fontsize=9),
+        column_names_gp = gpar(fontsize=7),
+        column_split = gsub('.[1-6]$','', colnames(subMat)))
+
+BackupAsPDF(hm, 'sigGenes.heatmap', dimensions=c(14,12))
+```
+Plot the collapsed heatmap 
+```{r}
+
+exp.mat <- dcast(exp.dt, Protein~GROUP, value.var = 'LogIntensities', fun.aggregate = mean, na.rm=T) %>% 
+  as.matrix(rownames='Protein')
+
+subMat <- exp.mat[rownames(exp.mat) %in% prots.oi,]
+
+subMat <- sweep(subMat, 1, STATS = apply(subMat, 1, median, na.rm=T))
+
+hm <- Heatmap(subMat, 
+        border=T,
+        name='mean(Ints. vs Median)',
+        cluster_columns = T,
+        show_row_names = F,
+        row_title=sprintf('%s proteins FC +/- 50%% & p.adj < 0.05', nrow(subMat)),
+        column_title_gp = gpar(fontsize=9),
+        column_names_gp = gpar(fontsize=7),
+        column_split = gsub('.[1-6]$','', colnames(subMat)))
+hm
+BackupAsPDF(hm, 'sigGenes.meanCollapsed.heatmap', dimensions=c(12,10))
+```
+Lets Annotate a couple of the more interesting pathways on the two plots
+For now just use these and wait for Danielle to suggest interesting GO terms to annotate
+- antigen processing and presentation
+- immmune response
+- viral process # we want to see how genes behave in all conditions including viral
+
+```{r}
+# extract the gensets we are interested in from the enrichment table
+immuneGenes <- unlist(strsplit(simp.enrich$simplified[ID == "immune response", geneID], "/"))
+antigGenes <- unlist(strsplit(simp.enrich$simplified[ID == "antigen processing and presentation", geneID], "/"))
+viralGenes <- unlist(strsplit(simp.enrich$simplified[ID == "viral process", geneID], "/"))
+```
+
+
+```{r}
+exp.mat <- dcast(exp.dt, Protein~sample, value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+subMat <- exp.mat[rownames(exp.mat) %in% prots.oi,]
+rownames(subMat) <- multiUniprots2multiGenes(rownames(subMat), species='MOUSE')
+
+subMat <- sweep(subMat, 1, STATS = apply(subMat, 1, median, na.rm=T))
+
+# rowames of all anno plots
+#names_bar <-  rownames(subMat) %in% c(immuneGenes,antigGenes, viralGenes)
+names_bar <-  rownames(subMat) %in% c(antigGenes, viralGenes)
+
+# creating our annotation heatmaps
+immune_bar <- rownames(subMat) %in% immuneGenes
+antig_bar <- rownames(subMat) %in% antigGenes
+viral_bar <- rownames(subMat) %in% viralGenes
+
+ht_list = Heatmap(subMat, 
+              show_row_names = T, 
+              show_column_names = T,
+              cluster_rows=T, 
+              cluster_columns = T, 
+              border=T,
+              row_title = paste0(nrow(subMat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              name = "Ints. vs Median",
+              column_split=sub("[.][1-6]$", "", colnames(subMat)),
+              column_title_gp = gpar(fontsize=9),
+              #heatmap_legend_param = list(direction='horizontal', title='z-score (Ints.)',
+              #heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=4))  +
+#  Heatmap(immune_bar + 0, name = "Immune Response", col = c("0" = "white", "1" = '#fde725'), 
+#       show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(antig_bar + 0, name = "Antigen Presentation + Processing", col = c("0" = "white", "1" = '#440154FF'), border=T,
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm")) +
+  Heatmap(viral_bar + 0, name = "Viral Response", col = c("0" = "white", "1" = '#5ec962'), border=T,
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm"))  +
+  rowAnnotation(link = anno_mark(at = which(names_bar), # gives row index of the items in names_bar
+        labels = rownames(subMat)[names_bar], 
+        labels_gp = gpar(fontsize = 6), padding = unit(0.1, "mm"))) 
+
+
+BackupAsPDF(draw(ht_list), 'sigGenes.GO.annoated.heatmap', dimensions=c(15,12))
+```
+
+
+07-06-24
+---
+Rerun the analysis from yesterday except with tmp normalized data to attempt to control for run-run variances
+
+```{r}
+smooth.dt <- fread('~/Documents/projects/052924_ARichards_AViDD_Murine/PC1_batchRemoval_data/2024_06_04_ProteinLevelQuant.PC1SmoothedValues.csv')
+```
+
+Run tmp med polish to adjust for run-to-run variances
+```{r}
+tmp.norm <- medpolish(smooth.mat)
+
+tmp.dt <- data.table(sample = names(tmp.norm$col),
+                     offSet = tmp.norm$col)
+
+smooth.dt <- merge(x=smooth.dt, y=tmp.dt, by='sample')
+smooth.dt[, newLogIntensities := LogIntensities - offSet]
+
+```
+
+
+
+plot some QC plots of the adjused data
+This actually looks great; looks like adjusting data matrix for latent variables (PC1 subtracted) and then readjusting for run-run effects has done a good job!
+Proceed with the differential analysis
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(exp.dt$GROUP)))
+
+g <- ggplot(smooth.dt, aes(x=paste0(GROUP,'.',SUBJECT), y=newLogIntensities, fill=GROUP)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+
+BackupAsPDF(g, 'smooth.prot.ints.tmpNorm.boxplots')
+```
+Lets look at heatmap to see if any samples should be dropped
+All these samples look pretty good to me.. I dont think any need to be removed
+```{r}
+smooth.mat <- dcast(smooth.dt, Protein~interaction(GROUP,SUBJECT), value.var = 'newLogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+subMat <- sweep(smooth.mat, 1, apply(smooth.mat, 1, median,na.rm=T))
+
+hm <- Heatmap(subMat,
+        column_split = gsub('.[1-6]$','', colnames(subMat)),
+        show_row_names = F,
+        border = T,
+        row_title =sprintf("%s Proteins", nrow(subMat)),
+        column_title_gp = gpar(fontsize=8),
+        column_names_gp = gpar(fontsize=6)
+        )
+
+BackupAsPDF(hm, 'smooth.tmpNorm.input.heatmap', dimensions=c(12,10))
+```
+This input looks much more promising to me... lets generate some PCA plots 
+Makes sense the market drug clusters with Mock at time 7, but our treatments follow a different trend
+Can clearly see a timepoint effect on PC2 (seems to correspond to viral clearance)
+```{r}
+# for PCA input we want our features to be columns and samples in rows
+# we wish to calculate the PCs for each row as described by the features(col) (same number of PCs asinput variable/rows)
+pcaOut <- prcomp(t(smooth.mat))
+
+colInfo <- data.table(colname = colnames(smooth.mat))
+colInfo[,c("status", "rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+pcaDT[, `:=`(timepoint = ifelse(grepl("[247]d", rn), str_extract(rn, "[247]d"), 'na'),
+             treat = gsub("[_.].+", "", rn)
+             )]
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = treat, shape = timepoint)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  #scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'smooth.tmpNorm.pca', dimensions=c(9,7))
+
+
+#plot first two components; color by timepoint
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = timepoint, shape=timepoint)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  #scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'smooth.tmpNorm.timepoint.pca', dimensions=c(9,7))
+```
+
+combine the smoothed dt with the original datatable
+```{r}
+p.quant[, sample := interaction(GROUP,SUBJECT)]
+
+exp.dt <- merge(x=smooth.dt, y=p.quant[, .(sample, Protein, RUN,originalRUN, TotalGroupMeasurements, NumMeasuredFeature, MissingPercentage, more50missing, NumImputedFeature)], by=c('sample','Protein'),  all.x=T) 
+
+exp.dt[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+
+# write out the new data matrix for use with WGCNA clustering
+#fwrite(exp.dt, ScriptAndDatedFileName('ProteinLevelQuant.PC1SmoothedValues.tmpNormCol.csv'))
+```
+Differential Expression
+----
+Ok, lets try running the differential expression with what we have
+If fails, try the PC reduction using the first pass of normalization, and then renormalize here using TMP
+
+Make a contrast matrix for the comparisons
+
+```{r}
+contrasts.txt <- fread('./data/MPro_Lung_052324/contrast.txt', sep='-', header=F)
+contrasts.txt[grep('V_', V1), V1 := gsub('V_',"Vehicle_", V1)]
+contrasts.txt[grep('V_', V2), V2 := gsub('V_',"Vehicle_", V2)]
+contrasts.txt[grep('mock', V1), V1 := gsub('mock',"Mock", V1)]
+contrasts.txt[grep('mock', V2), V2 := gsub('mock',"Mock", V2)]
+
+contrasts.list <- split(contrasts.txt, seq(nrow(contrasts.txt)))
+names(contrasts.list) <- apply(contrasts.txt, 1, function(x){ paste(x[1], x[2], sep='-') }) 
+
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(exp.dt$GROUP),
+                               labels = names(contrasts.list))
+```
+
+Read in the MSproc data and replace the p.quant with the cleaned exp
+
+```{r}
+dp.out <-  readRDS('AViDD_AB_murine_DE_data/2024_05_30_dp.out.rds')
+```
+
+Create the contrast matrix and add the smooth.dt as proteinleveldata to the ms proc obj 
+```{r}
+contrasts.list <- split(contrasts.txt, seq(nrow(contrasts.txt)))
+names(contrasts.list) <- apply(contrasts.txt, 1, function(x){ paste(x[1], x[2], sep='-') }) 
+
+contrasts.mat <- MSstats::MSstatsContrastMatrix(contrasts.list, 
+                               conditions = unique(dp.out$ProteinLevelData$GROUP),
+                               labels = names(contrasts.list))
+
+
+f.quant <- setDT(dp.out$FeatureLevelData)
+f.quant[, SUBJECT := interaction(GROUP,SUBJECT)]
+
+exp.dt[, SUBJECT := interaction(GROUP,SUBJECT)]
+# reset intensities to the tmp adjusted values
+exp.dt[, LogIntensities := newLogIntensities]
+
+
+dp.out$FeatureLevelData <- f.quant
+dp.out$ProteinLevelData <- exp.dt
+```
+
+Run MSStats
+```{r}
+# run msstats correcting for batch 
+mss <- groupComparison(contrast.matrix=contrasts.mat, data=dp.out)
+mss.dt <- setDT(mss$ComparisonResult)
+```
+
+Write out the raw results
+```{r}
+# write out raw results
+mss.dt[, gene := multiUniprots2multiGenes(as.character(Protein), species = 'MOUSE')]
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+
+fwrite(mss.dt, ScriptAndDatedFileName('mss.pwcontrasts.tmpNorm.cleanDat.csv'))
+
+mss.dt.wide <- dcast(mss.dt, gene+Protein~Label, value.var = c('log2FC','pvalue', 'p.adj'))
+fwrite(mss.dt.wide, ScriptAndDatedFileName('mss.pwcontrasts.tmpNorm.cleanDat.wide.csv'))
+```
+```{r}
+mss.dt <- mss.dt[!is.infinite(abs(log2FC)) & !issue %in% c("oneConditionMissing","completeMissing"), ] %>% 
+  .[, sig := 'not'] %>% 
+  .[abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+```
+
+Lets plot the number of sig hits per comparison
+Reduced number of DEG, but lets inspect the differential expression
+```{r}
+g <- ggplot(mss.dt[sig != 'not', .N, by=.(sig,Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N significant hits per contrast') +
+  scale_fill_manual(values=c('down'=muted('blue'), 'up'=muted('red'))) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+g
+BackupAsPDF(g, 'N.sigHits.barplots')
+```
+Volcanoplots of each of the groups
+```{r}
+
+g <- ggplot(mss.dt, aes(x=log2FC, y=-log10(adj.pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & sig != 'not'], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_bw()
+g
+BackupAsPDF(g, 'combined.volcano', dimensions=c(18,24))
+```
+Plot vs vehicle and vs Mock separately to see if we see trends
+The first timepoint of x673 vs Mock just does not make sense... should we maybe look at correlations between the comparisons/timepoint groups to try match labels
+
+```{r}
+contrasts.oi <- grep('-Mock',unique(mss.dt$Label), value = T)
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi,], aes(x=log2FC, y=-log10(adj.pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & sig != 'not'], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum()
+g
+BackupAsPDF(g, 'vsMock.volcano', dimensions=c(16,20))
+```
+
+```{r}
+contrasts.oi <- grep('-Vehicle',unique(mss.dt$Label), value = T)
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi,], aes(x=log2FC, y=-log10(adj.pvalue), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & sig != 'not'], show.legend = FALSE, size = 2, max.overlaps = 20) +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'='#990033', 'down'='#336699', 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum()
+g
+BackupAsPDF(g, 'vsVehicle.volcano', dimensions=c(16,20))
+```
+
+GO enrichment of the DEG results
+FGSEA instead? would need to run on each column of a matrix and then rbind the results, but would then have an input for the GSEA heatmap..
+Lets just go with GO enrichment for now. 
+
+```{r}
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(dbName = 'org.Mm.eg.db', ontology = "ALL", keyType = "SYMBOL")
+```
+
+Define universe and perform the enrichment
+Background? I think it makes sense to just use the filtered set as others not considered for DE
+```{r}
+exp.dt[, gene := multiUniprots2multiGenes(Protein, species='MOUSE')]
+
+# define the universe, the total set of identified genes in our study
+universe <- unique(exp.dt$gene)
+
+# now want to run enrichment on each 
+mss.dt[, enrich.grp := interaction(Label,sig)]
+
+enrich.dt <- enricherOnGroups(mss.dt[sig != 'not',], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = gmt.go, 
+                              universe = universe)
+
+fwrite(enrich.dt, ScriptAndDatedFileName('GOenrichments.smoothData.tmpNorm.csv'))
+
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich.grp')
+fwrite(simp.enrich$simplified, ScriptAndDatedFileName('GOenrichments.smoothData.tmpNorm.simplified.csv'))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, 
+                                groupColumn = 'enrich.grp', 
+                                topN = 5,
+                                title='GO term enrichment', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp, value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+
+ht
+BackupAsPDF(ht, 'GO.enrich.heatmap', dimensions = c(13,10))
+```
+
+plot the Vs Mock and vs Vehicle subgroups
+
+```{r}
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified[grep('-Mock', enrich.grp), ], 
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO term enrichment comparisons vs Mock', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp[grep('-Mock', simp.enrich$simplified$enrich.grp)], value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+
+ht
+BackupAsPDF(ht, 'GO.enrich.vsMock.heatmap', dimensions = c(13,10))
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified[grep('-Vehicle', enrich.grp), ], 
+                                groupColumn = 'enrich.grp', 
+                                topN = 8,
+                                title='GO term enrichment comparisons vs Vehicle', 
+                                row_names_gp = gpar(fontsize = 7), 
+                                negCols=unique(grep('down', simp.enrich$simplified$enrich.grp[grep('-Vehicle', simp.enrich$simplified$enrich.grp)], value=T)),
+                                column_names_gp= gpar(fontsize = 6), 
+                                upperThreshold = 8)
+
+ht
+BackupAsPDF(ht, 'GO.enrich.vsVehicle.heatmap', dimensions = c(13,10))
+```
+
+Ok, now generate heatmaps of the results, annotated with interesting GO terms
+
+```{r}
+prots.oi <- mss.dt[sig != 'not', unique(Protein)]
+
+exp.mat <- dcast(exp.dt, Protein~sample, value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+subMat <- exp.mat[rownames(exp.mat) %in% prots.oi,]
+
+subMat <- sweep(subMat, 1, STATS = apply(subMat, 1, median, na.rm=T))
+
+hm <- Heatmap(subMat, 
+        border=T,
+        name='Ints. vs Median',
+        cluster_columns = F,
+        show_row_names = F,
+        row_title=sprintf('%s proteins FC +/- 50%% & p.adj < 0.05', nrow(subMat)),
+        column_title_gp = gpar(fontsize=9),
+        column_names_gp = gpar(fontsize=7),
+        column_split = gsub('.[1-6]$','', colnames(subMat)))
+
+BackupAsPDF(hm, 'sigGenes.heatmap', dimensions=c(14,12))
+```
+Plot the collapsed heatmap 
+```{r}
+exp.mat <- dcast(exp.dt, Protein~GROUP, value.var = 'LogIntensities', fun.aggregate = mean, na.rm=T) %>% 
+  as.matrix(rownames='Protein')
+
+subMat <- exp.mat[rownames(exp.mat) %in% prots.oi,]
+
+subMat <- sweep(subMat, 1, STATS = apply(subMat, 1, median, na.rm=T))
+
+hm <- Heatmap(subMat, 
+        border=T,
+        name='mean(Ints. vs Median)',
+        cluster_columns = T,
+        show_row_names = F,
+        row_title=sprintf('%s proteins FC +/- 50%% & p.adj < 0.05', nrow(subMat)),
+        column_title_gp = gpar(fontsize=9),
+        column_names_gp = gpar(fontsize=7),
+        column_split = gsub('.[1-6]$','', colnames(subMat)))
+hm
+BackupAsPDF(hm, 'sigGenes.meanCollapsed.heatmap', dimensions=c(12,10))
+```
+Lets Annotate a couple of the more interesting pathways on the two plots
+For now just use these and wait for Danielle to suggest interesting GO terms to annotate
+- antigen processing and presentation
+- immmune response
+- viral process # we want to see how genes behave in all conditions including viral
+
+```{r}
+# extract the gensets we are interested in from the enrichment table
+immuneGenes <- unlist(strsplit(simp.enrich$simplified[ID == "immune response", geneID], "/"))
+antigGenes <- unlist(strsplit(simp.enrich$simplified[ID == "antigen processing and presentation", geneID], "/"))
+viralGenes <- unlist(strsplit(simp.enrich$simplified[ID == "viral process", geneID], "/"))
+```
+
+
+```{r}
+exp.mat <- dcast(exp.dt, Protein~sample, value.var = 'newLogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+
+subMat <- exp.mat[rownames(exp.mat) %in% prots.oi,]
+rownames(subMat) <- multiUniprots2multiGenes(rownames(subMat), species='MOUSE')
+
+subMat <- sweep(subMat, 1, STATS = apply(subMat, 1, median, na.rm=T))
+
+# rowames of all anno plots
+#names_bar <-  rownames(subMat) %in% c(immuneGenes,antigGenes, viralGenes)
+names_bar <-  rownames(subMat) %in% c(antigGenes, viralGenes)
+
+# creating our annotation heatmaps
+immune_bar <- rownames(subMat) %in% immuneGenes
+antig_bar <- rownames(subMat) %in% antigGenes
+viral_bar <- rownames(subMat) %in% viralGenes
+
+ht_list = Heatmap(subMat, 
+              show_row_names = T, 
+              show_column_names = T,
+              cluster_rows=T, 
+              cluster_columns = T, 
+              border=T,
+              row_title = paste0(nrow(subMat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              name = "Ints. vs Median",
+              column_split=sub("[.][1-6]$", "", colnames(subMat)),
+              column_title_gp = gpar(fontsize=9),
+              #heatmap_legend_param = list(direction='horizontal', title='z-score (Ints.)',
+              #heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=4))  +
+#  Heatmap(immune_bar + 0, name = "Immune Response", col = c("0" = "white", "1" = '#fde725'), 
+#       show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(antig_bar + 0, name = "Antigen Presentation + Processing", col = c("0" = "white", "1" = '#440154FF'), border=T,
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm")) +
+  Heatmap(viral_bar + 0, name = "Viral Response", col = c("0" = "white", "1" = '#5ec962'), border=T,
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm"))  +
+  rowAnnotation(link = anno_mark(at = which(names_bar), # gives row index of the items in names_bar
+        labels = rownames(subMat)[names_bar], 
+        labels_gp = gpar(fontsize = 6), padding = unit(0.1, "mm"))) 
+
+
+BackupAsPDF(draw(ht_list), 'sigGenes.GO.annoated.heatmap', dimensions=c(15,12))
+```
+Maybe plot the same heatmap, but this time subtrack the mock avg intensity from each of the others and plot. 
+Hopefully this will help highlight trends over time
+Clear that the samples dont match the market drug trend, even though we see this in the in vitro models
+
+```{r}
+# calculate difference vsMock
+exp.dt[, vsMock := newLogIntensities - mean(newLogIntensities[GROUP == 'Mock'], na.rm=T), by=.(Protein)]
+
+p.mat <- dcast(exp.dt, Protein~(SUBJECT), value.var = 'vsMock') %>% 
+  as.matrix(rownames='Protein')
+
+# subset to the degs and remove the Mock samples
+subMat <-  p.mat[rownames(p.mat) %in% prots.oi, grep('Mock', colnames(p.mat), invert=T)]
+
+rownames(subMat) <- multiUniprots2multiGenes(rownames(subMat), species='MOUSE')
+
+
+ht_list = Heatmap(subMat, 
+              show_row_names = T, 
+              show_column_names = T,
+              cluster_rows=T, 
+              cluster_columns = F, 
+              border=T,
+              row_title = paste0(nrow(subMat), ' FC +/- 50% & p.adj < 0.05'),
+              row_title_gp = gpar(fontsize=9),
+              name = "Ints. vs Mock",
+              column_split=sub("[.][1-6]$", "", colnames(subMat)),
+              column_title_gp = gpar(fontsize=9),
+              #heatmap_legend_param = list(direction='horizontal', title='z-score (Ints.)',
+              #heatmap_legend_side = "left"),
+              column_names_gp = gpar(fontsize=7), 
+              row_names_gp = gpar(fontsize=4))  +
+#  Heatmap(immune_bar + 0, name = "Immune Response", col = c("0" = "white", "1" = '#fde725'), 
+#       show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=5), column_gap = unit(0.2, "cm"), gap = unit(3, "cm")) +
+  Heatmap(antig_bar + 0, name = "Antigen Presentation + Processing", col = c("0" = "white", "1" = '#440154FF'), border=T,
+        show_heatmap_legend = FALSE, width = unit(3, "mm"),  column_names_gp = gpar(fontsize=7), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm")) +
+  Heatmap(viral_bar + 0, name = "Viral Response", col = c("0" = "white", "1" = '#5ec962'), border=T,
+        show_heatmap_legend = FALSE, width = unit(3, "mm"), column_names_gp = gpar(fontsize=7), column_gap = unit(0.05, "cm"), gap = unit(0.5, "cm"))  +
+  rowAnnotation(link = anno_mark(at = which(names_bar), # gives row index of the items in names_bar
+        labels = rownames(subMat)[names_bar], 
+        labels_gp = gpar(fontsize = 6), padding = unit(0.1, "mm"))) 
+
+BackupAsPDF(draw(ht_list), 'sigGenes.GO.annoated.vsMock.heatmap', dimensions=c(15,12))
+```
+
+

@@ -1,0 +1,410 @@
+---
+title: "123024_PH_InitalQC"
+author: "Martin Gordon"
+date: "2024-12-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+Analysis of the PH data from Jyotis AB and PH proteomics experiment
+Not a whole lot of findings from the abundance data; most differences confined to the infected vs mock, rather than across strains
+
+*ToDo*
+Compare the RNAseq and the AB/PH data (scatterplots of both? Color things significant in both sets)
+
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+# kinase enrichment analysis
+source("/Users/martingordon/Documents/utils/bp_utils/KinaseActivityScores.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+
+customTheme <- theme_bw() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+#set one
+col.pal <- getQualitativePalette(n=13)
+
+```
+
+
+```{r}
+test <- fread('./data/PH_MRC5/MSstats_20241218_100929_JB_MRC5_PH_121824_Report.tsv')
+
+hu.list <- list(msstats=fread('./data/PH_MRC5/MSstats_20241218_100929_JB_MRC5_PH_121824_Report.tsv'),
+             keys=fread('./data/PH_MRC5/JB_MRC5_PH_121824_ConditionSetup.tsv'))
+
+bat.list <-  list(msstats=fread('./data/PH_RFe/MSstats_20241223_150057_JB_RFe_PH_122324_Report.tsv'),
+               keys=fread('./data/PH_RFe/JB_RFe_PH_122324_ConditionSetup.tsv'))
+
+
+bat.list[[1]][grepl('nsp', ProteinName)]
+hu.list[[1]][grepl('orf', ProteinName)]
+```
+Conditions same as the abundance data
+3 viral strains * 3 timepoints + mock (n=3 reps) for human
+3 viral strains * 4 timepoints + mock (n=3 reps) for bat
+
+```{r}
+hu.list[[2]][,.N, by=Condition][order(Condition)]
+bat.list[[2]][,.N, by=Condition][order(Condition)]
+
+# make level orders easier
+bat.list[[1]][, Condition := gsub('_6hpi', '_06hpi', Condition)]
+bat.list[[2]][, Condition := gsub('_6hpi', '_06hpi', Condition)]
+```
+features eluting more than once? 
+None in either dataset; can treat each row as a feature
+
+```{r}
+hu.list[[1]][,.N, by=.(Run, ProteinName, PeptideSequence,PrecursorCharge)][N > 1,]
+bat.list[[1]][,.N, by=.(Run, ProteinName, PeptideSequence,PrecursorCharge)][N > 1,]
+```
+plot thw number of phosphorylated features in each run
+```{r}
+plotNPhosphoFeatures <-  function(dt){
+  
+  summary.dt <- dt[, .(Features=.N, phosphorylatedFeatures=sum(grepl('Phospho', PeptideSequence))), by=.(Run, Condition, BioReplicate)]
+  
+  ggplot(summary.dt, aes(x=paste0(Condition, '.', BioReplicate), y=Features, fill=Condition)) +
+    geom_bar(stat='Identity', position='dodge') +
+    labs(x='sample') +
+    ggtitle('N phosphorylated features per sample') +
+    scale_fill_manual(values=col.pal) +
+    customTheme
+}
+
+BackupAsPDF(plotNPhosphoFeatures(hu.list[[1]]), 'hu.nPhosphoFeatures.barplot')
+BackupAsPDF(plotNPhosphoFeatures(bat.list[[1]]), 'bat.nPhosphoFeatures.barplot')
+```
+plot the proportion of features to better see recovery 
+
+```{r}
+hu.list[[1]][, phosphorylated := ifelse(grepl('Phospho', PeptideSequence), 'yes', 'no')]
+bat.list[[1]][, phosphorylated := ifelse(grepl('Phospho', PeptideSequence), 'yes', 'no')]
+
+g <- ggplot(hu.list[[1]][, .N, by=.(Condition, BioReplicate, phosphorylated)], aes(x=paste0(Condition, '.', BioReplicate), y=N, fill=phosphorylated)) +
+    geom_bar(stat='Identity', position='stack') +
+    labs(x='sample') +
+    ggtitle('Breakdown of phosphorylated features per sample') +
+    scale_fill_manual(values=col.pal) +
+    customTheme
+g
+BackupAsPDF(g, 'hu.PhosphoFeaturesBreakdown.barplot')
+
+
+g <- ggplot(bat.list[[1]][, .N, by=.(Condition, BioReplicate, phosphorylated)], aes(x=paste0(Condition, '.', BioReplicate), y=N, fill=phosphorylated)) +
+    geom_bar(stat='Identity', position='stack') +
+    labs(x='sample') +
+    ggtitle('Breakdown of phosphorylated features per sample') +
+    scale_fill_manual(values=col.pal) +
+    customTheme
+g
+BackupAsPDF(g, 'bat.PhosphoFeaturesBreakdown.barplot')
+```
+
+
+N features per cell-line; much lower than abundance; expected as I guess this is an enriched set?
+# almost 35% of features dont have PH sites
+
+
+```{r}
+# MRC5 features
+g <- ggplot(hu.list[[1]][,.N, by=.(Condition,BioReplicate,Run)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('MRC5 Features') +
+  xlab('Condition.Replicate') +
+  ylab('Number of Features') +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90, size=8))
+g
+BackupAsPDF(g, 'MRC5.nFeatures.barplot')
+
+
+#RFe features
+g <- ggplot(bat.list[[1]][,.N, by=.(Condition,BioReplicate,Run)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('RFe Features') +
+  xlab('Condition.Replicate') +
+  ylab('Number of Features') +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90, size=8))
+g
+BackupAsPDF(g, 'RFe.nFeatures.barplot')
+```
+
+```{r}
+g <-  ggplot(bat.list[[1]], aes(x=log2(Intensity))) +
+  geom_histogram(bins=50, fill="palegreen2") +
+  ggtitle('RFe feature ints.') +
+  theme_ipsum_rc()
+
+p <- ggplot(hu.list[[1]], aes(x=log2(Intensity))) +
+  geom_histogram(bins=50, fill="#CAB2D6") +
+  ggtitle('MRC5 feature ints.') +
+  theme_ipsum_rc()
+
+BackupAsPDF(p+g, 'feature.intensity.histograms')
+```
+
+Tidy the sample names 
+
+```{r}
+spec.list <- list('MRC5'=hu.list[[1]],
+                  'Rfe'=bat.list[[1]])
+
+spec.list <- lapply(spec.list, function(x){
+  
+  unique(x$Condition) %>%  print()
+  x[, strain := gsub('_12hpi|_24hpi|_48hpi|_06hpi', '', Condition)]
+  x[, timepoint := ifelse(grepl('Mock', Condition), 'na', str_extract(Condition, '[012468]+hpi'))]
+})
+
+
+```
+```{r}
+# is this modified in place? yes, no need to overwrite
+lapply(spec.list, function(x){
+
+  x[, `:=`(timepoint = factor(timepoint),
+             strain = factor(strain))]
+})
+
+
+# rm from memory
+rm(bat.list)
+rm(hu.list)
+```
+
+Check the spec list for the SARS fasta... SARS-COV2 features not found.. generate PCA and sample heatmap anyway
+```{r}
+lapply(spec.list, function(x){
+  
+  
+  fname <- ifelse(any(x$timepoint == '06hpi'), 'RFe','MRC5')
+  print(fname)
+  
+  message('creating matrix...')
+  spec.mat <- dcast(x, paste(ProteinName,PeptideSequence,PrecursorCharge, sep='_')~paste(strain,timepoint,BioReplicate, sep='.'), value.var = 'Intensity') %>% 
+    as.matrix(rownames=1)
+  
+  dim(spec.mat) %>% print()
+  message('Subsetting to complete cases for PCA...')
+  submat <- spec.mat[complete.cases(spec.mat),]
+  
+  submat <- log2(submat)
+
+  pcaOut <- prcomp(t(submat))
+
+  message('Setting up col info')
+  colInfo <- data.table(colname = colnames(spec.mat))
+  colInfo[, c("strain", "timepoint", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2,3)) ]
+
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  
+  #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = strain, shape = timepoint)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(fname, "PCA using",  nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(fname,'.features.strainCol.pca'), dimensions=c(8,6))
+  
+    #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = timepoint, shape = strain)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(fname, "PCA using",  nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(fname,'.features.timepointCol.pca'), dimensions=c(8,6))
+  
+      #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = biorep, shape = strain)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(fname, "PCA using", nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(fname,'.features.biorepCol.pca'), dimensions=c(8,6))
+})
+```
+
+```{r}
+lapply(spec.list, function(x){
+  x[, IsotopeLabelType := 'L']
+})
+```
+```{r}
+lapply(names(spec.list), function(x){
+  print(x)
+  fwrite(spec.list[[x]], ScriptAndDatedFileName(paste0(x, '.mssInput.csv')))
+  })
+
+```
+
+
+
+Run MSStats to process the sites; do I need additional information to do this?
+
+Change protein name
+```{r}
+
+# there are also help functions that use a input fasta and peptide seq to map the protein sequences to sites, but use this function to handle the site info directly
+# I normally usee the other function with human samples..)
+specPTMLocation2artmsStyleSingleProtein <- function (ProteinName, ptmLocations, ptmRE = "^(S|T|Y)"){
+  # sanity check for supplied cols; must have parenthesis and no semi-colon
+  stopifnot (substr(ptmLocations[1], 1, 1) == "(")
+  stopifnot (!any(grepl(";", ProteinName)))
+  stopifnot (!any(grepl(";", ptmLocations)))
+  
+  noEdgeParens <- substr(ptmLocations ,2, nchar(ptmLocations)-1 ) # remove the parentheses
+  
+  if(any(grepl("\\)\\(", noEdgeParens))){
+    message ("Some proteins with PTMs in duplicated peptides. Choosing the first peptide/positions reported")
+    noEdgeParens <- tstrsplit(noEdgeParens, "\\)\\(")[[1]]
+  }
+  
+  listOfSingleMods <- strsplit(noEdgeParens,",")
+  # remove those that don't match ptmRE, C123 as the usual example
+  listOfSingleMods <- lapply(listOfSingleMods, function(v)grep(ptmRE, v, value = TRUE) )
+  listOfProteinNames <- lapply(1:length(listOfSingleMods),
+                               function (i) ifelse(length(listOfSingleMods[[i]]) > 0,  # can happen when mods are all Cys_CAM etc.
+                                                   paste0(ProteinName[i], "_", listOfSingleMods[[i]], collapse = ";"),
+                                                   ""))
+  #result <- sapply(listOfProteinNames, paste0, collapse = ";")
+  return (listOfProteinNames)
+}
+```
+
+preprocessing for msstats input
+```{r}
+specPTMLocation2ProteinNames <- function(specFile){
+  multiProtMapper <- unique(specFile[EG.ProteinPTMLocations != "", .(ProteinName, EG.ProteinPTMLocations)])
+  singleProtMapper <- multiProtMapper[, .(singleProtein = unlist(strsplit(ProteinName, ";")), singlePTMset = unlist(strsplit(EG.ProteinPTMLocations, ";"))), by = .(ProteinName, EG.ProteinPTMLocations) ]
+  singleProtMapper[, artMSName := specPTMLocation2artmsStyleSingleProtein(singleProtein, singlePTMset)]
+  
+  # collapse back to multiProts
+  multiProtMapper <- singleProtMapper[artMSName != "", .(artMSName = paste0(artMSName, collapse = ";")), by = .(ProteinName, EG.ProteinPTMLocations)]
+  
+  multiProtMapper[specFile, artMSName, on = c ("ProteinName", "EG.ProteinPTMLocations")]
+}
+
+spec.list[[1]]
+
+spec.list[[1]][, artMSProteinName := specPTMLocation2ProteinNames(spec.list[[1]])]
+
+# remove the non-STY modified
+spec.dt <- spec.dt[artMSProteinName != ""]
+spec.dt[, ProteinName := artMSProteinName]  
+
+# add this to protein name
+spec.dt[, IsotopeLabelType := "L"]
+
+fwrite(spec.dt, "./output/MSstatsInput.PH.csv")
+
+fread('./output/MSstatsInput.PH.csv')
+```
+
+run msstats 
+
+```{r}
+dp.list <- lapply(spec.list, function(x){
+  dp.out <- MSstats::dataProcess(x, 
+                                 MBimpute =  FALSE, 
+                                 normalization = 'equalizeMedians',
+                                 summaryMethod = "TMP")
+  return(dp.out)
+})
+```
+
+```{r}
+
+```
+

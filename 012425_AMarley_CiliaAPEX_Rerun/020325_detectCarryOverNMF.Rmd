@@ -1,0 +1,153 @@
+---
+title: "020325_detectCarryOverNMF"
+author: "Martin Gordon"
+date: "2025-02-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Tried to run NMF to capture the 'carryover' signal, but as the same groups have the same high N peptides, I think best option is to proceed as is with de analysis within each group
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(showtext)
+library(readxl)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/NMF_Helpers.R")
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <- theme_ipsum_rc() +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+```
+
+read in the data and id mapping file 
+```{r}
+p.quant <-  fread('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/012425_ciliaAPEX_firstLook_data/2025_01_24_ProteinlvlQuant.2ndRoundNorm.csv')
+
+mh_mappings <- fread('~/Documents/utils/mg_utils/data/mouseHumanIDConversion.txt')
+
+cilia.AM <- c('INPP5E', 'LCA5', 'PRKAR1A', 'ARL13B', 'SMO', 'EVC2', 'EVC', 'PKD2', 'TTC21B', 'PKHD1', 'IFT88', 'NPHP4', 'EFCAB7', 'CYS1')
+
+cilia.Consensus <- c('Pdap1','Cep131','Cep41','Ift122','Ift172','Ift52','Ift57','Ift74','Ift81','Ift88','Cfap97','Lca5','Cemip2','Wdr35',
+                     'Arl13b','Arl3','Inpp5e','Nme7','Kif3a','Kif3b','Kifap3','Ywhaz','Cys1','Evc2','Ttc21b','Ift56')
+
+cilia.Consensus[!cilia.Consensus %in% unique(mh_mappings$Symbol.mouse)]
+
+# all found
+cilia.AM.prots <- mh_mappings[Symbol.human %in% cilia.AM, SWISS_PROT_IDs.mouse]
+cilia.Consensus.prots <- mh_mappings[Symbol.mouse %in% cilia.Consensus, SWISS_PROT_IDs.mouse]
+```
+
+Convert our data to linear scale matrix (additive and non-zero)
+
+```{r}
+p.mat <- dcast(p.quant, Protein~GROUP+SUBJECT, value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+# scale 0-1
+p.mat <- 2^p.mat # Intensities on linear scale
+p.mat <- sweep(p.mat, 1, STAT=apply(p.mat, 1, max, na.rm=T), FUN='/')
+
+#convert na to 0 
+p.mat[is.na(p.mat)] <-  0
+```
+
+```{r}
+n = 9
+
+# create a color scale within these boundaries
+pal <- RColorBrewer::brewer.pal(n, "YlOrBr")
+scaledIntensityColors <- circlize::colorRamp2(breaks = (seq_len(n)-1)/(n-1),
+                                              col = pal)
+
+Heatmap(p.mat, 
+              name = "Scaled Ints.",
+              col = scaledIntensityColors,
+              cluster_columns = FALSE,
+        show_row_names = F,
+        column_split = gsub("_[12345]{1}$", "", colnames(p.mat)),
+        column_title_rot = 90,
+        column_names_gp = gpar(fontsize = 9)) |>
+  draw() 
+
+
+
+```
+Run NMF: lets try geenrate a 10 rank matrix 
+
+```{r}
+allNMF <- doParallelNMF(p.mat, ranks = 2:10)
+```
+save output
+```{r, eval  = FALSE}
+saveRDS(allNMF, ScriptAndDatedFileName("cillaMarkers.NMF.rank1Torank10.rds"))
+```
+
+```{r}
+allNMF <- readRDS('~/Documents/projects/012425_AMarley_CiliaAPEX_Rerun/020325_detectCarryOverNMF_data/2025_02_03_cillaMarkers.NMF.rank1Torank10.rds')
+allNMF <- allNMF[c(2:10)] # drop the NA
+
+names(allNMF) <- paste0('rank.', seq(2,10))
+```
+
+
+```{r, fig.width =12 , fig.height= 8}
+lapply(seq_along(allNMF), function(x,n,i){
+  
+  hm1 <- PlotNMFHeatmap(x[[i]],
+                       mainColors = scaledIntensityColors,
+                       name = "Scaled\n LogInts.",
+                       originalMatrix = p.mat,
+                       show_row_names=F,
+                       column_split = gsub("_[12345]{1}$", "", colnames(p.mat)),
+                       column_title_rot = 90,
+                       topAnno = "bars")
+ 
+    BackupAsPDF(hm1, paste0(n[[i]], '.nmf.heatmap'))
+
+},x=allNMF, n=names(allNMF))
+```

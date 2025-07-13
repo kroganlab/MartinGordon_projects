@@ -1,0 +1,369 @@
+---
+title: "GC01.GC02.PWcontrastsOverlaps"
+author: "Martin Gordon"
+date: "2023-12-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Qiongyu request for overlaps from the GC01.GC02 analysis
+Identify these overlaps in conditions, return the table in tidy format
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(MSstats)
+library(magrittr)
+library(stringr)
+library(ComplexHeatmap)
+library(randomcoloR)
+#library(VennDiagram)
+library(ggvenn)
+library(ggVennDiagram) # main diff to above is you can quantify overlapping regions
+
+
+source ("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+read in the PW comparisons and identify overlaps in T5 and T10 comparisons
+Things that are 'up' in the DE comparison are significant with the addition of agonist
+
+take raw for now and lets filter out na groups
+```{r}
+QRFPR.mss <- fread('/Users/martingordon/Documents/projects/071123_QLi_DARPA.GC01.GC02/output/QRFPR.mss.pwcomparisons.proc.csv')
+MRX2.mss <- fread('/Users/martingordon/Documents/projects/071123_QLi_DARPA.GC01.GC02/output/MRX2.mss.pwcomparisons.proc.csv')
+
+mss.out <-  rbind(MRX2=MRX2.mss,
+                 QRFPR=QRFPR.mss)
+```
+Lets find the overlapping hits
+
+Venn diagram of candidates significant for YM 5 min vs. 5 min, overlapped with the correlation analysis Gq top correlation candidates. 
+Before we decide to use 5 min or 10 min, we could check the heatmap from a pair-wise comparison for 5min +/- YM and 10min +/- YM
+We are prob interested in the downregulated things (inhiibited with addition of YM) and how these sites correlate with GProteins
+
+Firstly, look at the candidates in 5 min and 10 min treat dataset
+Generate a heatmap of these results
+
+
+Looks like a very fast interaction; already less sig hits by 10 mins
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(k=2)
+
+mss.out$Label %>%  unique()
+
+# we are probably interested in the downregulated stuff
+contrasts.oi <- c("ZC05_YM-ZC05", "ZC10_YM-ZC10")
+
+#overlap of significant hits in these contrasts:
+mss.out[Label %in% contrasts.oi, .N, by=.(sig)]
+
+# only 32 things differentially expressed in total
+mss.out[Label %in% contrasts.oi & sig != 'not', gene]
+
+g <- ggplot(mss.out[Label %in% contrasts.oi & sig != 'not',.N, by=.(Label,sig)], aes(x=Label, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=c('down'='blue', 'up'='red')) +
+  ylab('N sig hits (FC +/- 50% & p.adj < 0.05)') +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'MRX2.T5.T10.YM.Nsig.hits.barplot')
+```
+What are these genes? Create a lollipop plot of theses sig hits and their log2FC in each condition
+PRKD3, PRKD2, OSBPL8 & DGKZ found in both and consistently moving in same direction
+(Could also drop significance threshold to increase number of hits, but as you are looking for + ctrl candidates left as is. Let me know...)
+
+```{r}
+#test <- mss.out[Label %in% contrasts.oi & sig != 'not',] %>% 
+#  .[order(log2FC),] %>% 
+#  .[, N := seq_len(.N), by=(Label)] # nice function to generate row IDs by group
+
+
+g <- mss.out[Label %in% contrasts.oi & sig != 'not',] %>% 
+  .[order(log2FC)] %>% 
+  ggplot(., aes(x=reorder(gene,log2FC), y=log2FC, color=sig)) +
+  geom_segment(aes(x=reorder(gene,log2FC), xend=reorder(gene,log2FC), y=0, yend=log2FC), color='grey', lwd=.5, linetype=1) +
+  geom_point(size=3) +
+  geom_hline(yintercept=0, alpha=0.2, linetype=2) +
+  facet_wrap(~Label, scales = 'free_y') +
+  theme_bw() + 
+  coord_flip() +
+  xlab('gene') +
+  ylab('N sig hits (FC +/- 50% & p.adj < 0.05)') +
+  scale_color_manual(values=c('down'='blue', 'up'='red')) +
+  theme(
+    axis.text.x = element_text(angle=90, vjust=0.6)
+  )
+g
+BackupAsPDF(g, 'MRX2.T5.T10.YM.Nsig.hits.lollipop.basic.')
+```
+Generate the same plots with a reduced log2FC threshold 
+now looking at log2FC +/- 50% and pval < 0.001
+
+```{r}
+mss.out[, sig := 'not']
+mss.out[abs(log2FC) > 0.58 & pvalue < 0.001, sig := ifelse(log2FC > 0, 'up', 'down')]
+
+g <- ggplot(mss.out[Label %in% contrasts.oi & sig != 'not',.N, by=.(Label,sig)], aes(x=Label, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=c('down'='blue', 'up'='red')) +
+  ylab('N sig hits (FC +/- 50% & p.val < 0.001)') +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'MRX2.T5.T10.YM.Nsig.hits.pval0.001.barplot')
+
+```
+generate the lollipop plot again 
+```{r}
+
+mss.out[Label %in% contrasts.oi & sig != 'not',] %>% 
+  .[order(log2FC), by=Label] %>% 
+  .[,  rank := seq_len(.N)]
+
+g <- mss.out[Label %in% contrasts.oi & sig != 'not',] %>% 
+  .[order(log2FC)] %>% 
+  ggplot(., aes(x=reorder(gene,log2FC), y=log2FC, color=sig)) +
+  geom_segment(aes(x=reorder(gene,log2FC), xend=reorder(gene,log2FC), y=0, yend=log2FC), color='grey', lwd=.5, linetype=1) +
+  geom_point(size=3) +
+  geom_hline(yintercept=0, alpha=0.2, linetype=2) +
+  facet_wrap(~Label, scales = 'free_y') +
+  theme_bw() + 
+  coord_flip() +
+  xlab('gene') +
+  ylab('N sig hits (FC +/- 50% & p.val < 0.001)') +
+  scale_color_manual(values=c('down'='blue', 'up'='red')) +
+  theme(
+    axis.text.x = element_text(angle=90, vjust=0.6)
+  )
+g
+BackupAsPDF(g, 'MRX2.T5.T10.YM.Nsig.hits.pval0.001.lollipop.basic.')
+```
+I think just go with our regular hits for now
+Theres some genesOI in the top hits, so proceed as is for now
+(reason we use our own pval is to control for local correction, and to also avoid the '0' pval issue with missing conditions that will get flagged as significant by thresholding!)
+
+
+Why is one of the ZC10 samples dropped? (ZC10_2); intensities very different to rest of group..
+Look over the contrasts and find this... was it dropped from DE testing? Check degrees of freedom
+
+```{r}
+unique(mss.out$DF)
+```
+
+
+```{r}
+mss.out[, sig := 'not']
+mss.out[abs(log2FC) > 0.58 & p.adj < 0.05, sig := ifelse(log2FC > 0, 'up', 'down')]
+# only 12 things found significant in both
+mss.out[Label %in% contrasts.oi, .N, by=.(sig)]
+```
+why cant I find the proteins of interest
+```{r}
+MRX2.dp  <- readRDS('./output/MRX2.rds')
+p.quant <- setDT(MRX2.dp$ProteinLevelData)
+
+# sig hits; look across conditions OI
+prots.oi <- mss.out[Label %in% contrasts.oi & sig != 'not',Protein]
+
+p.mat <-  dcast(p.quant, Protein~GROUP+SUBJECT, value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+colnames(p.mat)
+
+#subset view to the samples we want
+samples.oi <- c("ZC05_1","ZC05_2","ZC05_3","ZC05_YM_1","ZC05_YM_2","ZC05_YM_3", "ZC10_1","ZC10_2","ZC10_3","ZC10_YM_1","ZC10_YM_2","ZC10_YM_3")
+
+subMat <-  p.mat[rownames(p.mat) %in% prots.oi, colnames(p.mat) %in% samples.oi]
+
+subMat <-  sweep(subMat, 1, FUN='-', STAT=apply(subMat,1, median, na.rm=T))
+rownames(subMat) <- multiUniprots2multiGenes(rownames(subMat))
+
+clusterwNA <- function(x, na.val=0,...){
+  
+  x[is.na(x)] <- na.val
+  dist(x) %>%  hclust(method='complete')
+}
+
+hm <- Heatmap(subMat, 
+              cluster_columns = FALSE, 
+              name = 'log Ints/Median',
+              cluster_rows = clusterwNA(subMat),
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (FC +/ .5 & p.adj < 0.05)', nrow(subMat)),
+              row_names_gp = gpar(fontsize = 6),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list(ifelse(grepl('ZC05', colnames(subMat)), '5min', '10min'),
+                                  ifelse(grepl('YM', colnames(subMat)), 'YM', 'CTRL')
+                                  ),
+              column_title_gp = gpar(fontsize=9))
+
+hm
+BackupAsPDF(hm, 'overlapping.T5T10.YM.padj.medianScale.heatmap.')
+```
+lets create the same plot with genes sig at pval < 0.001 for completeness
+
+```{r}
+# sig hits; look across conditions OI
+prots.oi <- mss.out[Label %in% contrasts.oi & p.adj < 0.05 & abs(log2FC) > 0.58, Protein]
+length(prots.oi)
+
+mss.out
+
+#subset view to the samples we want
+samples.oi <- c("ZC05_1","ZC05_2","ZC05_3","ZC05_YM_1","ZC05_YM_2","ZC05_YM_3", "ZC10_1","ZC10_2","ZC10_3","ZC10_YM_1","ZC10_YM_2","ZC10_YM_3")
+
+subMat <-  p.mat[rownames(p.mat) %in% prots.oi, colnames(p.mat) %in% samples.oi]
+
+subMat <-  sweep(subMat, 1, FUN='-', STAT=apply(subMat,1, median, na.rm=T))
+rownames(subMat) <- multiUniprots2multiGenes(rownames(subMat))
+
+clusterwNA <- function(x, na.val=0,...){
+  
+  x[is.na(x)] <- na.val
+  dist(x) %>%  hclust(method='complete')
+}
+
+hm <- Heatmap(subMat, 
+              cluster_columns = FALSE, 
+              name = 'log Ints/Median',
+              cluster_rows = clusterwNA(subMat),
+            #  column_title = paste0(n[[i]], ' CM101 treatment effects'),
+              row_title = sprintf('%s Proteins (FC +/ .5 & p.val < 0.001)', nrow(subMat)),
+              row_names_gp = gpar(fontsize = 6),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list(ifelse(grepl('ZC05', colnames(subMat)), '5min', '10min'),
+                                  ifelse(grepl('YM', colnames(subMat)), 'YM', 'CTRL')
+                                  ),
+              column_title_gp = gpar(fontsize=9))
+
+hm
+BackupAsPDF(hm, 'overlapping.T5T10.YM.pval0.001.medianScale.heatmap.')
+
+```
+Ok, now that I have the heatmaps of these interactions, I want to pull out the 'significant' cor scores (2nd percentile & 5th percentile)
+pull the 5th percentile and 2nd percentile scores and correlate with sig hits on the Venn Diagram
+
+YM inhibits Gq signalling, so we would expect overlap with Gq/G11 correlated module I think?
+First pass; extract list of sig hits for Gq/G11 and YM sig hits and overlap
+
+
+Good news! Of our 28 hits, 10 of them are also in the top 2% of percentile scores
+```{r}
+sec.perc   <- fread("/Users/martingordon/Documents/projects/082423_QLi_GPR_WGCNA/041223.regen.fig5plots_data/2023_12_06_2perc.gprot.corscores.csv")
+fifth.perc <- fread("/Users/martingordon/Documents/projects/082423_QLi_GPR_WGCNA/041223.regen.fig5plots_data/2023_12_06_5perc.gprot.corscores.csv")
+
+# map to proteins significant in each of the groups
+prots.oi <- mss.out[Label %in% contrasts.oi & adj < 0.001 & abs(log2FC) > 0.58, Protein]
+
+g <- ggvenn(list('Gq/G11' = sec.perc[GProtein == 'Gq/G11',unique(gene)],
+                   'Gi/Go' =  sec.perc[GProtein == 'Gi/Go',unique(gene)],
+                   'Gs'    =  sec.perc[GProtein == 'Gs',unique(gene)],
+                   'MRX2 ZC YM+/- \n50% FC & 0.05 adj.pval' = mss.out[Label %in% contrasts.oi & sig != 'not',unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 1.8
+       )
+     
+BackupAsPDF(g, '2ndperc.allgprots.sig.adj.pval.venn.')    
+
+
+g <- ggvenn(list('Gq/G11' = sec.perc[GProtein == 'Gq/G11',unique(gene)],
+                  `MRX2 ZC YM+/- \n50% FC & 0.05 adj.pval` = mss.out[Label %in% contrasts.oi & sig != 'not',unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+
+BackupAsPDF(g, '2ndperc.gqg11.sig.adj.pval.venn.')  
+
+
+# look at the 4 sets for up and down
+
+
+g <- ggvenn(list('Gq/G11\nneg cor' = sec.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                 'Gq/G11\npos cor' = sec.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                 'MRX2 ZC YM+/- \nupreg & 0.05 adj.pval' = mss.out[Label %in% contrasts.oi & sig == 'up', unique(gene)],
+                 'MRX2 ZC YM+/- \ndownreg & 0.05 adj.pval' = mss.out[Label %in% contrasts.oi & sig == 'down', unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+
+BackupAsPDF(g, '2ndperc.gqg11.sigbreakdown.adj.pval.venn.')  
+```
+extract the hits from the overlapping sites
+
+```{r}
+# all overlaps
+all.gq.g11.overlaps <- intersect(sec.perc[GProtein == 'Gq/G11',unique(gene)], mss.out[Label %in% contrasts.oi & sig != 'not',unique(gene)])
+all.gq.g11.overlaps.dt <- data.table(gene=all.gq.g11.overlaps, setname='Gq/G11.98th&2nd.percentile__ZC[05/10]_YM-ZC[05/10].padj.0.05')
+
+
+# get the interesting intersections
+up.gq.g11.downDE <- intersect(sec.perc[GProtein == 'Gq/G11' & R > 0, unique(gene)], mss.out[Label %in% contrasts.oi & sig == 'down',unique(gene)])
+down.gq.g11.upDE <- intersect(sec.perc[GProtein == 'Gq/G11' & R < 0, unique(gene)], mss.out[Label %in% contrasts.oi & sig == 'up',unique(gene)])
+down.gq.g11.upDE.DT <-  data.table(gene=down.gq.g11.upDE, setname='Gq/G11.98th&2nd.percentile.negCor__ZC[05/10]_YM-ZC[05/10].upReg.padj.0.05')
+up.gq.g11.downDE.DT <-  data.table(gene=up.gq.g11.downDE, setname='Gq/G11.98th&2nd.percentile.posCor__ZC[05/10]_YM-ZC[05/10].negReg.padj.0.05')
+
+
+allDT <- rbind(up.gq.g11.downDE.DT, down.gq.g11.upDE.DT, all.gq.g11.overlaps.dt)
+fwrite(allDT, ScriptAndDatedFileName('2nd.5th.percentile.gq.g11.MRX2.ZC.YM.padj.overlaps.'))
+```
+repeat with 'looser' threshold; pval < 0.001 on DE genes and 5th and 95th percentile and extract the hits
+
+```{r}
+mss.out[, sig := 'not']
+mss.out[abs(log2FC) > 0.58 & pvalue < 0.001, sig := ifelse(log2FC > 0, 'up', 'down')]
+```
+
+The overlap % is reduced, not really worth looking in more depth
+
+```{r}
+g <- ggvenn(list('Gq/G11' = fifth.perc[GProtein == 'Gq/G11',unique(gene)],
+                  `MRX2 ZC YM+/- \n50% FC & 0.001 pval` = mss.out[Label %in% contrasts.oi & sig != 'not',unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+
+BackupAsPDF(g, '5thperc.gqg11.sig.pval.0.001.venn.')  
+
+```
+9 & 6 rather than 6 and 4... less enriched for hits; think proceed with 2 and 98 percentile
+
+```{r}
+g <- ggvenn(list('Gq/G11\nneg cor' = fifth.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                 'Gq/G11\npos cor' = fifth.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                 'MRX2 ZC YM+/- \nupreg & 0.001 pval' = mss.out[Label %in% contrasts.oi & sig == 'up', unique(gene)],
+                 'MRX2 ZC YM+/- \ndownreg & 0.001 pval' = mss.out[Label %in% contrasts.oi & sig == 'down', unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+
+BackupAsPDF(g, '5htperc.gqg11.sigbreakdown.pval.0.001.venn.')  
+```
+
+extract the enriched groups
+
+```{r}
+# all overlaps
+all.gq.g11.overlaps <- intersect(fifth.perc[GProtein == 'Gq/G11',unique(gene)], mss.out[Label %in% contrasts.oi & sig != 'not',unique(gene)])
+all.gq.g11.overlaps.dt <- data.table(gene=all.gq.g11.overlaps, setname='Gq/G11.95th&5th.percentile__ZC[05/10]_YM-ZC[05/10].pval.0.001')
+
+
+# get the interesting intersections
+up.gq.g11.downDE <- intersect(fifth.perc[GProtein == 'Gq/G11' & R > 0, unique(gene)], mss.out[Label %in% contrasts.oi & sig == 'down',unique(gene)])
+down.gq.g11.upDE <- intersect(fifth.perc[GProtein == 'Gq/G11' & R < 0, unique(gene)], mss.out[Label %in% contrasts.oi & sig == 'up',unique(gene)])
+down.gq.g11.upDE.DT <-  data.table(gene=down.gq.g11.upDE, setname='Gq/G11.95th&5th.percentile.negCor__ZC[05/10]_YM-ZC[05/10].upReg.pval.0.001')
+up.gq.g11.downDE.DT <-  data.table(gene=up.gq.g11.downDE, setname='Gq/G11.95th&5th.percentile.posCor__ZC[05/10]_YM-ZC[05/10].negReg.pval.0.001')
+
+
+allDT <- rbind(up.gq.g11.downDE.DT, down.gq.g11.upDE.DT, all.gq.g11.overlaps.dt)
+fwrite(allDT, ScriptAndDatedFileName('5th.95th.percentile.gq.g11.MRX2.ZC.YM.pval.0.001.overlaps.'))
+```
+

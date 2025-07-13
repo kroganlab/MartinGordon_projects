@@ -1,0 +1,915 @@
+---
+title: "kenrichment_tool"
+author: "Martin Gordon"
+date: "2023-07-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+TODO
+
+16/08/23
+Wary of inflating significance; maybe do the sig gene counting after filtering for sites not in DB? larger denominator than expected? prob adjust
+Wrapper to split each contrast and run function on each (necessary? maybe just loop through the contrasts and plot for each. Not urgent atm
+Heatmap of the enrichment results
+
+14/08/23
+String match using Bens code as template
+multi-ph sites: split sites and take single. Replicate with the script used to process msout data
+
+08/08/23
+match by string rather than prot name
+Lapply for multiple contrasts
+heatmap plotting function
+add kinase type info to the db file?
+mlutiple testing? currently correcting per contrast (n=606, up & down together); correct per kinase instead (up and down seperately)
+Considering sites that are both up and down reg?
+
+Find discrepancies in counts in app and our code; numerators different although sig hits the same, but less counts in our data... more sites available on website? 
+-  match by AA sequence rather than uniprot_site combo? maybe more sensitive and seems to be how app works..
+
+
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(readxl)
+library(ggrepel)
+
+
+# load bens util scripts for the analysis
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+source ("../..//utils/bp_utils/MSstats_Helper_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/KinaseActivityScores.R")
+
+# script with enrichment functions., plots etc.
+source ("../../utils/mg_utils/HelperFunctions.R")
+```
+
+
+## Convert the tool for kinase enrichment analysis from Pyhton to R
+
+Tool available here: https://kinase-library.phosphosite.org/ea?a=de
+Goal is to run this in-house per contrast/label 
+TODO: annotate with kinase group information? We also don't distinguish from S/Th vs Tyrosine enrichment.. maybe include gorup. info They only considet the S/Thr set
+
+General workflow:
+Score all sites for all kinases (think this is complete) - For scoring substrates, the values of the corresponding amino acids in the corresponding positions were multiplied and scaled by the probability of a random peptide (Supplementary Note 2)
+
+1) categorize phosphosites in MS data as  up,down,not-regulated based on log2FC & adj.pval (define our standard threshodls)
+2) Find top 15 predicted kinases per site based on percentile
+3) Per kinase, compare the number of times it appears in up-regulated prediction set vs non-regulated prediction
+set using 
+3a) one-sided Fisher’s exact test for a p value. (Repeat for down-regulated vs non-regulated)
+3b) Calculate frequency factors (or log odds ratio)
+4) Adjust p.values based on number of kinases
+
+Input data?
+Based on our other enrichment results we would want the output of the FC estimates per site per contrast (controlling for abundance? Basically a subtraction of AB from the PH)
+cols: site, protein, log2FC, pval
+
+For testing, take a  subset of the AViDD PH dataset (significant results for one contrast)
+
+
+```{r}
+
+# for now just take 50 
+mss.ph <- fread('/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_msstats_groupcomparisons.csv.gz') %>% 
+  .[Label %chin% c('WT+ vs EV+', 'WT+ vs N10t20+') & abs(log2FC) > log2(1.5) & adj.pvalue < 0.05 & !issue %like% 'Condition' ]
+
+test.ph <- fread('/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_msstats_groupcomparisons.csv.gz') %>% 
+  .[Label %chin% c('WT+ vs EV+'),]
+  #.[Label %chin% c('WT+ vs EV+') & abs(log2FC) > log2(1.5) & adj.pvalue < 0.05 & !issue %like% 'Condition' ] %>% 
+  #.[1:20,] # rem any rows with condition issues
+
+
+```
+
+Look at the DB file:
+Alphabetically ordered for each protein based on UNIPROT ID, phosphosite
+Gives the sequence for each site where it is phosphorylated; take just the rank 1:15 %between% data.table function
+
+To do:
+- format the input file from our log2 test [protein, site, log2FC, pval, adj.pval]
+
+
+test the tool by first creating a file format we need:
+merge the contrast table with the PH id/count table (need to create this first)
+
+```{r }
+#function to read in keys and spec file overwrite spec Condition and BioReplicate cols with keys file values
+preprocessSpec <- function(spec_f,keys_f){
+
+  #fread stores as data.table by default
+  spec <- fread(spec_f)
+  keys <- fread(keys_f)
+
+  # apply Condition, BioReplicate from keys to spec
+  spec[keys , Condition := i.Condition , on = c(Run = "RawFile")] #overwrite condition col w values from keys file, match run col in spec to rawfile col in keys
+  spec[keys , BioeReplicate := i.BioReplicate , on = c(Run = "RawFile")]
+  
+  return(spec)
+  setnames(spec) = dat_name
+}
+```
+
+
+```{r load-data}
+
+specs <- '/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/data/MSstats_PH.txt'
+keys <- '/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/data/keys.txt'
+
+spec <- preprocessSpec(specs,keys)
+
+```
+
+Check each biorep has a unique identifier for MSstats processing
+```{r}
+#remove keys biorep column
+spec[,10] <- NULL
+spec[,.N, by=.(Condition)]
+spec[, .N, by=.(Condition,BioReplicate)]
+```
+
+Remove likely artifacts
+
+```{r}
+
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram(bins = 100)
+
+spec <- spec[log2(Intensity) >5,]
+
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram(bins = 100)
+
+```
+Confirm that each detected peptide occurs once per run/charge
+False indicates each peptide detected only once per run
+```{r n-ids}
+any(spec[, .N, by=.(PeptideSequence,PrecursorCharge,Run)]$N) > 1
+```
+
+No fasta file specified, so just run with the canonical list of UNIProt proteins prepared by Ben & available on the Krogan github
+
+```{r}
+#function belwo takes path to fasta reference
+fasta <- '/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/data/human_all_proteins_canonical_uniprot-proteome_UP000005640.fasta.gz'
+
+spec.ph <- sitifyProteins_SpectronautFile(spec, fastaFile = fasta, site = "PH") 
+
+#fwrite(spec.ph, './data/spec.ph.csv.gz')
+
+```
+
+Output for the tool: 
+For each kinase; it outputs the name, its group , n upregualted sites in the data, n downregulatd sites in the data, background set sites(??), dominant set (upreg/downreg), log2 enrihcment val, p-val, adj-pval
+
+Questions:
+- Not all our PH sites are in the kinase db? How likely are FP hits in data we generate?
+- multi sites per line, duplicate lines or is this double counting? For simplicity, remove multi PH sites per peptide. Other options? Split each site on (tstrsplit), duplicate rows per site, take one site? If dupliating and multiple peptides, take most significant, or avg of the peptide?
+- Need to handle different contrasts also!!! lapply, but for now just keep simple until running
+
+
+Prepare kinase DB for function use
+Top 15 based on percentile (use second approach to break ties)
+(top 15 based on percentile below..)
+
+I think I have to match the sites...
+
+```{r}
+#kinase.db <- data.table(read_xlsx('./docs/kinase.scores.xlsx', sheet=2))
+#kinase.db[,Protein.Site := paste0(`Uniprot Primary Accession`,'_',Phosphosite)]
+
+#neworder <- c(1:8,620,9:619)
+
+#setcolorder(kinase.db,neworder)
+
+#head(kinase.db)
+
+# write out this file to somewhere 
+#fwrite(kinase.db, '~/Documents/utils/mg_utils/data/kinase.scores.csv.gz')
+
+kinase.db <- fread('~/Documents/utils/mg_utils/data/kinase.scores.csv.gz')
+
+# drop unnecessary cols form kinase.db for now; just keep IDs, kinase_ranks
+
+cols.noi <- c('Database Uniprot Accession', 'Uniprot Entry','Gene', 'Alternative Gene Names', 'Protein',
+              'Description', 'Phosphosite', "median_percentile","promiscuity_index",'SITE_+/-7_AA','Kinase','Database', 'phos_res', grep("*rank*",colnames(kinase.db), value=TRUE))
+kinase.db <- kinase.db[, !..cols.noi]
+
+kinase.db <- melt(kinase.db, id.vars = c('Uniprot Primary Accession','Protein.Site'))
+
+colnames(kinase.db) <- c('Uniprot', 'Protein.Site', 'Kinase', 'Percentile')
+kinase.db[, Kinase := sub('_percentile', '', Kinase)]
+
+
+#write out all kinase percentile scores
+kinase.db <- fread('~/Documents/utils/mg_utils/data/kinase.percentiles.long.csv.gz')
+
+#enriched kinases -top 15 per site
+# fixed as based on available DB
+
+kinase.db.prc <- kinase.db %>% 
+  .[order(Protein.Site,-Percentile),] %>% 
+  .[, head(.SD, 15), by = Protein.Site] %>% 
+  .[,.(Protein.Site,Kinase,Percentile)]
+
+#fwrite(kinase.db.prc, '~/Documents/utils/mg_utils/data/kinase.percentile.top15.long.csv.gz')
+
+
+kinase.db[, unique(Kinase)]
+# go with this
+prc.scores.long <- fread('~/Documents/utils/mg_utils/data/kinase.percentile.top15.long.csv.gz')
+
+
+
+#kinase.db <- fread('~/Documents/utils/mg_utils/data/kinase.scores.long.csv.gz')
+
+#top 15 per site
+prc.scores.long[, .N, by=Protein.Site] %>% 
+  .[N != 15,]
+      
+
+#some 606 per site; duplicate uniprot Ids...
+#need to go by site, but write the app first
+kinase.db[, .N, by=Protein.Site] %>% 
+  .[N!= 303,]
+
+```
+
+1) categorize phosphosites in MS data as up,down, not-regulated based on log2FC & adj.pval
+Our thresholds: log2FC > 0.58, adj p.val < 0.05
+
+```{r}
+## lets read in the raw data for this
+mss.ph <- fread('/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_msstats_groupcomparisons.csv.gz') 
+
+test.ph <- mss.ph %>% 
+  #.[Label %chin% c('WT+ vs EV+', 'WT+ vs N10t20+') & abs(log2FC) > log2(1.5) & adj.pvalue < 0.05 & !issue %like% 'Condition' ] %>% 
+  .[Label %chin% c('WT+ vs EV+') & issue == '',] %>%
+  .[ Protein %like% "_" & !Protein %like% ';' ,] #keep only sites with mods and rem multi-uniprots brings to 10954 when removing stuff
+  #.[1:10000,] # rem any rows with condition issues
+
+#classify sites (set pval = 1 as not looking at p-val threshold)
+class.ph <- classifySites(test.ph, log2FC = 0.58, pval = 0.05)
+```
+
+2) Identify biochemically favoured sites
+Like paper only looking at singly phosphorylated peptides (multi-ph dropped) * create warning for how many are dropped
+Find the top 15 kinases per site based on percentile (should we use score this looks to find top candidates per substrate?? I think percentile looka)
+
+Want warning message like this: baiscally break up sites into not reg upreg and down reg
+8% (121 out of 1442) upregulated sites are invalid
+26% (167 out of 635) downregulated sites are invalid
+21% (2807 out of 13287) background sites are invalid
+
+Merge sig and kinase.db site info
+
+Not filtering for sites only in DB at moment as not done by algorithm.. maybe an issue as increasing the denominator..
+We also don't distinguish from S/Th vs Tyrosine enrichment..
+
+```{r}
+#top15 kinases per all site in DB; give same results in most cases...
+kinase.db <- fread('~/Documents/utils/mg_utils/data/kinase.prc.scores.long.csv.gz') #percentiles
+#kinase.db <- fread('~/Documents/utils/mg_utils/data/kinase.ranks.long.csv.gz') #ranks 
+
+# calculate set size - NOT adjusting only for proteins present in kinase DB.. ask Ben
+# this has all counts of sig sites in the data 
+# add to classify sites
+class.ph[, `:=`(upregulated_set_size   = sum(sig == 'Up'),
+                downregulated_set_size = sum(sig == 'Down'),
+                background_set_size    = sum(sig == 'Not'))]
+
+#keep only those in DB... dropping multi-PH sites
+message('dropping multisites as not present in DB...')
+
+mapper <- kinase.db[Protein.Site %in% class.ph$Protein,] %>% 
+  .[order(Protein.Site)]
+
+# sanity check.. Y when we use rank as there are ties
+any(mapper[, .N, by=.(Protein.Site)]$N != 15)
+
+# check loss of sites
+start.sites <- class.ph[, .N,by=Protein] %>% nrow()
+end.sites <- mapper[, .N, by=.(Protein.Site)] %>% nrow()
+
+sprintf("% s of % s sites detected in kinase DB. This function does not currently handle multi-phosphorlyated peptides. Continuing... ", end.sites, start.sites) 
+# TODO break down discarded sites
+#maybe include a list of PH sites not analysed ( and seperately the multisites; print to screen as error msg.)
+
+
+message('merging...')
+# merge exp data each site; top 15 kinases per site
+# good; 15 kinases per site in data
+mapper[class.ph, `:=`(sig = sig, 
+                   upregulated_set_size = upregulated_set_size, 
+                   downregulated_set_size = downregulated_set_size,
+                   background_set_size = background_set_size), on=c(Protein.Site = "Protein")] %>% 
+  .[order(Protein.Site,-Percentile)]
+
+```
+
+
+3) Per kinase, compare the number of times it appears in up-regulated prediction set vs unregulated prediction
+
+```{r}
+# group by kinase, count breakdown
+cont.tab <-   mapper[, `:=`(upregulated_set_hits   = sum(sig == 'Up'),
+                            downregulated_set_hits = sum(sig == 'Down'), 
+                            background_set_hits    = sum(sig == 'Not')), by=.(Kinase)] %>%
+  .[, dominant_direction := ifelse(upregulated_set_hits > downregulated_set_hits, 'up', 'down')] %>% 
+  .[order(Kinase), .(Kinase,upregulated_set_hits,upregulated_set_size,
+                     downregulated_set_hits,downregulated_set_size,
+                     background_set_hits,background_set_size, dominant_direction)] %>% unique() #not sure if this is v tidy...
+
+cont.tab[order(Kinase)] %>% head()
+app.out[order(kinase)] %>% head()
+
+
+cont.tab
+```
+3a) one-sided Fisher’s exact test for a p value. (Repeat for down-regulated vs non-regulated) (or log odds ratio)
+- Do Fishers Exact Test & extract log odds ratio (frequency factors maybe)
+
+```{r}
+
+cont.tab
+
+# test this function
+# fisher test on each row
+#               outcome
+#              +       -
+#          +-------+-------+
+#        + |   a   |   b   | a + b
+#  group   +-------+-------+
+#        - |   c   |   d   | c + d
+#          +-------+-------+
+#            a + c   b + d
+#
+
+row_fisher <- function(counts.tab, countCols = c('upregulated_set_hits','upregulated_set_size','background_set_hits','background_set_size'), # cols to use to create matrix - c(a,b,c,d) ORDER IMPORTANT! See diagram above
+                       direction = 'up', return.OR = TRUE,
+                       alt = 'greater', cnf = 0.95) {
+  
+  mat <- matrix(as.numeric(counts.tab[countCols]), ncol=2, byrow=T)
+  
+  f <- fisher.test(mat, alternative = alt, conf.level = cnf)
+  
+  if (return.OR == TRUE) {
+    return(c(counts.tab,
+          assign(paste0(direction, pvalue)) = f$p.value,
+          odds.ratio = f$estimate[[1]],
+          or.lower = f$conf.int[1],
+          or.upper = f$conf.int[2]))
+  } else {
+    return(c(counts.tab,
+          pval = f$p.value))
+  }
+}
+
+
+
+
+out <- t(apply(cont.tab, 1, row_fisher, return.OR = F))
+cont.tab
+
+
+ftest.out <- rbindlist(apply(cont.tab, 1, 
+      function(x){
+          
+           up.ft <- fisher.test(matrix(as.numeric(x[c('upregulated_set_hits','upregulated_set_size','background_set_hits','background_set_size')]), ncol=2, byrow=T),
+                       alternative='greater')
+           
+           up.x <- data.table(Kinase    = x['Kinase'],
+                              test       = 'up',
+                              odds.ratio = up.ft$estimate,
+                              pval       = up.ft$p.value)
+                           
+           down.ft <- fisher.test(matrix(as.numeric(x[c('downregulated_set_hits','downregulated_set_size','background_set_hits','background_set_size')]), ncol=2, byrow=T),
+                        alternative='greater')
+           
+           down.x <- data.table(Kinase = x['Kinase'],
+                              test       = 'down',
+                              odds.ratio = (down.ft$estimate),
+                              pval       = down.ft$p.value)
+           
+           x <- rbind(up.x, down.x)
+           x[, adj.pval := p.adjust(pval, method='BH')] # correction for n=606 tests
+
+           return(x)
+           }))
+
+```
+
+
+3b) merge DFs & calculate frequency factors & odds ratio
+
+```{r}
+ftest.out <- ftest.out[cont.tab, on=c(Kinase = 'Kinase')] %>%
+  #.[test == dominant_direction,] %>% # only keep dominant direction data
+  .[, `:=`(frequency_factor = ifelse(test == 'up', upregulated_set_hits/background_set_hits, downregulated_set_hits/background_set_hits),
+           odds_ratio       = ifelse(test == 'up', (upregulated_set_hits/upregulated_set_size)/(background_set_hits/background_set_size),
+                                     (downregulated_set_hits/downregulated_set_size)/(background_set_hits/background_set_size)) )]
+
+```
+
+
+Plot to inspect the results
+Plot upregulated sites, plot downregulated sites and plot volcano
+Generate a volcano plot of the significant results
+````{r}
+
+ftest.out[,sig := fcase(
+  adj.pval > 0.05, 'not',
+  adj.pval < 0.05 & frequency_factor > 0, 'up',
+  adj.pval < 0.05 & frequency_factor < 0, 'down'
+)]
+
+ggplot(ftest.out[dominant_direction == test,], aes(x=log2(frequency_factor), y=-log10(adj.pval))) +
+  geom_point(aes(color=sig)) +
+  geom_hline(yintercept = -log10(0.05), linetype="dotdash", alpha=0.4) +
+  geom_vline(xintercept = c(-0.58, 0.58), linetype="dotdash", alpha=0.4) +
+  geom_text_repel(aes(label=Kinase), size=3) +
+  theme_classic() +
+  coord_cartesian()
+
+```
+
+
+
+
+Structure below: kinase as explanatory variable
+
+            up-reg not-reg
+            ------ --------
+kinaseA
+All
+
+
+Difference in how we compare hits; they basically take count of all sig up and sig down regules
+Hits v size?? maybe try their way and see if we reocver same results; sig below right but background hits will be up + down and N for both will be all background
+
+k.up and k.down the same, but background up is sum N when sig != 'up'
+
+
+3a) one-sided Fisher’s exact test for a p value. (Repeat for down-regulated vs non-regulated) (or log odds ratio)
+- Do Fishers Exact Test
+
+I think makes more sense here to wirte a function to perform fishers exact test and simplify an output and add a id col ('up' or 'down'), fdr correction, then rbind the two dfs 
+Then group_by kinase, and check which direction is larger
+
+merge info from the count table; use this information to calculate the odds ratio (think FET uses MLE to estimate, so not the same..)
+
+
+Steps
+Compared the percentage of phosphorylation sites for which each kinase was predicted among the upregulated/downregulated (increased/decreased, respectively) phosphorylation sites (sites with |log2[fold change]| equal or greater than the log[fold change] threshold), versus the percentage of biochemically favoured phosphorylation sites for that kinase within the set of unregulated (unchanged) sites in this study (sites with |log2[fold change]| less than the log[fold change] threshold). 
+
+
+
+The log-transformed fold change threshold was determined to be 1.5 for all panels in Fig. 4, except for Fig. 4e, in which the threshold was set to 0.5 owing to the low range of the log[fold change] in the data. Contingency tables were corrected using Haldane correction (adding 0.5 to the cases with zero in one of the counts). Statistical significance was determined using one-sided Fisher’s exact tests, and the corresponding P values were adjusted using the Benjamini–Hochberg procedure. Kinases that were significantly enriched (adjusted P ≤ 0.1), or depleted (log2[frequency factor] < 0) for both upregulated and downregulated analysis were excluded from downstream analysis. Then, for every kinase, the most significant enrichment side (upregulated or downregulated) was selected on the basis of the adjusted P value and presented in the volcano plots
+
+DB Prep Stuff..
+-----
+
+Taking top 15 ranked.. ties an issue so go with percentile..
+```{r}
+kinase.db <- fread('~/Documents/utils/mg_utils/data/kinase.scores.long.csv.gz')
+
+#kinase.db <- kinase.db %>% 
+#  .[Rank %between% c(1,15), .(Kinase,Rank), by=Protein.Site] %>% 
+#  .[order(Protein.Site,Rank),]
+
+
+#fwrite(kinase.rk.db, '~/Documents/utils/mg_utils/data/kinase.ranks.long.csv.gz')
+```
+
+testing fishers exact test 
+```{r}
+FisherbyRow <- function(counts.tab,          # cols below to use to create matrix - c(a,b,c,d) ORDER IMPORTANT! See diagram above
+                        countCols = c('upregulated_set_hits','upregulated_set_size','background_set_hits','background_set_size'),
+                        return.OR = TRUE,
+                        alt = 'greater',
+                        cnf = 0.95) {
+  
+  mat <- matrix(as.numeric(counts.tab[countCols]), ncol=2, byrow=T)
+  
+  f <- fisher.test(mat, alternative = alt, conf.level = cnf)
+  
+  if (return.OR == TRUE) {
+    return(c(counts.tab,
+             pval = f$p.value,
+             odds.ratio = f$estimate[[1]],
+             or.lower = f$conf.int[1],
+             or.upper = f$conf.int[2]))
+  } else {
+    return(c(counts.tab,
+             pval = f$p.value))
+  }
+}
+
+
+```
+
+
+## Testing function
+# now recovering about 150 more when using aa rather than site so replace (add info to script), but are these correctly added?
+# how to improve? look through the ones we dropped; are they in the database? proteins are but the ph site is different... do we allow error tolerant matchin?
+
+
+```{r test-functions}
+out <- kinaseEnrichmentonMSSResults(test.ph, top.sites = 15)
+kinaseEnrichmentVolcano(out, pvalCol = 'adj.pval', plot_dominant_only = T)
+
+```
+
+
+## Updates
+
+Testing splitting multi-ph sites to one per line
+
+```{r}
+test <- test.ph
+
+# create new row for each single ph site
+t <- test[, .(Label, log2FC, pvalue, adj.pvalue, singProtein = unlist(strsplit(Protein, ";"))), by=.(Protein)] %>% 
+  .[, .SD[which.max(abs(log2FC))], by=singProtein] %>% 
+  .[, Protein := singProtein] %>% 
+  .[, singProtein := NULL]
+
+t
+
+expandMultiPtmSites <- function(dt, cols=c()){
+  
+  dt
+  
+  
+}
+  
+          lapply (unique) %>% #removes any duplicate elements in list
+          lapply (paste, collapse = ";") %>% #colapses back to unique prot names
+          unlist]
+
+
+test
+unlist(strsplit(test$Protein,";"))
+```
+
+
+Idnetify site and merge on peptide string matching rather than uniprot+site.pos
+Losing approx 10% of our data using our method, so modify to mirror app approach; expand size size of flanking region to match substr?
+
+First; read in our data, merge with spec to recover ph site and simplify string (remove mods)
+
+```{r updates}
+# read in test data 
+## lets read in the raw data for this
+mss.ph <- fread('/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_msstats_groupcomparisons.csv.gz') 
+
+test.ph <- mss.ph %>% 
+  #.[Label %chin% c('WT+ vs EV+', 'WT+ vs N10t20+') & abs(log2FC) > log2(1.5) & adj.pvalue < 0.05 & !issue %like% 'Condition' ] %>% 
+  .[Label %chin% c('WT+ vs EV+'),]
+ # .[ Protein %like% "_" & !Protein %like% ';' ,] #
+
+#write function to string match the kinase DB and our sites
+
+#fix error...
+test <- preparePHplusTable(test.ph, spec.f = spec.ph)
+test.ph
+
+View(test)
+```
+read in kinase db with AA string info
+
+```{r}
+kinase.db <- fread('~/Documents/utils/mg_utils/data/kinase.scores.csv.gz')
+colnames(kinase.db)
+# drop unnecessary cols form kinase.db for now; just keep IDs, kinase_ranks
+
+cols.noi <- c('Database Uniprot Accession', 'Uniprot Entry','Gene', 'Alternative Gene Names', 'Protein',
+              'Description', 'Phosphosite', "median_percentile","promiscuity_index",'Kinase','Database', 'phos_res', grep("*rank*",colnames(kinase.db), value=TRUE))
+kinase.db <- kinase.db[, !..cols.noi]
+
+
+kinase.db <- melt(kinase.db, id.vars = c('Uniprot Primary Accession','Protein.Site','SITE_+/-7_AA'))
+
+head(kinase.db)
+colnames(kinase.db) <- c('Uniprot', 'Protein.Site', 'Neg7_Site_Pos7', 'Kinase', 'Percentile')
+kinase.db[, Kinase := sub('_percentile', '', Kinase)]
+
+
+#not neecded
+#kinase.db[, site := gsub("^(.{8})(.*)$", "\\1(ph)\\2", 'SITE_+/-7_AA')] # insert ph at phosphorylated site
+
+# write out all kinase results
+#fwrite(kinase.db,'~/Documents/utils/mg_utils/data/kinase.percentiles.sites.long.csv.gz')
+
+head(kinase.db)
+## not needed....
+
+#kinase.db
+#write out all kinase percentile scores
+kinase.db <- fread('~/Documents/utils/mg_utils/data/kinase.percentiles.sites.long.csv.gz')
+head(kinase.db)
+#enriched kinases -top 15 per site
+# fixed as based on available DB
+
+#kinase.db.prc <- kinase.db %>% 
+#  .[order(Protein.Site,-Percentile),] %>% 
+#  .[, head(.SD, 15), by = Protein.Site] %>% 
+#  .[,.(Protein.Site,Kinase,Percentile)]
+
+
+```
+
+Read in the kinase DB and perform string mathching
+First we need to acquire a similar site info based on 
+
+Don't think I need spec.ph; if I have uniprot and site I can extract the sequence
+
+```{r}
+# read in test data 
+## lets read in the raw data for this
+mss.ph <- fread('/Users/martingordon/Documents/projects/060123_DSwaney_AshworthPH/060123_DSwaney_AshworthPH_data/2023_06_01_msstats_groupcomparisons.csv.gz') 
+
+test.ph <- mss.ph %>% 
+  #.[Label %chin% c('WT+ vs EV+', 'WT+ vs N10t20+') & abs(log2FC) > log2(1.5) & adj.pvalue < 0.05 & !issue %like% 'Condition' ] %>% 
+  .[Label %chin% c('WT+ vs EV+'),] %>% 
+  .[ Protein %like% "_" & !Protein %like% ';' ,] #
+
+spec.ph <- fread('./data/spec.ph.csv.gz')
+
+
+# split the sites
+test.ph[, c("Uniprot","Site") := tstrsplit(Protein, "_")]
+test.ph[, pos := as.numeric(sub("^[STY]{1}", "", Site))]
+
+# lod uniprot mapping
+uniprots <- loadUniprots(test.ph$Uniprot, fastaFile = "~/Documents/utils/mg_utils/data/human_all_proteins_canonical_uniprot-proteome_UP000005640.fasta.gz")
+
+# match on our msout file
+test.ph[uniprots, sequence := i.sequence, on=c(Uniprot = 'uniprot')]
+
+# create a matching sequence for the uniprots
+test.ph[, `:=`(aa.lflank = substr(sequence, pos-7, pos-1),
+               aa.rflank = substr(sequence, pos+1, pos+7) )]
+
+test.ph[, `:=`(aa.lflank = sapply(aa.lflank, FUN = function(x) addFlankingSites(x, n.char=7, char='_', side='left')),
+               aa.rflank = sapply(aa.rflank, FUN = function(x) addFlankingSites(x, n.char=7, char='_', side='right')) )]
+
+
+# create the character vector
+test.ph[, ph.pos.aa.flank := paste0(aa.lflank, gsub('[0-9]+', '', Site), aa.rflank, sep='')]
+
+
+test <- classifySites(test.ph)
+
+# using uniprot ID and reference fasta file, extract flanking sequences (7 n characters default)
+getFlankingSequence <- function(spec.f, 
+                                fastaFile = "~/Documents/utils/mg_utils/data/human_all_proteins_canonical_uniprot-proteome_UP000005640.fasta.gz", 
+                                n.char=7){
+  
+  #get site uniprot id
+  spec.f[, c("Uniprot","Site") := tstrsplit(Protein, "_")]
+  spec.f[, pos := as.numeric(sub("^[STY]{1}", "", Site))]
+  
+  uniprots <- loadUniprots(spec.f$Uniprot, fastaFile = "~/Documents/utils/mg_utils/data/human_all_proteins_canonical_uniprot-proteome_UP000005640.fasta.gz")
+  
+  # match on our msout file
+  spec.f[uniprots, sequence := i.sequence, on=c(Uniprot = 'uniprot')]
+  
+  # create a matching sequence for the uniprots
+  spec.f[, `:=`(aa.lflank = substr(sequence, pos-n.char, pos-1),
+                aa.rflank = substr(sequence, pos+1, pos+n.char) )]
+  # add flanking char for shoter sequences
+  spec.f[, `:=`(aa.lflank = sapply(aa.lflank, FUN = function(x) addFlankingSites(x, n.char=n.char, char='_', side='left')),
+                aa.rflank = sapply(aa.rflank, FUN = function(x) addFlankingSites(x, n.char=n.char, char='_', side='right')) )]
+  
+  # concatenate flanking seqs and site
+  spec.f[, neg7_ph_pos7 := paste0(aa.lflank, gsub('[0-9]+', '', Site), aa.rflank, sep='')]
+  
+  message("Checking ph sites...")
+  if (any(!spec.f[, substring(neg7_ph_pos7,8,8)] %in% c('S','T','Y'))){
+    stop(paste0("Error; wrong aa residue phosphorylated. Exiting.."))} else {
+      message('Check complete')
+    }
+  
+  return(spec.f[, .(Label, Protein, neg7_ph_pos7, sig)])
+}
+
+test <- getFlankingSequence(test, fastaFile = "~/Documents/utils/mg_utils/data/human_all_proteins_canonical_uniprot-proteome_UP000005640.fasta.gz")
+
+#sanity check
+any(!test[, substring(neg7_ph_pos7,8,8)] %in% c('S','T','Y'))
+
+```
+
+Combine our sites with the kinase.db
+
+```{r}
+kinase.raw <- fread('~/Documents/utils/mg_utils/data/kinase.scores.csv.gz')
+kinase.raw[`Database Uniprot Accession`  ==  'Q8IWC1',] %>%  .[order(Phosphosite)]
+colnames(kinase.raw)
+
+Q9UIF9_S137, Q9ULL5_S915, Q8IWC1_S429
+
+kinase.db <- fread('~/Documents/utils/mg_utils/data/kinase.percentiles.sites.long.csv.gz')
+head(kinase.db)
+
+top.kinases <- kinase.db %>% 
+    .[order(Protein.Site,-Percentile),] %>% 
+    .[, head(.SD, 15), by = Protein.Site] %>% #select n kinases per site
+    .[,.(Protein.Site,Neg7_Site_Pos7,Kinase,Percentile)]
+
+#keep only those in DB... dropping multi-PH sites
+message('dropping multisites as not present in DB...')
+
+
+mapper <- top.kinases[test, ,on = c("Protein.Site" = "Protein")] %>% 
+  .[order(Protein.Site)]
+
+
+# sanity check.. Y when we use rank as there are ties
+mapper[, .N, by=.(Neg7_Site_Pos7)]$N
+
+# check loss of sites
+start.sites <- test[, .N,by=Protein] %>% nrow()
+end.sites <- mapper[, .N, by=.(Protein.Site)] %>% nrow()
+
+sprintf("% s of % s sites detected in kinase DB. This function does not currently handle multi-phosphorlyated peptides. Continuing... ", end.sites, start.sites) 
+# TODO break down discarded sites
+#maybe include a list of PH sites not analysed ( and seperately the multisites; print to screen as error msg.)
+
+
+message('merging...')
+# merge exp data each site; top 15 kinases per site
+# good; 15 kinases per site in data
+mapper[class.ph, `:=`(sig = sig, 
+                   upregulated_set_size = upregulated_set_size, 
+                   downregulated_set_size = downregulated_set_size,
+                   background_set_size = background_set_size), on=c(Protein.Site = "Protein")] %>% 
+  .[order(Protein.Site,-Percentile)]
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Not needed 
+-----
+
+Top hits for total data and subset 
+Discrepancies in the counts. More hits in the apps, although trends seem consistent
+```{r}
+app.out <- fread('./docs/enrichment-analysis-result-table.txt')
+
+head(app.out[order(kinase),])
+head(class.ph)
+
+app.sub.out <- fread('./docs/enrichment-analysis-result-table.subset.txt')
+
+app.sub.out[order(kinase)]
+```
+Create phosphosite per label for testing (output the same for both tools)
+Same input for app (processPHTable) & script
+
+```{r}
+test.ph <- mss.ph %>% 
+  #.[Label %chin% c('WT+ vs EV+', 'WT+ vs N10t20+') & abs(log2FC) > log2(1.5) & adj.pvalue < 0.05 & !issue %like% 'Condition' ] %>% 
+  .[Label %chin% c('WT+ vs EV+') & issue == '',] %>%
+  .[ Protein %like% "_" & !Protein %like% ';' ,] 
+
+# now fine as long as correct cols specified 
+DT <- processPHTable(test.ph,spec.ph, pvalCol = 'adj.pvalue')
+
+#fwrite(DT[, .(site,log2FC,pvalue)], './docs/kinase.enrich.test.tsv', sep = '\t')
+
+# test subset
+#fwrite(DT[1:2000, .(site,log2FC,pvalue)], './docs/kinase.enrich.test.subset.tsv', sep = '\t')
+
+sub.ph <- test.ph[1:2000,]
+```
+
+
+Lets look at the processed table to see if we can find the issue
+Work back;
+first identify number of upregulated sites(total)
+then number of upreg sites of a specific kinase (find the upreg sites and count N times that kinase is in top 15 -AAK1 for test)
+
+N uprg sites: 2168 (adj.pval) #for both DT and test
+Same number of upreg/downreg sites as our pipeline detected, seems the dataset may be different for app and ours
+
+Our counts look ok, so this may be an issue with our DB setup....
+not pval threshold.. investigate the output of app run, then subset dt used as input and we can find the error
+
+```{r}
+DT[ abs(log2FC) > log2(1.5),.N]
+up.sites <- sub.ph[adj.pvalue <= 0.05 & log2FC >= .58,]$Protein
+
+up.sites # 262 sites
+
+# now for the kinase.db, find out how many times AAK1 is in the top 15 for these
+kinase.db[Protein.Site %in% up.sites,]
+up.sites
+
+#this is our output.. so for AAK1 that was found in 220 of the upreg sites
+kinase.db.prc[Protein.Site %chin% up.sites & Kinase == 'AAK1',]  #& Per %between% c(1,15),.N]
+
+head(kinase.db)
+
+
+kinase.db[,.N, by=.(Protein.Site)] %>%  View()
+
+
+kinase.db.prc
+```
+
+No needed merging sites in the file to log2FC results...
+
+```{r}
+
+#split each; and unlist, for each combo of log2FC, pval, adj.pval etc
+# need to split by label!
+#test.ph[, .(Protein = unlist(tstrsplit(Protein, ";"))), by=.(Label, log2FC, pvalue, adj.pvalue, sig)]
+test.ph
+# for now just drop multi-labels - 7 sites in test
+test.ph <- test.ph[ !Protein %like% ';',]
+
+# merge exp data each site (303n per site, 1 per kinase)
+mapper <- kinase.db[test.ph, `:=`(log2FC     =    log2FC,
+                                  pvalue     =    pvalue,
+                                  sig        =    sig,
+                                  adj.pvalue = adj.pvalue), on=c(Protein.Site = "Protein")] %>% 
+  .[!is.na(log2FC),] %>%  #subset to sites only detected in our exp
+  .[order(Protein.Site)]
+
+#extract the top ranked 1-15 kinases (allow user to refine threshold as desired)
+# keep rows with top 15 sites
+mapper <- mapper[Rank %between% c(1,15), .(Kinase, Rank,log2FC,pvalue,adj.pvalue,sig), by=Protein.Site] %>% 
+  .[order(Protein.Site,Rank)]
+
+
+#extract the top ranked 1-15 kinases (allow user to refine threshold as desired)
+# keep rows with top 15 sites
+#top.n.K <- mapper[Rank %between% c(1,15), .(Kinase, Rank,log2FC,pvalue,adj.pvalue,sig), by=Protein.Site] %>% 
+ # .[order(Protein.Site,Rank)]
+
+
+###
+
+```
+
+counting frequencies 
+
+```{r}
+#%>% 
+#  .[, `:=`(upregulated_set_size   = sum(site.sig == 'Up'),
+           downregulated_set_size = sum(site.sig == 'Down'),
+           background_set_hits    = sum(site.sig != 'Not'),
+           background_set_size    = sum(site.sig == 'Not')), by=.(Protein.Site) ]
+
+ # .[, dominant_set := ifelse(k.up > k.down, 'up', 'down')] %>% 
+#  .[, `:=`(N = NULL,
+ #          sig = NULL)] %>% #drop unnecessary cols
+ # unique()
+
+cont.tab[Kinase == 'ZAK',]
+# when calculating their background correct odds ratio appears
+ # log2((17/1313)/(89/10280))
+
+
+counts <- cont.tab  <- top.n.K[, .N, by=.(Kinase,sig)] %>% 
+  .[, `:=`(k.up   = sum(N[sig == 'Up']),
+           k.down = sum(N[sig == 'Down'])
+           k.not  = sum(N[sig == 'Not'])), by=.(Kinase) ] %>% 
+  .[, `:=`(other.up   = sum(k.up) - k.up,
+           other.down = sum(k.down) - k.down,
+           other.not  = sum(k.not) - k.not) ] %>% 
+  .[, dominant_set := ifelse(k.up > k.down, 'up', 'down')] %>% 
+  .[, `:=`(N = NULL,
+           sig = NULL)] %>% #drop unnecessary cols
+  unique()
+
+```
+

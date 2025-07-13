@@ -1,0 +1,246 @@
+---
+title: "2023_06_15_DSwaney_MSstats_newcontrasts"
+author: "Martin Gordon"
+date: "2023-06-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Need to rerun msstats on  AB AVIDD data 
+
+## Packages
+
+```{r packages}
+library(purrr)
+library(tidyr)
+library(dplyr)
+library(data.table)
+library(MSstats)
+library(ggplot2)
+library(magrittr)
+library(circlize)
+library(ComplexHeatmap)
+library(parallelDist) #needed for some custom enrichment functions
+library(ggvenn)
+
+#source Bens utility scripts
+source("/Users/martingordon/Documents/utils/bp_utils/MSstats_V4_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/MSstats_Helper_Functions.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+
+## Read in spectronaut data 
+
+```{r}
+path <- getwd()
+path
+AB_input <- fread(paste0(path, '/docs/MartinGordon_MSAnalysis_forDanielle/AA08/AB/20230516_094910_AA08_AB_Report.csv'))
+AB_meta <- fread(paste0(path, '/docs/MartinGordon_MSAnalysis_forDanielle/AA08/AB/AA08_AB_ConditionSetup.xls'))
+AB_input$ProteinName <- sub(">", "", AB_input$ProteinName)
+```
+
+```{r data-inspection}
+summary(AB_input)
+
+AB_input$BioReplicate <- as.factor(AB_input$BioReplicate)
+AB_input$Run <- as.factor(AB_input$Run)
+AB_input$Condition <- as.factor(AB_input$Condition)
+```
+
+
+```{r data structure}
+# order by Condition
+setorder(AB_input, Condition)
+# One run per condition per replicate
+AB_input[, .N, by = .(Run, Condition, BioReplicate)]
+```
+
+Remove '>' preceeding some ProteinNames
+```{r}
+AB_input$ProteinName <- sub(">", "", AB_input$ProteinName)
+```
+
+
+Bioreplicate numbers (1-4) are repeated across conditions. Modified as msstats assumes repeated bioreplicate ids indicate a time-series analysis.
+Asigned each cond/biorep combo a unique ID (1-20) for msstats to model as a case-control experiment.
+
+```{r}
+# create new ID col for pairwise comparisons
+AB_input[, ID:=.GRP, by=.(Condition,BioReplicate)]
+
+#reassign to biorep col and drop ID
+AB_input[, BioReplicate:=ID]
+AB_input[, ID:=NULL]
+
+#sanity check
+AB_input[, .N, by = .(Condition,BioReplicate)]
+```
+Remove low-intensity spectronaut artifacts
+
+```{r}
+ggplot(data=AB_input,  mapping=aes(x=log2(Intensity))) +
+  geom_histogram(binwidth = 0.1)
+
+AB_input <- AB_input[log2(Intensity) > 5] #filter out low abundance 
+
+ggplot(data=AB_input,  mapping=aes(x=log2(Intensity))) +
+  geom_histogram(binwidth = 0.1)
+```
+
+Data Processing
+----
+Convert spectronaut data to msstats format
+```{r msstats-formatting}
+ab.mss <- specFileToCompleteMSstats(AB_input)
+ab.mss[, IsotopeLabelType := 'L'] #label free
+setDF(ab.mss)  # convert to DF for msstats processing
+
+```
+
+Normalise, Filter & Summarise to Protein Levels using MSStats
+
+```{r}
+dp.out <- MSstats::dataProcess(ab.mss,
+                               normalization = 'equalizeMedians',
+                               summaryMethod="TMP",
+                               featureSubset = "highQuality",
+                               remove_uninformative_feature_outlier = TRUE,
+                               MBimpute = FALSE )
+
+```
+Differential Expression Analysis
+------
+
+Perform DEA with provided contrasts
+Generate a contrast matrix for requested pairwise comparisons:
+Naming convention still Krogan(numerator - denominator)
+
+```{r}
+#fread('~/Library/CloudStorage/Box-Box/Mac1_omics_data/CellLines_RNAseq/core_table_gene.xls.gz')
+
+MSstatsContrastMatrix("pairwise", unique(dp.out$ProteinLevelData$GROUP))
+
+## create contrast matrix
+NDpos_WTpos <- matrix(c(0,1,0,0,-1),nrow=1)
+WTpos_EVpos <- matrix(c(-1,0,0,0,1),nrow=1)
+
+
+dp.contrasts <- rbind(WTpos_EVpos,NDpos_WTpos)
+
+# using names from the ranseq file
+#fread('~/Library/CloudStorage/Box-Box/Mac1_omics_data/CellLines_RNAseq/core_table_gene.xls.gz')
+
+row.names(dp.contrasts)<-c("WT_IFNg-vs-EV_IFNg","ND_IFNg-vs-WT_IFNg")
+colnames(dp.contrasts) <- c('EVpos', 'N10t20pos', 'PARneg', 'PARpos', 'WTpos')
+
+dp.contrasts
+```
+Perform the desired pairwise comparisons & writeout file
+```{r}
+test.mss <- groupComparison(contrast.matrix=dp.contrasts, data=dp.out)
+test.mss.all <- setDT(test.mss$ComparisonResult)
+
+# adjust p values using the Benjamini Hochberg method, which estimates False Discovery Rate
+test.mss.all[, fdr := p.adjust(pvalue, method = "BH")] 
+#get gene names
+test.mss.all[, gene_symbol := multiUniprots2multiGenes(as.character(Protein), simplify = TRUE, allowDups = FALSE)]
+
+
+fwrite(test.mss.all, ScriptAndDatedFileName("ab-mssstats_groupcomparisons_newcontrasts.csv.gz"))
+```
+
+
+Generate Volcano plots for each of the pairwise comparisons
+
+```{r multi-volcanoplot}
+## volcano plots
+
+# define significant proteins
+test.mss.all[, sig := "Not"]
+test.mss.all[fdr < 0.05 & abs(log2FC) > log2(1.5),sig := ifelse (log2FC  > 0, "Up", "Down")]
+
+p <- ggplot (test.mss.all, aes (x = log2FC, y = -log10(fdr), color = sig, label = gene_symbol)) +
+  geom_point() +
+  scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+  ggrepel::geom_text_repel(data = test.mss.all[sig != "Not"]  ,  size = 2, max.overlaps = 20) +
+  theme_bw() +
+  facet_wrap(~ Label)
+
+BackupAsPDF(p, "volcanoplot_multipanel")
+```
+
+Over plotting. Generate each volcano plot separately.
+```{r split-dt}
+#split datatable by comparison
+
+test.mss.list <- split(test.mss.all, test.mss.all$Label)
+```
+
+```{r cal-geommean}
+#calculate geomemtric mean
+test.mss.list <- test.mss.list %>% 
+  map( ~{
+    dt <- .x
+    dt$gm.pval.log2fc <- sqrt(dt[,'fdr']*abs(dt[,'log2FC']))
+    
+    return(dt)
+  })
+
+```
+
+
+```{r volcanoplots}
+# use purr to plot each list element 
+
+
+  imap(test.mss.list, ~ {
+    dt <- .x
+    dt.name <- .y
+    
+    p <- ggplot (dt, aes (x = log2FC, y = -log10(fdr), color = sig, label = gene_symbol)) +
+      geom_point() +
+      scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+      ggrepel::geom_text_repel(data = dt[sig != "Not"][order(gm.pval.log2fc)][1:40]  ,  size = 2, max.overlaps = 20) +
+      ggtitle(paste0(dt.name, ' Volcano plot')) +
+      theme_minimal()
+    p
+   BackupAsPDF(p, paste0(dt.name,"_volcanoplot"))
+  })
+```
+
+Perform enrichment analysis for each of the comparisons
+```{r}
+test.mss.all[ sig != 'Not',.N, by=.(Label)]
+
+#creat new factor col of combined label sig info
+test.mss.all[, enrich_grp:= interaction(Label,sig)]
+
+
+# all go ontology genes (biological process, cellular componetn & metabolic function) for enrichment analysis
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# all identified genes as the background set
+universe <- unique(test.mss.all$gene_symbol)
+
+# perform enrichment on significant genes for all groups
+enrich.dt <- enricherOnGroups(test.mss.all[test.mss.all$sig != 'Not'], groupColumns = 'enrich_grp', term2gene.gmt = gmt.go, geneColumn = 'gene_symbol', universe = universe)
+
+#simplify enrich results to remove redundant GO terms
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+
+# failed.. troubleshoot
+enrichmentOnGroupsPL(test.mss.all[test.mss.all$sig != 'Not'], geneColumn = 'gene_symbol', groupColumns = 'enrich_grp', gmt = gmt.go, universe = universe)
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = simp.enrich$simplified, NULL, groupColumn = 'enrich_grp', topN = 8, negCols =unique(simp.enrich$simplified$enrich_grp[grep('Down', simp.enrich$simplified$enrich_grp)]), row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 5)  # compare enrichment in the top 10 terms per group
+BackupAsPDF(ht, ".wt.ev.heatmap_go_enrichment")
+
+fwrite(simp.enrich$simplified, 'wt.ev.nd.enrichment.results.csv.gz')
+```
+
+

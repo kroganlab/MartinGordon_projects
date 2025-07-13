@@ -1,0 +1,886 @@
+---
+title: "031725_toolComparison_ASDdataset"
+author: "Martin Gordon"
+date: "2025-03-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Purpose of this is to create slides comparing the 3 different tools; put in the scatterplot of the 
+
+What do we need i) a runtime barplot for each tool and ii) a 
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(viridis)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(readxl)
+library(pROC) #ROC curves
+library(eulerr)
+
+# custom theme 
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    linewidth = 1),
+        axis.text.x = element_text(angle=90)
+        )
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source('~/Documents/utils/bp_utils/UniprotIDMapping.R')
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+
+#get col palette
+col.pal <- getQualitativePalette(n=13)
+```
+# read in the AF3, AF2
+```{r}
+asd.ppi <- fread('../120324_MGordon_MGordon_AF3_pipeline/output/asd_ppi_summaryScores.csv')
+asd.random <- fread('../120324_MGordon_MGordon_AF3_pipeline/output/asd_random_summaryScores.csv')
+
+asd.af2 <- fread('../120324_MGordon_MGordon_AF3_pipeline/output/asd_AF2.ppi.csv')
+
+# subset the AF2 set to bait-interaction and bait-random
+asd.af2 <- asd.af2[asdppi_disjoint_group %in% c('bait_random', 'bait_int'),]
+
+asd.ppi[, asdppi_disjoint_group := 'bait_int']
+asd.random[, asdppi_disjoint_group := 'bait_random']
+asd.af3 <- rbind(asd.ppi, asd.random)
+
+asd.af3[,.N, by=asdppi_disjoint_group]
+
+asd.af3[, pairOrdered := toupper(gsub('[.]seed.+$', '', model))]
+summary.asd.af3 <- asd.af3[, .(mean_iptm=mean(iptm, na.rm=T), sd_iptm=sd(iptm, na.rm=T), mean_ptm=mean(ptm, na.rm=T), sd_ptm=sd(ptm, na.rm=T)), by=.(pairOrdered, asdppi_disjoint_group)]
+
+```
+join the two
+```{r}
+summary.asd.af3[, model := 'Alphafold3']
+asd.af2[, model := 'Alphafold-multimer']
+
+comb.dt <-  rbind(x=summary.asd.af3[, .(pairOrdered, asdppi_disjoint_group, mean_iptm, sd_iptm, model)], 
+                  y=asd.af2[, .(pairOrdered, asdppi_disjoint_group, mean_iptm, sd_iptm, model)])
+```
+Read in the RosettaFold2-PPI scores and lets compare 
+
+```{r}
+r2.ppi <- fread('../031125_MBennett_Bridge2AI_APMSOverlapRF2-PPI/data/RF_scores')
+tail(r2.ppi)
+## 33 million ppi scores
+r2.ppi[, c('Protein1', 'Protein2') := tstrsplit(V1, '_', keep=c(1,2))]
+
+## order each protein alphabetically and join. Will use this for subsetting the datatable
+r2.ppi[, pairOrdered := paste0(sort(c(Protein1, Protein2)), collapse = "__"), by=.I]
+```
+Get the gene names too and lets compare boxplots of scores of the 3 tools
+```{r}
+r2.ppi <- fread('~/Documents/projects/031725_MGordon_PPIScreening_KroganLabPresentation/031725_PPItoolComparison_data/2025_03_17_r2.ppi.scores.csv')
+```
+
+```{r}
+r2.ppi[, gene1 := multiUniprots2multiGenes(Protein1, species='HUMAN')]
+r2.ppi[, gene2 := multiUniprots2multiGenes(Protein2, species='HUMAN')]
+
+r2.ppi[, geneOrdered := paste0(sort(c(gene1, gene2)), collapse = "__"), by=.I]
+fwrite(r2.ppi[, .(pairOrdered, geneOrdered, protein1=Protein1, protein2=Protein2, gene1, gene2, score)], ScriptAndDatedFileName('r2.ppi.scores.csv'))
+```
+
+```{r}
+r2.ppi <- fread('~/Documents/projects/031725_MGordon_PPIScreening_KroganLabPresentation/031725_PPItoolComparison_data/2025_03_17_r2.ppi.scores.csv')
+r2.ppi
+```
+
+```{r}
+comb.dt[, c('Protein1', 'Protein2') := tstrsplit(pairOrdered, '__', keep=c(1,2))]
+
+## order each protein alphabetically and join. Will use this for subsetting the datatable
+comb.dt[, pairOrdered := paste0(sort(c(Protein1, Protein2)), collapse = "__"), by=.I]
+
+# pull out the correct pairs
+pairs.oi <- comb.dt$pairOrdered %>% 
+  unique()
+```
+
+```{r}
+r2.subdt <- r2.ppi[geneOrdered %in% pairs.oi,]
+r2.subdt[, model := 'RoseTTAFold-PPI']
+#get the label
+r2.subdt <- merge(r2.subdt, unique(comb.dt[, .(pairOrdered, asdppi_disjoint_group)]), by.x='geneOrdered', by.y='pairOrdered', all.x=T)
+
+comb.dt <- rbind(comb.dt[,.(geneOrdered=pairOrdered, asdppi_disjoint_group, score=mean_iptm, model)],
+      r2.subdt[, .(geneOrdered, asdppi_disjoint_group, score, model)])
+
+fwrite(comb.dt, ScriptAndDatedFileName('comb.asdSet.ppiScoring.csv'))
+```
+```{r}
+asd.ppi <- fread('~/Documents/projects/031725_MGordon_PPIScreening_KroganLabPresentation/031725_PPItoolComparison_data/2025_03_17_comb.asdSet.ppiScoring.csv')
+
+asd.ppi$asdppi_disjoint_group %>% unique()
+asd.ppi[,asdppi_disjoint_group := factor(asdppi_disjoint_group, levels=c('bait_random', 'bait_int'))]
+```
+What we will do here is plot the combined AUC for each of the different sets
+Remember AUC is aggregated over classification thresholds and is  classification threshold invariant;
+  We dont want classification threshold invariance as we know we only trust model scores above certain thresholds
+  
+  
+```{r}
+
+par(pty = "s") #create a square plotting region
+pdf('./output/toolComparison.ASD.roc.pdf')
+roc1 <- plot(roc(data=asd.ppi[model == 'Alphafold-multimer',], response='asdppi_disjoint_group', predictor='score', percent=F),
+              main="Comparison on ASD set",
+              lwd=3,
+              col="#55C667FF"
+             )
+roc2 <- lines.roc(roc(data=asd.ppi[model == 'Alphafold3',], response='asdppi_disjoint_group', predictor='score'),col="#3a5e8cFF", lwd=3)
+roc3 <- lines.roc(roc(data=asd.ppi[model == 'RoseTTAFold-PPI',], response='asdppi_disjoint_group', predictor='score'), col="#541352FF", lwd=3)
+legend("bottomright", legend=c("Alphafold-multimer", "Alphafold3", "RoseTTAFold2-PPI"), col=c("#55C667FF", "#3a5e8cFF", "#541352FF"), lwd=2)
+#par(pty = "s")
+dev.off()
+```
+This is interesting; there is a definitive peak at the 
+```{r}
+
+par(pty = "s") #create a square plotting region
+pdf('./output/toolComparison.ASD.roc.subset.pdf')
+roc1 <- plot(roc(data=asd.ppi[model == 'Alphafold-multimer' & geneOrdered %in% sharedSubset,], response='asdppi_disjoint_group', predictor='score', legacy.axis=TRUE, percent=F),
+              main="Comparison on ASD set",
+              lwd=3,
+              col="#55C667FF"
+             )
+roc2 <- lines.roc(roc(data=asd.ppi[model == 'Alphafold3'  & geneOrdered %in% sharedSubset,], response='asdppi_disjoint_group', predictor='score'), legacy.axis=TRUE, col="#3a5e8cFF",lwd=3)
+roc3 <- lines.roc(roc(data=asd.ppi[model == 'RoseTTAFold-PPI'  & geneOrdered %in% sharedSubset,], response='asdppi_disjoint_group', predictor='score'), legacy.axis=TRUE,  col="#541352FF", lwd=3)
+legend("bottomright", legend=c("Alphafold-multimer", "Alphafold3", "RoseTTAFold2-PPI"), col=c("#55C667FF", "#3a5e8cFF", "#541352FF"), lwd=2)
+dev.off()
+```
+
+Zoom in on the AUC region where we see seperation
+
+```{r}
+library(plotrix)
+
+par(pty = "s") 
+roc1 <- plot(roc(data=asd.ppi[model == 'Alphafold-multimer',], response='asdppi_disjoint_group', predictor='score', percent=F, partial.auc=c(1,.95)),
+                # partial.auc.correct=TRUE,          # define a partial AUC (pAUC)
+         print.auc.pattern = "Corrected pAUC (100-90%% SP):\n%.1f%%",
+         print.auc.col = "#1c61b6",
+         auc.polygon = TRUE, 
+         auc.polygon.col = "#1c61b6",       # show pAUC as a polygon
+         max.auc.polygon = TRUE, 
+         max.auc.polygon.col = "#1c61b622", # also show the 100% polygon # show pAUC as a polygon
+              main="Comparison on ASD set",
+              lwd=3,
+              xlab="False Positive Rate (1-Specificity)", 
+              ylab="True Postive Rate (Sensitivity)",
+              legacy.axes = TRUE,
+              col="#55C667FF")
+
+roc2 <- lines.roc(roc(data=asd.ppi[model == 'Alphafold3',], response='asdppi_disjoint_group', predictor='score'),col="#3a5e8cFF", legacy.axes = TRUE, lwd=3)
+roc3 <- lines.roc(roc(data=asd.ppi[model == 'RoseTTAFold-PPI',], response='asdppi_disjoint_group', predictor='score'), col="#541352FF", legacy.axes = TRUE, lwd=3)
+legend("bottomright", legend=c("Alphafold-multimer", "Alphafold3", "RoseTTAFold2-PPI"), col=c("#55C667FF", "#3a5e8cFF", "#541352FF"), lwd=2)
+#"Alphafold-multimer"="#55C667FF","Alphafold3"="#3a5e8cFF", "RoseTTAFold-PPI"="#541352FF"
+```
+
+Compare the score distributions of the different tools
+
+```{r}
+g <- ggplot(asd.ppi, aes(x=model, y=score, fill=asdppi_disjoint_group)) +
+  geom_boxplot(position="dodge") +
+  ggtitle('Distributions of model scores') +
+  labs(y='PPI score', x='model') +
+  scale_fill_manual(values=c('bait_int'='gold1', 'bait_random'='grey')) +
+  customTheme +
+  theme(axis.text.x=element_text(size=6))
+g
+BackupAsPDF(g, 'modelScores.boxplot')
+```
+rank the R2 scores and add the names to the top set
+
+```{r}
+r2.subdt[, rankedScore := rank(score)]
+
+g <- ggplot(r2.subdt, aes(x=rankedScore, color=asdppi_disjoint_group, y=score, label=ifelse(score > 0.75, geneOrdered, ''))) +
+  geom_point(alpha=0.5) +
+  scale_color_manual(values=c('gold1', 'grey')) +
+  ggrepel::geom_text_repel(max.overlaps = 40, size=2, color='black', linetype=2, segment.alpha=0.3) +
+  labs(x='gene pair (rank order)', y='RoseTTAFold2-PPI score') +
+  customTheme +
+  theme(axis.text.x=element_blank())
+
+g
+BackupAsPDF(g, 'r2.ppi.rankplot')
+```
+For the three different data sets, I want to look at ecdf functions of their scores, what proportions of their 
+```{r}
+g <- ggplot(asd.ppi[asdppi_disjoint_group == 'bait_int',], aes(x=score, color=model)) +
+  stat_ecdf(pad=T) +
+  scale_color_manual(values=c("Alphafold-multimer"="#55C667FF","Alphafold3"="#3a5e8cFF", "RoseTTAFold-PPI"="#541352FF")) +
+  theme_bw() +
+  guides(color=guide_legend("dataset")) 
+g
+BackupAsPDF(g, 'ppiScore.ecdf.linechart')
+```
+
+```{r}
+g <- ggplot(asd.ppi[asdppi_disjoint_group == 'bait_int',], aes(x=score, alpha=0.6, fill=model)) +
+  geom_density() +
+  scale_fill_manual(values=c("Alphafold-multimer"="#55C667FF","Alphafold3"="#3a5e8cFF", "RoseTTAFold-PPI"="#541352FF")) +
+  theme_bw() +
+  guides(color=guide_legend("dataset"),
+         alpha='none') 
+BackupAsPDF(g, 'ppiScores.density')
+
+library(ggridges)
+
+g <- ggplot(asd.ppi[asdppi_disjoint_group == 'bait_int',], aes(x=score, alpha=0.75, y=model, fill=model)) +
+  geom_density_ridges(scale = 1.5) +
+  ggtitle('bait-interactor set') +
+  scale_fill_manual(values=c("Alphafold-multimer"="#55C667FF","Alphafold3"="#3a5e8cFF", "RoseTTAFold-PPI"="#541352FF")) +
+  customTheme +
+  guides(color=guide_legend("dataset"),
+         alpha='none') 
+
+g
+BackupAsPDF(g, 'ppiScores.densityRidges')
+```
+number of representatives in each
+
+```{r}
+g <- ggplot(asd.ppi[,.N, by=.(model, asdppi_disjoint_group)], aes(x=model, y=N, fill=asdppi_disjoint_group)) +
+  geom_bar(stat='identity',position="dodge") +
+  ggtitle('N representatives in each set') +
+  labs(y='N', x='model') +
+  scale_fill_manual(values=c('grey', 'gold1')) +
+  theme_bw()
+
+g
+BackupAsPDF(g, 'setsize.barplot')
+```
+
+```{r}
+asd.ppi$model %>% unique()
+
+asd.ppi[model == "RoseTTAFold-PPI" & score > 0.5,.N, by=asdppi_disjoint_group] # 6% FP
+asd.ppi[model == "Alphafold3" & score > 0.6,.N, by=asdppi_disjoint_group] # 16% FP
+asd.ppi[model == "Alphafold-multimer" & score > 0.6,.N, by=asdppi_disjoint_group] # 14% FP
+```
+mosaic plot to see how this breaks down
+
+```{r}
+# make a sigcol
+asd.ppi$model %>%
+  unique()
+
+asd.ppi[, potentialPPI := ifelse(model =="RoseTTAFold-PPI" & score > 0.5, 'yes',
+                                 ifelse(model %in% c("Alphafold3","Alphafold-multimer") & score > 0.5, 'yes', 'no'))]
+
+
+model.mat <- dcast(asd.ppi[potentialPPI == 'yes',.N, by=.(asdppi_disjoint_group, model)], model~asdppi_disjoint_group, value.var = 'N') %>% 
+  as.matrix(., rownames='model')
+
+#par(pty = "s") #create a square plotting region
+pdf('./output/setComparison.mosaicplot.reduceAFthreshold.pdf')
+g <- mosaicplot(model.mat, 
+           main='Breakdown of PPI passing scoring thresholds',
+           xlab='model',
+           ylab='set',
+           cex=0.9,
+           color=c( 'gold1','grey'))
+dev.off()
+par(pty = "m") #create a square plotting region
+```
+
+```{r}
+#fwrite(counts.dt, ScriptAndDatedFileName('countsInMosaic.reducedThresholds.csv'))
+testcounts.dt <- fread('~/Documents/projects/031725_MGordon_PPIScreening_KroganLabPresentation/031725_PPItoolComparison_data/2025_03_20_countsInMosaic.reducedThresholds.csv')
+rm(testcounts.dt)
+```
+
+new mosaic plot
+```{r}
+
+counts.dt <- as.data.table(model.mat, keep.rownames=T) %>% 
+  melt()
+setnames(counts.dt, old=c('rn', 'variable'), new=c('model', 'set'))
+
+cols.oi <- c('model', 'set')
+counts.dt[, c(cols.oi) := lapply(.SD, as.factor), .SDcols = cols.oi]
+counts.dt %>% str()
+
+
+counts.dt[, total := sum(value), by=model]
+counts.dt[, labOffset := 1- value/total]
+
+# just use gplot
+g <- ggplot(counts.dt, aes(x=model, y=value, width=sqrt(total), label=as.character(value), fill=factor(set, levels=c('bait_random', 'bait_int'))) ) +
+  geom_col(color='black', position='fill') +
+  facet_grid(~model, scales = "free_x", space = "free_x") +
+  geom_label(data=counts.dt, aes(y=labOffset+0.04), color='black', fill='white', size=4) +
+  scale_fill_manual(values=c('bait_random'='grey', 'bait_int'='gold1')) +
+  theme_void() +
+  guides(fill=guide_legend(title='set'))
+
+g
+BackupAsPDF(g, 'passingThresholds.mosaicPlot')
+```
+Look at the overlap in the set shared by all; how many pass thresholds?
+
+```{r}
+red.model.mat <- dcast(asd.ppi[geneOrdered %in% sharedSubset & potentialPPI == 'yes', .N,by=.(asdppi_disjoint_group, model)], model~asdppi_disjoint_group, value.var = 'N') %>% 
+  as.matrix(., rownames='model')
+
+counts.dt <- as.data.table(red.model.mat, keep.rownames=T) %>% 
+  melt()
+setnames(counts.dt, old=c('rn', 'variable'), new=c('model', 'set'))
+
+cols.oi <- c('model', 'set')
+counts.dt[, c(cols.oi) := lapply(.SD, as.factor), .SDcols = cols.oi]
+              
+counts.dt[, total := sum(value), by=model]
+counts.dt[, labOffset := 1- value/total]
+
+g <- ggplot(counts.dt, aes(x=model, y=value, width=sqrt(total), label=as.character(value), fill=factor(set, levels=c('bait_random', 'bait_int'))) ) +
+  geom_col(color='black', position='fill') +
+  facet_grid(~model, scales = "free_x", space = "free_x") +
+  geom_label(data=counts.dt, aes(y=labOffset+0.04), color='black', fill='white', size=4) +
+  scale_fill_manual(values=c('bait_random'='grey', 'bait_int'='gold1')) +
+  theme_void() +
+  guides(fill=guide_legend(title='set'))
+
+g
+BackupAsPDF(g, 'passingThresholds.subsetShared.mosaicPlot')
+```
+
+```{r}
+g <- ggplot(counts.dt, aes(x=model, y=value, width=sqrt(total), label=as.character(value), fill=factor(set, levels=c('bait_random', 'bait_int'))) ) +
+  geom_col(color='black', position='fill') +
+  facet_grid(~model, scales = "free_x", space = "free_x") +
+  geom_label(data=counts.dt, aes(y=labOffset+0.04), color='black', fill='white', size=4) +
+  scale_fill_manual(values=c('bait_random'='grey', 'bait_int'='gold1')) +
+  theme_void() +
+  guides(fill=guide_legend(title='set'))
+
+g
+anno.dt
+```
+
+What are the hits that are different in RF2-PPI vs the others? Can we find any reasons why they may be different? Also worth nothing a greatly reduced set size for PPI than AF2/AF3
+Highlight them in the distributions AF2/AF3 distribtutions
+```{r}
+# none of the values in the expected table are less than five, so the X2 test seems appropriate
+ppi.gs <- list('Alphafold3'=asd.ppi[potentialPPI == 'yes' & model == 'Alphafold3' & asdppi_disjoint_group == 'bait_int', unique(geneOrdered)],
+               'Alphafold-multimer'=asd.ppi[potentialPPI == 'yes' & model == "Alphafold-multimer" & asdppi_disjoint_group == 'bait_int', unique(geneOrdered)],
+               'RoseTTAFold-PPI'=asd.ppi[potentialPPI == 'yes' & model == "RoseTTAFold-PPI" & asdppi_disjoint_group == 'bait_int', unique(geneOrdered)])
+           
+
+g <- plot(euler(ppi.gs),
+     labels = list(font = 4),
+     alpha=0.7,
+     fill=c(values=c("#3a5e8cFF","#ffcf20FF","#541352FF")),
+     quantities = TRUE)
+
+BackupAsPDF(g, 'sig.ppiOverlap.euler')
+
+r2.uniq.ppi <- setdiff(ppi.gs[['RoseTTAFold-PPI']], c(ppi.gs[['Alphafold3']], ppi.gs[['Alphafold-multimer']]))
+af.uniq.ppi <- setdiff(intersect(ppi.gs[['Alphafold3']], ppi.gs[['Alphafold-multimer']]), ppi.gs[['RoseTTAFold-PPI']])
+```
+
+plot these scores on the boxplots
+
+```{r}
+g <- ggplot(asd.ppi[asdppi_disjoint_group == 'bait_int' & model != 'RoseTTAFold-PPI',], aes(x=model, y=score, fill=model)) +
+  geom_violin(alpha=0.6) +
+  geom_point(data=asd.ppi[geneOrdered %in% r2.uniq.ppi & model != 'RoseTTAFold-PPI',], aes(fill=asdppi_disjoint_group), 
+             size = 1.5, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+ # ggrepel::geom_text_repel(data=asd.ppi[geneOrdered %in% r2.uniq.ppi,], aes(label=geneOrdered),size=2, max.overlaps = 15) +
+  geom_hline(yintercept=0.6, linetype=2, col='darkred') +
+  scale_fill_manual(values=c("Alphafold-multimer"="#55C667FF","Alphafold3"="#3a5e8cFF", "RoseTTAFold-PPI"="#541352FF")) +
+  ggtitle('Distribution of R2-PPI significant interactors') +
+  labs(y='PPI score', x='model') +
+  customTheme
+g
+
+BackupAsPDF(g, 'r2ppi.passingSet.distribution.violin')
+
+g <- ggplot(asd.ppi[asdppi_disjoint_group == 'bait_int',], aes(x=model, y=score, fill=model)) +
+  geom_violin(alpha=0.6) +
+  geom_point(data=asd.ppi[geneOrdered %in% r2.uniq.ppi,], aes(fill=asdppi_disjoint_group), 
+             size = 1.5, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+ # ggrepel::geom_text_repel(data=asd.ppi[geneOrdered %in% r2.uniq.ppi,], aes(label=geneOrdered),size=2, max.overlaps = 15) +
+  geom_hline(yintercept=0.6, linetype=2, col='darkred') +
+  geom_hline(yintercept=0.5, linetype=2, col='black') +
+  scale_fill_manual(values=c("Alphafold-multimer"="#55C667FF","Alphafold3"="#3a5e8cFF", "RoseTTAFold-PPI"="#541352FF")) +
+  ggtitle('Distribution of R2-PPI significant interactors') +
+  labs(y='PPI score', x='model') +
+  customTheme
+g
+BackupAsPDF(g, 'r2ppi.passingSet.distribution.all.violin')
+```
+
+```{r}
+g <- ggplot(asd.ppi[asdppi_disjoint_group == 'bait_int',], aes(x=model, y=score, fill=model)) +
+  geom_violin(alpha=0.6) +
+  geom_point(data=asd.ppi[geneOrdered %in% af.uniq.ppi,], aes(fill=asdppi_disjoint_group), 
+             size = 1.5, shape = 21, alpha=0.7, position = position_jitterdodge(jitter.width=0.2, dodge.width = .75, seed=1), color='black') +
+ # ggrepel::geom_text_repel(data=asd.ppi[geneOrdered %in% r2.uniq.ppi,], aes(label=geneOrdered),size=2, max.overlaps = 15) +
+  geom_hline(yintercept=0.6, linetype=2, col='darkred') +
+  geom_hline(yintercept=0.5, linetype=2, col='black') +
+  scale_fill_manual(values=c("Alphafold-multimer"="#55C667FF","Alphafold3"="#3a5e8cFF", "RoseTTAFold-PPI"="#541352FF")) +
+  ggtitle('Distribution of AF significant interactors') +
+  labs(y='PPI score', x='model') +
+  customTheme
+g
+BackupAsPDF(g, 'alphafold.ppi.passingSet.distribution.all.violin')
+```
+Redo the list and take the set of interactors in all 3
+
+```{r}
+# just take the stuff in both databases
+sharedSubset <- asd.ppi[,.N, by=.(geneOrdered)][N>=3, geneOrdered]
+
+# none of the values in the expected table are less than five, so the X2 test seems appropriate
+ppi.gs <- list('Alphafold3'=asd.ppi[potentialPPI == 'yes' & model == 'Alphafold3' & asdppi_disjoint_group == 'bait_int', unique(geneOrdered)],
+               'Alphafold-multimer'=asd.ppi[potentialPPI == 'yes' & model == "Alphafold-multimer" & asdppi_disjoint_group == 'bait_int', unique(geneOrdered)],
+               'RoseTTAFold-PPI'=asd.ppi[potentialPPI == 'yes' & model == "RoseTTAFold-PPI" & asdppi_disjoint_group == 'bait_int', unique(geneOrdered)])
+           
+
+g <- plot(euler(ppi.gs),
+     labels = list(font = 4),
+     alpha=0.7,
+     fill=c(values=c("#3a5e8cFF","#55C667FF","#541352FF")),
+     quantities = TRUE)
+g
+BackupAsPDF(g, 'sig.ppiOverlap.reducedAFthreshold.euler')
+```
+
+Just take the reduced set of shared things
+
+```{r}
+f.ppi.gs <- lapply(ppi.gs, function(x){
+  return(x[x %in% sharedSubset])
+})
+
+g <- plot(euler(f.ppi.gs),
+     labels = list(font = 4),
+     alpha=0.7,
+     fill=c(values=c("#3a5e8cFF","#55C667FF","#541352FF")),
+     quantities = TRUE)
+g
+BackupAsPDF(g, 'sig.ppiOverlap.filtered.reducedAFthreshold.euler')
+```
+```{r}
+r2.uniq.ppi <- setdiff(ppi.gs[['RoseTTAFold-PPI']], c(ppi.gs[['Alphafold3']], ppi.gs[['Alphafold-multimer']]))
+af.uniq.ppi <- setdiff(intersect(ppi.gs[['Alphafold3']], ppi.gs[['Alphafold-multimer']]), ppi.gs[['RoseTTAFold-PPI']])
+```
+
+
+
+Extract the list of PPI from ASD list that is not 
+
+```{r}
+missing.set <- setdiff(asd.ppi[model == 'Alphafold-multimer', geneOrdered], asd.ppi[model == "RoseTTAFold-PPI" , geneOrdered])
+
+subset <- asd.af2[pairOrdered %in% missing.set, ] %>% 
+  .[, c('gene1', 'gene2') := tstrsplit(pairOrdered, '__', keep=c(1,2))] 
+
+new.col <- c('protein1', 'protein2')
+subset[, c(new.col) := lapply(.SD, function(x) translateGeneName2Uniprot(x, species='HUMAN')), .SDcols = c('gene1', 'gene2')] 
+subset <- subset[!(is.na(protein1) | is.na(protein2)),]
+
+input.dt <- rbind(subset[pairOrdered %in% af.uniq.ppi, .(protein1, protein2)],
+                  subset[!pairOrdered %in% af.uniq.ppi, .(protein1, protein2)])
+
+
+input.dt[, batch := rep(seq(1,200),length.out = .N)]
+fwrite(input.dt[,.(batch, protein1, protein2)], sep=',', col.names = F, ScriptAndDatedFileName('r2.ppi.testinput.csv'))
+
+fread('~/Documents/projects/031725_MGordon_PPIScreening_KroganLabPresentation/031725_PPItoolComparison_data/2025_03_19_r2.ppi.testinput.csv')
+```
+plot scatter plots of the different sets against each other for each of the tools and show their R score
+
+```{r}
+# weird seems one protein is in twice
+asd.ppi[geneOrdered %in% c('FOXP1__FOXP2','CTNNB1__TCF7L2') & model == 'Alphafold3']
+asd.ppi <- asd.ppi[, .SD[which.max(score),], by=.(geneOrdered, model)]
+
+asd.ppi.wide <- dcast(asd.ppi, geneOrdered+asdppi_disjoint_group~model, value.var = 'score')
+
+library(patchwork)
+
+g <- ggplot(asd.ppi.wide, aes(x=Alphafold3, y=`Alphafold-multimer`, color=asdppi_disjoint_group)) +
+  geom_point(size=1.25) +
+  geom_density2d(color='black', alpha=0.7) +
+  geom_vline(xintercept = 0.5,linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.6) +
+  annotate('text', x=0.2, y=0.9, size=6, label=round(0.6458751, 3)) +
+  scale_color_manual(values=c('bait_random'='grey', 'bait_int'='gold1')) +
+  ggtitle('AF3 vs AF-multimer') +
+  customTheme +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  guides(color=guide_legend(title='test set'))
+g
+p <- ggplot(asd.ppi.wide, aes(x=`RoseTTAFold-PPI`, y=`Alphafold-multimer`, color=asdppi_disjoint_group)) +
+  geom_point(size=1.25) +
+  geom_density2d(color='black', alpha=0.7) +
+  geom_vline(xintercept = 0.5,linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.6) +
+  annotate('text', x=0.2, y=0.9, size=6, label=round(0.3432865, 3)) +
+  scale_color_manual(values=c('bait_random'='grey', 'bait_int'='gold1')) +
+  ggtitle('RosETTAFold-PPI vs AF-multimer') +
+  customTheme +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  guides(color=guide_legend(title='test set'))
+
+q <- ggplot(asd.ppi.wide, aes(x=`RoseTTAFold-PPI`, y=Alphafold3, color=asdppi_disjoint_group)) +
+  geom_point(size=1.25) +
+  geom_density2d(color='black', alpha=0.7) +
+  geom_vline(xintercept = 0.5,linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.6) +
+  annotate('text', x=0.2, y=0.9, size=6, label=round(0.3047240, 3)) +
+  scale_color_manual(values=c('bait_random'='grey', 'bait_int'='gold1')) +
+  ggtitle('RosETTAFold-PPI vs AF3') +
+  customTheme +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  guides(color=guide_legend(title='test set'))
+
+null <- grid::textGrob('Comparisons of PPI tool scores')
+
+BackupAsPDF(wrap_plots(g, null, p, q), 'scoreComparisons.reducedAFthreshold.scatterplots', dimensions=c(14,10))
+```
+Read in the annotation files from the ASD paper; is there anything relevant about these ppi that are unique; interesting
+
+```{r}
+anno.dt <- fread('./docs/2023_12_06_Fig4Supp_SummarizedAFScores_perPair.csv') %>% 
+  .[(bait_int == TRUE | bait_random == TRUE),]
+
+unique.set <- anno.dt[(bait_int == TRUE | bait_random == TRUE), pairOrdered] %>% 
+  unique() 
+
+# good; all present in the set
+asd.ppi[model == "Alphafold-multimer"]$geneOrdered %in% unique.set %>% 
+  length()
+
+asd.ppi <- merge(asd.ppi, anno.dt[, .(geneOrdered=pairOrdered,asdppi_disjoint_group, mean_iptm, sd_iptm, max_confidence, known, stringCombined, 
+            humanNetGoldStandard, corumPair, humanNet.score, best_PDB_by_PID, geometric_mean_PID, best_PDB_by_Expect, geometric_mean_negLog10_expect)],
+            by=c('geneOrdered','asdppi_disjoint_group'), all.x=T)
+```
+
+Get a match in PDB col and facet by this
+```{r}
+#asd.ppi[,asdppi_disjoint_group := asdppi_disjoint_group.x]
+model.oi <- asd.ppi$model %>% 
+  unique()
+
+#fwrite(asd.ppi, ScriptAndDatedFileName('asd.ppiTools.withAnno.csv'))
+asd.ppi <- fread('~/Documents/projects/031725_MGordon_PPIScreening_KroganLabPresentation/031725_PPItoolComparison_data/2025_03_20_asd.ppiTools.withAnno.csv')
+
+# get a factor col for match in PDB
+asd.ppi[, matchInPDB := ifelse(best_PDB_by_Expect == '', 'no', 'yes')]
+
+asd.ppi.wide <- dcast(asd.ppi,  geneOrdered+asdppi_disjoint_group+known+matchInPDB~model, value.var = 'score')
+```
+
+Look at PDB matches; can they help distinguish the set
+
+```{r}
+labs.oi <- asd.ppi.wide[`RoseTTAFold-PPI` > .75 & matchInPDB == 'no', geneOrdered]
+labs.oi
+g <- ggplot(asd.ppi.wide[asdppi_disjoint_group == 'bait_int',], aes(x=Alphafold3, y=`Alphafold-multimer`, color=matchInPDB)) +
+  geom_point(size=1.25) +
+  geom_density2d(color='black', alpha=0.7) +
+  geom_vline(xintercept = 0.5,linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.6) +
+  #annotate('text', x=0.2, y=0.9, size=6, label=round(0.6458751, 3)) +
+  scale_color_brewer(type='qual', direction=-1, palette=6) +
+  ggtitle('AF3 vs AF-multimer') +
+  customTheme +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  guides(color=guide_legend(title='Match in PDB?'))
+g
+p <- ggplot(asd.ppi.wide[asdppi_disjoint_group == 'bait_int',], aes(x=`RoseTTAFold-PPI`, y=`Alphafold-multimer`, color=matchInPDB)) +
+  geom_point(size=1.25) +
+  geom_density2d(color='black', alpha=0.7) +
+  #geom_text_repel(data=asd.ppi.wide[asdppi_disjoint_group == 'bait_int' & geneOrdered %in% labs.oi,], aes(label=geneOrdered), size=6) +
+  geom_vline(xintercept = 0.5,linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.6) +
+  #annotate('text', x=0.2, y=0.9, size=6, label=round(0.3432865, 3)) +
+  scale_color_brewer(type='qual', direction=-1, palette=6) +
+  ggtitle('RosETTAFold-PPI vs AF-multimer') +
+  customTheme +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  guides(color=guide_legend(title='Match in PDB?'))
+
+q <- ggplot(asd.ppi.wide[asdppi_disjoint_group == 'bait_int',], aes(x=`RoseTTAFold-PPI`, y=Alphafold3,color=matchInPDB)) +
+  geom_point(size=1.25) +
+  geom_density2d(color='black', alpha=0.7) +
+  geom_vline(xintercept = 0.5,linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.6) +
+  #geom_text_repel(data=asd.ppi.wide[asdppi_disjoint_group == 'bait_int' & geneOrdered %in% labs.oi,], aes(label=geneOrdered), size=6) +
+  #annotate('text', x=0.2, y=0.9, size=6, label=round(0.3047240, 3)) +
+ # scale_color_viridis(discrete = T,option='A') +
+  scale_color_brewer(type='qual', direction=-1, palette=6) +
+  ggtitle('RosETTAFold-PPI vs AF3') +
+  customTheme +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  guides(color=guide_legend(title='Match in PDB?'))
+
+null <- grid::textGrob('Comparisons of PPI tool scores')
+wrap_plots(g, null, p, q)
+BackupAsPDF(wrap_plots(g, null, p, q), 'scoreComparisons.baitInteractor.subset.inPDB.scatterplots', dimensions=c(14,10))
+```
+
+plot the other anno fields; do any of them explain why we see 
+
+```{r}
+asd.ppi %>%  colnames()
+# add other anno fields 
+asd.ppi.wide <- dcast(asd.ppi,  geneOrdered+asdppi_disjoint_group+known+matchInPDB+geometric_mean_negLog10_expect+corumPair+humanNet.score~model, value.var = 'score')
+
+asd.ppi.wide <-  asd.ppi.wide[known != '']
+
+g <- ggplot(asd.ppi.wide[asdppi_disjoint_group == 'bait_int',], aes(x=Alphafold3, y=`Alphafold-multimer`, color=known)) +
+  geom_point(size=1.25) +
+  geom_density2d(color='black', alpha=0.7) +
+  geom_vline(xintercept = 0.5,linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.6) +
+  #annotate('text', x=0.2, y=0.9, size=6, label=round(0.6458751, 3)) +
+  scale_color_brewer(type='qual', direction=-1, palette=6) +
+  ggtitle('AF3 vs AF-multimer') +
+  customTheme +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  guides(color=guide_legend(title='Known Interactor?'))
+g
+p <- ggplot(asd.ppi.wide[asdppi_disjoint_group == 'bait_int',], aes(x=`RoseTTAFold-PPI`, y=`Alphafold-multimer`, color=known)) +
+  geom_point(size=1.25) +
+  geom_density2d(color='black', alpha=0.7) +
+  geom_vline(xintercept = 0.5,linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.6) +
+  #annotate('text', x=0.2, y=0.9, size=6, label=round(0.3432865, 3)) +
+  scale_color_brewer(type='qual', direction=-1, palette=6) +
+  ggtitle('RosETTAFold-PPI vs AF-multimer') +
+  customTheme +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  guides(color=guide_legend(title='Known Interactor?'))
+
+q <- ggplot(asd.ppi.wide[asdppi_disjoint_group == 'bait_int',], aes(x=`RoseTTAFold-PPI`, y=Alphafold3, color=known)) +
+  geom_point(size=1.25) +
+  geom_density2d(color='black', alpha=0.7) +
+  geom_vline(xintercept = 0.5,linetype=2, alpha=0.6) +
+  geom_hline(yintercept = 0.5, linetype=2, alpha=0.6) +
+  #annotate('text', x=0.2, y=0.9, size=6, label=round(0.3047240, 3)) +
+  scale_color_brewer(type='qual', direction=-1, palette=6) +
+  ggtitle('RosETTAFold-PPI vs AF3') +
+  customTheme +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1)) +
+  guides(color=guide_legend(title='Known Interactor?'))
+
+null <- grid::textGrob('Comparisons of PPI tool scores')
+wrap_plots(g, null, p, q)
+
+BackupAsPDF(wrap_plots(g, null, p, q), 'scoreComparisons.baitInteractorset.knownInteractor.scatterplots', dimensions=c(14,10))
+```
+Generate a mosaic plot to drive home the point about the proportions, then ROC then done...
+Could make my own function to generate a MOSAIC plot but leave as is for now...
+```{r}
+asd.ppi.wide[,.N, by=.(asdppi_disjoint_group, known)]
+
+model.mat <- dcast(asd.ppi[potentialPPI == 'yes' & asdppi_disjoint_group == 'bait_int', .N,by=.(known, model)], model~known, value.var = 'N') %>% 
+  as.matrix(., rownames='model')
+
+counts.dt <- as.data.table(model.mat, keep.rownames=T) %>% 
+  melt()
+setnames(counts.dt, old=c('rn', 'variable'), new=c('model', 'set'))
+
+cols.oi <- c('model', 'set')
+counts.dt[, c(cols.oi) := lapply(.SD, as.factor), .SDcols = cols.oi]
+              
+counts.dt[, total := sum(value), by=model]
+counts.dt[, labOffset := 1- value/total]
+
+g <- ggplot(counts.dt, aes(x=model, y=value, width=sqrt(total), label=as.character(value), fill=factor(set, levels=c('novel', 'known'))) ) +
+  geom_col(color='black', position='fill') +
+  facet_grid(~model, scales = "free_x", space = "free_x") +
+  geom_label(data=counts.dt, aes(y=labOffset+0.04), color='black', fill='white', size=4) +
+  scale_fill_brewer(type='qual', direction=1, palette=6) +
+  theme_void() +
+  guides(fill=guide_legend(title='set'))
+g
+BackupAsPDF(g, 'knownVsNovel.mosaic')
+
+
+# plot the same for the PDB breakdown
+model.mat <- dcast(asd.ppi[potentialPPI == 'yes' & asdppi_disjoint_group == 'bait_int', .N,by=.(matchInPDB, model)], model~matchInPDB, value.var = 'N') %>% 
+  as.matrix(., rownames='model')
+
+counts.dt <- as.data.table(model.mat, keep.rownames=T) %>% 
+  melt()
+setnames(counts.dt, old=c('rn', 'variable'), new=c('model', 'set'))
+
+cols.oi <- c('model', 'set')
+counts.dt[, c(cols.oi) := lapply(.SD, as.factor), .SDcols = cols.oi]
+ 
+counts.dt[, total := sum(value), by=model]
+counts.dt[, labOffset := 1- value/total]
+counts.dt[, customLab := c('50', '47', '28', '63', '37', '13')]
+
+g <- ggplot(counts.dt, aes(x=model, y=value, width=sqrt(total), label=as.character(customLab),fill=factor(set, levels=c('no', 'yes'))) ) +
+  geom_col(color='black', position='fill') +
+  facet_grid(~model, scales = "free_x", space = "free_x") +
+  #annotate('text', aes(x=c(1,1,2,2,3,3), y=c(0.2,0.8,0.2,0.8,0.4,0.9), label=c('1'))) +
+  geom_label(data=counts.dt, aes(y=c(0.2, 0.8, 0.2, 0.8, 0.2, 0.8)), color='black', fill='white', size=4) +
+  scale_fill_brewer(type='qual', direction=-1, palette=6) +
+  theme_void() +
+  guides(fill=guide_legend(title='matchInPDB'))
+g
+BackupAsPDF(g, 'PDBpresence.mosaic')
+```
+
+## 03-24-25
+Tidy the ROC plots and write a custom ROC function
+```{r}
+
+par(pty = "s") 
+#pdf('./output/toolComparison.ASD.roc.new.pdf')
+roc1 <- plot(roc(data=asd.ppi[model == 'Alphafold-multimer',], response='asdppi_disjoint_group', predictor='score', partial.auc = c(1, 0.95), percent=F),
+                 partial.auc.correct=TRUE,          # define a partial AUC (pAUC)
+                 print.auc.pattern = "Corrected pAUC (100-90%% SP):\n%.1f%%",
+                 print.auc.col = "lightyellow",
+                 auc.polygon = TRUE, 
+                 auc.polygon.col = "lightyellow",       # show pAUC as a polygon
+                 max.auc.polygon = TRUE, 
+                max.auc.polygon.col = "lightyellow", # also show the 100% polygon # show pAUC as a polygon
+              main="Comparison on ASD set",
+              lwd=3,
+              xlab="False Positive Rate (1-Specificity)", 
+              ylab="True Postive Rate (Sensitivity)",
+             # legacy.axes = TRUE,
+              col="#55C667FF")
+
+roc2 <- lines.roc(roc(data=asd.ppi[model == 'Alphafold3',], response='asdppi_disjoint_group', predictor='score'),col="#3a5e8cFF", legacy.axes = TRUE, lwd=3)
+roc3 <- lines.roc(roc(data=asd.ppi[model == 'RoseTTAFold-PPI',], response='asdppi_disjoint_group', predictor='score'), col="#541352FF", legacy.axes = TRUE, lwd=3)
+legend("bottomright", legend=c("Alphafold-multimer", "Alphafold3", "RoseTTAFold2-PPI"), col=c("#55C667FF", "#3a5e8cFF", "#541352FF"), lwd=2)
+
+
+roc1
+
+r2.ppi <- data.table(TPR=rev(roc1$sensitivities),
+                     FPR=rev(1 - roc1$specificities),
+                     labels=roc1$response, 
+                     scores=roc1$predictor)
+
+length(roc2$sensitivities)
+
+rev(roc2$sensitivities)
+
+
+help(auc)
+```
+
+Wrap the output up into a single dt
+```{r}
+
+roc1$
+lapply(c(roc1, roc2,roc3), function(x){
+  
+  print(x)
+   dt <- data.table(TPR=rev(x$sensitivities),
+                     FPR=rev(1 - x$specificities),
+                     labels=x$response, 
+                     scores=x$predictor)
+}) %>% rbindlist()
+```
+
+Lets make our own ROC plot curve...
+Custom AUC calculation to try calculate partial ROC
+
+```{r}
+generate_roc_by_group <- function(dt, group_col, label_col, score_col) {
+  if (!all(c(group_col, label_col, score_col) %in% names(dt))) {
+    stop("Specified columns must exist in the data.table.")
+  }
+  
+  # Compute ROC for each group
+  roc_results <- dt[, {
+    roc_obj <- roc(get(label_col), get(score_col))
+    data.table(
+      FPR = 1 - roc_obj$specificities, 
+      TPR = roc_obj$sensitivities, 
+      Thresholds = roc_obj$thresholds  # Keeps track of the group
+    )
+  }, by = group_col]
+  
+  return(roc_results)
+}
+
+dt <- asd.ppi[, .(group=model, label=asdppi_disjoint_group, score=score)]
+roc_data <- generate_roc_by_group(dt, "group", "label", "score")
+
+
+roc_data[grepl('0[.]500', Thresholds)]
+
+# now color the lines according to 
+g <- ggplot(roc_data, aes(x=FPR, y=TPR, color=group)) +
+  geom_point() +
+  geom_vline(xintercept=0.015078408,color="#55C667FF", linetype=2) +
+  geom_vline(xintercept=0.016727273, color="#3a5e8cFF", linetype=2) +
+  geom_vline(xintercept=0.007518797, color="#541352FF", linetype=2) +
+  coord_equal() +
+  geom_abline(slope=1, intercept=0, color='grey', alpha=0.75) +
+  labs(x='False Positive Rate', y='True Positive Rate') +
+  scale_color_manual(values=c("Alphafold-multimer"="#55C667FF", "Alphafold3"="#3a5e8cFF", "RoseTTAFold-PPI"= "#541352FF")) +
+  coord_cartesian(xlim=c(0,0.25), ylim=c(0,0.25)) +
+  theme_bw() +
+  guides(color=guide_legend('model'))
+
+g
+BackupAsPDF(g, 'simple.roc.curve.wLineSegments.zoom.roc')
+```
+calculate partial area under the curve
+
+```{r}
+generate_roc_by_group <- function(dt, group_col, label_col, score_col) {
+  if (!all(c(group_col, label_col, score_col) %in% names(dt))) {
+    stop("Specified columns must exist in the data.table.")
+  }
+  
+  # Compute ROC for each group
+  roc_results <- dt[, {
+    roc_obj <- roc(get(label_col), get(score_col), partial.auc=c(1, 0.95))
+    data.table(
+      FPR = 1 - roc_obj$specificities, 
+      TPR = roc_obj$sensitivities, 
+      partialAUC=roc_obj$auc,
+      Thresholds = roc_obj$thresholds  # Keeps track of the group
+    )
+  }, by = group_col]
+  
+  return(roc_results)
+}
+
+roc_data <- generate_roc_by_group(dt, "group", "label", "score")
+
+roc_data[, .N, by=.(group,partialAUC)]
+```
+
+random set of points 
+
+```{r}
+g <- ggplot(data.table(x=rnorm(1000), y=rnorm(1000)), aes(x=x, y=y)) +
+  geom_point(size=1) +
+  theme_bw() +
+  coord_equal()
+
+BackupAsPDF(g, 'randomNoise.plot')
+
+
+
+```
+

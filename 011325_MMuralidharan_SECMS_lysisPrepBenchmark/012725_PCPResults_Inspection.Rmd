@@ -1,0 +1,421 @@
+---
+title: "012726_PCPResults_Inspection"
+author: "Martin Gordon"
+date: "2025-01-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+library(ggplot2)
+library(ComplexHeatmap)
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+library(hrbrthemes)
+library(RColorBrewer)
+library(eulerr)
+library(viridis)
+
+# useful utility scripts
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext::showtext_auto()
+
+
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <-  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+Read in the PCprophet  complex report; as a simple first pass, lets just id how many complexes we found using PCProphet
+
+
+Make a couple of basic plots; positive vs negative complexIDs
+Only consider a complex if it is reported in both replicates
+```{r}
+complex.id <- fread('./output/012325_firstPass/ComplexReport.txt')
+
+
+# subset to is complex is positive (these are complexes with a prediction score > .5)
+complex.id <- complex.id[`Is Complex` == 'Positive',] 
+
+complex.id[, Sample_ID := gsub('_2', '', Sample_ID)]
+
+g <- ggplot(complex.id[`Is Complex` == 'Positive',.N, by=.(Sample_ID, Condition, Replicate)], aes(x=paste0(Sample_ID,'.',Replicate), y=N, fill=Sample_ID)) +
+  geom_bar(stat='identity', position='dodge') +
+  ggtitle('PCProphet complexes detected per sample') +
+  labs(x='sample', y='N complexes (PCP score > 0.5)') +
+  scale_fill_brewer(type='qual',palette=3) +
+  scale_alpha(range=c(0.5,1)) +
+  customTheme +
+  guides(fill=guide_legend('Replicate'))
+g
+BackupAsPDF(g, 'nPositiveComplexes.barplot')
+```
+Relative proportion of FP to TP  complexes per sample
+```{r}
+summary.dt <- complex.id[,.(.N), by=.(Sample_ID,Condition, Replicate, `Is Complex`)] %>% 
+  .[, .(prop=N/sum(N), isComplex=`Is Complex`), by=.(Sample_ID,Replicate)]
+
+g <- ggplot(summary.dt, aes(x=paste0(Sample_ID,'.',Replicate), y=prop, fill=isComplex)) +
+  geom_bar(stat='identity', position='stack') +
+  ggtitle('Proportion of positive complexes vs total') +
+  labs(x='sample', y='% pos complexes') +
+  scale_fill_brewer(type='qual',palette=3) +
+  scale_alpha(range=c(0.5,1)) +
+  customTheme
+g
+BackupAsPDF(g, 'propPosComplexes.barplot')
+```
+Total counts 
+```{r}
+g <- ggplot(complex.id[,.(.N), by=.(Sample_ID,Condition, Replicate, `Is Complex`)], aes(x=paste0(Sample_ID,'.',Replicate), y=N, fill=`Is Complex`)) +
+  geom_bar(stat='identity', position='stack') +
+  ggtitle('Proportion of positive complexes vs total') +
+  labs(x='sample', y='N complexes') +
+  scale_fill_brewer(type='qual',palette=3) +
+  scale_alpha(range=c(0.5,1)) +
+  customTheme
+g
+BackupAsPDF(g, 'relativePropPosComplexes.barplot')
+
+```
+
+Ok, so now that we have positive complexes in each, focus on these and subset to complexes found in both replicates
+Number of shared complexes
+```{r}
+summary.dt <- complex.id[`Is Complex` == 'Positive',.N, by=.(Sample_ID, ComplexID)] %>% 
+  .[N == 2,] %>% 
+  .[,.(Ncomplexes=.N), by=Sample_ID]
+```
+
+Is this correct? Looks like a good result...
+```{r}
+g <- ggplot(summary.dt, aes(x=Sample_ID, y=Ncomplexes, fill=Sample_ID)) +
+  geom_bar(stat='identity', position='stack') +
+  ggtitle('N complexes detected in both replicates') +
+  labs(x='sample', y='N complexes') +
+  scale_fill_brewer(type='qual',palette=3) +
+  customTheme
+g
+BackupAsPDF(g, 'nSharedComplexes.barplot')
+```
+
+```{r}
+g <- ggplot(summary.dt, aes(x=Sample_ID, y=Ncomplexes, fill=Sample_ID)) +
+  geom_bar(stat='identity') +
+  geom_text(aes(label = Ncomplexes, x = Sample_ID, y = Ncomplexes), position = position_dodge(width = 0.8), vjust = -0.6, color='red',size=2, fontface='bold') +
+  ggtitle('N complexes detected in both replicates') +
+  labs(x='sample', y='N complexes') +
+  scale_fill_brewer(type='qual',palette=3) +
+  customTheme
+g
+BackupAsPDF(g, 'nSharedComplexes.wAnno.barplot')
+```
+Distribution of complex scores
+```{r}
+g <- ggplot(complex.id, aes(x=`Prediction confidence`, fill=Sample_ID)) +
+  geom_histogram(bins=100) +
+  geom_vline(xintercept = 0.5, linetype=2, col='red') +
+  annotate('text', x=0.65, y=100, label='positive\ncomplex', size=3, color='red') +
+  ggtitle('Complex prediction scores distribution') +
+  facet_grid(Replicate~Sample_ID) +
+  scale_fill_ipsum() +
+  customTheme
+g
+BackupAsPDF(g, 'complexScore.distribution.histogram',dimensions = c(10,8))
+```
+Lets do a venn diagram or eulerr plot of the overlapping complexes, first do all by all,then look at shared complex overlap
+
+```{r}
+# easiest way is to make a logical matrix; convert dt to long and then use if else
+complex.long <- dcast(complex.id[`Is Complex` == 'Positive',], ComplexID~Sample_ID+Replicate, value.var='ComplexID') %>% 
+  as.matrix(rownames='ComplexID')
+
+logical.mat <- ifelse(is.na(complex.long),FALSE,TRUE)
+BackupAsPDF(plot(euler(logical.mat), quantities = TRUE,legend=T, fill=brewer.pal(11,'Accent'), alpha=0.6), 'allPosComplexes.euler',dimensions=c(10,8))
+
+BackupAsPDF(plot(euler(logical.mat[, grepl('CL', colnames(logical.mat))]), quantities = TRUE,legend=T), 'CL_PosComplexes.euler')
+BackupAsPDF(plot(euler(logical.mat[, grepl('FT', colnames(logical.mat))]), quantities = TRUE, fill = c("red", "steelblue4"), alpha=0.5, legend=T), 'FT_PosComplexes.euler')
+BackupAsPDF(plot(euler(logical.mat[, grepl('Sonic', colnames(logical.mat))]), quantities = TRUE, fill = c( "#386CB0","#F0027F"), alpha=0.5, legend=T), 'Sonic_PosComplexes.euler')
+brewer.pal(11,'Accent')
+```
+Look at the ratio of novel to reported complexes returned
+```{r}
+g <- ggplot(complex.id, aes(x=`Prediction confidence`, color=paste0(Sample_ID, '_', Replicate))) +
+  stat_ecdf(geom='step', alpha=0.8) +
+  geom_vline(xintercept=0.5, linetype=2, color='red') +
+  scale_y_continuous(breaks=seq(0, 1, 0.1)) +
+  ggtitle('ECDF sample prediction scores') +
+  customTheme +
+  guides(color=guide_legend('sample')) +
+  coord_cartesian(xlim=c(0,1), ylim=c(0,1))
+
+g
+BackupAsPDF(g, 'samplePredictionScores.ecdf', dimensions = c(9,8))
+```
+Last thing to look at; euler plot of the complexes detected in both replicates
+Create a matrix
+```{r}
+# in this case we only want to find the number of positive complexes in both conditnolns
+complex.long <- dcast(complex.id[`Is Complex` == 'Positive',], ComplexID~Sample_ID, value.var='ComplexID') %>% 
+  as.matrix(rownames='ComplexID')
+
+# create a logical matrix of the output
+complex.long <- ifelse(complex.long < 2, FALSE, TRUE)
+
+BackupAsPDF(plot(euler(complex.long), quantities = TRUE, fill = brewer.pal(n=3, 'Set1'), alpha=0.6, legend=T), 'bothReps.posComplex.euler')
+```
+
+**ßToDo**
+Maybe look at a correlation matrix of the prediction scores
+
+```{r}
+mat <- dcast(complex.id, ComplexID~sample, value.var='Prediction confidence') %>% 
+  as.matrix(rownames='ComplexID')
+
+# log2 transform for normal distirbution
+corMat <- cor(mat, method='pearson', use = 'pairwise.complete.obs')
+
+# dendo ordereding
+od =  hclust(dist(corMat))$order
+corMat = corMat[od, od]
+
+
+hm <- Heatmap(corMat,
+        col=viridis(10, option='D'),
+        name='Pearsons r',
+        border=F,
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        column_dend_side = 'bottom',
+        rect_gp = gpar(type = "none"),
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=6),
+	      cell_fun = function(j, i, x, y, w, h, fill) {
+		      if(i >= j) {
+			      grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		        grid.text(sprintf("%.2f", corMat[i, j]), x, y, gp = gpar(col='white', fontsize = 7))
+		      }
+	  })
+hm
+BackupAsPDF(draw(hm, column_title='Pairwise sample correlations (Prediction score)'), 'predScore.heatmap')
+```
+
+```{r}
+mat <- dcast(complex.id, ComplexID~sample, value.var='GO Score') %>% 
+  as.matrix(rownames='ComplexID')
+
+# log2 transform for normal distirbution
+corMat <- cor(mat, method='pearson', use = 'pairwise.complete.obs')
+
+# dendo ordereding
+od =  hclust(dist(corMat))$order
+corMat = corMat[od, od]
+
+
+hm <- Heatmap(corMat,
+        col=viridis(10, option='D'),
+        name='Pearsons r',
+        border=F,
+        cluster_rows = FALSE, 
+        cluster_columns = FALSE,
+        column_dend_side = 'bottom',
+        rect_gp = gpar(type = "none"),
+        column_names_gp = gpar(fontsize=6),
+        row_names_gp = gpar(fontsize=6),
+	      cell_fun = function(j, i, x, y, w, h, fill) {
+		      if(i >= j) {
+			      grid.rect(x, y, w, h, gp = gpar(fill = fill, col = fill))
+		        grid.text(sprintf("%.2f", corMat[i, j]), x, y, gp = gpar(col='white', fontsize = 7))
+		      }
+	  })
+hm
+BackupAsPDF(draw(hm, column_title='Pairwise sample correlations (Prediction score)'), 'predScore.heatmap')
+```
+
+Barplot of the ratio of reported/novel complexes in each
+
+```{r}
+g <- ggplot(complex.id[`Is Complex` == 'Positive', .N, by=.(Sample_ID, Replicate, Reported)], aes(x=paste0(Sample_ID, '.', Replicate), y=N, fill=Reported)) +
+  geom_bar(stat='identity', position = 'stack') +
+  ggtitle('Positive complexes breakdown') +
+  labs(x='sample', y='N complexes') +
+  scale_fill_brewer(type='qual',palette=3) +
+  customTheme
+
+g
+BackupAsPDF(g, 'posComplexesBreakdown.barplot')
+```
+Look at the complexes detected in both replicates and see if we can identify the differences in novel vs reported
+
+```{r}
+complex.id[`Is Complex` == 'Positive', .(.N), by=.(Sample_ID, Replicate, Reported)]
+
+# just take the positive complexes, and look at the novel/reported breakdown
+summary.dt <- complex.id[`Is Complex` == 'Positive',.N, by=.(Sample_ID, ComplexID, Reported)] %>% 
+  .[N == 2, .N, by=.(Sample_ID, Reported)]
+
+g <- ggplot(summary.dt, aes(x=Sample_ID, y=N, fill=Reported)) +
+  geom_bar(stat='identity', position='stack') +
+  geom_text(data=summary.dt[Reported == 'Novel',], aes(label = N, x = Sample_ID, y = c(1010, 580, 900)), position = position_dodge(width = 0.7), color='red',size=3, fontface='bold') +
+  ggtitle('Proportion of positive complexes vs total') +
+  labs(x='sample', y='% pos complexes') +
+  scale_fill_brewer(type='qual',palette=3) +
+  scale_alpha(range=c(0.5,1)) +
+  customTheme
+g
+
+BackupAsPDF(g, 'propPosComplexesNovel.barplot')
+```
+Next plot, identify the differential complexes in each prep set-up, and plot linecharts, enrichment etc.
+
+```{r}
+de.complex.dt <- fread('./output/012325_firstPass/DifferentialComplexReport.txt')
+de.complex.dt[, Sample_ID := gsub('[_][0-9]$' ,'', Sample_ID)]
+
+# seems that CL is the baseline here, but most differences are driven by Replicate one... not sure if I trust these results
+de.complex.dt[,.N, by=.(Replicate,Sample_ID)]
+```
+
+
+```{r}
+#fwrite(complex.id, ScriptAndDatedFileName('complexReport.anno.dt'))
+complex.id <- fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/012725_PCPResults_Inspection_data/2025_01_28_complexReport.anno.dt')
+
+# extract the set that are positive in both reps and their conditions; find the 
+sigComplexes <- list(CL=complex.id[status == 'PositiveBothReps' & Sample_ID == 'CL', unique(ComplexID)], 
+                     FT=complex.id[status == 'PositiveBothReps' & Sample_ID == 'FT', unique(ComplexID)], 
+                     Sonic=complex.id[status == 'PositiveBothReps' & Sample_ID == 'Sonic', unique(ComplexID)])
+```
+
+Get names of complexes unique to each set
+```{r}
+CL.sig <- setdiff(sigComplexes[['CL']], c(sigComplexes[['Sonic']], sigComplexes[['FT']])) 
+Sonic.sig <- setdiff(sigComplexes[['Sonic']], c(sigComplexes[['CL']], sigComplexes[['FT']])) 
+FT.sig <- setdiff(sigComplexes[['FT']], c(sigComplexes[['CL']], sigComplexes[['Sonic']])) 
+```
+
+have the 3 sig sets, now filter these to just include complexes not detected in either of the other replicates
+```{r}
+FT.outer  <- complex.id[ComplexID %in% FT.sig & `Is Complex`=='Positive' & Sample_ID != 'FT', unique(ComplexID)]
+Sonic.outer  <- complex.id[ComplexID %in% Sonic.sig & `Is Complex`=='Positive' & Sample_ID != 'Sonic', unique(ComplexID)]
+CL.outer  <- complex.id[ComplexID %in% CL.sig & `Is Complex`=='Positive' & Sample_ID != 'CL', unique(ComplexID)]
+
+FT.sig <- setdiff(FT.sig, FT.outer) 
+FT.sig # 39 not found in other condition
+
+Sonic.sig <- setdiff(Sonic.sig, Sonic.outer) 
+Sonic.sig # 85
+
+CL.sig <- setdiff(CL.sig, CL.outer) 
+CL.sig # 30 sig hits not found in other, but a high proportion seem to be in other datasets
+```
+
+Ok now that I have a collection of complexes that are different between the conditions, can we see the 
+
+```{r}
+Sonic.topScorers <- complex.id[ComplexID %in% Sonic.sig & Sample_ID == 'Sonic',] %>% 
+  .[,.(ComplexID, Replicate, `Prediction confidence`, Sample_ID, Members, `GO Score`, `Common GO Biological Process`, `Common GO Cellular Component`, `Common GO Molecular Function`)] %>% 
+  .[,.SD[which.max(`Prediction confidence`)], by=.(ComplexID)]
+
+CL.topScorers <- complex.id[ComplexID %in% CL.sig & Sample_ID == 'CL',] %>% 
+  .[,.(ComplexID, Replicate, `Prediction confidence`, Sample_ID, Members, `GO Score`,  `Common GO Biological Process`, `Common GO Cellular Component`, `Common GO Molecular Function`)] %>% 
+  .[,.SD[which.max(`Prediction confidence`)], by=.(ComplexID)]
+
+FT.topScorers <- complex.id[ComplexID %in% FT.sig & Sample_ID == 'FT',] %>% 
+  .[,.(ComplexID, Replicate, `Prediction confidence`,Sample_ID, Members, `GO Score`,  `Common GO Biological Process`, `Common GO Cellular Component`, `Common GO Molecular Function`)] %>% 
+  .[,.SD[which.max(`Prediction confidence`)], by=.(ComplexID)]
+
+
+de.complexes.dt <- rbind(Sonic.topScorers, CL.topScorers, FT.topScorers)
+#fwrite(de.complexes.dt, ScriptAndDatedFileName('de.complexes.csv'))
+de.complexes.dt <- fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/012725_PCPResults_Inspection_data/2025_01_28_de.complexes.csv')
+```
+
+Now we have a list of complexes present in one conditon (both reps) but not the other
+
+```{r}
+
+de.complexes.dt %>% colnames()
+de.complexes.dt[order(-`Prediction confidence`), head(.SD, 5), by=`Sample_ID`]
+```
+
+Maybe can do a distribution of the top scores (or difference in Rep scores, scaled by overall score)
+Plot a distribution of the top scores in each set
+
+
+Quick plot of the GO scores of the heatmap
+```{r}
+de.mat <- dcast(complex.id[ComplexID %in% de.complexes.dt$ComplexID,], ComplexID~paste0(Sample_ID, '.', Replicate), value.var='Prediction confidence') %>% 
+  as.matrix(rownames='ComplexID')
+
+hm <- Heatmap(de.mat, 
+              name='PCP prediction score',
+              border=T,
+              col=viridis(100),
+              show_row_names = F,
+              row_names_gp = gpar(fontsize=5),
+              cluster_rows = clusterWNA(de.mat),
+              row_title = sprintf("%s DE complexes", nrow(de.mat)),
+              column_split = gsub('[.][12]$', '', colnames(de.mat)))
+
+BackupAsPDF(hm, 'deComplexes.heatmap', dimensions=c(10,12))
+```
+
+Show the linecharts for the top few hits 
+
+```{r}
+
+```
+
+
+
+```{r}
+posComplexes.dt <- complex.id[`Is Complex` == 'Positive',]
+
+# Identify the complexes in found both reps, and see which ones are not present in the other conditions
+summary.dt <- complex.id[`Is Complex` == 'Positive',.N, by=.(Sample_ID, ComplexID, Reported)] %>% 
+  .[N == 2, .(Sample_ID, ComplexID, status='PositiveBothReps')]
+
+complex.id <- merge(complex.id, summary.dt, by=c('Sample_ID', 'ComplexID'), all.x = T)
+complex.id[is.na(status),]
+
+
+complex.long <- dcast(complex.id[`Is Complex` == 'Positive',], ComplexID~Sample_ID+Replicate, value.var='ComplexID') %>% 
+  as.matrix(rownames='ComplexID')
+```
+```{r}
+
+```
+

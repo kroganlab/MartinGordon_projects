@@ -1,0 +1,1069 @@
+---
+title: "111223.apms.test"
+author: "Martin Gordon"
+date: "2023-12-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Process APMS data
+Run a standard QC of the data
+Share data with Danielle
+
+12/12/23
+---
+
+```{r}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(seqinr)
+library(stringr)
+library(randomcoloR)
+library(ComplexHeatmap)
+
+# for APMS processing
+library(artMS)
+library(seqinr)#read.fasta
+library(readxl)
+
+source ("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+
+getwd()
+```
+
+Read in the files
+
+```{r}
+spec <-  fread('./data/MSstats.csv')
+spec %>%  str()
+
+int.spec <- fread('./data/reprint.int.tsv')
+spec.counts <- fread('./data/reprint.spc.tsv')
+
+# looks like a matrix; intensity of each gene in a given condition
+# why is there more genes in the spectral counts file?
+int.spec %>% dim() #more in the spectral counts; must be filtered? Ask Danielle and share the ones missing
+spec.counts %>%  dim()
+# so they are all in the second dataset? 
+spec.counts.only <- spec.counts[which(!spec.counts$GENEID %in% int.spec$GENEID)]$GENEID %>%  unique()
+spec.counts.only
+
+int.spec[,unique(GENEID)] %>%  length()
+spec.counts[,unique(GENEID)] %>%  length()
+# which of these are duplicates then
+int.spec[duplicated(GENEID)]
+spec.counts[duplicated(GENEID)]
+
+# sample to metadata matching 
+meta.data <- fread('./data/TT01.fp-manifest')
+```
+Visualise counts per Condition
+```{r}
+spec[,.N,.(Run,Condition,BioReplicate)] # all have the same number of N, meaning there will be many NA values in each of these 
+
+dim(spec)
+summary(spec)
+str(spec)
+```
+create a summary DT
+
+```{r}
+summary.table <- spec[,.(totalRows = .N, 
+     missing = sum(is.na(Intensity)), 
+     contam = sum(grepl("contam", ProteinName) & !is.na(Intensity)),
+     counts = sum(!is.na(Intensity) & !grepl("contam", ProteinName))),
+  by = Run]
+
+# combine w condition and biorep info
+summary.table[spec, Condition := i.Condition, on=c('Run'='Run')]
+summary.table[spec, BioReplicate := i.BioReplicate, on=c('Run'='Run')]
+
+
+summary.table[, MissingOrContamProportion := (missing+contam)/totalRows]
+fwrite(summary.table, ScriptAndDatedFileName('mssStats.summarytable.tsv'))
+```
+first check we only have one measurement per elution
+No, this is good so dont need to merge
+
+```{r}
+any(spec[,.N,by=.(PeptideSequence, Condition, BioReplicate)]$N > 1)
+```
+ 
+Proporiton of NAs per sample?
+ 
+```{r}
+spec[, missing := ifelse(is.na(Intensity) | grepl("contam", ProteinName), 'yes' ,'no')]
+spec[, missing := factor(missing, levels=c('yes', 'no'))]
+
+g <- ggplot(spec, aes(x=reorder(interaction(Condition,BioReplicate)), fill=missing)) +
+  geom_bar() +
+  ggtitle('Proportion of NA (missing or contaminants)') +
+  scale_fill_manual(values=c('yes'='red', 'no'='blue')) +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=90, size=6),
+        legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm'))
+  
+g
+BackupAsPDF(g, 'propMissing.barplot.pdf')
+```
+ counts of contaminants in the data. 
+```{r}
+g <- ggplot(summary.table, aes(x=reorder(interaction(Condition,BioReplicate)), y=contam, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('N contaminants per sample') +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=90, size=6),
+        legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm'))
+  
+BackupAsPDF(g, 'N.contaminants.barplot')
+```
+ 
+
+barplot of counts per sample
+
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(k=length(unique(spec$Condition))) 
+
+unique(spec$Condition)
+
+g <- ggplot(summary.table, aes(x=reorder(interaction(Condition,BioReplicate)), y=counts, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('N measured peptides (contaminants removed)') +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=90, size=6),
+        legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm'))
+  
+g
+BackupAsPDF(g, 'N.measuredpeptides.pdf')
+```
+proportion of NA per plot
+
+```{r}
+
+g <- ggplot(spec[,.N, by=], aes(x=reorder(interaction(Condition,BioReplicate)), y=counts, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('N measured peptides (contaminants removed)') +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=90, size=6),
+        legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm'))
+  
+g
+```
+
+what are the average intensities in each sample?
+based on average intensities, samples seem quite variable, but I presume we correct for this using some type of normalisation?
+```{r}
+g <- ggplot(spec, aes(x=reorder(interaction(Condition,BioReplicate)), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('raw sample intensities') +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=90, size=6))
+
+BackupAsPDF(g, 'raw.intensities.boxplots')
+```
+
+cluster with NA vals function 
+
+```{r}
+clusterwNA <- function(x, na.val=0){
+  
+  x[is.na(x)] <- na.val
+  dist(x) %>%  hclust(method='complete')
+}
+```
+
+
+```{r}
+f.mat <-dcast(spec, interaction(PeptideSequence,PrecursorCharge)~interaction(Condition,BioReplicate), value.var = 'Intensity') %>% 
+  as.matrix(rownames='PeptideSequence')
+
+f.mat <- log2(f.mat)
+
+f.mat <- f.mat[complete.cases(f.mat),]
+
+submat <- f.mat[sample(rownames(f.mat), 3000),]
+Heatmap(submat, cluster_rows = clusterwNA(submat), show_row_names = F, column_names_gp = gpar(size=4))
+
+
+# do a median sweep and replot
+submat <-  sweep(f.mat, 1, STATS = apply(f.mat, 1, median, na.rm=T))
+submat <- submat[sample(rownames(f.mat), 3000),]
+
+
+hm <- Heatmap(submat, cluster_rows = clusterwNA(submat), show_row_names = F, column_names_gp = gpar(fontsize=6))
+
+# to my eyes seems there are a couple of nosiy samples that may need to be dropped 
+BackupAsPDF(hm, 'raw.intensities.median.scaled.heatmap')
+```
+at quick glance, looks like there may be some problematic samples;
+these three seem to have very different expresion patterns to other group members..
+
+orf3aS171L.1
+orf3aQ57H.3
+Lorf3aBeta.2
+
+lets look at a pca plot of the data;
+as expected, 3 of the samples cluster seperately to the others...
+```{r}
+pcaOut <- prcomp(t(f.mat))
+
+colInfo <- data.table(colname = colnames(f.mat))
+colInfo[,c("treat","rep") := tstrsplit(colname, "[.]", keep = c(1,2)) ] # v useful fucntion
+
+
+colInfo
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = treat, shape=rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  theme(legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm')) +
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  #scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_manual(values=c(col.pal)) +
+  scale_shape_manual(values=c(21:24)) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+
+p
+BackupAsPDF(p, "complete.features.pca.")
+```
+
+also check out the pca of the spectral counts
+~9200 peptides shared across samples
+
+spectral counts are at the protein level; lets see what the data looks like:
+Do we keep zero values in the table, or convert to NA?
+```{r}
+spec.dt <-  spec.counts[-1, c(-2,-3)]  %>%  data.table()
+
+cols.oi <- spec.dt[,-1] %>%  colnames()
+
+# important distinction below; top one regenerates colyumns specified in brackets, other creates a new data.table
+spec.dt <- spec.dt[, (cols.oi) := lapply(.SD, as.integer), .SDcols = cols.oi]
+#spec.dt <- spec.dt[, lapply(.SD, as.integer), .SDcols=cols.oi]
+
+speccounts.mat <- as.matrix(spec.dt, rownames='PROTID') 
+
+f.mat %>%  dim()
+speccounts.mat %>%  dim()
+
+spec.mat <-  speccounts.mat[complete.cases(speccounts.mat),]
+dim(spec.mat)
+```
+
+
+create a pca of the spectral counts data
+these are different, while using features they were seperayed on y axis with spec counts they are seperated on the x axis and cluster by themselves..
+tomorrow question whether these should be removed; need to create a new summary table and redo the plots for the spectral counts..
+
+```{r}
+pcaOut <- prcomp(t(spec.mat))
+
+colInfo <- data.table(colname = colnames(spec.mat))
+
+colInfo
+colInfo[,c("treat","rep") := tstrsplit(colname, "[_]", keep = c(1,2)) ] # v useful fucntion
+
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = treat, shape=rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  theme(legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm')) +
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  #scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_manual(values=c(col.pal)) +
+  scale_shape_manual(values=c(21:24)) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+
+BackupAsPDF(p, 'spectral.counts.pca')
+```
+
+
+Lets look at clustering of spectralCounts data and counts per sample
+median scale to view row-row trends
+can see again orf3aS171L.1 orf3aQ57H.3 Lorf3aBeta.2 look like clear outliers (PC1) and also possibly Empty_2/3 and Lempty_3
+
+```{r}
+Heatmap(spec.mat[sample(rownames(spec.mat), 2000),], show_row_names = F)
+
+# do a median sweep and replot
+submat <-  sweep(spec.mat, 1, STATS = apply(spec.mat, 1, median, na.rm=T))
+hm <- Heatmap(submat, show_row_names = F, row_title = paste0(nrow(submat), ' protein spectral counts'), column_names_gp = gpar(fontsize=6), name='spec.counts/median')
+
+BackupAsPDF(draw(hm, column_title='spectral counts heatmap'), 'spec.counts.mediancaled.heatmap')
+```
+other plots of spectral counts?
+barplots etc; lets look at number of proteins with 0 spec counts
+
+
+```{r}
+spec.counts.dt <- melt(spec.counts[-1,], id.vars=c('PROTID','GENEID', 'PROTLEN'), variable.name='sample',value.name = 'spectral.counts')
+
+spec.counts.dt[, missing := ifelse(spectral.counts == 0, 'yes' ,'no')]
+spec.counts.dt[, missing := factor(missing, levels=c('yes', 'no'))]
+
+spec.counts.dt[, Condition := gsub('_[123]{1}_SPC', '', sample)]
+spec.counts.dt[, BioReplicate := as.integer(str_extract(sample, '[123]{1}(?=_SPC)'))]
+spec.counts.dt[, spectral.counts := as.integer(spectral.counts)]
+
+#sanity check
+#spec.counts.dt[,.N, by=.(BioReplicate, sample, Condition)]
+g <- ggplot(spec.counts.dt, aes(x=sample, fill=missing)) +
+  geom_bar() +
+  ggtitle('Spectral Counts Proportion of NA') +
+  scale_fill_manual(values=c('yes'='red', 'no'='blue')) +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=90, size=6),
+        legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm'))
+  
+g
+BackupAsPDF(g, 'Nmissing.spectralCounts.samples')
+
+```
+get counts per sample
+
+```{r}
+g <- ggplot(spec.counts.dt[spectral.counts != 0,], aes(x=sample, fill=Condition)) +
+  geom_bar() +
+  ggtitle('Counts Per Sample') +
+  scale_fill_manual(values=c(col.pal)) +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=90, size=6),
+        legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm'))
+  
+g
+BackupAsPDF(g, 'N.spectralCounts.samples')
+```
+boxplots of counts 
+log2 transform + pseudocount 1
+
+```{r}
+g <- ggplot(spec.counts.dt, aes(x=sample, y=log2(spectral.counts+1), fill=Condition)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('raw sample intensities') +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=90, size=6),
+        legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm'))
+g
+BackupAsPDF(g, 'spec.counts.withZeros.boxplots')
+
+
+g <- ggplot(spec.counts.dt[spectral.counts != 0,], aes(x=sample, y=log2(spectral.counts), fill=Condition)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('raw sample intensities') +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=90, size=6),
+        legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm'))
+g
+BackupAsPDF(g, 'spec.counts.noZeros.boxplots')
+```
+what is the core protein set?
+Identify shared proteins and look at intensity values
+
+```{r}
+# 60 samples 20 conditions
+spec.counts.dt$Condition %>%  unique()
+
+# new facet labels
+# New facet label names for supp variable
+facet.labs <- c("Detected in 1 Reps", "Detected in 2 Reps", "Detected in 3 Reps")
+names(facet.labs) <- c("1", "2", "3")
+
+# want a non-zero val in at least 2 samples per condition
+g <- ggplot(spec.counts.dt[spectral.counts != 0, .N, by=.(PROTID,GENEID,Condition)], aes(x=Condition, y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  facet_wrap(~N,
+             labeller = labeller(N=facet.labs)) +
+  ggtitle('Within group protein counts') +
+  ylab('N Proteins') +
+  theme_classic() +
+  theme(axis.text.x=element_text(angle=90, size=6),
+        legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm'))
+g
+BackupAsPDF(g, 'proteinNbreakdown.pergroup.barplot.')
+```
+extract the unique list of proteins with 3 reps and plot a heatmap of these 
+
+```{r}
+core.set <- spec.counts.dt[spectral.counts >= 2, .N, by=.(PROTID,Condition)] %>% 
+  .[, .N, by=PROTID] %>% 
+  .[N == 20, PROTID]
+
+#1208 proteins appear in at least two bioreps in all 20 conditions. Consider this our core set of proteins 
+core.set %>%  length()
+
+Heatmap(spec.mat[rownames(spec.mat) %in% core.set, ], show_row_names = F)
+
+# do a median sweep and replot
+submat <-  sweep(spec.mat, 1, STATS = apply(spec.mat, 1, median, na.rm=T))
+hm <- Heatmap(submat[rownames(submat) %in% core.set, ], show_row_names = F, row_title = paste0(nrow(submat[rownames(submat) %in% core.set, ]), ' proteins'), column_names_gp = gpar(fontsize=6), name='spec.counts/median')
+
+BackupAsPDF(draw(hm, column_title='core protein set (>= 2 measurements in all Conditions)'), 'spec.counts.coreset.medianscaled.heatmap.')
+```
+We can see even with the coreset the 6 outlier samples on far right. indicates clustering not driven by NA values, but differences in expression/counts
+
+
+**Create SAINTexpress input**
+
+
+Create evidence file from msstats
+-----
+prepare input files 
+no need the msstats file looks v similar to evidence
+for keys look at previous project example
+```{r}
+evidence.example <- fread('~/Documents/projects/practise-scripts/Intro_To_Krogan_Analyses/artMS/2023_04_10_Intro_to_artMS_data/dir/evidence.txt')
+evidence.mss.example <- fread('~/Documents/projects/practise-scripts/Intro_To_Krogan_Analyses/artMS/2023_04_10_Intro_to_artMS_data/dir/evidence-mss.txt')
+keys.example <- fread('~/Documents/projects/practise-scripts/Intro_To_Krogan_Analyses/artMS/2023_04_10_Intro_to_artMS_data/dir/keys.txt')
+
+keys.example %>% head()
+
+colnames(evidence.mss.example)
+head(evidence.mss.example)
+# only fraction col is missing.. should work as is 
+colnames(evidence.mss.example) %in% colnames(spec)
+
+# sample to metadata matching 
+meta.data <- fread('./data/TT01.fp-manifest')
+
+# add this to kets
+meta.data[, IsotopeLabelType := 'L']
+
+meta.data[, RawFile := str_extract(V1, 'exLewis.+raw') ]
+meta.data[, BioReplicate := V3] 
+meta.data[,Condition := V2]
+
+meta.data <- meta.data[order(RawFile)] %>% 
+  .[, Run := .I] # create row index
+
+#sanity check; confirm condition+biorep in keys == msstats files
+
+keys.example %>% head()
+meta.data[order(Run)]
+
+# extract relevant cols for the keys file
+keys.tidy <- meta.data[, .(RawFile,Condition, BioReplicate, Run, IsotopeLabelType)]
+
+evidence.tidy <- spec[, RawFile := paste0(Run, '.raw')]
+evidence.tidy <- evidence.tidy[order(RawFile),] %>% 
+  .[, Run := .I]
+
+# cols from example evidence files
+cols.oi <- c("ProteinName","PeptideSequence","PrecursorCharge","FragmentIon","ProductCharge","IsotopeLabelType","Condition","BioReplicate","Run","Intensity" )
+evidence.tidy <- evidence.tidy[, ..cols.oi]
+
+keys <- meta.data %>% 
+  .[,.(Condition, RawFile, BioReplicate, IsotopeLabelType, Run)]
+
+evidence.tidy[,.N, by=.(Condition,BioReplicate,RawFile)] %>%  
+  .[order(Condition)]
+keys[,.N, by=.(Condition,BioReplicate,RawFile)] %>% 
+  .[order(Condition)]
+
+
+str(evidence.tidy)
+str(keys)
+
+
+merge(evidence.tidy, keys, by=c('RawFile','IsotopeLabelType'))
+
+# sanity checks
+keys[,.N, by=.(Condition,BioReplicate,RawFile)][order(Condition)]$RawFile == evidence.tidy[,.N, by=.(Condition,BioReplicate,RawFile)][order(Condition)]$RawFile
+keys[,.N, by=.(Condition,BioReplicate,RawFile)][order(Condition)]$Condition == evidence.tidy[,.N, by=.(Condition,BioReplicate,RawFile)][order(Condition)]$Condition
+keys[,.N, by=.(Condition,BioReplicate,RawFile)][order(Condition)]$BioReplicate == evidence.tidy[,.N, by=.(Condition,BioReplicate,RawFile)][order(Condition)]$BioReplicate
+
+#rename ProteinName to Proteins in evidence.txt to work with all downstream functions
+evidence.tidy %>% colnames()
+setnames(evidence.tidy, old='ProteinName', new='Proteins')
+
+# testing functions hashed are working
+#my.load_evidencekey(evidence.tidy, keys)
+#filterMaxqData(evidence.tidy)
+#filterData(evidence.tidy)
+
+
+my.preprocessAPMS(evidence.tidy, keys)
+
+
+fasta <-  './data/2023-05-22-decoys-reviewed-contam-UP000005640_andSARS2.fas'
+my.MaxQToMIST(evidence.tidy, keys, ref_proteome_file = fasta)
+```
+
+Use supporting functions from Yuan utils
+https://github.com/kroganlab/Yuan_utils/blob/main/code%20for%20PPI.R
+
+```{r}
+#works
+my.load_evidencekey=function(evidence,key)
+{
+  data=evidence
+  colnames(data) <- gsub('\\s','.',colnames(data))
+  data <- subset(data, trimws(data$Proteins) != "") # remove white Proteins ids
+  colnames(data)[grep(colnames(data), pattern="raw.file", ignore.case = TRUE)] <- "RawFile"
+  data$Intensity[data$Intensity<1] <- NA
+  if(!'IsotopeLabelType' %in% colnames(data)) data$IsotopeLabelType <- 'L'
+  
+  keys <- key
+  
+  # check
+  unique_data <- unique(data$RawFile)
+  unique_keys <- unique(keys$RawFile)
+  keys_not_found = setdiff(unique_keys, unique_data)
+  data_not_found = setdiff(unique_data, unique_keys)
+  if (length(keys_not_found) > 0) {
+    message(sprintf("Keys: %d/%d RawFiles not found: %s", length(keys_not_found), length(unique_keys), paste(keys_not_found, collapse=",")))
+  }
+  if (length(data_not_found) > 0) {
+    message(sprintf("Data: %d/%d RawFiles not found: %s", length(data_not_found), length(unique_data), paste(data_not_found, collapse=",")))
+  }
+  
+  # combine
+  data = merge(data, keys, by=c('RawFile','IsotopeLabelType'))
+  return(list(data=data,keys=keys))
+}
+
+filterMaxqData <- function(data){
+  data_selected <- data[grep("contam_sp|REV__",data$Proteins, invert=T),]
+  blank.idx <- which(data_selected$Proteins =="")
+  if(length(blank.idx)>0)  data_selected = data_selected[-blank.idx,]
+  return(data_selected)
+}
+
+filterData <- function(data){
+  data_f = data
+  #if(config$filters$protein_groups == 'remove') 
+  data_f <- data_f[grep(";",data_f$Proteins, invert=T),]
+  #if(config$filters$contaminants) 
+  data_f <- filterMaxqData(data_f)
+  msg <- sprintf("Data Filter: %d/%d (%s%%) records remained", 
+                 nrow(data_f), nrow(data), round(100*nrow(data_f)/nrow(data),1))
+  message(msg)
+  return(data_f)
+}
+```
+
+```{r}
+## APMS functions
+# ******************************************** #
+# FUNCTIONS for AP-MS scoring
+# ******************************************** #
+
+# Filtering and aggregate intensity/spectral_count for each protein
+## rm_itself: remove interactions of bait and itself
+## fix_itself: for interactions of bait and itself, fix prey name
+my.preprocessAPMS <- function(evidence,key, rm_itself = TRUE, fix_itself = TRUE) {
+  # Load data/key
+  #config <- my.load_config(dataset_id)
+  data <- my.load_evidencekey(evidence,key)$data
+  
+  # Filter
+  data_f <- data
+  # if (!is.null(config$filters$resolve_baitgroup)) {
+  #   data_f <- resolve_baitgroup(data=data_f, bait_pattern=trimws(config$filters$resolve_baitgroup))
+  #   data_f <- remove_bait_contaminant(data_f, bait_pattern=trimws(config$filters$resolve_baitgroup))
+  # }
+  data_f <- filterData(data_f)
+  colnames(data_f)[grep(pattern="ms.ms.count", x = colnames(data_f), ignore.case = TRUE)] <- 'spectral_counts'
+  
+  if (rm_itself) data_f <- subset(data_f, Condition != Proteins)
+  if (!rm_itself & fix_itself) {
+    idx <- which(data_f$Condition == data_f$Proteins)
+    data_f[idx,"Proteins"] <- paste0(data_f[idx,"Proteins"], "prey")
+  }
+  
+  # Aggregate Intensity
+  data_f_agg <- aggregate(Intensity ~ TestControl+BaitName+RawFile+BioReplicate+Run+Condition+Proteins+Sequence+Charge, data=data_f, FUN = max)
+  data_f_agg <- aggregate(Intensity ~ TestControl+BaitName+RawFile+BioReplicate+Run+Condition+Proteins, data=data_f_agg, FUN = sum)
+  data_f_agg <- subset(data_f_agg, !is.na(Intensity))
+  
+  # Aggregate SPC
+  data_f_spc <- aggregate(spectral_counts ~ TestControl+BaitName+RawFile+BioReplicate+Run+Condition+Proteins+Sequence+Charge,data=data_f,FUN = max)
+  data_f_spc <- aggregate(spectral_counts ~ TestControl+BaitName+RawFile+BioReplicate+Run+Condition+Proteins,data=data_f_spc,FUN = sum)
+  data_f_spc <- subset(data_f_spc, !is.na(spectral_counts))
+  
+  return( list(data_f = data_f, agg_intensity = data_f_agg, agg_spc = data_f_spc) )
+}
+
+my.MaxQToMIST <- function(evidence,key,ref_proteome_file, outdir = "/bf2/smb-data/tnguyen/projects/fluomics/tempdata", quant_variable="spc") {
+  # Load and aggregate data/key
+  datalist <- my.preprocessAPMS(evidence,key)
+  
+  quant_variable <- trimws(tolower(quant_variable))
+  if (! quant_variable %in% c("spc","intensity")) stop("Please input quant_variable as 'spc' or 'intensity'")
+  data_sel <- datalist$agg_spc
+  data_sel$ms_spectral_counts <- data_sel$spectral_counts
+  quant_col <- 'ms_spectral_counts'
+  if (quant_variable == "intensity") {
+    data_sel <- datalist$agg_intensity
+    data_sel$ms_intensity <- data_sel$Intensity
+    quant_col <- 'ms_intensity'
+  }
+  keysout <- unique(data_sel[,c("RawFile","Condition")])
+  
+  # Select columns
+  data_sel$ms_unique_pep = ""
+  data_sel <- data_sel[,c('RawFile','Proteins','ms_unique_pep', quant_col)]
+  colnames(data_sel) = c('id','ms_uniprot_ac','ms_unique_pep', quant_col)
+  
+  # Uniprot annotate
+  #conn <- my.bf2_connect()
+  #uniprot <- dbGetQuery(conn, "select distinct Entry as ms_uniprot_ac, Length from view_uniprot")
+  #dbDisconnect(conn)
+  
+  # library(dplyr)
+  # uniprot <- distinct(uniprot,Entry,Length)
+  # colnames(uniprot)[which(colnames(uniprot)=="Entry")]="ms_uniprot_ac"
+  # d <- setdiff(data_sel$ms_uniprot_ac, uniprot$ms_uniprot_ac)
+  # if (length(d)>0) {
+  #   msg <- sprintf("These proteins are not found in uniprot db, please check: %s", paste(d, collapse=","))
+  #   #stop(msg)
+  #   message(msg)
+  # }
+  
+  ref_proteome <- read.fasta(
+    file = ref_proteome_file,
+    seqtype = "AA",
+    as.string = TRUE,
+    set.attributes = TRUE,
+    legacy.mode = TRUE,
+    seqonly = FALSE,
+    strip.desc = FALSE
+  )
+  p_lengths <- c()
+  p_names <- c()
+  for (e in ref_proteome) {
+    p_lengths <- c(p_lengths, nchar(e[1]))
+    p_names <- c(p_names, attr(e, 'name'))
+  }
+  ref_table <- data.table(names = p_names, lengths = p_lengths)
+  ref_table[, uniprot_ac := gsub('([a-z,0-9,A-Z]+\\|{1})([A-Z,0-9,\\_]+)(\\|[A-Z,a-z,0-9,_]+)',
+                                 '\\2',
+                                 names)]
+  ref_table[, uniprot_id := gsub('([a-z,0-9,A-Z]+\\|{1})([a-z,0-9,A-Z]+\\|{1})([A-Z,a-z,0-9,_]+)',
+                                 '\\3',
+                                 names)]
+  colnames(ref_table)[which(colnames(ref_table)=="uniprot_ac")]="ms_uniprot_ac"
+  d <- setdiff(data_sel$ms_uniprot_ac, ref_table$ms_uniprot_ac)
+  if (length(d)>0) {
+    msg <- sprintf("These proteins are not found in fasta, please check: %s", paste(d, collapse=","))
+    #stop(msg)
+    message(msg)
+  }
+  
+  # Get mass
+  data_sel <- base::merge(data_sel, ref_table, by = "ms_uniprot_ac")
+  data_sel$Mass <- 110*data_sel$lengths
+  
+  # Write out
+  ## data
+  outdir <- paste0(outdir, "/mist/", quant_variable)
+  dir.create(outdir, show=FALSE, recursive = TRUE)
+  data_outfile <- sprintf("%s/mist-data.%s.txt", outdir, quant_variable)
+  write.table(data_sel, file=data_outfile, eol='\n', sep='\t', quote=F, row.names=F, col.names=T)
+  
+  ## keys
+  key_outfile <- sprintf("%s/mist-key.%s.txt", outdir, quant_variable)
+  write.table(keysout, file=key_outfile, eol='\n', sep='\t', quote=F, row.names=F, col.names=F)
+  
+  return(list(data_file=data_outfile, keys_file=key_outfile))
+}
+```
+
+artMS QC
+----
+
+our mss input will suffice as an evidence file
+For the keys,we just need a biosample,run,condition mapper
+
+read in example files 
+
+```{bash}
+#cp ~/Downloads/keys.txt .
+cp ~/Downloads/evidence.txt .
+```
+missing ms.ms count etc cols to use Artms...
+
+need to prep the spectronaut file for artMS input
+
+```{r}
+
+a <- fread (spectronautPeptideFile)
+​
+# histogram for log2 intensity
+hist(log2(a$Intensity), breaks = 100)
+abline(v = 5)
+​
+source (file.path("~/Downloads", "bp_utils", "spectronautFile2ArtMS.R"))
+​
+cf<- list()
+# normalization method FALSE = no normalization; default is global medians which you can get my removing/commenting out all normalization lines
+# cf$msstats$normalization_method = FALSE
+​
+#cf$msstats$normalization_method = "globalStandards"
+#cf$msstats$normalization_reference <-  "P38398"
+​
+# should artms attempt to annotate proteins 1 = yes; 0 = no
+cf$output_extras$annotate$enabled <- as.integer(1)
+# should artms do extended QC 1 = yes; 0= no
+cf$qc$extended <- as.integer(1)
+cf$qc$basic <- as.integer(1)
+​
+# cf$output_extras$annotate$species <- "MOUSE"
+​
+# make files in artMS format
+globalInput <- spectronautFile2ArtMS(spectronautPeptideFile, 
+                                     outFilePrefix = "/PATH_TO_PROJECT_DIR", 
+                                     artmsConfig = cf, contrastPatterns  = contrastPatterns)
+evidence <- read.table(file = "/PATH_TO_PROJECT_DIR/evidence.txt", header = T, sep = "\t", stringsAsFactors = F, check.names = F)
+evidence_sub <- evidence[-which(is.na(evidence$Intensity)), ]
+# check contaminate
+contaminate <- c("O77727", "P00698", "P00761", "P00883", "P02662", "P02663", "P02666", "P02668", "P02769")
+# check Leading proteins formate
+if(any(grepl("sp\\|", evidence_sub$`Leading proteins`)))
+{
+  evidence_sub$`Leading proteins` <- gsub("sp\\|", "", evidence_sub$`Leading proteins`)
+  # evidence_sub$`Leading proteins`[grep("_HUMAN", evidence_sub$`Leading proteins`, invert = T)] <- paste("CON__", evidence_sub$`Leading proteins`[grep("_HUMAN", evidence_sub$`Leading proteins`, invert = T)], sep = "")
+  evidence_sub$`Leading proteins` <- gsub("\\|.*", "", evidence_sub$`Leading proteins`)
+}
+if(any(contaminate %in% evidence_sub$`Leading proteins`))
+{
+  evidence_sub$`Leading proteins`[which(evidence_sub$`Leading proteins` %in% contaminate)] <- 
+    paste("CON__", evidence_sub$`Leading proteins`[which(evidence_sub$`Leading proteins` %in% contaminate)], sep = "")
+}
+write.table(evidence_sub, "/PATH_TO_PROJECT_DIR/evidence_sub.txt", sep = "\t", row.names = F, quote = F)
+​
+# QC
+setwd("/PATH_TO_PROJECT_DIR")
+artmsQualityControlEvidenceBasic(evidence_file = "/PATH_TO_PROJECT_DIR/evidence_sub.txt", 
+                                 keys_file = "/PATH_TO_PROJECT_DIR/keys.txt", 
+                                 prot_exp = "APMS")
+artmsQualityControlEvidenceExtended(evidence_file = "/PATH_TO_PROJECT_DIR/evidence_sub.txt", 
+                                    keys_file = "/PATH_TO_PROJECT_DIR/keys.txt", 
+                                    plotPCA = FALSE)
+​
+# PCA
+# MSstats
+peptideDF <- fread(spectronautPeptideFile)
+peptideDF$PeptideModifiedSequence <- peptideDF$PeptideSequence
+peptideDF$IsotopeLabelType <- "L"
+​
+library(MSstats)
+mssquant <- dataProcess(raw = as.data.frame(peptideDF),
+                        MBimpute=F)
+write.table(
+  mssquant$FeatureLevelData,
+  file = 'output/mss-FeatureLevelData.txt',
+  eol = "\n",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = TRUE
+)
+outputDirectory <- "/PATH_TO_PROJECT_DIR/output"
+mss.normalized.txt <-file.path(outputDirectory, "mss-FeatureLevelData.txt") 
+normPepInt <- fread (mss.normalized.txt)
+​
+normPepInt[, logCenteredIntensity := log2(INTENSITY/(median(INTENSITY, na.rm=TRUE))), by = PEPTIDE]
+normInt.mat <- as.matrix(dcast(normPepInt, PEPTIDE~GROUP+SUBJECT, value.var = "logCenteredIntensity"), rownames = "PEPTIDE")
+​
+# subset to complete cases
+normInt.mat <- normInt.mat[complete.cases(normInt.mat),]  # select rows with no missing values
+​
+colInfo <- data.table(colname = colnames(normInt.mat))
+# something like, this depends on the structure of your condition names
+# colInfo[,c("treat", "time", "rep") := tstrsplit(colname, "[_.]", keep = c(1,2,5)) ]
+colInfo$treat <- gsub("_.*", "", colInfo$colname)
+# colInfo$rep <- gsub(".*-", "", colInfo$colname)
+colInfo$rep <- gsub(".*_", "", colInfo$colname)
+​
+​
+title <- NULL
+#PCA
+pcaOut <- prcomp(t(normInt.mat))
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+​
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+​
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+​
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2, fill = treat, shape = rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(normInt.mat))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = 21:25) +
+  #scale_fill_manual(values = c(`05` = "gray", `30` = "black")) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+# BackupAsPDF(p, "PCA_Complete_Features")
+cairo_pdf(file.path(outputDirectory, "PCA_Complete_Features.pdf"), width = 10, height = 7)
+print (p)
+dev.off()
+​
+# if you want to exclude runs, put them in this vector
+# it is the "BioReplicate" column in the keys.txt file
+runsToSkip <- c() #c("MDA_Control-1")
+​
+​
+# timsTOF to SAINTexpress
+spc <- data.table::fread(file = "/PATH_TO_PROJECT_DIR/reprint.spc.tsv")
+# remove first row
+spc <- spc[-1, ]
+spc_long <- reshape2::melt(spc, id.vars = c("PROTID", "GENEID", "PROTLEN"))
+spc_long$variable <- as.character(spc_long$variable)
+spc_long$value <- as.integer(spc_long$value)
+spc_long$variable <- gsub("_SPC", "", spc_long$variable)
+spc_long$BioReplicate <- gsub(".*_", "", spc_long$variable)
+spc_long$Condition <- sub('_[^_]*$', '', spc_long$variable)
+spc_long$BioReplicate <- paste(spc_long$Condition, spc_long$BioReplicate, sep = "-")
+# check contaminate and remove
+if(length(contaminate) == 1){
+  spc_long <- spc_long[-which(spc_long$PROTID == contaminate), ]
+}else{
+  spc_long <- spc_long[-which(spc_long$PROTID %in% contaminate), ]
+}
+# remove samples didn't pass QC
+if(length(runsToSkip) > 0){
+  if(length(runsToSkip) == 1){
+    spc_long <- spc_long[-which(spc_long$BioReplicate == runsToSkip), ]
+  }else{
+    spc_long <- spc_long[-which(spc_long$BioReplicate %in% runsToSkip), ]
+  }
+  
+}
+​
+# Bait
+dir.create(paste("/PATH_TO_PROJECT_DIR", "/msspc", sep = ""))
+setwd(paste("/PATH_TO_PROJECT_DIR", "/msspc", sep = ""))
+Bait <- unique(spc_long$BioReplicate)
+Bait <- gsub("-", "_", Bait)
+Bait <- sub("_([^_]*)$", "-\\1", Bait)
+Bait <- data.frame(BioReplicate = Bait, Condition = gsub("-.*", "", Bait))
+Bait$SAINT <- "T"
+Bait$SAINT[grep("Control", Bait$Condition)] <- "C"
+write.table(Bait, "spectral_counts-saint-baits.txt", sep = "\t", quote = F, row.names = F, col.names = F)
+​
+# interactions
+interactions <- data.frame(BioReplicate = spc_long$BioReplicate, 
+                           Condition = gsub("-.*", "", spc_long$BioReplicate), 
+                           PROTID = spc_long$PROTID, 
+                           spc = spc_long$value)
+interactions$BioReplicate <- gsub("-", "_", interactions$BioReplicate)
+interactions$BioReplicate <- sub("_([^_]*)$", "-\\1", interactions$BioReplicate)
+interactions$Condition <- gsub("-.*", "", interactions$BioReplicate)
+​
+# remove 0 counts
+interactions <- interactions[which(interactions$spc != 0), ]
+write.table(interactions, "spectral_counts-saint-interactions.txt", sep = "\t", quote = F, row.names = F, col.names = F)
+​
+# preys
+preys <- data.frame(PROTID = spc_long$PROTID, 
+                    PROTLEN = spc_long$PROTLEN, 
+                    GENEID = spc_long$GENEID)
+preys <- unique(preys)
+write.table(preys, "spectral_counts-saint-preys.txt", sep = "\t", quote = F, row.names = F, col.names = F)
+​
+##########################
+int <- data.table::fread(file = "/PATH_TO_PROJECT_DIR/reprint.int.tsv")
+# remove first row
+int <- int[-1, ]
+int_long <- reshape2::melt(int, id.vars = c("PROTID", "GENEID"))
+int_long$variable <- as.character(int_long$variable)
+int_long$value <- as.numeric(int_long$value)
+int_long$variable <- gsub("_INT", "", int_long$variable)
+int_long$BioReplicate <- gsub(".*_", "", int_long$variable)
+int_long$Condition <- sub('_[^_]*$', '', int_long$variable)
+int_long$BioReplicate <- paste(int_long$Condition, int_long$BioReplicate, sep = "-")
+# check contaminate and remove
+if(length(contaminate) == 1){
+  int_long <- int_long[-which(int_long$PROTID == contaminate), ]
+}else{
+  int_long <- int_long[-which(int_long$PROTID %in% contaminate), ]
+}
+# remove samples didn't pass QC
+if(length(runsToSkip) > 0){
+  if(length(runsToSkip) == 1){
+    int_long <- int_long[-which(int_long$BioReplicate == runsToSkip), ]
+  }else{
+    int_long <- int_long[-which(int_long$BioReplicate %in% runsToSkip), ]
+  }
+  
+}
+# Bait
+dir.create(paste("/PATH_TO_PROJECT_DIR", "/msint", sep = ""))
+setwd(paste("/PATH_TO_PROJECT_DIR", "/msint", sep = ""))
+Bait <- unique(int_long$BioReplicate)
+Bait <- gsub("-", "_", Bait)
+Bait <- sub("_([^_]*)$", "-\\1", Bait)
+Bait <- data.frame(BioReplicate = Bait, Condition = gsub("-.*", "", Bait))
+Bait$SAINT <- "T"
+Bait$SAINT[grep("Control", Bait$Condition)] <- "C"
+write.table(Bait, "Intensity-saint-baits.txt", sep = "\t", quote = F, row.names = F, col.names = F)
+​
+# interactions
+interactions <- data.frame(BioReplicate = int_long$BioReplicate, 
+                           Condition = gsub("-.*", "", int_long$BioReplicate), 
+                           PROTID = int_long$PROTID, 
+                           int = int_long$value)
+interactions$BioReplicate <- gsub("-", "_", interactions$BioReplicate)
+interactions$BioReplicate <- sub("_([^_]*)$", "-\\1", interactions$BioReplicate)
+interactions$Condition <- gsub("-.*", "", interactions$BioReplicate)
+​
+# remove 0 counts
+interactions <- interactions[which(interactions$int != 0), ]
+write.table(interactions, "Intensity-saint-interactions.txt", sep = "\t", quote = F, row.names = F, col.names = F)
+​
+# preys
+preys <- data.frame(PROTID = int_long$PROTID,  
+                    GENEID = int_long$GENEID)
+preys <- unique(preys)
+file.copy(from="/PATH_TO_PROJECT_DIR/msspc/spectral_counts-saint-preys.txt", 
+          to="/PATH_TO_PROJECT_DIR/msint", 
+          overwrite = TRUE, recursive = FALSE, 
+          copy.mode = TRUE)
+​
+
+
+```
+
+
+```{r}
+# keys looks fine, but lets check the evidence.txt
+fread('./keys.txt')
+keys %>%  colnames() # looks same except biorep in ours is just integer whereas its pasted w condition in above
+setnames(keys, old='RawFile', new='Raw.file')
+setnames(evidence.tidy, old='RawFile', new='Raw.file')
+
+# adjusting keys to match example table
+keys[, BioReplicate := paste0(Condition,'.', BioReplicate)]
+# write out our files
+fwrite(keys, ScriptAndDatedFileName('artms.keys.txt'))
+fwrite(evidence.tidy, ScriptAndDatedFileName('artms.evidence.txt'))
+
+
+
+outdir <- './111223.APMSRun1_data'
+
+
+test.evidence <- fread('~/Box\ Sync/Intro_To_Krogan_Analyses/artMS/2023_04_10_Intro_to_artMS_data/dir/evidence.txt')
+test.keys <- fread('~/Box\ Sync/Intro_To_Krogan_Analyses/artMS/2023_04_10_Intro_to_artMS_data/dir/keys.txt')
+
+test.keys
+
+
+
+write.table(evidence.tidy, file='./output/evidence.txt', sep='\t', col.names = T, row.names = F)
+write.table(keys, file='./output/keys.txt', sep='\t', col.names = T, row.names = F)
+
+
+
+fread('output/keys.txt')
+
+# test config
+test.config <-  fread('~/Box\ Sync/Intro_To_Krogan_Analyses/artMS/2023_04_10_Intro_to_artMS_data/dir/config.yaml')
+test.config
+
+
+#QC
+dir.create(paste(outdir, "/QC.Extended", sep = ""))
+setwd(paste(outdir, "/QC.Extended", sep = ""))
+
+artmsQualityControlEvidenceExtended(evidence_file='./output/evidence.txt',
+                                    keys_file='./output/keys.txt')
+
+# dir.create(paste(outdir, "/QC Basic", sep = ""))
+setwd(paste(outdir, "/QC.Basic", sep = ""))
+artmsQualityControlEvidenceBasic(evidence_file='./output/evidence.txt',
+                                    keys_file='./output/keys.txt',
+                                 prot_exp="APMS",output_name="A3", verbose = TRUE)
+
+View(artmsQualityControlEvidenceBasic)
+
+fread('./111223.APMSRun1_data/2023_12_12_artms.keys.txt')
+
+evide
+
+keys[]
+evidence.tidy
+View(artmsQualityControlEvidenceBasic)
+```
+
+
+
+```{r}
+# create another column to isolate first part of ID to see what is available
+spec[grep('', ProteinName)]
+
+mss[grep('', ProteinName)]
+mss[, ProtType := str_extract(ProteinName, '.+(?=_sp)')]
+mss$ProtType %>%  unique()
+
+
+
+```
+create barplots of each peptide sample
+
+```{r}
+ggplot(mss, aes(x=interaction(Condition, BioReplicate), y))
+```
+

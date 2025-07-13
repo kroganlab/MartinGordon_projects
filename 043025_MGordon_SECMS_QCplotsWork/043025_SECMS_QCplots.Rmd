@@ -1,0 +1,812 @@
+---
+title: "043025_QCpFunctions"
+author: "Martin Gordon"
+date: "2025-04-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overivew 
+
+Write a number of functions to visualize the QC quality of different replicates; these need to be implemented as part of the standard SEC-MS workflow
+- first; start from peptide data; create a clean long format file and then write a funciton to summarize to Proteins (will use mstats)
+- at protein level; look at correlations of sister peptides across the replicates (with/wo phagoSome and riboSome proteins)
+
+
+Look at Bens complexes and see how they appear
+
+```{r cars}
+library(MSstats)
+library(magrittr)
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(stringr)
+library(eulerr)
+
+source("~/Documents/utils/bp_utils/ManageScriptData.R") # read the SECms utils library
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R") # read the SECms utils library
+source("~/Documents/utils/bp_utils/SEC_MS_utils.localMods.R")
+```
+Read in the peptide level data
+```{r}
+lysisPrep.list[[1]]
+lysisPrep.list <- list('sonic'=fread("/Users/martingordon/Documents/projects/043025_MGordon_SECMS_QCplotsWork/data/2025_02_SEC_Lysis_Test/Spectronaut/2. NP40-Lysis buffer + Sonication/20250115_092735_MM_Sonic_Lysis_122724_MSStats_Report.txt"),
+                       'FT'=fread("/Users/martingordon/Documents/projects/043025_MGordon_SECMS_QCplotsWork/data/2025_02_SEC_Lysis_Test/Spectronaut/3. NP40-Lysis buffer + Freeze-Thaw/20250114_172438_MM_FT_Lysis_122724_MSStats_Report.txt"),
+                       'CL'=fread("/Users/martingordon/Documents/projects/043025_MGordon_SECMS_QCplotsWork/data/2025_02_SEC_Lysis_Test/Spectronaut/1. CellLytic M Lysis buffer/20250114_135820_MM_CL_Lysis_122724_MSStat_Report.txt"))
+```
+Need to tidy up this list; get the fraction ID
+
+```{r}
+lapply(lysisPrep.list, function(x){
+  
+  x[, Fraction := str_extract(Run, '(?<=Frac-)[0-9]{1,2}')]
+  x[, Condition :=  paste0(Condition, '.', Fraction)] 
+  x[, IsotopeLabelType := 'L']
+})
+```
+
+```{r}
+# looking at some missing fractions in the two groups.. lets summarize first, then remove
+lapply(lysisPrep.list, function(x){
+  x[,.N, by=.(BioReplicate,Condition)][,.N, by=Condition][N < 2,]
+})
+
+# for a quick QC check, lets look at the data
+lysisPrep.dt <- lysisPrep.list %>% 
+  rbindlist(., idcol='sample')
+
+# tidy colnames to conform with SEDC_MS standards
+lysisPrep.dt[, treatment := sample]
+lysisPrep.dt[, sample := paste0(sample, '_', BioReplicate)] #unique ID
+lysisPrep.dt[, fraction := as.integer(str_extract(Run, '(?<=Frac-)[0-9]{1,2}'))]
+#lysisPrep.dt[, fraction := factor(fraction, levels=as.character(seq(1,72,1)))]
+lysisPrep.dt[, protein := ProteinName]
+lysisPrep.dt[, peptide := paste0(PeptideSequence, '.', PrecursorCharge)]
+lysisPrep.dt[, replicate := BioReplicate]
+lysisPrep.dt[, intensity := Intensity]
+
+cols.oi <- c('sample', 'treatment', 'replicate', 'fraction', 'protein', 'peptide', 'intensity')
+
+# work with this for now
+sec.dt <- lysisPrep.dt[, ..cols.oi]
+sec.dt[, peptideSequence := gsub('[.][0-9]+$','', peptide)]
+
+# how many peptides per protein and how often are they observed
+sec.dt[, nfeatures := .N, by=.(protein,sample, fraction)] # n features per protein/fraction
+```
+
+save the file to output
+```{r}
+#fwrite(sec.dt, ScriptAndDatedFileName('lysis.test.raw.peptide.longformat.csv.gz'))
+sec.dt <- fread('~/Documents/projects/043025_MGordon_SECMS_QCplotsWork/043025_SECMS_QCplots_data/2025_04_30_lysis.test.raw.peptide.longformat.csv.gz')
+```
+
+collapse features to peptides (CCprofiler does this to help with completeness; just sum precursor ints)
+Look at the distributions of the nFractions observed
+
+```{r}
+sec.dt <- sumFeatureIntensities(sec.dt)
+
+sec.dt[, .(nTimesObserved=.N), by=.(treatment,replicate,peptideSequence)][replicate == 2]
+g <- ggplot(sec.dt[, .(nTimesObserved=.N), by=.(treatment,replicate,peptideSequence)], aes(x=nTimesObserved, color=treatment, linetype=as.factor(replicate))) +
+  geom_freqpoly(bins=72) +
+  labs(title='Distribution of peptide detections', x='n fractions observed in') +
+  scale_color_brewer(palette = 1, type='qual') +
+  theme_bw()
+g
+BackupAsPDF(g, 'npeptideObsAcrossfractions.frequencypoly')
+
+g <- ggplot(sec.dt[, .(nTimesObserved=.N), by=.(treatment,replicate,peptideSequence)], aes(x=nTimesObserved, color = treatment, linetype=as.factor(replicate))) +
+  geom_density() +
+  labs(title='Dpeptide detections', x='n fractions observed in') +
+  scale_color_brewer(palette = 1, type='qual') +
+  theme_bw() +
+  guides(linetype=guide_legend('replicate'))
+g
+BackupAsPDF(g, 'npeptideObsAcrossfractions.density')
+```
+N observed peptides per fraction
+
+```{r}
+g <- ggplot(sec.dt[, .(nObserved=length(unique(protein))), by=.(treatment,replicate,fraction)], aes(x=fraction, y=nObserved, color = treatment, shape=as.factor(replicate))) +
+  geom_line(aes(group=interaction(treatment, replicate), linetype = as.factor(replicate))) +
+  labs(title='Number of peptides detected', x='fraction number') +
+  scale_fill_brewer(palette = 1, type='qual') +
+  scale_color_brewer(palette = 1, type='qual') +
+  theme_bw() +
+  guides(linetype=guide_legend('replicate'))
+g
+BackupAsPDF(g, 'numPeptidesDetected.linechart')
+
+# another way to look at it; plot
+g <- ggplot(sec.dt[, .(nObserved=length(unique(protein))), by=.(treatment,replicate,fraction)], aes(x=fraction, y=nObserved, fill = treatment)) +
+  geom_bar(stat='identity') +
+  labs(title='Number of peptides detected', x='fraction number') +
+  scale_fill_brewer(palette = 1, type='qual') +
+  scale_alpha_manual(values=c('1'=1, '2'=0.5)) +
+  theme_bw() +
+  facet_grid(replicate~treatment) +
+  guides(linetype=guide_legend('replicate'))
+g
+BackupAsPDF(g, 'numPeptidesDetected.linechart')
+```
+Look at distributions of the consecutive detections per run;
+What does a good protein look like?
+
+```{r}
+#' Flag low quality peptides based on missingness proportion, lack of consecutive detections <5 for now as required for peak detection
+FlagLowQualityPeptides <- function(secLong.dt, idcol='peptideSequence', intsCol='intensity', ConsecFractionThreshold=5, detectionCutoff=0){
+  
+  .oneMatrix <- function(sub.dt){
+    mat <- dcast(sub.dt, sub.dt[[idcol]]~fraction, value.var = intsCol) %>% 
+      as.matrix(rownames = 1)
+    mat[is.na(mat)] <- 0.0
+    mat[order(rownames(mat)),]
+  }
+  
+    #' Identify the max number of consecitive measurmeents
+  .MaxConsecFractionMeasurments <- function(row, cutoff=detectionCutoff){
+    # get unique values in a vector and the maximum run of consec vals
+    detectVec <- rle(row > cutoff)
+    return(max(detectVec$lengths[detectVec$values == TRUE]))
+  }
+  
+  # one matrix per sample 
+  mats <- lapply(split(secLong.dt, list(secLong.dt$sample)), .oneMatrix)
+  
+  consec.dt <- lapply(mats, function(x) {
+    apply(x, 1, function(pep){ MaxRunOfConsecFractionMeasurments(row = pep, cutoff = 0) }) %>% 
+    as.data.table(keep.rownames=T)
+  }) %>% 
+  rbindlist(idcol='sample')
+  
+  setnames(consec.dt, new=c('sample', 'peptideSequence', 'consecutiveDetections'))
+  consec.dt[, passThreshold := ifelse(consecutiveDetections >= ConsecFractionThreshold, TRUE, FALSE)]
+  return(consec.dt)
+}
+```
+
+```{r}
+consec.dt <- FlagLowQualityPeptides(sec.dt, idcol = 'peptide')
+consec.dt[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+```
+
+```{r}
+g <- ggplot(consec.dt, aes(x=consecutiveDetections, fill=interaction(treatment,replicate), linetype=replicate)) +
+  geom_freqpolygon(bins=72) +
+  labs(title='Max number of consecutive detections per peptide', x='N fractions', y='N peptides') +
+  scale_color_brewer(palette = 1, type='qual') +
+  scale_alpha_manual(values=c('1'=1, '2'=0.5)) +
+  theme_bw() +
+  guides(linetype=guide_legend('replicate'))
+g
+#BackupAsPDF(g, 'npeptideConsecutiveMeasurements.linechart')
+
+g <- ggplot(consec.dt, aes(x=consecutiveDetections, fill=interaction(treatment,replicate), linetype=replicate)) +
+  geom_histogram(bins=72) +
+  labs(title='Max number of consecutive detections per peptide', x='N fractions', y='N peptides') +
+  scale_color_brewer(palette = 1, type='qual') +
+  scale_alpha_manual(values=c('1'=1, '2'=0.5)) +
+  theme_bw() +
+  guides(linetype=guide_legend('replicate'))
+g
+
+g <- ggplot(consec.dt, aes(x=paste0(treatment,'_',replicate), fill=passThreshold)) +
+  geom_bar(position = 'stack') +
+  labs(title='Number of passing peptides per sample', x='sample', y='N peptides') +
+  scale_fill_brewer(palette = 3, type='qual') +
+  scale_alpha_manual(values=c('1'=1, '2'=0.5)) +
+  theme_bw() +
+  guides(linetype=guide_legend('replicate'))
+g
+#BackupAsPDF(g, 'npeptidePassingThresholds.barplot')
+```
+What is a good peptide? 
+Get an indication of peptide ids
+```{r}
+# adds col for filtering and n consecutive runs
+filterPeptides(sec.dt, consec.dt)
+```
+Now of the good peptides, see how many overlap between the different conditions
+```{r}
+g <- ggplot(sec.dt[passThreshold==TRUE,unique(peptideSequence), by=.(treatment, replicate)][,.N, by=.(treatment,replicate)], aes(x=paste0(treatment, replicate), y=N, fill=treatment)) +
+  geom_bar(stat='identity') +
+  labs(title='Good peptides per sample', x='sample', y='counts') +
+  scale_fill_brewer(palette = 1, type='qual') +
+  scale_alpha_manual(values=c('1'=1, '2'=0.5)) +
+  theme_bw() +
+  guides(linetype=guide_legend('replicate'))
+g
+BackupAsPDF(g, 'nGoodpeptidesPersample.barplot')
+```
+
+Overlapping good peptide ids... what lysis prep method looks best?
+```{r}
+
+protTraces
+# need to get htis as character vector
+ids <- sec.dt[passThreshold == TRUE, unique(peptideSequence), by=.(sample)] %>% 
+  split(., by='sample', keep.by=F) 
+ids <- lapply(ids, function(x) unname(unlist(x)))
+
+g <- plot(euler(ids),
+     labels = list(font = 4),
+     alpha=0.7,
+     fill=c(values=c("#3a5e8cFF","#3a5e8cFF", "#ffcf20FF","#ffcf20FF","#541352FF","#541352FF")),
+    quantities = TRUE)
+g
+BackupAsPDF(g, 'sig.ppiOverlap.euler')
+```
+sec.ms imputation; question is if imputation can clean up the results protein summarization
+Question is whether imputation cleans the intensity summarization? We dont know; need to run  and assess
+MStstats imputation looks to impute censored data (true 0s under limit of detection),  looks across runs, find the lowest val (LOD) and imputes a value lower than this
+```{r}
+#' Read in the peptide DT, filter low qual proteinsand then run
+MSstatsFormatting <-  function(secLong.dt){
+ 
+  stopifnot(c('peptide', 'protein', 'intensity', 'sample', 'treatment', 'fraction', 'replicate') %in% colnames(secLong.dt))
+  stopifnot(is.numeric(secLong.dt$fraction) & is.numeric(secLong.dt$replicate))
+   
+  message('Converting input DT to format expected by MSstats...')
+  .msstatsifyDTformat <- function(secLong.dt){
+    # 
+    ms.dt <- secLong.dt[, .(
+      Condition = paste(treatment, fraction, sep='_'),
+      BioReplicate = replicate,
+      ProteinName=protein,
+      Intensity=intensity,
+      PeptideSequence=peptideSequence,
+      PrecursorCharge = as.numeric(gsub('.+[_][.]', '', peptide)),
+      FragmentIon = NA,
+      ProductCharge = NA,
+      IsotopeLabelType = 'L')
+    ]
+    ms.dt[, Run := paste(Condition, BioReplicate, sep='_')]
+    return(ms.dt)
+  }
+  mss.dt <- .msstatsifyDTformat(secLong.dt)
+  return(mss.dt)
+}
+
+```
+
+## Run MSSTats summarization w and without imputation; save both files seperately and investigate their sister peptide correlations tomorrow
+Run failed; try facet by sample or at least condition
+Remove peptides with 0 across all rows
+```{r}
+mss.dt <- MSstatsFormatting(secLong.dt = sec.dt[passThreshold == TRUE,])
+#fwrite(mss.dt, ScriptAndDatedFileName('mssInput.csv.gz'))
+mss.dt <- fread('~/Documents/projects/043025_MGordon_SECMS_QCplotsWork/043025_SECMS_QCplots_data/2025_05_02_mssInput.csv.gz')
+
+```
+msstats summarize
+```{r}
+msStatsSummarization <- function(mss.dt, imputeVals=FALSE){
+  
+  stopifnot(c('Condition', 'BioReplicate', 'ProteinName', 'Intensity', 'PeptideSequence', 'PrecursorCharge', 'FragmentIon','ProductCharge', 'IsotopeLabelType', 'Run') %in% colnames(mss.dt))
+  
+  message('Converting 0 values to NA...')
+  mss.dt[Intensity == 0, Intensity := NA]
+  message('Running msstats summarization...')
+  if (imputeVals){
+    message('Warning: imputation is enabled')
+  }
+  dp.out <- MSstats::dataProcess(mss.dt, 
+                                 MBimpute =  imputeVals, 
+                                 normalization = FALSE, # turn off for SECMS
+                                 summaryMethod = "TMP",
+                                 featureSubset = 'highQuality',
+                                 censoredInt = "NA", # consider NA not missing at random and impute
+                                 remove_uninformative_feature_outlier=T)
+
+  return(dp.out)
+}
+
+View(ScriptNamedDir)
+```
+
+Run per sample, lets see if its just an issue with one sample and we can troubleshoot
+```{r}
+#lets just run the imputation per sample as a test and save the outpu
+mss.dt[, treatment := gsub('_.+','', Condition)]
+mss.dt[, conditionOI := paste0(treatment, '.',BioReplicate)]
+
+# all unique set
+mss.dt[,.N, by=.(Run,ProteinName, PeptideSequence, PrecursorCharge)]$N %>% unique() 
+
+condition.oi <- names(split(mss.dt, list(mss.dt$treatment, mss.dt$BioReplicate)))
+#dont know why this failed
+lapply(condition.oi, function(cond){
+  
+  dp.out <- msStatsSummarization(mss.dt = mss.dt[conditionOI == cond,], imputeVals=FALSE)
+  saveRDS(dp.out, ScriptAndDatedFileName(paste0(cond,'.mss.dp.no.impute.rds')))
+})
+```
+So individual samples run fine; lets combine two too see if this still throws an issue, then test by modifying birep column
+```{r}
+lapply(c("sonic.1", "CL.2","FT.2","sonic.2"), function(cond){
+  
+  dp.out <- msStatsSummarization(mss.dt = mss.dt[conditionOI == cond,], imputeVals=FALSE)
+  saveRDS(dp.out, ScriptAndDatedFileName(paste0(cond,'.mss.dp.no.impute.rds')))
+})
+```
+
+Run summarisation with imputation turned on
+```{r}
+lapply(condition.oi, function(cond){
+  
+  dp.out <- msStatsSummarization(mss.dt = mss.dt[conditionOI == cond,], imputeVals=TRUE)
+  saveRDS(dp.out, ScriptAndDatedFileName(paste0(cond,'.mss.dp.impute.rds')))
+})
+```
+
+Read in and combine all the protein level quants, and lets see if we see an improvement on sister protein quantification/correlation
+First, try run the quantification on all files at onece and savew
+
+```{r}
+dp.out <- msStatsSummarization(mss.dt = mss.dt,imputeVals = TRUE)
+saveRDS(dp.out, ScriptAndDatedFileName('mss.dp.impute.combined.rds'))
+```
+
+plots; prot-prot correlation in specific complexes and correlate replicates with each other
+
+I think we need to first test this on one run and see where it falls down, or is it one sample problematic?
+```{r}
+oneSample <- mss.dt[Condition %like% 'sonic' & BioReplicate == 1,]
+
+testRun <- msStatsSummarization(oneSample, imputeVals = F)
+```
+
+
+# lets try summarizing the results
+```{r}
+ms.noimpute.dt <- msStatsSummarization(mss.dt=mss.dt, minNumberFeatures = 2, imputeVals = TRUE)
+saveRDS(ms.noimpute.dt, ScriptAndDatedFileName('mss.dp.no.impute.rds'))
+
+ms.impute.dt <- msStatsSummarization(mss.dt=mss.dt, minNumberFeatures = 2, imputeVals = FALSE)
+saveRDS(ms.impute.dt, ScriptAndDatedFileName('mss.dp.impute.rds'))
+```
+Keep an et
+
+```{r}
+
+mss.dt
+```
+
+
+```{r}
+
+
+sec.dt
+View(data)
+
+mss.impiute <- MSstatsSummarize(sec.dt, minNumberFeatures = 2, imputeVals=TRUE)
+saveRDS(mss.impiute, ScriptAndDatedFileName('mss.dp.impute.rds'))
+```
+
+Go look at the quantifications that go up or down and investigat
+
+```{r}
+sec.dt
+mss.dt <- MSstatsSummarize(secLong.dt = sec.dt,imputeZero = TRUE)
+mss.d
+
+t
+```
+```{r}
+lysisPrep.dt
+```
+
+
+```{r}
+
+print('heel')
+# filters out proteins missing in at least 5 fractions
+FlagLowQualityPeptides <- function(secLong.dt, idcol='peptideSequence', intsCol='intensity', ConsecFractionThreshold=5, detectionCutoff=0){
+  
+  .oneMatrix <- function(sub.dt){
+    mat <- dcast(sub.dt, sub.dt[[idcol]]~fraction, value.var = intsCol) %>% 
+      as.matrix(rownames = 1)
+    mat[is.na(mat)] <- 0.0
+    mat[order(rownames(mat)),]
+  }
+  
+    #' Identify the max number of consecitive measurmeents
+  .MaxConsecFractionMeasurments <- function(row, cutoff=detectionCutoff){
+    # get unique values in a vector and the maximum run of consec vals
+    detectVec <- rle(row > cutoff)
+    return(max(detectVec$lengths[detectVec$values == TRUE]))
+  }
+  
+  # one matrix per sample 
+  mats <- lapply(split(secLong.dt, list(secLong.dt$sample)), .oneMatrix)
+  
+  consec.dt <- lapply(mats, function(x) {
+    apply(x, 1, function(pep){ MaxRunOfConsecFractionMeasurments(row = pep, cutoff = 0) }) %>% 
+    as.data.table(keep.rownames=T)
+  }) %>% 
+  rbindlist(idcol='sample')
+  
+  setnames(consec.dt, new=c('sample', 'peptideSequence', 'consecutiveDetections'))
+  consec.dt[, passThreshold := ifelse(consecutiveDetections >= ConsecFractionThreshold, TRUE, FALSE)]
+  return(consec.dt)
+}
+```
+
+
+
+```{r}
+testmat <- dcast(sec.dt[sample == 'FT_1'], peptideSequence~fraction, value.var='intensity') %>% 
+  as.matrix(rownames='peptideSequence')
+
+testmat[is.na(testmat)] <- 0
+
+
+sec.dt
+
+
+cor.dt <- apply(testmat, 1, function(row) MaxRunOfConsecFractionMeasurments(row, 0))
+cor.dt <- data.table(peptide=names(cor.dt), nConsec=cor.dt)
+
+
+ggplot(cor.dt, aes(x=nConsec)) +
+  geom_histogram(bins=72)
+
+
+
+badpeptides <- cor.dt[nConsec < 5]$peptide 
+```
+
+```{r}
+hm <- Heatmap(testmat[rownames(testmat) %in% badpeptides,], cluster_columns = F, show_row_names = F)
+hm
+BackupAsPDF(hm, ScriptAndDatedFileName('badproteins.heatmap'))
+```
+
+
+```{r}
+# there are some genuine waringingas alos
+sec.dt[sample == 'CL_1' & peptideSequence == '_[Acetyl (Protein N-term)]AQPGTLNLNNEVVK_']
+lysisPrep.dt[sample == 'CL' & BioReplicate == 1 & grepl('AQPGTLNLNNEVVK_', PeptideSequence)]
+
+
+
+```
+
+
+Tag good peptides per protein
+A good peptide should i) have a run of at least 5 fractions (peak picking algorithm needs this)
+
+```{r}
+sec.dt
+test.dt[]
+DetectGoodQualityPeptides(test.dt[sample == 'sonic_1'])
+```
+
+
+Define some QC summary metrics
+
+First off; define a set of proteins we may want to exclude from the analysis
+Pull out phagosome and ribosome proteins
+```{r}
+source("~/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+gmt.cc <- loadGmtFromBioconductor(ontology = "CC")
+
+bigComplexes <- rbind(data.table(gmt.cc[grepl('ribosome', ont), .(GO_CC='ribosome', gene)]),
+                      data.table(gmt.cc[grepl('phagosome', ont), .(GO_CC='phagosome', gene)]))
+```
+Ok here is the plots of the sister peptide correlations in each sample
+I think we can filter this to remove noisy peptides and replot
+```{r}
+rawpeptideCor <- correlateSisterPeptideElutionProfiles(sec.dt)
+
+g <- ggplot(rawpeptideCor, aes(x=r, color=treatment, linetype = replicate)) +
+  geom_density() +
+  labs(title='sister peptide elution profiles') +
+  scale_color_brewer(palette = 1, type='qual') +
+  theme_bw()
+
+BackupAsPDF(g, 'sisterPeptideElutions.density')
+# rerun w/o all the ribosomal stuff and see how things look
+
+# for some reason we are not filtering out bg complexes; need to fix this...
+filteredCor.dt <- correlateSisterPeptideElutionProfiles(secLong.dt = sec.dt[!protein %in% bigComplexes$gene,])
+
+g <- ggplot(filteredCor.dt, aes(x=r, color=treatment, linetype = replicate)) +
+  geom_density() +
+  labs(title='sister peptide elution profiles') +
+  scale_color_brewer(palette = 1, type='qual') +
+  theme_bw()
+g
+BackupAsPDF(g, 'sisterPeptideElutions.density')
+
+```
+
+sum feature intensities to the peptide level and replot; see if this improves the agreement
+```{r}
+#' ccprofiler setup; summed peptide intensities
+#' Collapse to the peptide level 
+#' 
+sec.dt
+sumFeatureIntensities <- function(secLong.dt){
+  
+  return(secLong.dt[, .(intensity=sum(intensity, na.rm=TRUE), npeptides=npeptides, ntimesObserved), by=.(sample, treatment, replicate, fraction, protein, peptideSequence)])
+  
+}
+
+collapse.sec.dt <- sumFeatureIntensities(sec.dt)
+
+collapse.sec.dt[npeptides == 32,]
+```
+
+
+*not used*
+
+sister peptide correlations
+```{r}
+#' within each sample, calculate sister peptide correlations basically do an all by all correlation within each protein
+#' remove multi-proteins; just want a quick overview for simplicity
+#' excludedProteins: vecotr of proteins to remove from the datasrt
+
+test.dt <- sec.dt[treatment == 'sonic' & protein %in% c('P02538', 'P04264')]
+
+test.dt[, if(.N > 30) .(meanints=mean(intensity, na.rm=T)), by=.(sample, protein)]
+
+correlateElutionProfiles <- function(secLong.dt, idcol='peptide', intsCol='intensity', excludedSet=c()){
+  
+  if (is.null(excludedSet)){ 
+    allProteins <- unique(secLong.dt$protein)
+  } else {
+    rmSet <- sum(unique(secLong.dt$protein) %in% unique(excludedSet))
+    message('Removing ', rmSet, ' proteins from calculations..')
+    allProteins <- unique(secLong.dt$protein[!secLong.dt$protein %in% excludedSet])
+  }
+  .oneMatrix <- function(sub.dt){
+    mat <- dcast(sub.dt, sub.dt[[idcol]]~fraction, value.var = intsCol) %>% 
+      as.matrix(rownames = 1)
+    mat[is.na(mat)] <- 0.0
+    mat[order(rownames(mat)),]
+  }
+  
+  .correlateSisterPeptides <- function(mat){
+    cor.mat <- cor(t(mat), use='pairwise.complete.obs')
+    r.dt <- setDT(reshape2::melt(cor.mat))
+    setnames(r.dt, new=c('feature1', 'feature2', 'r'))
+    return(r.dt)
+  }
+  
+  multipep.dt <-  secLong.dt[npeptides > 2,]
+  mats <- lapply(split(multipep.dt, list(multipep.dt$sample, multipep.dt$protein)), .oneMatrix)
+  print(mats[1])
+  
+  cor.dt <- lapply(mats, .correlateSisterPeptides) %>% 
+    rbindlist(idcol = 'subset')
+  cor.dt[, c('sample', 'protein') := tstrsplit(subset, '[.]', keep=c(1,2))]
+  
+  return(cor.dt[feature1 != feature2, .(sample, protein, feature1, feature2, r)])
+}
+```
+Look at distributions of sister peptide correlations in the same sample; do the distirbutions look good?
+```{r}
+# sanity check that this runs for more than none treatment
+test.dt <- sec.dt[treatment == 'sonic']
+
+rawpeptideCor <- correlateSisterPeptideElutionProfiles(sec.dt)
+rawpeptideCor
+g <- ggplot(rawpeptideCor, aes(x=r, color=treatment, linetype = replicate)) +
+  geom_density() +
+  labs(title='sister peptide elution profiles') +
+  scale_color_brewer(palette = 1, type='qual') +
+  theme_bw()
+g
+BackupAsPDF(g, 'sisterPeptideElutions.density')
+# rerun w/o all the ribosomal stuff and see how things look
+
+# for some reason we are not filtering out bg complexes; need to fix this...
+filteredCor.dt <- correlateSisterPeptideElutionProfiles(secLong.dt = sec.dt[!protein %in% bigComplexes$gene,])
+
+g <- ggplot(filteredCor.dt, aes(x=r, color=treatment, linetype = replicate)) +
+  geom_density() +
+  labs(title='sister peptide elution profiles') +
+  scale_color_brewer(palette = 1, type='qual') +
+  theme_bw()
+g
+BackupAsPDF(g, 'sisterPeptideElutions.density')
+
+features.oi <- c('_NAWGNLSYADLITR_.2', '_AGSAMAIGGGGGSR_.2')
+
+# a lot of missingness for these 'crap' scores; remove 
+mat <- dcast(sec.dt[treatment == 'CL' & replicate == '1' & peptide %in% features.oi,], peptide~fraction, value.var='intensity') %>% 
+ as.matrix(rownames=1)
+mat[is.na(mat)] <- 0
+Heatmap(mat)
+```
+
+# peptide max number of detected consec runs, and summarize this at protein level (avg consec runs, sd consec runs)
+
+```{r}
+
+sec.dt
+#' ccprofiler setup; summed peptide intensities
+#' Collapse to the peptide level 
+sumFeatureIntensities <- function(secLong.dt){
+  
+  return(secLong.dt[, .(peptide=peptideSequence, intensity=sum(intensity, na.rm=TRUE), npeptides=npeptides), by=.(sample, treatment, replicate, fraction, protein)])
+  
+}
+
+collapse.sec.dt <- sumFeatureIntensities(sec.dt)
+
+
+
+sec.dt[peptideSequence == '_QQVSPIR_']
+collapse.sec.dt[peptide == '_QQVSPIR_']
+```
+
+
+Other summary stats; n consecutive measurements per feature, missingness per peptide/protein
+Write generally, so that we can modify to run for everyhtin
+
+
+```{r}
+#' Flag low quality peptides based on missingness proportion, lack of consecutive detections <5 for now as required for peak detection
+FlagLowQualityPeptides <- function(secLong.dt, idcol='peptideSequence', intsCol='intensity', ConsecFractionThreshold=5, detectionCutoff=0){
+  
+  .oneMatrix <- function(sub.dt){
+    mat <- dcast(sub.dt, sub.dt[[idcol]]~fraction, value.var = intsCol) %>% 
+      as.matrix(rownames = 1)
+    mat[is.na(mat)] <- 0.0
+    mat[order(rownames(mat)),]
+  }
+  
+    #' Identify the max number of consecitive measurmeents
+  .MaxConsecFractionMeasurments <- function(row, cutoff=detectionCutoff){
+    # get unique values in a vector and the maximum run of consec vals
+    detectVec <- rle(row > cutoff)
+    return(max(detectVec$lengths[detectVec$values == TRUE]))
+  }
+  
+  # one matrix per sample 
+  mats <- lapply(split(secLong.dt, list(secLong.dt$sample)), .oneMatrix)
+  
+  consec.dt <- lapply(mats, function(x) {
+    apply(x, 1, function(pep){ MaxRunOfConsecFractionMeasurments(row = pep, cutoff = 0) }) %>% 
+    as.data.table(keep.rownames=T)
+  }) %>% 
+  rbindlist(idcol='sample')
+  
+  setnames(consec.dt, new=c('sample', 'peptideSequence', 'consecutiveDetections'))
+  consec.dt[, passThreshold := ifelse(consecutiveDetections >= ConsecFractionThreshold, TRUE, FALSE)]
+  return(consec.dt)
+}
+
+View(MaxRunOfConsecFractionMeasurments)
+consec.dt <- FlagLowQualityPeptides(sec.dt)
+consec.dt[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+
+g <- ggplot(consec.dt, aes(x=consecutiveDetections, fill=interaction(treatment,replicate), linetype=replicate)) +
+  geom_freqpolygon(bins=72) +
+  labs(title='Max number of consecutive detections per peptide', x='N fractions', y='N peptides') +
+  scale_color_brewer(palette = 1, type='qual') +
+  scale_alpha_manual(values=c('1'=1, '2'=0.5)) +
+  theme_bw() +
+  guides(linetype=guide_legend('replicate'))
+g
+BackupAsPDF(g, 'npeptideConsecutiveMeasurements.linechart')
+
+g <- ggplot(consec.dt, aes(x=paste0(treatment,'_',replicate), fill=passThreshold)) +
+  geom_bar(position = 'stack') +
+  labs(title='Number of passing peptides per sample', x='sample', y='N peptides') +
+  scale_fill_brewer(palette = 3, type='qual') +
+  scale_alpha_manual(values=c('1'=1, '2'=0.5)) +
+  theme_bw() +
+  guides(linetype=guide_legend('replicate'))
+g
+BackupAsPDF(g, 'npeptidePassingThresholds.barplot')
+```
+
+What does a good peptide look like?
+A good number of consecutive non-zero values (what is good? Again shared with sibling peptides)
+```{r}
+#' Identify the max number of consecitive measurmeents
+MaxRunOfConsecFractionMeasurments <- function(row, cutoff=0){
+  # rle finds the unique values in a vector and the maximum run of consec vals
+  binVec <- rle(row > cutoff)
+  return(max(binVec$lengths[binVec$values == TRUE]))
+} 
+
+
+MaxRunOfConsecFractionMeasurments(c(0,1,0,2,2,3,3,4,4,0,0,1), cutoff=3)
+
+
+
+correlateElutionProfiles <- function(secLong.dt, idcol='peptide', intsCol='intensity', excludedSet=c()){
+  
+  if (is.null(excludedSet)){ 
+    allProteins <- unique(secLong.dt$protein)
+  } else {
+    rmSet <- sum(unique(secLong.dt$protein) %in% unique(excludedSet))
+    message('Removing ', rmSet, ' proteins from calculations..')
+    allProteins <- unique(secLong.dt$protein[!secLong.dt$protein %in% excludedSet])
+  }
+  .oneMatrix <- function(sub.dt){
+    mat <- dcast(sub.dt, sub.dt[[idcol]]~fraction, value.var = intsCol) %>% 
+      as.matrix(rownames = 1)
+    mat[is.na(mat)] <- 0.0
+    mat[order(rownames(mat)),]
+  }
+  
+  .correlateSisterPeptides <- function(mat){
+    cor.mat <- cor(t(mat), use='pairwise.complete.obs')
+    r.dt <- setDT(reshape2::melt(cor.mat))
+    setnames(r.dt, new=c('feature1', 'feature2', 'r'))
+    return(r.dt)
+  }
+  
+  multipep.dt <-  secLong.dt[npeptides > 2,]
+  mats <- lapply(split(multipep.dt, list(multipep.dt$sample, multipep.dt$protein)), .oneMatrix)
+  print(mats[1])
+  
+  cor.dt <- lapply(mats, .correlateSisterPeptides) %>% 
+    rbindlist(idcol = 'subset')
+  cor.dt[, c('sample', 'protein') := tstrsplit(subset, '[.]', keep=c(1,2))]
+  
+  return(cor.dt[feature1 != feature2, .(sample, protein, feature1, feature2, r)])
+}
+```
+
+
+
+```{r}
+help(cor)
+
+test.dt
+correlateProfiles(test.dt, idcol='peptide')
+
+sisterPepetideCorrelations <- function(dt, excludedSet=c()){
+  
+  proteins <- dt[!grepl(';', protein), unique(protein)]
+  
+  if (!is.null(excludedSet)){ 
+    rmSet <- sum(unique(proteins) %in% unique(excludedSet))
+    message('Removing ', rmSet, ' proteins from calculations..')
+    proteins <- proteins[!proteins %in% excludedSet]
+  }
+}
+  
+  # subset the data.table to each protein per 
+  lapply(proteins, function(prot){
+    
+    subdt <- dt[protein ]
+    
+  }
+}
+
+
+
+test.dt <- sec.dt[treatment == 'sonic']
+
+sec.dt[,.SD(), .SDcols='protein']
+
+
+
+# use the .N > 20 filter to exclude teams with few observations
+test.dt[ , if (.N > 1) .(peptideCor = cor(x=intensity[sample]), by = .(sample,protein, peptide)]
+
+
+
+          ][ , hist(w_coef, 20L, las = 1L,
+                    xlab = 'Fitted Coefficient on W',
+                    ylab = 'Number of Teams', col = 'darkgreen',
+                    main = 'Team-Level Distribution\nWin Coefficients on ERA')]
+abline(v = overall_coef, lty = 2L, col = 'red')
+
+sisterPepetideCorrelations(sec.dt, excludedSet = bigComplexes$gene) %>% length()
+```
+
+

@@ -1,0 +1,984 @@
+---
+title: "130923_DAR31_contrastofcontrasts"
+author: "Martin Gordon"
+date: "2023-09-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## DAR31 looking at contrast of the different ligand treatments per receptor group
+Issue with this is normalisation factors are different; have now rerun the analysis to process each group together
+
+```{r}
+library(data.table)
+library(ComplexHeatmap)
+library(circlize)
+library(ggplot2)
+library(magrittr)
+library(circlize)
+library(stringr)
+library(emmeans) #EMM package for post-hoc analysis on models
+library(parallelDist) #needed for some of Bens custom enrichment functions
+
+
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+#other R scripts with heler functions for the analysis
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R") # lm modesl with emmeans functionality
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R") #custom enrichment functions using complex heatmap
+
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+For DAR31, we have 3 conditions followed over 5 timepoints
+Canabonid receptor 1 (CB1) with 3 treatments
+We want to see if there is any difference in the response over time; check for an interaction effect between the receptor 
+Similar to the analysis for DAR34; run lm model per prot, look for significant interactions first, plot and run GO enrichment
+
+150923
+--- 
+reprocess the expression data, as each of the DARPA datasets were processed individually
+
+Data generated from Spectronaut DIA 
+Assuming is CBXXX is receptor, _[0=9] refers to timepoint, there are 3 receptors (CB3234,CB1066,CBCP55) measured across 4 timepoints (00,01,05,10,30) and a control (Cyto)
+Splitting dataset into each individual receptor
+
+```{r}
+spec <- fread('./data/DAR031/EX/All/DIA/Results/DirDIA/20230524_185013_DAR31_EX_dirDIA_all_MSStatsFormatReport.xls')
+unique(spec$Condition) #3 unique drugs conditions : CB1066, CB3234, CBCP55
+
+spec <- spec[!Condition %like% 'Cyto',]
+
+spec$Condition %>%  unique()
+```
+remove the low intensity 'trash' on the 
+
+```{r}
+spec <- spec[Intensity > 2^5,]
+ggplot(spec, aes(x=log2(Intensity))) + geom_histogram(bins=100)
+```
+msstats data process
+
+```{r}
+
+spec.mss <- specFileToCompleteMSstats(spec)
+spec.mss[, IsotopeLabelType := "L"]
+
+setDF(spec.mss)
+
+dp.out <- MSstats::dataProcess(spec.mss,
+                               normalization = 'equalizeMedians',
+                               summaryMethod="TMP",
+                               featureSubset = "highQuality",
+                               remove_uninformative_feature_outlier = TRUE,
+                               MBimpute = FALSE )
+```
+#save the output as RData file
+```{r}
+#saveRDS(dp.out, file = './output/DAR31.msstats.proc.out.Rdata')
+
+fwrite(dp.out$ProteinLevelData, './output/mss.dataProc.Protein.csv.gz')
+fwrite(dp.out$FeatureLevelData, './output/mss.dataProc.Feature.csv.gz')
+```
+
+
+plot the normalised values and assess if we need to run a second round of normalisation
+proceed as is for now; dont want to over-correct for true biological differences
+
+```{r}
+mss <- as.data.table(dp.out$ProteinLevelData)
+mss
+```
+
+
+```{r}
+# including the dropped sample for now
+protQuant <- fread ("./output/mss.dataProc.Protein.csv.gz")
+
+protQuant %>%  str()
+protQuant$GROUP %>%  unique()
+
+# parse GROUP names to define the actual columns that the linear models will work on
+# this work depends on how your columsn are defined
+protQuant[, ligand   := gsub("_[0-9]{2}$", "",GROUP)]
+
+# fix subject info to account for treatment batch 
+protQuant[,  SUBJECT := as.factor(interaction(ligand, SUBJECT))]
+
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+protQuant[, rep := str_extract(SUBJECT, '[0-9]{1}$')]
+
+protQuant[, timeStr := str_extract(GROUP, "[0-9]{2}$")]
+protQuant[, rankTime := as.integer(as.factor(timeStr))] #timeranked to 0-5; we do this to allow even intervals between the timepoints
+protQuant[, .(timeStr, rankTime)] %>% unique() #timepoint to time rank 
+
+protQuant[, .N, by=.(ligand, timeStr,SUBJECT)] %>% 
+  .[order(timeStr,ligand)]
+
+
+
+#removing troublesome samples
+protQuant <- protQuant[ !(ligand == "CBCP55" & SUBJECT == 'CBCP55.3')]
+protQuant <- protQuant[ !(ligand == "CBCP55" & SUBJECT =='CBCP55.1' & timeStr %in% c("00", "01"))]
+protQuant <- protQuant[ !(ligand == "CB1066" & SUBJECT =='CB1066.4' & timeStr %in% c("05"))]
+
+
+# calculate vsT0 expression
+# check if this is correct? does ligand need to be changed to GROUP?
+protQuant[, intVsMeanTime0 := LogIntensities - mean(LogIntensities[timeStr == '00']), by = .(ligand, Protein)]
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, ligand)]
+
+
+ggplot(data=protQuant, aes(x=paste0(GROUP,'.', SUBJECT), y=LogIntensities, fill=GROUP)) + geom_boxplot() + rotate.x.axis.text
+
+#write out the cleaned data used in the downstream analysis
+#fwrite(protQuant,"./output/mss.dataProc.Protein.clean.csv.gz")
+
+protQuant <- fread("./output/mss.dataProc.Protein.clean.csv.gz")
+protQuant[, timeStr := as.factor(timeStr)]
+```
+
+model to look at intensity over time
+emtrends: contrast trendlines over ligand factor levels
+```{r}
+model <- lm(LogIntensities ~ SUBJECT + poly(rankTime,degree=3)*ligand, data=protQuant)
+anova(model) # model suggests there is good distinction between the different ligand effects
+emtrends(model, pairwise ~ ligand, var='rankTime')$contrasts
+emmip(model,  ligand ~ rankTime, cov.reduce= range)
+```
+CP55 vs 1066
+----
+Lets just look at pairwise comparisons for now
+Drop CP3234 for the first comparison - also calculate vs T0 intensities
+
+```{r}
+ligQuant <- protQuant[ligand != 'CB3234']
+ligQuant <- ligQuant[NumMeasuredFeature != 1,] # remove proteins with only 1 measured feature
+
+# remove proteins with < 15 measured per group
+ligQuant[, prots.per.condition := .N, by=.(Protein,ligand)] 
+rm.prots <- ligQuant[prots.per.condition < 15, unique(Protein)]
+
+ligQuant <- ligQuant[!Protein %in% rm.prots]
+```
+
+Run the model
+```{r}
+#using lm code, look for interactions between ligand response
+lm.out <- linearModelsAllProteins(ligQuant, 
+                                  formulaList = list(full  = LogIntensities ~ SUBJECT + ligand + rankTime + I(rankTime^2) + I(rankTime^3) + ligand:I(rankTime^2)  + ligand:I(rankTime^3)),
+                                  splitColumn = "Protein") 
+```
+
+
+plot results histogram
+nothing significant found here
+```{r}
+g <- ggplot(lm.out$anova, aes(x=p.value)) +
+  geom_histogram(boundary=0.0, binwidth = 0.005) + 
+  facet_wrap(~term)
+
+g
+
+interaction(protQuant$GROUP, protQuant$SUBJECT)
+BackupAsPDF(g, 'cp55.cp1066.pva.histogram')
+```
+
+
+```{r}
+lm.out$anova[, fdr := p.adjust(p.value, method = 'BH')]
+lm.out$anova[, gene := multiUniprots2multiGenes(Protein)]
+
+# write out the results
+fwrite(lm.out$anova, './output/cp55.cp1066.anova.csv.gz')
+```
+
+plot the CP55:CP1066 data
+
+```{r}
+cb55.cb1066 <- fread('./output/cp55.cp1066.anova.csv.gz')
+
+sigProteins <- cb55.cb1066[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+p.mat <- dcast(ligQuant, Protein~paste0(GROUP,'.', rep), value.var = 'intVsMeanTime0') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CP55", colnames(p.mat)), "CP55", "CP1066")))
+hm
+BackupAsPDF(hm, '1066.CP55.interaction.fdr<0.05.heatmap')
+```
+Collapse replicates and plot
+
+```{r, fig.width=4, fig.height=5}
+
+# calculate mean expression per ligand/tp/protein
+ligQuant.sum <- ligQuant[, .(gene, GROUP, mean.Ints.vsT0 = mean(intVsMeanTime0, na.rm=T), mean.Intensity = mean(LogIntensities, na.rm=T)), by=.(ligand, timeStr, Protein)] %>%  unique() %>% 
+  .[order(timeStr, ligand)]
+
+# now to get vsT0 subtract from 
+ligQuant.sum[, mean.vsT0 := mean.Intensity - mean.Intensity[timeStr == '0'],  by=.(Protein,ligand)]
+
+
+cb55.cb1066 <- fread('./output/cp55.cp1066.anova.csv.gz')
+
+sigProteins <- cb55.cb1066[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+p.mat <- dcast(ligQuant.sum[!timeStr %in% '0',], Protein~GROUP, value.var = 'mean.Ints.vsT0') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+p.mat
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CP55", colnames(p.mat)), "CBCP55", "CB1066")))
+
+BackupAsPDF(hm, 'cb1066.cbcp55.sigProtes.collapsed.heatmap')
+```
+
+
+
+Plot raw intensity values 
+No real evidence of consistent change
+```{r}
+
+sigProteins <- cb55.cb1066[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+
+p.mat <- dcast(ligQuant, Protein~paste0(GROUP,'.', rep), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+col_fun = colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints.',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CP55", colnames(p.mat)), "CP55", "CP1066")))
+hm
+BackupAsPDF(hm, '1066.CP55.interaction.intensities.fdr<0.05.heatmap')
+
+```
+
+Go enrichment of all significant results
+No significant hits
+```{r}
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+universe <- protQuant$gene %>%  unique()
+
+lm.out$anova[, enrich_grp := 'no']
+lm.out$anova[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & p.value < 0.01, enrich_grp := 'yes']
+
+enrich.dt <- enricherOnGroups(lm.out$anova[enrich_grp == 'yes'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt,  gmt=gmt.go, groupColumn = 'enrich_grp', )
+
+#how the heatmap is constructed
+#dcast(enrich.dt[pvalue < 0.001], as.formula(paste("Description", 'enrich_grp', sep="~")), value.var="p.adjust") %>% as.matrix(rownames='Description') %>%  Heatmap() 
+
+ggplot(enrich.dt[p.adjust < 0.05], aes(x=Description, y=-log10(pvalue))) + geom_col(fill='darkblue') + ggtitle('CP1066:CBCP55 sig GO terms') + coord_flip() + theme_minimal() %>% 
+  BackupAsPDF('cp1066:cbcp55.sigGOterms.pdf')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable =  enrich.dt, groupColumn = NULL, topN = 1, title='GO term enrichment (proteins FDR < 0.05)', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), reduceRedundantsAcrossGroups=FALSE, upperThreshold = 10)
+```
+
+re-run lm and emmeans using emtrends to extract estimates of covariate slope for each drug level
+```{r}
+
+prot.mat <- dcast(ligQuant, Protein~paste0(ligand,'.',timeStr, rep), value.var = 'vsTimeZero') %>% 
+  as.matrix(rownames='Protein')
+
+
+#just filter out proteins with more than 25% of values misssing
+na.vals <- apply(prot.mat, 1, function(x){
+  # use the any function to detect 
+  any(sum(is.na(x)) > 11) })
+
+sum(na.vals) # removing over 1k proteins
+names(na.vals[na.vals == TRUE])
+
+
+
+#run our own analysis;anova per protein
+# try again with this filter, will also rm prots with low numbers of reps
+test.dt <- ligQuant[!Protein %in% names(na.vals[na.vals == TRUE]),] %>% # filter out missing vals
+split(., .$Protein)
+
+
+# run lm on each. of the proteins, 
+test.out <- lapply(test.dt, function(x){
+     lm.x <- lm(vsTimeZero ~ SUBJECT + ligand*poly(rankTime, degree=3), data=x) # different response to drug over time
+     #emm1 = emmeans(lm.x, specs = pairwise ~ drug|poly(rankTime, degree=3)) #compare the CZ SP drug response over time 
+     emm1 = emtrends(lm.x, pairwise ~ ligand, var='rankTime') #asking is the slope different for each level of the factor
+     emm1$contrasts %>%  
+     as.data.table()
+})
+
+
+test.out <- rbindlist(test.out, idcol = 'Protein')
+test.out[, fdr := p.adjust(p.value, method='BH')]
+```
+
+Visualise the proteins with different trends per ligand
+None found at a significance < 0.05
+
+```{r}
+
+sigProteins <- test.out[p.value < 0.01, unique(Protein)]
+
+p.mat <- dcast(ligQuant, Protein~paste0(GROUP,'.', rep), value.var = 'intVsMeanTime0') %>% 
+  as.matrix(rownames='Protein')
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+dim(p.mat)
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (p.value < 0.01)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CP55", colnames(p.mat)), "CP55", "CP1066")))
+
+
+hm
+BackupAsPDF(hm, '1066.CP55.interaction.p.value<0.01.emmeans.trends.heatmap')
+```
+
+Compare CP55 to CP3234
+
+```{r}
+ligQuant <- protQuant[ligand != 'CB1066']
+ligQuant <- ligQuant[NumMeasuredFeature != 1,] # remove proteins with only 1 measured feature
+
+# remove proteins with < 15 measured per group
+ligQuant[, prots.per.condition := .N, by=.(Protein,ligand)] 
+rm.prots <- ligQuant[prots.per.condition < 15, unique(Protein)]
+
+ligQuant <- ligQuant[!Protein %in% rm.prots]
+```
+
+Run the model per prot
+```{r}
+#using lm code, look for interactions between ligand response
+lm.out <- linearModelsAllProteins(ligQuant, 
+                                  formulaList = list(full  = LogIntensities ~ SUBJECT + ligand + rankTime + I(rankTime^2) + I(rankTime^3) + ligand:I(rankTime^2)  + ligand:I(rankTime^3)),
+                                  splitColumn = "Protein") 
+```
+
+
+plot results histogram
+again not much evidence of interaction between treatment type and time
+```{r}
+g <- ggplot(lm.out$anova, aes(x=p.value)) +
+  geom_histogram(boundary=0.0, binwidth = 0.005) + 
+  facet_wrap(~term)
+
+g
+
+BackupAsPDF(g, 'cb3234.cbcp55.pva.histogram')
+```
+
+```{r}
+lm.out$anova[, fdr := p.adjust(p.value, method = 'BH')]
+lm.out$anova[, gene := multiUniprots2multiGenes(Protein)]
+
+# write out the results
+fwrite(lm.out$anova, './output/cb3234.cbcp55.anova.csv.gz')
+```
+
+
+plot the cb3234.cbcp55 data
+
+```{r}
+cbcp3234.cbcp55 <- fread('./output/cb3234.cbcp55.anova.csv.gz')
+
+sigProteins <- cbcp3234.cbcp55[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+p.mat <- dcast(ligQuant, Protein~paste0(GROUP,'.', rep), value.var = 'intVsMeanTime0') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CP55", colnames(p.mat)), "CBCP55", "CP3234")))
+hm
+BackupAsPDF(hm, 'CP3234.CBCP55.interaction.fdr<0.05.heatmap')
+```
+
+collapse replicates and plot 
+
+```{r, fig.width=4, fig.height=6}
+
+# calculate mean expression per ligand/tp/protein
+ligQuant.sum <- ligQuant[, .(gene, GROUP, mean.Ints.vsT0 = mean(intVsMeanTime0, na.rm=T), mean.Intensity = mean(LogIntensities, na.rm=T)), by=.(ligand, timeStr, Protein)] %>%  unique() %>% 
+  .[order(timeStr, ligand)]
+
+
+ligQuant
+
+# now to get vsT0 subtract from 
+ligQuant.sum[, mean.vsT0 := mean.Intensity - mean.Intensity[timeStr == '0'],  by=.(Protein,ligand)]
+
+
+cbcp3234.cbcp55 <- fread('./output/cb3234.cbcp55.anova.csv.gz')
+
+sigProteins <- cbcp3234.cbcp55[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+p.mat <- dcast(ligQuant.sum[!timeStr %in% '0',], Protein~GROUP, value.var = 'mean.Ints.vsT0') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+p.mat
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CP55", colnames(p.mat)), "CBCP55", "CB3234")))
+
+hm
+BackupAsPDF(hm, 'cb3234.cbcp55.sigProtes.collapsed.heatmap')
+```
+
+Plot the raw intensities
+
+```{r}
+p.mat <- dcast(ligQuant, Protein~paste0(GROUP,'.', rep), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints.',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CP55", colnames(p.mat)), "CBCP55", "CP3234")))
+hm
+BackupAsPDF(hm, 'CP3234.CBCP55.interaction.intensities.fdr<0.05.heatmap')
+```
+Go enrichment 
+No significant results
+```{r}
+lm.out$anova[, enrich_grp := 'no']
+lm.out$anova[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, enrich_grp := 'yes']
+
+enrich.dt <- enricherOnGroups(lm.out$anova[enrich_grp == 'yes'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'enrich_grp', topN = 10, title='GO term enrichment (proteins FDR < 0.05)', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 10)
+```
+
+Compare CP1066 vs CP3234
+
+```{r}
+ligQuant <- protQuant[ligand != 'CBCP55']
+ligQuant <- ligQuant[NumMeasuredFeature != 1,] # remove proteins with only 1 measured feature as likely ID mismatch
+
+# remove proteins with < 15 measured per group
+ligQuant[, prots.per.condition := .N, by=.(Protein,ligand)] 
+rm.prots <- ligQuant[prots.per.condition < 15, unique(Protein)]
+
+ligQuant <- ligQuant[!Protein %in% rm.prots]
+```
+
+Run the model per prot
+```{r}
+#using lm code, look for interactions between ligand response
+lm.out <- linearModelsAllProteins(ligQuant, 
+                                  formulaList = list(full  = LogIntensities ~ SUBJECT + ligand + rankTime + I(rankTime^2) + I(rankTime^3) + ligand:I(rankTime^2)  + ligand:I(rankTime^3)),
+                                  splitColumn = "Protein") 
+```
+plot results histogram
+again not much evidence of interaction between treatment type and time
+```{r}
+g <- ggplot(lm.out$anova, aes(x=p.value)) +
+  geom_histogram(boundary=0.0, binwidth = 0.005) + 
+  facet_wrap(~term)
+
+g
+
+BackupAsPDF(g, 'cp1066.cp3234.pval.histogram')
+```
+
+```{r}
+lm.out$anova[, fdr := p.adjust(p.value, method = 'BH')]
+lm.out$anova[, gene := multiUniprots2multiGenes(Protein)]
+
+# write out the results
+fwrite(lm.out$anova, './output/cb1066.cb3234.anova.csv.gz')
+```
+
+
+plot the cb1066.cb3234 data
+
+```{r}
+cb1066.cb3234 <- fread('./output/cb1066.cb3234.anova.csv.gz')
+
+sigProteins <- cb1066.cb3234[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+p.mat <- dcast(ligQuant, Protein~paste0(GROUP,'.', rep), value.var = 'intVsMeanTime0') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CB3234", colnames(p.mat)), "CB1066", "CB3234")))
+hm
+BackupAsPDF(hm, 'CP3234.CB1066.interaction.fdr<0.05.heatmap')
+```
+
+collapse replicates and plot 
+
+```{r, fig.width=4, fig.height=5}
+
+# calculate mean expression per ligand/tp/protein
+ligQuant.sum <- ligQuant[, .(gene, GROUP, mean.Ints.vsT0 = mean(intVsMeanTime0, na.rm=T), mean.Intensity = mean(LogIntensities, na.rm=T)), by=.(ligand, timeStr, Protein)] %>%  unique() %>% 
+  .[order(timeStr, ligand)]
+
+
+# now to get vsT0 subtract from 
+ligQuant.sum[, mean.vsT0 := mean.Intensity - mean.Intensity[timeStr == '0'],  by=.(Protein,ligand)]
+
+
+cb1066.cb3234 <- fread('./output/cb1066.cb3234.anova.csv.gz')
+
+sigProteins <- cb1066.cb3234[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+p.mat <- dcast(ligQuant.sum[!timeStr %in% '0',], Protein~GROUP, value.var = 'mean.Ints.vsT0') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+p.mat
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("1066", colnames(p.mat)), "CB1066", "CB3234")))
+
+
+BackupAsPDF(hm, 'cb3234.cbcp55.sigProtes.collapsed.heatmap')
+```
+
+
+Plot raw intensities 
+```{r}
+p.mat <- dcast(ligQuant, Protein~paste0(GROUP,'.', rep), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints.',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CB3234", colnames(p.mat)), "CB1066", "CB3234")))
+hm
+BackupAsPDF(hm, 'CP3234.CB1066.interaction.intensities.fdr<0.05.heatmap')
+```
+Look at GO enrichment 
+No significant results
+
+```{r}
+lm.out$anova[, enrich_grp := 'no']
+lm.out$anova[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, enrich_grp := 'yes']
+
+enrich.dt <- enricherOnGroups(lm.out$anova[enrich_grp == 'yes'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'enrich_grp', topN = 10, title='GO term enrichment (proteins FDR < 0.05)', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 10)
+```
+
+
+
+
+
+```{r}
+# including the dropped sample for now
+protQuant <- fread ("/Users/martingordon/Documents/projects/052623_BPolacco_DARPA/052623_DARPa31_data/DAR31-ProteinLevelData.csv.gz")
+
+# parse GROUP names to define the actual columns that the linear models will work on
+# this work depends on how your columsn are defined
+protQuant[, ligand   := gsub("CB|_[0-9]{2}", "",GROUP)]
+
+# fix subject info to account for treatment batch 
+protQuant[,  SUBJECT := as.factor(interaction(ligand, SUBJECT))]
+
+protQuant[, timeStr := str_extract(GROUP, "[0-9]{2}$")]
+protQuant[, rankTime := as.integer(as.factor(timeStr))] #timeranked to 0-5; we do this to allow even intervals between the timepoints
+protQuant[, .(timeStr, rankTime)] %>% unique() #timepoint to time rank 
+
+protQuant[, .N, by=.(ligand, timeStr,SUBJECT)] %>% 
+  .[order(timeStr,ligand)]
+
+
+# this doesnt account for missing values in the data
+protQuant[, intVsMeanTime0 := LogIntensities - mean(LogIntensities[timeStr == '00']), by = .(ligand, Protein)]
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, ligand)]
+protQuant <- protQuant[ligand != '1066']
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+protQuant[, rep := str_extract(SUBJECT, '.[0-9]{1}$')]
+```
+
+
+```{r}
+lm.out <- linearModelsAllProteins(protQuant, 
+                                  formulaList = list(full  = LogIntensities ~ SUBJECT + ligand + rankTime + I(rankTime^2) + I(rankTime^3) + ligand:I(rankTime^2)  + ligand:I(rankTime^3)),
+                                  splitColumn = "Protein", cl=6) 
+```
+
+Save results, visualize and 
+
+```{r}
+ggplot(lm.out$anova, aes(x=p.value)) + geom_histogram(boundary=0) + facet_wrap(~term) %>% 
+  BackupAsPDF('cp55.cp3234.histogram')
+```
+
+```{r}
+lm.out$anova[, fdr := p.adjust(p.value, method = 'BH')]
+lm.out$anova[, gene := multiUniprots2multiGenes(Protein)]
+
+# write out the results
+fwrite(lm.out$anova, './output/cb55.cb3234.anova.csv.gz')
+```
+
+```{r}
+
+cb55.cb3234 <- fread('./output/cb55.cb3234.anova.csv.gz')
+
+sigProteins <- cb55.cb3234[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+p.mat <- dcast(protQuant, Protein~paste0(ligand,'.',timeStr, rep), value.var = 'intVsMeanTime0') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CP55", colnames(p.mat)), "CP55", "CP3234")))
+
+
+hm
+
+BackupAsPDF(hm, 'CP3234.CP55.interaction.fdr<0.05.heatmap')
+```
+LogIntensities plot
+```{r}
+p.mat <- dcast(protQuant, Protein~paste0(ligand,'.',timeStr, rep), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints.',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CP55", colnames(p.mat)), "CP55", "CP3234")))
+
+
+hm
+BackupAsPDF(hm, 'CP3234.CP55.interaction.intensities.fdr<0.05.heatmap')
+```
+No significany Go enrichment terms
+```{r}
+lm.out$anova[, enrich_grp := 'no']
+lm.out$anova[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.1, enrich_grp := 'yes']
+
+enrich.dt <- enricherOnGroups(lm.out$anova[enrich_grp == 'yes'], groupColumns = 'enrich_grp', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'enrich_grp')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'enrich_grp', topN = 10, title='GO term enrichment (proteins FDR < 0.05)', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 4), upperThreshold = 10)
+```
+
+Compare CP1066 to CP3234
+```{r}
+# including the dropped sample for now
+protQuant <- fread ("/Users/martingordon/Documents/projects/052623_BPolacco_DARPA/052623_DARPa31_data/DAR31-ProteinLevelData.csv.gz")
+
+# parse GROUP names to define the actual columns that the linear models will work on
+# this work depends on how your columsn are defined
+protQuant[, ligand   := gsub("CB|_[0-9]{2}", "",GROUP)]
+
+# fix subject info to account for treatment batch 
+protQuant[,  SUBJECT := as.factor(interaction(ligand, SUBJECT))]
+
+protQuant[, timeStr := str_extract(GROUP, "[0-9]{2}$")]
+protQuant[, rankTime := as.integer(as.factor(timeStr))] #timeranked to 0-5; we do this to allow even intervals between the timepoints
+protQuant[, .(timeStr, rankTime)] %>% unique() #timepoint to time rank 
+
+protQuant[, .N, by=.(ligand, timeStr,SUBJECT)] %>% 
+  .[order(timeStr,ligand)]
+
+
+# this doesnt account for missing values in the data
+protQuant[, intVsMeanTime0 := LogIntensities - mean(LogIntensities[timeStr == '00']), by = .(ligand, Protein)]
+protQuant[, vsTimeZero := LogIntensities - mean(LogIntensities[timeStr == timeStr[!is.na(LogIntensities)][1] ]), by = .(Protein, ligand)]
+protQuant <- protQuant[ligand != 'CP55']
+protQuant[, gene := multiUniprots2multiGenes(Protein)]
+
+protQuant[, rep := str_extract(SUBJECT, '.[0-9]{1}$')]
+
+protQuant$ligand %>%  unique()
+```
+
+```{r}
+lm.out <- linearModelsAllProteins(protQuant, 
+                                  formulaList = list(full  = LogIntensities ~ SUBJECT + ligand + rankTime + I(rankTime^2) + I(rankTime^3) + ligand:I(rankTime^2)  + ligand:I(rankTime^3)),
+                                  splitColumn = "Protein", cl=6) 
+```
+
+Save results, visualize and 
+
+```{r}
+ggplot(lm.out$anova, aes(x=p.value)) + geom_histogram(boundary=0) + facet_wrap(~term) %>% 
+  BackupAsPDF('cp1066.cp3234.histogram')
+```
+
+```{r}
+lm.out$anova[, fdr := p.adjust(p.value, method = 'BH')]
+lm.out$anova[, gene := multiUniprots2multiGenes(Protein)]
+
+# write out the results
+fwrite(lm.out$anova, './output/cb3234.cb1066.anova.csv.gz')
+```
+
+```{r}
+sigProteins <- lm.out$anova[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+p.mat <- dcast(protQuant, Protein~paste0(ligand,'.',timeStr, rep), value.var = 'intVsMeanTime0') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("1066", colnames(p.mat)), "CP1066", "CP3234")))
+
+
+hm
+
+BackupAsPDF(hm, 'CP3234.CP1066.interaction.fdr<0.05.heatmap')
+```
+```{r}
+sigProteins <- lm.out$anova[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+p.mat <- dcast(protQuant, Protein~paste0(ligand,'.',timeStr, rep), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("1066", colnames(p.mat)), "CP1066", "CP3234")))
+
+hm
+```
+150923
+----
+Redo the plots; remove the noisy proteins and rm any replicates that are proble
+
+CB1066 vs CB3234
+filter dataset
+```{r}
+protQuant$ligand %>% unique()
+
+ligQuant <- protQuant[ligand != 'CBCP55']
+ligQuant <- ligQuant[NumMeasuredFeature != 1,] # remove proteins with only 1 measured feature
+
+# remove proteins with < 15 measured per group
+ligQuant[, prots.per.condition := .N, by=.(Protein,ligand)] 
+rm.prots <- ligQuant[prots.per.condition < 15, unique(Protein)]
+
+ligQuant <- ligQuant[!Protein %in% rm.prots]
+
+```
+
+
+```{r}
+lm.out <- linearModelsAllProteins(ligQuant, 
+                                  formulaList = list(full  = LogIntensities ~ SUBJECT + ligand + rankTime + I(rankTime^2) + I(rankTime^3) + ligand:I(rankTime^2)  + ligand:I(rankTime^3)),
+                                  splitColumn = "Protein", cl=6) 
+```
+
+Save results, visualize and 
+
+```{r}
+ggplot(lm.out$anova, aes(x=p.value)) + geom_histogram(boundary=0) + facet_wrap(~term) %>% 
+  BackupAsPDF('cp1066.cp3234.histogram')
+```
+
+```{r}
+lm.out$anova[, fdr := p.adjust(p.value, method = 'BH')]
+lm.out$anova[, gene := multiUniprots2multiGenes(Protein)]
+
+# write out the results
+fwrite(lm.out$anova, './output/cb1066.cb3234.anova.csv.gz')
+```
+
+```{r}
+
+cb1066.cb3234 <- fread('./output/cb1066.cb3234.anova.csv.gz')
+
+sigProteins <- cb1066.cb3234[term %in% c("ligand:I(rankTime^2)","ligand:I(rankTime^3)") & fdr < 0.05, unique(gene)]
+
+p.mat <- dcast(ligQuant, Protein~paste0(ligand,'.',timeStr, rep), value.var = 'intVsMeanTime0') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints. vs T0',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CB1066", colnames(p.mat)), "CB1066", "CP3234")))
+
+
+hm
+
+BackupAsPDF(hm, 'CP3234.CP55.interaction.fdr<0.05.heatmap')
+
+
+ggplot(protQuant, aes(x=paste0(GROUP,SUBJECT), y=LogIntensities)) + geom_boxplot()
+```
+LogIntensities plot
+```{r}
+p.mat <- dcast(protQuant, Protein~paste0(ligand,'.',timeStr, rep), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+rownames(p.mat) <- multiUniprots2multiGenes(rownames(p.mat))
+
+
+p.mat <- p.mat[rownames(p.mat) %in% sigProteins,]
+
+
+hm <- Heatmap(p.mat, cluster_columns = FALSE, 
+              name = 'Log2 Ints.',
+              #column_title = 'CP55 vs CP1066',
+              row_title = sprintf('%s Proteins (fdr < 0.05)', nrow(p.mat)),
+              row_names_gp = gpar(fontsize = 5.5),
+              column_names_gp = gpar(fontsize = 8),
+              column_split = list (ifelse(grepl("CP55", colnames(p.mat)), "CP55", "CP3234")))
+
+
+hm
+BackupAsPDF(hm, 'CP3234.CP55.interaction.intensities.fdr<0.05.heatmap')
+```
+
+
+

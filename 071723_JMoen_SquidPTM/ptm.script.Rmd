@@ -1,0 +1,271 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Script to loop through PTM analysis
+
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library(tidyverse)
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+#source("./scripts/LocatePeptidePtmInProteins.R") #jacks version of script
+
+source("../../utils/bp_utils/LocatePeptidePtmInProteins.R")
+
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+Configure paths to files
+
+```{r setup}
+#path to files on your machine
+path <- "/Users/martingordon/Documents/projects/071723_JMoen_SquidPTM"
+
+fasta <- paste0(path,'/docs/squid_Annotated_v5_tryptic_edits_fixed.fasta')  #use this as dups removed
+
+f_input <- dir(path = paste0(path, '/data/'), pattern = "*.All_PTMs_fixed.txt", recursive = FALSE, full.names = TRUE) 
+k_input <- dir(path = paste0(path, '/data/'), pattern = "*_keys.txt", recursive = FALSE, full.names = TRUE)
+
+
+input <-  expand.grid(f_input,k_input)
+
+
+input <- input %>% 
+  mutate(ptm_type=as.factor(str_extract(k_input, pattern="AcK|diMeK|monoMeK|triMeK|PH|UB"))) %>% 
+  arrange(ptm_type)
+```
+
+```{r functions}
+
+#file preprocessing
+preprocessSpec <- function(spec_f,keys_f){
+
+  #fread stores as data.table by default
+  spec <- fread(spec_f)
+  keys <- fread(keys_f)
+
+  #add semicolon if required 
+  spec[, ProteinName := gsub ("(?<![_>])PAC", ";PAC", ProteinName, perl = TRUE)] #uses perl regex v with negative lookbehind to negate -/> characters 
+
+
+  # for some reason the '>' was kep in the protein names here.  Remove those:
+  spec[, ProteinName := gsub (">", "", ProteinName)]
+
+  # apply Condition, BioReplicate from keys to spec
+  spec[keys , Condition := i.Condition , on = c(Run = "RawFile")] #overwrite condition col w values from keys file, match run col in spec to rawfile col in keys
+  spec[keys , BioReplicate := i.BioReplicate , on = c(Run = "RawFile")]
+  
+  #only select defined runs
+  spec <- spec[Condition != 'Not Defined',]
+  
+  return(spec)
+  setnames(spec) = dat_name
+}
+
+#run msstats
+
+runMSStats <- function(spec_in){
+
+  # required column for MSstats
+  spec_in[, IsotopeLabelType := "L"]
+
+  dp.out <- MSstats::dataProcess(spec_in, MBimpute = FALSE, featureSubset = "highQuality", remove_uninformative_feature_outlier = TRUE)
+  return(dp.out)
+}
+
+# create volcano plot
+```
+
+```{r make-contrast-matrix}
+contrasts <- scan(paste0(path,"/data/contrasts.txt"), what = "character")
+```
+
+```{r run-preprocesing}
+# not working.. read in the files and see 
+test.keys <- fread('/Users/martingordon/Documents/projects/071723_JMoen_SquidPTM/data//diMeK_keys.txt')
+test.f <- fread('/Users/martingordon/Documents/projects/071723_JMoen_SquidPTM/data/MSstats_All_PTMs_fixed.txt')
+
+unique(test.keys$RawFile)
+
+test.f[Run %in% unique(test.keys$RawFile),] %>% 
+  .[, unique(Run)]
+
+head(test.keys)
+head(test.f)
+
+test.f[test.keys, Condition := i.Condition, on = c(Run = 'RawFile')]
+
+#apply to each row of df and name after val in third column
+results_list <- setNames(apply(input, 1,function(row) {
+  spec=row[1]
+  keys=row[2]
+  preprocessSpec(spec,keys) }), input$ptm_type)
+
+```
+
+```{r}
+lapply(results_list, function(x){
+  x[, .N, by=.(Condition, BioReplicate, Run)]
+})
+```
+
+Add run info for modelling
+```{r}
+# check out the nbioconditions
+lapply(results_list, function(x){
+  x[, ID:=.GRP, by=.(Condition,BioReplicate)]
+  x[, BioReplicate := ID]
+  x[, .N, by=.(Condition, BioReplicate, Run)]
+  
+})
+```
+
+
+Spectronaut data trim left tail which is obviously garbage,
+Left shoulder peak: seems imputiation may have been used
+
+```{r plot-hist}
+
+#decide on cutoffs
+
+lapply(results_list, function(dt){
+  
+  ggplot(data=dt, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+
+} )
+
+
+# specify threshold (may need to do this individually for each list element)
+results_list <- lapply(results_list, function(x){
+  x <- x[Intensity >= 2^4]
+} )
+
+
+lapply(results_list, function(dt){
+  
+  ggplot(data=dt, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+
+} )
+
+```
+Run the PH
+
+```{r}
+
+ptm.list <- lapply(seq_along(results_list), function(x, n, i){
+
+  print(n[[i]])
+  
+  if (n[[i]] == 'AcK') {
+    sitifyProteins_SpectronautFile(x[[i]], fastaFile = fasta, site = "NAC") # for n-acetyl
+  } else if (n[[i]] == 'monoMeK') {
+    sitifyProteins_SpectronautFile(x[[i]], fastaFile = fasta, site = "MMET") 
+  } else if (n[[i]] == 'diMeK') {
+    sitifyProteins_SpectronautFile(x[[i]], fastaFile = fasta, site = "DMET") 
+  } else if (n[[i]] == 'triMeK') {
+    sitifyProteins_SpectronautFile(x[[i]], fastaFile = fasta, site = "TMET") 
+  } else if (n[[i]] == 'UB' | n[[i]] == 'PH') {
+    sitifyProteins_SpectronautFile(x[[i]], fastaFile = fasta, site = n[[i]]) 
+  }
+  
+}, x=results_list, n=names(results_list))
+
+names(ptm.list) <- names(results_list)
+```
+
+```{r filter dts}
+
+ptm.list <- lapply(ptm.list, function(dt){
+  dt <- dt[!is.na(dt$oldProteinName)]
+  return(dt)
+} )
+
+lapply(ptm.list, function(dt){
+  
+  ggplot(data=dt, aes(x=log2(Intensity))) +
+    geom_histogram(stat='bin', bins=100)
+
+} )
+
+```
+
+```{r run-msstats}
+# make contrasts
+#put in function
+
+# run msstats on each list element
+msstats_proc <- lapply(ptm.list, function(dt) {
+  runMSStats(dt)
+})
+
+# write out files to output directory
+imap(msstats_proc, function(dt, idt) {
+  fwrite(dt$ProteinLevelData, ScriptAndDatedFileName(paste0(idt,"-ProteinLevelData.csv")))
+  fwrite(dt$FeatureLevelData, ScriptAndDatedFileName(paste0(idt,"-FeatureLevelData.csv")))
+})
+
+# MSStats Differential Expression
+msdiff_list <- lapply(msstats_proc, function(dt) {
+  contrast.mat <- makeContrast.AllByAll(mssQ = dt)
+  gc.out <- MSstats::groupComparison(contrast.mat, dt)
+  return(gc.out)
+})
+
+# write out differential expression results to file
+imap(msdiff_list, function(dt, idt) {
+  fwrite(dt$ComparisonResult, ScriptAndDatedFileName(paste0(idt,"-diff-results.txt")))
+})
+
+```
+
+Generate volcano plots
+```{r}
+lapply(seq_along(msdiff_list), function(x, n, i) {
+  
+  
+  dt <- data.table(x[[i]]$ComparisonResult)
+  
+  pvalueThreshold <- 0.05
+  log2FCThreshold <- log2(1.5) # modify as needed
+  pvalueVariable <-  "adj.pvalue" # or "pvalue"
+  dt[, sig := "not"]
+  dt[dt[[pvalueVariable]] < pvalueThreshold & abs(log2FC) > log2FCThreshold, sig := ifelse(log2FC  < 0, "down", "up")]
+  dt[, yVariable := -log10(dt[[pvalueVariable]])]
+  
+  p <- ggplot (dt, aes(x=log2FC, y = yVariable, color = sig)) + 
+  geom_point(show.legend = FALSE, alpha = 0.5, size = 1, shape = 16) + 
+  facet_wrap (~Label) + 
+  scale_color_manual(values = c(down= "blue", not = "gray", up = "red")) +
+  #scale_x_continuous(limits = c(-4,4)) +
+  scale_y_continuous(name = paste(pvalueVariable, "(-log10)", collapse = "")) +
+  geom_hline(yintercept = -log10(pvalueThreshold), lty="dotted") +
+  geom_vline(xintercept = c(-1, 1) * log2FCThreshold, lty="dotted") + 
+  theme_bw() 
+
+  pdf(paste0(n[[i]],"-Volcano_plot.pdf"))
+  print(p)
+  dev.off()
+  
+  
+}, x=msdiff_list, n=names(msdiff_list))
+
+```
+
+
+# don't run: just examples of command for each. PTM
+sitifyProteins_SpectronautFile(results_list[['PH']], fastaFile = fasta, site = "PH") 
+sitifyProteins_SpectronautFile(results_list[['AcK']], fastaFile = fasta, site = "NAC") 
+sitifyProteins_SpectronautFile(results_list[['monoMeK']], fastaFile = fasta, site = "MMET")
+sitifyProteins_SpectronautFile(results_list[['diMeK']], fastaFile = fasta, site = "DMET") 
+sitifyProteins_SpectronautFile(results_list[['triMeK']], fastaFile = fasta, site = "TMET") 
+sitifyProteins_SpectronautFile(results_list[['UB']], fastaFile = fasta, site = "UB")
+

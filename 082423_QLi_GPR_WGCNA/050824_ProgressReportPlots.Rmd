@@ -1,0 +1,730 @@
+---
+title: "050824_ProgressReport"
+author: "Martin Gordon"
+date: "2024-05-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Generate a couple of plots of the DARPA data for the uocoming progress report on Friday
+
+- plot of Log2FC values for genes in clusters of interest - done
+- venn diagram of the MRX2 receptor
+- recover the genes from the venn diagram of the MRX2 receptor
+
+Review meeting notes from 050724 for details 
+
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(stringr)
+library(ggbeeswarm)
+library(ggrepel)
+library(patchwork)
+library(readxl)
+library(circlize)
+library(ComplexHeatmap)
+library(randomcoloR)
+library(scales) #for muted colors
+library(eulerr)
+
+# this is for the Venn diagram plots
+library(ggvenn)
+library(ggVennDiagram) # main diff to above is you can quantify overlapping regions
+
+#Ben utils
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+
+# helper scripts for module/network export etc
+source ("/Users/martingordon/Documents/utils/mg_utils/r_utils/HelperFunctions.R")
+```
+
+Read in the data produced previously:
+
+First the IUPAR and predicited correlation scores
+```{r}
+iupar.cor.dt <- fread("/Users/martingordon/Documents/projects/082423_QLi_GPR_WGCNA/041223.regen.fig5plots_data/2023_12_04_iupargprotein.corscores.csv")
+iupar.cor.dt <- iupar.cor.dt[numObservations == 11,] # only keep those with 11 observations
+
+gprots <-  unique(iupar.cor.dt$GProtein)
+```
+
+```{r}
+two.perc.dt <- fread('~/Documents/projects/082423_QLi_GPR_WGCNA/041223.regen.fig5plots_data/2023_12_06_2perc.gprot.corscores.csv')
+five.perc.dt <- fread('~/Documents/projects/082423_QLi_GPR_WGCNA/041223.regen.fig5plots_data/2023_12_06_5perc.gprot.corscores.csv')
+```
+
+Now read in the expression data and lets format correctly
+```{r}
+# read in the deg of the 11receptor dataset
+mss.out <- fread('./data/2022_08_31_NiceFitsPower3.csv')
+
+exp.mat <- dcast(mss.out,gene~receptor, value.var = 'log2FC') %>% 
+  .[, MOR.LG94 := NULL] %>% 
+  as.matrix(rownames ='gene')
+
+# filter to sig genes and reorder
+sig.genes <- mss.out[pvalue < 0.005 & abs(log2FC) > log2(1.5) & receptor != 'MOR.LG94', unique(gene) ]
+exp.mat <- exp.mat[rownames(exp.mat) %in% sig.genes,]
+
+# renanme MOR DAMGO to MOR
+colnames(exp.mat) <- c('DOR', 'KOR', 'MOR', 'MRX2', 'MRX4', 'NK1R', 'NPFFR1', 'NPY1R','PTGER1', 'PTGER4','QRFPR')
+
+# reorder the cols to match the matrices
+col.order <-  c("MRX2","MRX4","NPFFR1","NPY1R","DOR","KOR","MOR","PTGER1","PTGER4","QRFPR","NK1R")
+
+# sanity checking and moving column; all looks good
+exp.mat[1:10,1:10]
+exp.mat <- exp.mat[, col.order]
+exp.mat[1:10,1:10]
+```
+
+
+
+Take top correlated genes and plot
+```{r}
+# both pos and neg cor
+genes.oi <- sapply(gprots, function(x){
+  sub.dt <- iupar.cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.98) | R <= quantile(R,0.02), unique(gene)])
+}) %>% c() %>% unique()
+
+# take only the genes positiviely correlated with each group 
+# set at 5%
+genes.pos.cor <- sapply(gprots, function(x){
+  sub.dt <- iupar.cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.95), unique(gene)])
+}) %>% c() %>% unique()
+# 195
+genes.pos.cor %>%  length()
+
+genes.pos.cor %>%  unlist()
+# each GProtein cor has returned many unique values. Perhaps a good sign!
+genes.oi %>%  length()
+
+# dt of gene lists
+genes.list <- sapply(gprots, function(x){
+  sub.dt <- iupar.cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.98) | R <= quantile(R,0.02), unique(gene)])
+}) %>%  data.table()
+```
+
+Lets plot the heatmap of both sets
+I think the clustering here looks good with the full set of correlated genes; lets try 
+```{r}
+subMat <-  exp.mat[rownames(exp.mat) %in% genes.oi,]
+
+colnames(exp.mat)
+# name and reorder cols to match GProt annotation
+
+# create a different scoring metric
+#IMPORTANT: these classifications follow the scores.mat format available in 041223.regen.fig5plots.Rmd
+# inspect that markdown to ensure the cols match
+# shoiuld be (will be renamed to match the exp mat but order should be the same)
+## "MRGPRX2" "MRGPRX4" "NPFFR1"  "NPY1R"   "OPRD1"   "OPRK1"   "OPRM1"   "PTGER1"  "PTGER4"  "QRFPR"   "TACR1"
+
+GProtein <- c('Gi/Go & Gq/G11', 'Gq/G11', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gq/G11', 'Gs', 'Gi/Go & Gq/G11', 'Gq/G11 & Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue',
+                                            'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')) )
+                        
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'pearson',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+
+hm
+#hm <- draw(hm, column_title='2nd & 98th Percentile R scores')
+
+```
+Definitely good 
+```{r}
+subMat <-  exp.mat[rownames(exp.mat) %in% genes.pos.cor,]
+#subMat <-  sweep(subMat, 1, median(subMat, 1, na.rm=T))
+
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'euclidean',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 3),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='Top 5% Positively Correlated to IUPHAR groups')
+hm
+BackupAsPDF(hm, ('5perc.posCor.log2FC.heatmap'), dimensions=c(9,10))
+```
+Ok; now extract the clusters labelled by Qiongyu and use these genes to plot the heatmap
+
+Split the heatmap into different clusters
+
+```{r}
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'euclidean',
+        clustering_distance_rows = 'pearson',
+        show_column_names = T,
+        row_km=3,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title = c("", "Gq/G11", "Gi/Go"),
+         row_names_gp = gpar (fontsize= 3),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+     hm   
+hm <- draw(hm, column_title='Top 5% Positively Correlated to IUPHAR groups')
+hm
+BackupAsPDF(hm, ('5perc.posCor.log2FC.rowClust.heatmap'), dimensions=c(9,10))
+```
+```{r}
+cor.mat <- dcast(iupar.cor.dt, gene~GProtein, value.var = 'R') %>% 
+  as.matrix(rownames='gene')
+
+subMat <-  cor.mat[rownames(cor.mat) %in% genes.oi,]
+
+GProtein <- c('Gi/Go', 'Gq/G11', 'Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go'='#22A884FF', 'Gq/G11'='#440154FF',
+                                            'Gs'='#FDE725FF')) )
+
+hm <- Heatmap(subMat,
+        top_annotation = ha,
+        cluster_columns = T, 
+        row_km = 3,
+        row_gap = unit(1.5, "mm"),
+        clustering_distance_rows = 'euclidean',
+        name='Pearson r',
+        na_col = 'darkgrey',
+        row_title = "km_%s",
+        #row_title =sprintf("%d Proteins",
+        #                    nrow(subMat)),
+         row_names_gp = gpar (fontsize= 3),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+
+hm
+hm.k3 <- draw(hm, column_title='2nd & 98th Percentile R scores')
+
+BackupAsPDF(hm.k3, 'R.2nd.98thpercentile.gprotein.cor.3k.heatmap', dimensions = c(8,8))
+```
+
+Need to extract the cluster genes from this heatmap and visualise
+```{r}
+k3.clust.genes <- extractClustersfromHeatmap(hm.k3, subMat)
+k3.clust.genes[,.N,by=cluster]
+
+
+View(extractClustersfromHeatmap)
+
+genes.oi <- k3.clust.genes[cluster != 1, feature]
+
+#vecotr of genes to plot'
+subset.genes <- c('GORASP1', 'CEP295','USO1','YIF1A', 'NUS1','KIF7', 'PODXL',
+                  'ACTA2','SYP', 'C4AMC7;Q6VEQ5', 'DENND11', 'COMMD3','PIK3R4','STAM2','VTI1A','APBB2','MARK1','COG8',
+                  'PEF1','APLP2','CRTC1','BAG2','RHOC','RHOA', 'PACSIN2','SIM1','TAGLN2', 'NUMBL', 'MOCS2.O96007', 
+                  'MARK3','CDK17','CSRP2','MRTFA','REPS1', 'MARK2','OSBPL9', 'C12orf4', 'TPRN','OSBPL8', 'WDR35','SRSF7',
+                  'DGKH', 'TES','CIT','SLK', 'MELK', 'GDI2', 'RAB8A', 'PRKD2', 'N4BP2L2', 'PRKD1', 'ENAH', 'ARHGEF7', 'PPP3CA',
+                  'ANXA2', 'PRKCA', 'UNC13B', 'PACS1', 'FNBP1L', 'CPNE8', 'GIT1', 'ARHGAP5', 'ANKS1A', 'WDR44', 'PRKCI', 'HPCAL1','PRKD3','CPNE3','PRKCD')
+
+
+
+# get the subset in the heatmap
+subMat <- scale(exp.mat)
+subMat <-  exp.mat[rownames(exp.mat) %in% subset.genes,]
+#subMat <-  exp.mat[rownames(exp.mat) %in% subset.genes,]
+#subMat <-  exp.mat[rownames(exp.mat) %in% genes.oi,]
+# heatmap annotations
+GProtein <- c('Gi/Go & Gq/G11', 'Gq/G11', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gq/G11', 'Gs', 'Gi/Go & Gq/G11', 'Gq/G11 & Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue',
+                                            'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')) )
+
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+              cluster_columns = T, 
+              clustering_distance_columns = 'pearson',
+              clustering_distance_rows = 'pearson',
+              show_column_names = T,
+              name='log2FC',
+              na_col = 'darkgrey',
+              row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+              row_names_gp = gpar (fontsize= 5),
+              column_names_gp = gpar (fontsize= 8),
+              column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='Highlighted clusters log2FC profiles')
+BackupAsPDF(hm, 'interesting.subclusters.log2FC.heatmap',dimensions = c(8,8))
+
+```
+# 27-08-24
+# extract the subset of GqG11 cor genes and plot the log2FC heatmap
+
+```{r}
+genes.oi <- k3.clust.genes[cluster == 3, feature]
+
+# get the subset in the heatmap
+subMat <- scale(exp.mat)
+subMat <-  exp.mat[rownames(exp.mat) %in% genes.oi,]
+#subMat <-  exp.mat[rownames(exp.mat) %in% subset.genes,]
+#subMat <-  exp.mat[rownames(exp.mat) %in% genes.oi,]
+# heatmap annotations
+GProtein <- c('Gi/Go & Gq/G11', 'Gq/G11', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gq/G11', 'Gs', 'Gi/Go & Gq/G11', 'Gq/G11 & Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue',
+                                            'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')) )
+
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+              cluster_columns = T, 
+              clustering_distance_columns = 'pearson',
+              clustering_distance_rows = 'pearson',
+              show_column_names = T,
+              column_split = GProtein,
+              name='log2FC',
+              border=T,
+              na_col = 'darkgrey',
+              row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+              row_names_gp = gpar (fontsize= 5),
+              column_names_gp = gpar (fontsize= 8),
+              column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='Gq/G11 cluster log2FC profiles')
+BackupAsPDF(hm, 'gqg11.cluster.log2FC.colSplit.heatmap',dimensions = c(8,8))
+
+
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+              cluster_columns = T, 
+              clustering_distance_columns = 'pearson',
+              clustering_distance_rows = 'pearson',
+              show_column_names = T,
+              name='log2FC',
+              border=T,
+              na_col = 'darkgrey',
+              row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+              row_names_gp = gpar (fontsize= 5),
+              column_names_gp = gpar (fontsize= 8),
+              column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='Gq/G11 cluster log2FC profiles')
+BackupAsPDF(hm, 'gqg11.cluster.log2FC.heatmap',dimensions = c(8,8))
+```
+
+
+
+Lets do the same thing with just the positively correlated proteins in each set
+
+```{r}
+subMat <-  cor.mat[rownames(cor.mat) %in% genes.pos.cor,]
+
+GProtein <- c('Gi/Go', 'Gq/G11', 'Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go'='#22A884FF', 'Gq/G11'='#440154FF',
+                                            'Gs'='#FDE725FF')) )
+
+
+hm <- Heatmap(subMat,
+        top_annotation = ha,
+        cluster_columns = T, 
+        row_km = 3,
+        row_gap = unit(1.5, "mm"),
+        clustering_distance_rows = 'euclidean',
+         name='Pearson r',
+         na_col = 'darkgrey',
+         row_title = c("", "Gq/G11", "Gi/Go"),
+         row_names_gp = gpar (fontsize= 3),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+
+
+hm.k3 <- draw(hm, column_title='Top 5% Positive R scores')
+BackupAsPDF(hm.k3, 'R.top5perc.posCor.gprotein.heatmap', dimensions = c(8,8))
+```
+Nots lets plot the log2FC of these positively correlated sets
+
+```{r}
+k3.clust.genes <- extractClustersfromHeatmap(hm.k3, subMat)
+genes.oi <- k3.clust.genes[cluster != 1, feature]
+
+subMat <-  exp.mat[rownames(exp.mat) %in% genes.oi,]
+# heatmap annotations
+GProtein <- c('Gi/Go & Gq/G11', 'Gq/G11', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gi/Go', 'Gq/G11', 'Gs', 'Gi/Go & Gq/G11', 'Gq/G11 & Gs')
+
+ha <- HeatmapAnnotation(GProtein = GProtein,
+                        col=list(GProtein=c('Gi/Go & Gq/G11'='pink', 'Gq/G11'='lightblue',
+                                            'Gi/Go'='lightgreen', 'Gs'='#CBC3E3','Gq/G11 & Gs'='#FFD580')) )
+
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+              cluster_columns = T, 
+              clustering_distance_columns = 'pearson',
+              clustering_distance_rows = 'pearson',
+              show_column_names = T,
+              name='log2FC',
+              na_col = 'darkgrey',
+              row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+              row_names_gp = gpar (fontsize= 3),
+              column_names_gp = gpar (fontsize= 8),
+              column_title_gp = gpar (fontsize= 9))
+ 
+hm       
+hm <- draw(hm, column_title='Top 5% Positive R scores (clusters 2 & 3)')
+BackupAsPDF(hm, 'R.top5perc.posCor.clusters2nd3.log2FC.heatmap',dimensions = c(8,8))
+```
+Now, we need to generate Venn diagrams of the MRX2 receptor
+This is from the old GC01.GC02 dataset from 2023
+
+Recap of this dataset
+---
+two receptors, MRX2 and QRFPR (these are considered to interact with both Gi and Gq gproteins)
+two inhibitors: YM and PTX to inhibit Gq and Gi signalling respectively
+
+Read in the pwcomparisons from the data 
+```{r}
+QRFPR.mss <- fread('/Users/martingordon/Documents/projects/071123_QLi_DARPA.GC01.GC02/output/QRFPR.mss.pwcomparisons.proc.csv')
+QRFPR.mss[, receptor := 'QRFPR']
+MRX2.mss <- fread('/Users/martingordon/Documents/projects/071123_QLi_DARPA.GC01.GC02/output/MRX2.mss.pwcomparisons.proc.csv')
+MRX2.mss[, receptor := 'MRX2']
+
+mss.out <-  rbind(MRX2=MRX2.mss,
+                 QRFPR=QRFPR.mss)
+
+# get the inhibitors
+mss.out[, Inhibitor := str_extract(Label, 'PTX|YM')]
+```
+
+Lets find the overlapping hits
+Need to simplify this; other Venn diagram includes too many sets..
+lets divide the genes into positively correlated and negatively correlated (top 2 and bottom 2 perc), and upregulated and downregulated
+
+```{r}
+# we are probably interested in the downregulated stuff
+# take the YM treated (Gq inhibition) and the PTX treated (Gi inhibition)
+contrasts.oi <- c("ZC10_YM-ZC10","ZC05_YM-ZC05", "RF10_YM-RF10","RF05_YM-RF05")
+
+#overlap of significant hits in these contrasts:
+# many more hits found for QRFPR rather than MRX2
+mss.out[Label %in% contrasts.oi & sig != 'not', .N, by=.(sig,Inhibitor,receptor)]
+```
+
+
+```{r}
+
+sec.perc   <- fread("/Users/martingordon/Documents/projects/082423_QLi_GPR_WGCNA/041223.regen.fig5plots_data/2023_12_06_2perc.gprot.corscores.csv")
+fifth.perc <- fread("/Users/martingordon/Documents/projects/082423_QLi_GPR_WGCNA/041223.regen.fig5plots_data/2023_12_06_5perc.gprot.corscores.csv")
+
+# first lets plot the MRX2 genes 
+g <- ggvenn(list('Gq/G11\nneg cor' = sec.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                 'Gq/G11\npos cor' = sec.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                 'MRX2 ZC YM+/- \nupreg & 0.05 p.adj' = mss.out[Label %in% contrasts.oi[-c(3,4)] & sig == 'up', unique(gene)],
+                 'MRX2 ZC YM+/- \ndownreg & 0.05 p.adj' = mss.out[Label %in% contrasts.oi[-c(3,4)] & sig == 'down', unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+
+BackupAsPDF(g, '2ndperc.MRX2.gq.sigbreakdown.adj.pval.venn.')  
+
+
+# first lets plot the MRX2 genes 
+g <- ggvenn(list('Gq/G11\nneg cor' = fifth.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                 'Gq/G11\npos cor' = fifth.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                 'MRX2 ZC YM+/- \nupreg & 0.05 p.adj' = mss.out[Label %in% contrasts.oi[-c(3,4)] & sig == 'up', unique(gene)],
+                 'MRX2 ZC YM+/- \ndownreg & 0.05 p.adj' = mss.out[Label %in% contrasts.oi[-c(3,4)] & sig == 'down', unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+
+BackupAsPDF(g, '5thperc.MRX2.gq.sigbreakdown.adj.pval.venn.')  
+
+
+# lets drop the pvalue significance and replot
+g <- ggvenn(list('Gq/G11\nneg cor' = sec.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                 'Gq/G11\npos cor' = sec.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                 'MRX2 ZC YM+/- \nupreg & 0.001 p.val' = mss.out[Label %in% contrasts.oi[-c(3,4)] & (log2FC) >  0.58 & pvalue < 0.001, unique(gene)],
+                 'MRX2 ZC YM+/- \ndownreg & 0.001 p.val' = mss.out[Label %in% contrasts.oi[-c(3,4)] & (log2FC) < -0.58 & pvalue < 0.001, unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+BackupAsPDF(g, '2ndperc.MRX2.gq.sigbreakdown.raw.pval.venn.')  
+
+# so we want a reduced pval of the sig testing, but the fifth perc of the correlation analysis 
+g <- ggvenn(list('Gq/G11\nneg cor' = fifth.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                 'Gq/G11\npos cor' = fifth.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                 'MRX2 ZC YM+/- \nupreg & 0.001 p.val' = mss.out[Label %in% contrasts.oi[-c(3,4)] & (log2FC) > 0.58 & pvalue < 0.001, unique(gene)],
+                 'MRX2 ZC YM+/- \ndownreg & 0.001 p.val' = mss.out[Label %in% contrasts.oi[-c(3,4)] & (log2FC) < -0.58 & pvalue < 0.001, unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+BackupAsPDF(g, '5thperc.MRX2.gq.sigbreakdown.raw.pval.venn.')  
+```
+Now repeat the same plots for QRFPR
+```{r}
+# first lets plot the QRFPR genes 
+g <- ggvenn(list('Gq/G11\nneg cor' = sec.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                 'Gq/G11\npos cor' = sec.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                 'QRFPR RF YM+/- \nupreg & 0.05 p.adj' = mss.out[Label %in% contrasts.oi[-c(1,2)] & sig == 'up', unique(gene)],
+                 'QRFPR RF YM+/- \ndownreg & 0.05 p.adj' = mss.out[Label %in% contrasts.oi[-c(1,2)] & sig == 'down', unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+
+#BackupAsPDF(g, '2ndperc.QRFPR.YM.gq.sigbreakdown.adj.pval.venn.')  
+
+
+# first lets plot the MRX2 genes 
+g <- ggvenn(list('Gq/G11\nneg cor' = fifth.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                 'Gq/G11\npos cor' = fifth.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                 'QRFPR RF YM+/- \nupreg & 0.05 p.adj' = mss.out[Label %in% contrasts.oi[-c(1,2)] & sig == 'up', unique(gene)],
+                 'QRFPR RF YM+/- \ndownreg & 0.05 p.adj' = mss.out[Label %in% contrasts.oi[-c(1,2)] & sig == 'down', unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+
+#BackupAsPDF(g, '5thperc.QRFPR.YM.gq.sigbreakdown.adj.pval.venn.')  
+
+# lets drop the pvalue significance and replot
+g <- ggvenn(list('Gq/G11\nneg cor' = sec.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                 'Gq/G11\npos cor' = sec.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                 'QRFPR RF YM+/- \nupreg & 0.001 p.val' = mss.out[Label %in% contrasts.oi[-c(1,2)] & (log2FC) >  0.58 & pvalue < 0.001, unique(gene)],
+                 'QRFPR RF YM+/- \ndownreg & 0.001 p.val' = mss.out[Label %in% contrasts.oi[-c(1,2)] & (log2FC) < -0.58 & pvalue < 0.001, unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+BackupAsPDF(g, '2ndperc.QRFPR.YM.gq.sigbreakdown.raw.pval.venn.')  
+
+# so we want a reduced pval of the sig testing, but the fifth perc of the correlation analysis 
+g <- ggvenn(list('Gq/G11\nneg cor' = fifth.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                 'Gq/G11\npos cor' = fifth.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                 'QRFPR RF YM+/- \nupreg & 0.001 p.val' = mss.out[Label %in% contrasts.oi[-c(1,2)] & (log2FC) > 0.58 & pvalue < 0.001, unique(gene)],
+                 'QRFPR RF YM+/- \ndownreg & 0.001 p.val' = mss.out[Label %in% contrasts.oi[-c(1,2)] & (log2FC) < -0.58 & pvalue < 0.001, unique(gene)]),
+       fill_color = c("#0073C2FF", "#EFC000FF", "#868686FF", "#CD534CFF"),
+       stroke_size = 0.5, set_name_size = 2)# + position = position_nudge(x=-0.1)
+g
+#BackupAsPDF(g, '5thperc.QRFPR.YM.gq.sigbreakdown.raw.pval.venn.')  
+```
+Now want to extract the overlaps of the different sets to identify the gene names 
+
+```{r}
+##
+## MRX2
+##
+
+#  'MRX2 ZC YM+ upreg 0.001 p.val and Gq/G11 neg corr second percentile overlaps
+# "CSRP2"   "MARK2"   "OSBPL8"  "PACSIN2" "NUMBL"
+intersect(mss.out[Label %in% contrasts.oi[-c(3,4)] & (log2FC) >  0.58 & pvalue < 0.001, unique(gene)], sec.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)])
+
+#  'MRX2 ZC YM+ downreg  0.001 p.val and Gq/G11 pos corr second percentile overlaps
+# "UNC13B" "PRKD3"  "PRKCA"  "HPCAL1" "PPP3CA" "DGKH"   "CPNE8"  "PRKD2"
+intersect(mss.out[Label %in% contrasts.oi[-c(3,4)] & (log2FC) <  -0.58 & pvalue < 0.001, unique(gene)], sec.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)])
+
+#  'MRX2 ZC YM+ upreg 0.001 p.val and Gq/G11 neg corr second percentile overlaps
+# "CSRP2"   "MARK2"   "PIP4K2C" "OSBPL8"  "PACSIN2" "NUMBL"
+intersect(mss.out[Label %in% contrasts.oi[-c(3,4)] & (log2FC) >  0.58 & pvalue < 0.001, unique(gene)], fifth.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)])
+
+#  'MRX2 ZC YM+ downreg  0.001 p.val and Gq/G11 pos corr second percentile overlaps
+# "UNC13B" "PRKD3"  "PRKCA"  "HPCAL1" "PPP3CA" "DGKH"   "CPNE8"  "PRKD2"  "HINT3"
+intersect(mss.out[Label %in% contrasts.oi[-c(3,4)] & (log2FC) <  -0.58 & pvalue < 0.001, unique(gene)], fifth.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)])
+
+
+##
+## QRFPR
+##
+
+#  QRFPR RF YM+ upreg 0.001 p.val and Gq/G11 neg corr second percentile overlaps
+# "PACSIN2"
+intersect(mss.out[Label %in% contrasts.oi[-c(1,2)] & (log2FC) >  0.58 & pvalue < 0.001, unique(gene)], sec.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)])
+#  QRFPR RF YM+ downreg & 0.001 p.val and Gq/G11 pos second percentile corr overlaps
+#  "PRKCA"  "FNBP1L" "PRKD2" 
+intersect(mss.out[Label %in% contrasts.oi[-c(1,2)] & (log2FC) <  -0.58 & pvalue < 0.001, unique(gene)], sec.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)])
+
+# QRFPR RF YM+ upreg 0.001 p.val and Gq/G11 neg corr fifth percentile overlaps
+# "PIP4K2A" "PIP4K2C" "DOCK9"   "PSD3"    "PACSIN2"
+intersect(mss.out[Label %in% contrasts.oi[-c(1,2)] & (log2FC) >  0.58 & pvalue < 0.001, unique(gene)], fifth.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)])
+#  QRFPR RF YM+ downreg & 0.001 p.val and Gq/G11 pos fifth percentile corr overlaps
+#  "PRKCA"  "TRIP10" "FNBP1L" "WASF1"  "PRKD2"  "WASF3"  "WASF2" 
+intersect(mss.out[Label %in% contrasts.oi[-c(1,2)] & (log2FC) <  -0.58 & pvalue < 0.001, unique(gene)], fifth.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)])
+
+```
+
+euler plot of all the overlaps
+
+```{r}
+g <- plot(euler(list('Gq/G11 \n+Ve correlation' = sec.perc[GProtein == 'Gq/G11' & R < 0,unique(gene)],
+                     'Gq/G11 \n-Ve correlation' = sec.perc[GProtein == 'Gq/G11' & R > 0,unique(gene)],
+                     'QRFPR ZC YM+/- \nupreg' = mss.out[Label %in% contrasts.oi[-c(1,2)] & (log2FC) >  0.58 & pvalue < 0.001, unique(gene)],
+                     'QRFPR ZC YM+/- \ndownreg' = mss.out[Label %in% contrasts.oi[-c(1,2)] & (log2FC) < -0.58 & pvalue < 0.001, unique(gene)],
+                     'MRX2 ZC YM+/- \nupreg' = mss.out[Label %in% contrasts.oi[-c(3,4)] & (log2FC) >  0.58 & pvalue < 0.001, unique(gene)],
+                     'MRX2 ZC YM+/- \ndownreg' = mss.out[Label %in% contrasts.oi[-c(3,4)] & (log2FC) < -0.58 & pvalue < 0.001, unique(gene)])),
+          adjust_labels = TRUE,
+          legend=F,
+          labels=list(cex=.6, fontface=2),
+          main = list(label='Gq/G11 IUPHAR correlation (2nd & 98th percentile) & \nMRX2 & QRFPR YM Inhibitor treatment sig hits (FC +/-50% & pval < 0.001', cex=1, fontface=1),
+          quantities = TRUE
+     )
+g
+#BackupAsPDF(g, '2ndPerc.QRFPR.MRX2.YM.rawPval.euler')
+```
+
+
+
+Create a plot of the IUPAR correlations;
+----
+Use PRKCD as this is a 'gold standard'
+
+Read in the IUPAR classification to set correctly
+```{r}
+iupar <- data.table(read_xlsx("../310723_QLi_GPCR.correlations/data/IUPHAR_11GPCRs_Gprotein_class_primary.xlsx"))
+iupar <- t(iupar)
+colnames(iupar) <- iupar[1,]
+iupar <- iupar[-1,]
+colnames(iupar) <- c("PTGER4","QRFPR","NPY1R","PTGER1","NPFFR1","MRX4","MOR","DOR","MRX2","KOR","NK1R" )
+```
+
+
+```{r}
+colors <-  structure(c(('red'), ('blue')), names = c("1", "0"),space='LAB') # black, red, green, blue
+
+row_ha <- rowAnnotation('GProtein'=c('Gi/Go', 'Gq/G11', 'Gs'), 
+                        'R scores'=anno_text(c('R -0.31','R 0.92','R -0.09')),
+                       col=list(GProtein=c('Gq/G11'='#440154FF',
+                                           'Gs' ='#FDE725FF',
+                                           'Gi/Go'='#22A884FF')))
+                       
+                       
+      Gi/Go      Gq/G11          Gs 
+-0.31065018  0.92220031 -0.09787429 
+
+# column annotation with the log2FC values for PRKCD2
+
+PRKCD.vec <- sort(exp.mat[rownames(exp.mat) == 'PRKCD',])
+col.order <-  names(PRKCD.vec)
+
+col_ha <- HeatmapAnnotation('PRKCD Log2FC'=anno_points(PRKCD.vec, gp = gpar(col=c('#22A884FF','#FDE725FF','#22A884FF','#22A884FF','#22A884FF','#22A884FF',
+                                                                                     '#440154FF','#440154FF','#440154FF','#440154FF','#440154FF')), size=unit(2.5,'mm')),
+                            # these are annotation params
+                            height=unit(4,'cm')
+                            )
+
+hm <- Heatmap(iupar[, col.order], 
+        name='IUPAR classification',
+        cluster_rows = F,
+        top_annotation = col_ha,
+        right_annotation = row_ha,
+        cluster_columns = F,
+        show_row_names = F,
+        col=colors)
+
+hm
+BackupAsPDF(hm, 'IUPAR.classification.corAnalysis.heatmap')
+
+
+cor.mat[rownames(cor.mat) == 'PRKCD',]
+```
+
+
+
+```{r}
+col.pal <-  randomcoloR::distinctColorPalette(k=2)
+
+mss.out$Label %>%  unique()
+
+# we are probably interested in the downregulated stuff
+contrasts.oi <- c("ZC05_YM-ZC05", "ZC10_YM-ZC10")
+
+#overlap of significant hits in these contrasts:
+mss.out[Label %in% contrasts.oi, .N, by=.(sig)]
+
+# only 32 things differentially expressed in total
+mss.out[Label %in% contrasts.oi & sig != 'not', gene]
+
+g <- ggplot(mss.out[Label %in% contrasts.oi & sig != 'not',.N, by=.(Label,sig)], aes(x=Label, y=N, fill=sig)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=c('down'='blue', 'up'='red')) +
+  ylab('N sig hits (FC +/- 50% & p.adj < 0.05)') +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'MRX2.T5.T10.YM.Nsig.hits.barplot')
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Not used 
+-----
+# drop the Gs group; not enouugh datapoints so correlations likely spurious
+```{r}
+# drop the Gs group; not enouugh datapoints
+# take top 2 percentile
+genes.pos.cor <- sapply(gprots, function(x){
+  sub.dt <- iupar.cor.dt[GProtein == x,]
+  return(sub.dt[R >= quantile(R,0.98), unique(gene)])
+}) %>% c() %>% unique()
+
+length(genes.pos.cor)
+
+
+subMat <-  exp.mat[rownames(exp.mat) %in% genes.pos.cor, grep('PTGER4', colnames(exp.mat), invert=T, value=T)]
+
+hm <- Heatmap(subMat,
+              top_annotation = ha,
+        cluster_columns = T, 
+        clustering_distance_columns = 'euclidean',
+        clustering_distance_rows = 'euclidean',
+        show_column_names = T,
+        name='log2FC',
+        na_col = 'darkgrey',
+        row_title =sprintf("%d Proteins",
+                            nrow(subMat)),
+         row_names_gp = gpar (fontsize= 4),
+         column_names_gp = gpar (fontsize= 8),
+         column_title_gp = gpar (fontsize= 9))
+        
+hm <- draw(hm, column_title='Top 5% Positively Correlated to IUPHAR groups')
+hm
+```

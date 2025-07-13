@@ -1,0 +1,388 @@
+---
+title: "051225_lysisPrep_CCprofiler"
+author: "Martin Gordon"
+date: "2025-05-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview 
+
+Run `CCprofiler` on the lysisPrep datasets to benchmark vs bp pipeline
+Starting from protein level info, no pre-filtering/ normalization etc prior to importing
+Using default thresholds where possible to allow comparison 
+
+```{r}
+library(MSstats)
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(stringr)
+library(CCprofiler)
+
+
+# useful utility scripts
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+```{r}
+lysisPrep.list <- list('sonic'=fread('./data/050925_newBoxFolder/2025_02_SEC_Lysis_Test/Spectronaut/2.\ NP40-Lysis\ buffer\ +\ Sonication/20241227_104957_MM_Sonic_Lysis_122724_PG_Report.tsv'),
+                       'FT'=fread('./data/050925_newBoxFolder/2025_02_SEC_Lysis_Test/Spectronaut/3.\ NP40-Lysis\ buffer\ +\ Freeze-Thaw/20241227_104610_MM_FT_Lysis_122724_PG_Report.tsv'),
+                       'CL'=fread('./data/050925_newBoxFolder/2025_02_SEC_Lysis_Test/Spectronaut/1.\ CellLytic\ M\ Lysis\ buffer/20241227_104259_MM_CL_Lysis_122724_PG_Report.tsv')
+                       )
+```
+
+```{r}
+lysisSplit.list <- list('sonic_1'=lysisPrep.list[['sonic']][, .SD, .SDcols = patterns('^PG.|Sonic-1')],
+                        'sonic_2'=lysisPrep.list[['sonic']][, .SD, .SDcols = patterns('^PG.|Sonic-2')],
+                        'FT_1'=lysisPrep.list[['FT']][, .SD, .SDcols = patterns('^PG.|FT-1')],
+                        'FT_2'=lysisPrep.list[['FT']][, .SD, .SDcols = patterns('^PG.|FT-2')],
+                        'CL_1'=lysisPrep.list[['CL']][, .SD, .SDcols = patterns('^PG.|CL-1')],
+                        'CL_2'=lysisPrep.list[['CL']][, .SD, .SDcols = patterns('^PG.|CL-2')]
+)
+```
+
+Use the calibration file to estimate protein monomer mw at elution
+```{r}
+cal.std <- fread('~/Library/CloudStorage/Box-Box/2025_02_SEC_Lysis_Test/Cal_std.txt',header=F)
+
+cal.std <- rbind(cal.std, data.table(V1=36, V2=1398)) %>% 
+  .[order(V1), .(std_weights_kDa=V2, std_elu_fractions=V1)]
+
+
+cal.std
+calibration <-  calibrateMW(cal.std) 
+
+calibration$FractionToMW(30)
+```
+Need to make these files match the format expected by CCProfiler `traces` object
+data structure to replicate
+```{r}
+example.prot.traces <- readRDS('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/050925_CCprofiler_testRun_data/2025_05_12_protTraces.example.rds')
+example.prot.traces$trace_annotation
+```
+object type
+```{r}
+# obj type
+trace.type <- 'protein'
+```
+
+Fraction annotation
+```{r}
+keys.list <- lapply(lysisSplit.list, function(x){
+  
+  colnames.oi <- grep('Frac-[0-9]', colnames(x), value=T)
+  fraction.oi <- str_extract(colnames.oi, '(?<=[_-]Frac[_-])[0-9]{1,2}')
+  print(colnames.oi); print(fraction.oi)
+  dt <- data.table(filename=colnames.oi, id=as.numeric(fraction.oi))
+  dt[, molecular_weight := calibration$FractionToMW(id)]
+})
+
+# sanity check; all look good
+sapply(keys.list, function(x){ x$fraction == as.character(seq(1,72,1))}) %>% 
+  summary() 
+```
+trace annotation
+First prep the annotation info
+```{r}
+uniprot.txt <- fread('./docs/uniprotkb_reviewed_true_2025_05_13.tsv.gz')
+# tidy col names 
+uniprot.txt <- uniprot.txt[Organism == 'Homo sapiens (Human)', .(id=Entry, protein_id=Entry, Entry_name=`Entry Name`, Status='reviewed', Protein_names=`Protein names`, Gene_names=`Gene Names`, Organism, Length, Mass, GO_ID=`Gene Ontology IDs`, protein_mw=(Mass/1000), Decoy=0)]
+
+```
+
+remove NA
+```{r}
+anno.list <- lapply(lysisSplit.list, function(x){
+  prots.oi <- unique(x$PG.ProteinAccessions)
+  # first, lets subset this to proteins with at least one measurement 
+  dt.long <- melt(x, id.vars=c(c('PG.MolecularWeight', 'PG.ProteinAccessions', 'PG.Genes', 'PG.ProteinDescriptions')))
+  keep.prots <- dt.long[!is.na(value), .N, by=.(PG.ProteinAccessions)]$PG.ProteinAccessions
+  # subset it to keep prots; dont want empty rows in the data
+  return(uniprot.txt[id %in% keep.prots,])
+})
+```
+
+```{r}
+test <- copy(lysisSplit.list)
+
+#' function to generate traces object from input matrix
+convertToCCprofilerMatrix <- function(dt, colpattern="(?<=Frac[-_])[0-9]{1,2}"){
+  
+  fractionCols <- grep(colpattern, colnames(dt), perl=T, value=T)
+  fractID <-  stringr::str_extract(fractionCols, colpattern)
+  #fractID <- as.character(order(as.numeric(fractID))) # ensure order is numeric
+  
+  stopifnot(all((fractID) == seq(1,72,1)))
+  colorder <- c(fractID, 'protein_id')
+
+  setnames(dt, old=c('PG.ProteinAccessions', fractionCols), new=c('protein_id', fractID)) 
+
+  message('converting to matrix and removing zeros')
+  mat <- as.matrix(dt[, ..colorder], rownames='protein_id')
+  mat[is.na(mat)] <- 0
+  dt.mat <- as.data.table(mat, keep.rownames = T)
+  
+  colorder <- c(fractID, 'id')
+  setnames(dt.mat, old='rn', new='id')
+  return(dt.mat[,..colorder])
+}
+# looks good!
+convertToCCprofilerMatrix(test[[5]])
+```
+matrix list
+```{r}
+mat.list <- lapply(lysisSplit.list, function(x){
+  # first, lets subset this to proteins with at least one measurement 
+  dt.long <- melt(x, id.vars=c(c('PG.MolecularWeight', 'PG.ProteinAccessions', 'PG.Genes', 'PG.ProteinDescriptions')))
+  keep.prots <- dt.long[!is.na(value), .N, by=.(PG.ProteinAccessions)]$PG.ProteinAccessions
+  # subset it to keep prots; dont want empty rows in the data
+  convertToCCprofilerMatrix(x[PG.ProteinAccessions %in% keep.prots, ])
+})
+
+names(mat.list)
+```
+Now assmeble these objects into one data format
+
+```{r}
+traces.list <- lapply(names(lysisSplit.list), function(br){
+  
+  traces.obj <- list(traces=mat.list[[br]],
+                     trace_type=trace.type,
+                     trace_annotation=anno.list[[br]],
+                     fraction_annotation=keys.list[[br]]
+                     )
+  
+  return(traces.obj)
+})
+
+# set the class type as traces
+trace.list <- lapply(traces.list, function(x){ class(x) <- 'traces'; return(x)})
+
+#looks good... lets test a single one, then save and run later 
+trace.list
+```
+now make sure that the annotation mat matches the list of proteins in matrix and the order matches
+filter to the same subset and match row orders between mat and anno obj
+```{r}
+trace.list <- lapply(trace.list, function(x){
+  
+  mat <- x$traces
+  anno <- x$trace_annotation
+  
+  # subset the mat to the set of proteins in the anno.dt
+  submat <- mat[id %in% anno$id,]
+  print(dim(submat))
+  
+  #match the row ordering between anno and ints max
+  x$traces <- submat[match(anno$id, submat$id)]
+  return(x)
+})
+```
+
+test on one sample
+```{r}
+test <- trace.list[[1]]
+names(trace.list) <- names(lysisSplit.list)
+saveRDS(trace.list, ScriptAndDatedFileName('trace.class.input.rds'))
+
+```
+
+Complex recovery; load CORUM
+
+```{r}
+corum.dt <- fread('~/Documents/projects/011325_MMuralidharan_SECMS_lysisPrepBenchmark/050925_CCprofiler_testRun_data/2025_05_12_corum.5.1.hsComplexes.long.csv.gz')
+# filter to complexes with at least  two proteins or throws error
+corum.dt <- corum.dt[complex_id %in% corum.dt[,.N, by=complex_id][N>1, complex_id]]
+```
+
+Convert the complex db to binary matrix, get path lengths between interactors, and then 
+```{r,eval=TRUE}
+# complex to  ppi format
+binaryHypotheses <- generateBinaryNetwork(corum.dt)
+pathLength <- calculatePathlength(binaryHypotheses) # shortest path
+
+# generating corum complex + decoys 
+corumTargetsPlusDecoys <- generateComplexDecoys(target_hypotheses=corum.dt,
+                                                dist_info=pathLength,
+                                                min_distance = 2,
+                                                append=TRUE)
+
+corumTargetsPlusDecoys[, isDecoy := ifelse(grepl('DECOY', complex_name, ignore.case = T), 'yes', 'no')]
+corumTargetsPlusDecoys[,.N, by=isDecoy] # even split of true and false sets
+```
+
+Finding complex features in our data.. test run on single sample
+```{r}
+# each complex_id is considered a hyptohesis
+# imputes matrix missing values with random sample from bottom 5% of the distribution (per row)
+# loops over each complex and runs a sliding window, subsets imputed ints mat to these protein subunits
+# findComplexFeatureSW; sliding window correlation for all features in complex_id
+# findComplexFeaturesPP: peak picking; 3 up and 3 down to declare a peak, left and right ar ethe margins of hte picked peaks
+# selects peaks within the sliding window defined above to define features
+# collapses features, then correlates features across proteins to get a cor score
+
+complexFeatures <- findComplexFeatures(traces=test,
+                                       parallelized = TRUE,
+                                       n_cores = 3,
+                                       complex_hypothesis = corumTargetsPlusDecoys)
+
+```
+Run on all samples, filter complexes, save output
+```{r}
+complexes.list <- lapply(names(trace.list), function(dat){
+  res <- complexFeatures <- findComplexFeatures(traces=trace.list[[dat]],
+                                                parallelized = T,
+                                                n_cores = 6,
+                                                complex_hypothesis = corumTargetsPlusDecoys)
+  return(res)
+})
+
+```
+Attach names and save file
+```{r}
+names(complexes.list) <- names(trace.list)
+saveRDS(complexes.list, ScriptAndDatedFileName('complexes.list.rds'))
+```
+
+Functions for filtering detected complexes protein, complex ids, 
+Also filter using mw; complex APEX should be >=  <min_monoomer_distance_fractor> x largest monomer mw to be considered a complex
+Expect APEX peak to be larger than this
+```{r}
+test <- complexes.list[[1]]
+
+filterFeatures(complexFeatures,
+               complex_ids = NULL,
+               protein_ids = NULL,
+               min_feature_completeness = NULL,
+               min_hypothesis_completeness = NULL,
+               min_subunits = NULL,
+               min_peak_corr = NULL,
+               min_monomer_distance_factor = 2)
+```
+
+
+## Protein summarization, scoring, FDR estimation and filtering 
+
+The resulting protein complex features can be scored based on the co-elution characteristics (average protein subunit correlation) of the proteins within each protein complex feature. 
+The co-elution score is further statistcally corrected for the number of correlating proteins out of all the proteins in the protein complex hypothesis. 
+The statistically corrected co-elution score can be used to estimate q-values for each protein complex peak group. 
+
+Filtering the protein complex peak groups based on a specified q-value cutoff then achieves a final result table at specified FDR (a q-value cutoff of 0.05 results in a final table with 5% FDR). 
+First try with test dataset
+
+```{r}
+# this adds an overall co-elution score: what is this?
+complexFeaturesScored <- calculateCoelutionScore(test)
+# adds a pvalue and a q-value for the score (corrects for muliple testing)
+qvalueComplexFeaturesScored <- calculateQvalue(complexFeaturesScored)
+# not great below 0.05 is a safer cutoff
+qvalueComplexFeaturesScoredStats <- qvaluePositivesPlot(qvalueComplexFeaturesScored)
+
+complexFeaturesFiltered <- subset(qvalueComplexFeaturesScored, qvalue <= 0.05)
+summarizeFeatures(complexFeaturesFiltered, PDF=TRUE, name=ScriptAndDatedFileName('test'))
+```
+
+ loop through each of the files, filter using standard thresholds and share with Ben
+
+```{r}
+filtered.complexes <- lapply(names(complexes.list), function(x){
+  
+  # get co-elution score 
+  complexFeaturesScored <- calculateCoelutionScore(complexes.list[[x]])
+  # assign p/q values
+  qvalueComplexFeaturesScored <- calculateQvalue(complexFeaturesScored, PDF=TRUE, name=ScriptAndDatedFileName(paste0(x, '.pvalplots')))
+  
+  # n
+  qvalueComplexFeaturesScoredStats <- qvaluePositivesPlot(qvalueComplexFeaturesScored, PDF=TRUE, name=ScriptAndDatedFileName(paste0(x, '.TPvsQval')))
+  complexFeaturesFiltered <- subset(qvalueComplexFeaturesScored, qvalue <= 0.05)
+  
+  summarizeFeatures(complexFeaturesFiltered, PDF=TRUE, name=ScriptAndDatedFileName(paste0(x, '.complexSummaryplots.filtered.qval0.05')))
+  return(qvalueComplexFeaturesScored)
+  })
+```
+
+filtered.complexes
+```{r}
+names(filtered.complexes) <- names(complexes.list)
+allComplex.features <- rbindlist(filtered.complexes, idcol='sample')
+
+# number of unique complex features detected
+fwrite(allComplex.features, ScriptAndDatedFileName('lysisPrep.ccprofiler.allComplexFeatures.csv.gz'))
+
+# take the best peak per complex, sample
+bestComplexFeature <- allComplex.features[,.SD[which.min(pvalue)], by=.(sample, complex_id)]
+fwrite(bestComplexFeature, ScriptAndDatedFileName('lysisPrep.ccprofiler.bestScoringFeaturePerComplex.csv.gz'))
+
+# number of complexes with at least one significant feature 
+bestComplexFeature[qvalue < 0.05, .N, by=sample]
+```
+
+
+## collapse complexes
+
+ *CCprofiler* is able to retrieve co-elution evidence from full protein complex queries but also subsets thereof.
+Due to partial overlap of the protein sets grouped as complex queries, the same co-elution signal can be retrieved as evidence for multiple diﬀerent queries. 
+collapse the initial results to truly unique signals with regard to (i), subunit composition and (ii), resolution in the chromatographic dimension.
+collapse complex features and save
+```{r}
+collapsed.complexes <- lapply(complexes.list, function(x){
+  
+  complexFeaturesUnique <- getUniqueFeatureGroups(x,
+                                                  rt_height = 0,
+                                                  distance_cutoff = 1.25)
+
+  complexFeaturesCollapsed <- callapseByUniqueFeatureGroups(complexFeaturesUnique,
+                                                            rm_decoys = TRUE)
+  complexFeaturesCollapsed
+})
+```
+
+```{r}
+fwrite(rbindlist(collapsed.complexes, idcol = 'sample'), ScriptAndDatedFileName('lysisPrep.ccprofiler.collapsedComplexes'))
+```
+
+
+complex subfeature summary is useful; most of the recovered complexes are based on a single elution window... maybe not super confident? hard to say...
+```{r}
+complexFeaturesFiltered[,.N, by=complex_id]
+
+View(complexClustering)
+```
+
+
+```{r}
+lapply(complexes.list, function(x){
+  
+  complexFeaturesScored <- calculateCoelutionScore(complexFeatures)
+  qvalueComplexFeaturesScored <- calculateQvalue(complexFeaturesScored)
+  qvalueComplexFeaturesScoredStats <- qvaluePositivesPlot(qvalueComplexFeaturesScored)
+  complexFeaturesFiltered <- subset(qvalueComplexFeaturesScored, qvalue <= 0.05)
+summarizeFeatures(complexFeaturesFiltered)
+  
+})
+```
+

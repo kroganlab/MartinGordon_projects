@@ -1,0 +1,927 @@
+---
+title: "121223.APMS.FragPipeIn"
+author: "Martin Gordon"
+date: "2023-12-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 
+## previous analysis didnt proceed with the correct format
+Fragpipe input - reprocess using bp_utils scripts
+
+
+## questions
+What are our controls?
+What are the backgrounds? tools we need to use?
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library(readxl)
+library(MSstats)
+library(circlize)
+library(ggvenn)
+
+source ("../../utils/bp_utils/spectronautFile2ArtMS.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+getwd()
+```
+
+path to spec file from FragPipe
+
+```{r}
+spectronautPeptideFile <- './data/MSstats.csv'
+```
+
+
+```{r}
+a <- fread (spectronautPeptideFile)
+
+# histogram for log2 intensity; alredy filtered
+hist(log2(a$Intensity), breaks = 100)
+abline(v = 5)
+
+
+boxplot(log2(Intensity)~interaction(Condition,BioReplicate), data=a) #doesnt look normalised anyway....
+```
+
+```{r}
+cf<- list()
+# normalization method FALSE = no normalization; default is global medians which you can get my removing/commenting out all normalization lines
+# cf$msstats$normalization_method = FALSE
+
+#cf$msstats$normalization_method = "globalStandards"
+#cf$msstats$normalization_reference <-  "P38398"
+
+# should artms attempt to annotate proteins 1 = yes; 0 = no
+cf$output_extras$annotate$enabled <- as.integer(1)
+# should artms do extended QC 1 = yes; 0= no
+cf$qc$extended <- as.integer(1)
+cf$qc$basic <- as.integer(1)
+
+cf$output_extras$annotate$species <- "HUMAN"
+
+
+# make files in artMS format
+# difference with prev attempt is we have included dummy variables 
+globalInput <- spectronautFile2ArtMS(spectronautPeptideFile, 
+                                     outFilePrefix = "./121223.APMS.FragPipeIn_data", 
+                                     artmsConfig = cf)
+
+# should we change to FragPipe??
+globalInput$evidence_file$type %>%  unique()
+```
+
+
+```{r}
+evidence <- read.table(file = "121223.APMS.FragPipeIn_data/evidence.txt", header = T, sep = "\t", stringsAsFactors = F, check.names = F)
+evidence_sub <- evidence[-which(is.na(evidence$Intensity)), ] # remove rows with NA intensities
+
+
+evidence_sub
+# check contaminants
+contaminate <- c("O77727", "P00698", "P00761", "P00883", "P02662", "P02663", "P02666", "P02668", "P02769")
+# check Leading proteins formate
+
+evidence.dt <-  data.table(evidence_sub)
+
+# isloate the leading proteins(|*|) and append CON__ for contaminants
+evidence.dt[, `Leading proteins` :=  str_extract(`Leading proteins`, '\\|[A-Z0-9]+\\|')]
+evidence.dt[, `Leading proteins` := gsub('\\|', '', `Leading proteins`)]
+evidence.dt[, `Leading proteins` := ifelse(grepl("contam_sp\\|", Proteins), paste0("CON__", `Leading proteins`), `Leading proteins`)]
+
+#looks good
+evidence.dt
+write.table(evidence.dt, "121223.APMS.FragPipeIn_data/evidence_sub.txt", sep = "\t", row.names = F, quote = F)
+
+```
+
+```{r}
+# QC
+artmsQualityControlEvidenceBasic(evidence_file = "./121223.APMS.FragPipeIn_data/evidence_sub.txt", 
+                                 keys_file = "./121223.APMS.FragPipeIn_data/keys.txt", 
+                                 prot_exp = "APMS")
+artmsQualityControlEvidenceExtended(evidence_file = "./121223.APMS.FragPipeIn_data/evidence_sub.txt", 
+                                    keys_file = "./121223.APMS.FragPipeIn_data/keys.txt", 
+                                    plotPCA = FALSE)
+
+```
+
+QC plots produced. just share these with Danielle for now in addition to the PCA plot
+
+```{r}
+# PCA
+# MSstats
+peptideDF <- fread(spectronautPeptideFile)
+peptideDF$PeptideModifiedSequence <- peptideDF$PeptideSequence
+peptideDF$IsotopeLabelType <- "L"
+
+library(MSstats)
+
+
+mssquant <- dataProcess(raw = as.data.frame(peptideDF),
+                        MBimpute=F)
+
+
+write.table(
+  mssquant$FeatureLevelData,
+  file = 'output/mss-FeatureLevelData.txt',
+  eol = "\n",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = TRUE
+)
+
+
+write.table(
+  mssquant$ProteinLevelData,
+  file = 'output/mss-ProteinLevelData.txt',
+  eol = "\n",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = TRUE
+)
+```
+
+read in data and generate PCA from peptide IONs
+
+```{r}
+f.quant <- fread('./output/mss-FeatureLevelData.txt')
+
+#normPepInt[, logCenteredIntensity := log2(INTENSITY/(median(INTENSITY, na.rm=TRUE))), by = PEPTIDE]
+
+f.mat <- dcast(f.quant,  PEPTIDE~GROUP+SUBJECT, value.var = "INTENSITY") %>% 
+  as.matrix(rownames='PEPTIDE')
+
+f.mat <-  log2(f.mat)
+
+f.mat <- f.mat[complete.cases(f.mat),]
+
+pcaOut <- prcomp(t(f.mat))
+
+colInfo <-  data.table(
+  colname= colnames(f.mat)
+)
+colInfo[,c("bait","rep") := tstrsplit(colname, "[._]", keep = c(1,2)) ] # v useful fucntion]
+
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = bait, shape=rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  theme(legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm')) +
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  #scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_manual(values=c(col.pal)) +
+  scale_shape_manual(values=c(21:24)) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'PCA.complete.features.')
+```
+generate a PCA plot from the proteins
+
+```{r}
+p.quant <-  fread('./output/mss-ProteinLevelData.txt')
+
+p.quant
+#normPepInt[, logCenteredIntensity := log2(INTENSITY/(median(INTENSITY, na.rm=TRUE))), by = PEPTIDE]
+
+p.mat <- dcast(p.quant,  Protein~GROUP+SUBJECT, value.var = "LogIntensities") %>% 
+  as.matrix(rownames='Protein')
+
+
+p.mat <- p.mat[complete.cases(p.mat),]
+
+pcaOut <- prcomp(t(p.mat))
+
+colInfo <-  data.table(
+  colname= colnames(p.mat)
+)
+colInfo[,c("bait","rep") := tstrsplit(colname, "[._]", keep = c(1,2)) ] # v useful fucntion]
+
+
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = bait, shape=rep)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  theme(legend.title = element_text(size = 8), 
+        legend.text = element_text(size = 6),
+        legend.key.size =  unit(0.4, 'cm')) +
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  #scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_fill_manual(values=c(col.pal)) +
+  scale_shape_manual(values=c(21:24)) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,#legend settings
+         color = guide_legend(override.aes = list(shape =21) ) )
+p
+
+BackupAsPDF(p, 'PCA.complete.proteins.')
+```
+
+13/12/23
+---
+Now that the QC run is complete, process the spec table 
+
+```{r}
+# timsTOF to SAINTexpress
+spc <- data.table::fread(file = "./data/reprint.spc.tsv", stringsAsFactors = F)
+
+spc.dt <- reshape2::melt(spc, id.vars= c("PROTID", "GENEID", "PROTLEN")) %>% 
+  .[-1,] %>% 
+  data.table()# rm first row 
+
+spc.dt %>%  str()
+
+spc.dt[, `:=`(Condition = str_extract(variable, '[A-Za-z1-9]+(?=_[123]{1}_SPC)'), # lookahead for _SPC
+              Spectral.Count = as.integer(value),
+              BioReplicate = str_extract(variable, '[123]{1}(?=_SPC)')  )]
+
+
+#add biorep identifier to condtiion
+spc.dt[, BioReplicate := paste0(Condition, '-', BioReplicate)]
+
+#remove any contaminants
+# use the evidence file to identify contaminations and screen spec.counts for this vector to remove
+evidence <- read.table(file = "121223.APMS.FragPipeIn_data/evidence.txt", header = T, sep = "\t", stringsAsFactors = F, check.names = F) %>% 
+  data.table()
+
+# identify contaminants in the ms
+contam.sp <- evidence %>%
+  .[Proteins %like% 'contam', str_extract(Proteins,'(?<=\\|).+(?=\\|)')] %>% #lookahead and lookbehind to capture between | |
+  unique()
+
+# sanity check for remaining contam...
+evidence[, uniprot := str_extract(Proteins,'(?<=\\|).+(?=\\|)')]
+evidence[!uniprot %in%  contam.sp, grep('contam', Proteins)]
+
+# no contaminant sp found.. cleaned??
+spec.dt[PROTID %in% contam.sp,]
+
+spec.dt
+# dropping runs? Will wait for Danielle to make call.. include all for now
+```
+No runs dropped atm. proceed...
+
+
+19-12-23
+-----
+
+preparing APMS controls for SAINT
+Using samplesheet provided by Danielle; process the samples in two batches
+
+```{r}
+orf3a.grps <- c('Empty', 'Lempty', 'Lorf3aBeta', 'Lorf3aQ57H', 'Lorf3aS171L', 'Lorf3aWT', 
+               'orf3aBeta', 'orf3aQ57H', 'orf3aS171L', 'orf3aWT', 'UT')
+
+nsp6.gprs <- c('DemptyVector', 'Dnsp6BA1', 'Dnsp6BA2', 'Dnsp6WT', 'Dnsp6XBB', 'Empty',
+               'nsp6BA1', 'nsp6BA2', 'nsp6WT', 'nsp6XBB', 'UT')
+
+orf3a.spc.dt <-  spc.dt[Condition %in% orf3a.grps, ]
+# sanity check
+orf3a.spc.dt[, .N, by=.(Condition,BioReplicate)]
+
+
+nsp6.spc.dt <-spc.dt[Condition %in% nsp6.gprs, ]
+nsp6.spc.dt[, .N, by=.(Condition,BioReplicate)]
+
+
+# add these to a list and process
+saint.in.dt <- list(orf3a=orf3a.spc.dt,
+                    nsp6=nsp6.spc.dt)
+
+
+# control conditions
+ctrl.grps <- c('DemptyVector', 'Empty', 'Lempty', 'UT')
+
+makeBaitCtrl <- function(dt,ctrls){
+  
+  # Bait-CTRL table
+  Bait <- unique(dt$BioReplicate)
+  Bait <- gsub("-", "_", Bait)
+  Bait <- sub("_([^_]*)$", "-\\1", Bait)
+  Bait <- data.table(BioReplicate = Bait, Condition = gsub("-.*", "", Bait))
+  Bait[, SAINT := "T"]
+  Bait[Condition %in% ctrls, SAINT := 'C']
+  #Bait$SAINT[Bait$Condition %in% ctrls] <- "C"
+  
+  return(Bait)
+}
+
+
+bait.tables <- lapply(saint.in.dt, function(x){
+  x.dt <- makeBaitCtrl(x, ctrl.grps)
+})
+
+# wirte out the data
+lapply(seq_along(bait.tables), function(x,n,i){
+  
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.speccounts.saint.baits.tsv'), sep = "\t", quote = F, row.names = F, col.names = F)
+  
+}, x=bait.tables, n=names(bait.tables))
+
+#looks good
+#fread('./output/nsp6.speccounts.saint.baits.tsv', header=F)
+#fread('./output/orf3a.speccounts.saint.baits.tsv', header=F)
+```
+create the prey table from the spec files
+
+```{r}
+makeInteractionTable <- function(dt){
+  
+  # interactions
+  interactions <- data.table(BioReplicate = dt$BioReplicate, 
+                           Condition = gsub("-.*", "", dt$BioReplicate), 
+                           PROTID = dt$PROTID, 
+                           spc = dt$value)
+  interactions[, BioReplicate := gsub("-", "_", BioReplicate)]
+  interactions[, BioReplicate := sub("_([^_]*)$", "-\\1", BioReplicate)]
+  interactions[, Condition := gsub("-.*", "", BioReplicate)]
+  # remove 0 counts
+  interactions <- interactions[spc != 0 & PROTID != 'na', ]
+  #write.table(interactions, "spectral_counts-saint-interactions.txt", sep = "\t", quote = F, row.names = F, col.names = F)
+}
+
+
+int.tables <- lapply(saint.in.dt, function(x){
+  x.dt <- makeInteractionTable(x)
+})
+
+# looks good write to file
+int.tables
+
+# wirte out the data
+lapply(seq_along(int.tables), function(x,n,i){
+  
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.speccounts.saint.interactions.tsv'), sep = "\t", quote = F, row.names = F, col.names = F)
+  
+}, x=int.tables, n=names(int.tables))
+
+# now create the prey table 
+
+makePreyTable <-  function(dt){
+  
+  preys <- data.table(PROTID = dt$PROTID, 
+                    PROTLEN = dt$PROTLEN, 
+                    GENEID = dt$GENEID)
+  
+  preys <-  preys[PROTID != 'na',]
+  preys <- unique(preys)
+}
+
+
+prey.tables <- lapply(saint.in.dt, function(x){
+  x.dt <- makePreyTable(x)
+})
+
+
+# write out the data
+lapply(seq_along(prey.tables), function(x,n,i){
+  
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.speccounts.saint.preys.tsv'), sep = "\t", quote = F, row.names = F, col.names = F)
+  
+}, x=prey.tables, n=names(prey.tables))
+```
+
+create the same tables with the intensity data
+-----
+read in the intensity tables
+```{r}
+# intensity prep to SAINTexpress
+spc <- fread(file = "./data/reprint.int.tsv", stringsAsFactors = F)
+
+spc.dt <- reshape2::melt(spc, id.vars= c("PROTID", "GENEID")) %>% 
+  .[-1,] %>% 
+  data.table()# rm first row 
+
+spc.dt %>%  str()
+
+spc.dt[, `:=`(Condition = str_extract(variable, '[A-Za-z1-9]+(?=_[123]{1}_INT)'), # lookahead for _INT
+              Intensity = as.integer(value),
+              BioReplicate = str_extract(variable, '[123]{1}(?=_INT)')  )]
+
+
+#add biorep identifier to condtiion
+spc.dt[, BioReplicate := paste0(Condition, '-', BioReplicate)]
+
+#remove any contaminants
+# use the evidence file from above to identify contaminations and screen spec.counts for this vector to remove
+
+# no contaminant sp found.
+spc.dt[PROTID %in% contaminate,]
+spc.dt[PROTID %in% contam.sp,]
+
+```
+
+probably actually dont need to recreate the condititon table as can reuse above..
+
+```{r}
+
+orf3a.spc.dt <-  spc.dt[Condition %in% orf3a.grps, ]
+# sanity check
+orf3a.spc.dt[, .N, by=.(Condition,BioReplicate)]
+
+
+nsp6.spc.dt <-spc.dt[Condition %in% nsp6.gprs, ]
+nsp6.spc.dt[, .N, by=.(Condition,BioReplicate)]
+
+
+# add these to a list and process
+saint.in.dt <- list(orf3a=orf3a.spc.dt,
+                    nsp6=nsp6.spc.dt)
+
+
+# control conditions
+ctrl.grps <- c('DemptyVector', 'Empty', 'Lempty', 'UT')
+
+bait.tables <- lapply(saint.in.dt, function(x){
+  x.dt <- makeBaitCtrl(x, ctrl.grps)
+})
+
+# sanity check
+bait.tables[[1]][, .N, .(BioReplicate,SAINT)] %>%  .[order(SAINT)]
+
+# wirte out the data
+lapply(seq_along(bait.tables), function(x,n,i){
+  
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.ints.saint.baits.tsv'), sep = "\t", quote = F, row.names = F, col.names = F)
+  
+}, x=bait.tables, n=names(bait.tables))
+
+#looks good
+#fread('./output/nsp6.ints.saint.baits.tsv', header=F)
+#fread('./output/orf3a.ints.saint.baits.tsv', header=F)
+```
+use same functions as above and just rename cols as necessary...
+```{r}
+
+int.tables <- lapply(saint.in.dt, function(x){
+  x.dt <- makeInteractionTable(x)
+})
+
+# just rename the spc col to int to match Yuan processing
+lapply(int.tables, function(x){
+  setnames(x, old='spc', new='int')
+  return(x)
+})
+
+# wirte out the data
+lapply(seq_along(int.tables), function(x,n,i){
+  
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.ints.saint.interactions.tsv'), sep = "\t", quote = F, row.names = F, col.names = F)
+  
+}, x=int.tables, n=names(int.tables))
+
+# now create the prey table 
+# wont cretae PROTLEN col as doesnt exist in intensity input dt
+prey.tables <- lapply(saint.in.dt, function(x){
+  x.dt <- makePreyTable(x)
+})
+
+# write out the data
+lapply(seq_along(prey.tables), function(x,n,i){
+  
+  fwrite(x[[i]], paste0('./output/', n[[i]], '.ints.saint.preys.tsv'), sep = "\t", quote = F, row.names = F, col.names = F)
+  
+}, x=prey.tables, n=names(prey.tables))
+```
+Ok, have now created the necessary input files for SAINT processing.
+create two subdirectories; one for ints data and one for spec counts and run saint for each
+Can also try running the other tools afterwards if needed 
+
+```{bash, eval=FALSE}
+#mkdir -p ./output/{spc,ints}/{orf3a,nsp6}
+#find ./output -type f -name "nsp6.ints.*" -exec mv {} ./output/ints/nsp6 \;
+#find ./output -type f -name "orf3a.ints.*" -exec mv {} ./output/ints/orf3a \;
+#find ./output -type f -name "nsp6.speccounts.*" -exec mv {} ./output/spc/nsp6 \;
+#find ./output -type f -name "orf3a.speccounts.*" -exec mv {} ./output/spc/orf3a \;
+```
+check output before processing with SAINT
+---
+tables seem ok; lets run 
+
+
+clone the docker image locally and run
+```{bash}
+#mkdir -p output/saintdocker
+#wget https://raw.githubusercontent.com/kroganlab/BenPolacco/master/saintDocker/Dockerfile -O output/saintdocker/Dockerfile
+
+#pull in saintExpress img
+#docker pull brianyee/saintexpress:3.6.3
+```
+
+Run SAINT; 
+Just share exact commands to run
+```{bash runSAINT eval=F}
+#cd ./output/ints/orf3a
+#../../../../../utils/saintDocker/saintDocker.sh int orf3a.ints.saint.interactions.tsv orf3a.ints.saint.preys.tsv orf3a.ints.saint.baits.tsv
+#cd -
+#cd ./output/ints/nsp6
+#../../../../../utils/saintDocker/saintDocker.sh int nsp6.ints.saint.interactions.tsv nsp6.ints.saint.preys.tsv nsp6.ints.saint.baits.tsv
+#cd - 
+#cd ./output/spc/orf3a
+#../../../../../utils/saintDocker/saintDocker.sh spc orf3a.speccounts.saint.interactions.tsv orf3a.speccounts.saint.preys.tsv orf3a.speccounts.saint.baits.tsv
+#cd ./output/spc/nsp6
+#../../../../../utils/saintDocker/saintDocker.sh spc nsp6.speccounts.saint.interactions.tsv nsp6.speccounts.saint.preys.tsv nsp6.speccounts.saint.baits.tsv
+```
+
+
+now we have the `list.txt` file produced from each run
+
+```{r}
+#ints data
+nsp6.ints <- fread('./output/ints/nsp6/list.txt')
+orf3a.ints <- fread('./output/ints/orf3a/list.txt')
+
+# spec data
+nsp6.spc <- fread('./output/spc/nsp6/list.txt')
+orf3a.spc <- fread('./output/spc/orf3a/list.txt')
+
+
+
+saint.list <-  list(nsp6.ints = nsp6.ints,
+                    orf3a.ints = orf3a.ints,
+                    nsp6.spc = nsp6.spc,
+                    orf3a.spc = orf3a.spc
+                    )
+
+saint.list
+```
+Ok, now that we have the SAINT output, look. at
+histogram of the SAINT scores; looks like majority are low and some high scorers 
+
+```{r}
+lapply(saint.list, function(x){
+  hist(x$TopoAvgP)
+  })
+```
+```{r}
+lapply(saint.list, function(x){
+  summary(x)
+  })
+```
+
+
+```{r}
+filtered.saint.list <-  lapply(seq_along(saint.list), function(x,n,i){
+  fwrite(x[[i]], paste0('./output/',n[[i]], '.saint.list.txt'))
+  
+  x.dt <-  x[[i]][BFDR < 0.05] 
+  
+  #fwrite(x.dt, paste0('./output/',n[[i]], '.saint.list.filtered.txt'))
+  return(x.dt)
+},x=saint.list, n=names(saint.list))
+
+filtered.saint.list
+
+# assign names
+names(filtered.saint.list) <- names(saint.list)
+```
+
+Todo
+---
+bait protein intensity and spectral counts across samples. This would be for these 2 proteins:  nsp6 and orf3a
+also, I would like to see a heatmap of the bait protein intensity and spectral counts across samples. This would be for these 2 proteins:  nsp6 and orf3a
+
+need intensity and spectral count matrices and generate for the two proteins
+
+```{r}
+int.spec <- fread('./data/reprint.int.tsv')
+spec.counts <- fread('./data/reprint.spc.tsv')
+
+
+seqinr::read
+
+int.spec[!GENEID %like% 'NSP',]
+
+int.spec
+
+
+fread('./data/-manifest')
+
+int.spec[GENEID %like% c('ORF'),]
+
+int.spec%>%  View()
+
+spec.counts[PROTID %like% c('ORF3A'),]
+
+
+mss <- fread('./data/MSstats.csv')
+
+mss[ProteinName %like% 'P',]
+
+mss
+
+
+spec.counts[PROTID %like% 'P0DTF1']
+
+
+# only 6 found
+spec.counts[PROTID %like% 'P0D',]
+int.spec[PROTID %like% 'P0D',]
+
+# NA..
+spec.counts[PROTID == 'A0A663DJA2']
+
+prots.oi <- spec.counts[PROTID %in% c('P0DTC1', 'P0DTC3'),]$PROTID
+prots.oi 
+#plot for PODTC3 (3a) and  P0DTD1
+# generate plots of all
+
+int.mat <-  int.spec[-1,-2] %>% 
+  as.matrix(rownames='PROTID')
+
+spec.mat <- spec.counts[-1,-c(2,3)] %>% 
+  as.matrix(rownames='PROTID') 
+
+
+class(spec.mat) <- 'numeric'
+class(int.mat) <- 'numeric'
+
+
+subMat <- spec.mat[rownames(spec.mat) %in% prots.oi,]
+
+# spec heatmap 
+subMat <- spec.mat[rownames(spec.mat) %in% prots.oi,]
+subMat
+
+
+hm <- Heatmap(subMat, 
+        na_col = 'grey',
+        name='spectral counts',
+        column_names_gp = gpar(fontsize=6),
+        col = colorRamp2(breaks=c(0,10,20,30), colors = c('grey', 'pink', 'red', 'darkred')))
+
+BackupAsPDF(draw(hm, column_title='Spectral counts of ORF3a (P0DTC3) & Replicase (P0DTC1)'), prefix='ORF3a.Replicase.spc.heatmap', dimensions=c(10,8))
+
+
+#intensity heatmap
+
+subMat <- int.mat[rownames(int.mat) %in% prots.oi,]
+subMat <- log2(subMat+1)
+
+subMat
+hm <- Heatmap(subMat, 
+        na_col = 'grey',
+        name='log2(Ints + psuedocount1)',
+        column_names_gp = gpar(fontsize=6),
+        col = colorRamp2(breaks=c(0,25,28,32), c('grey', 'pink', 'red', 'darkred')) )
+
+hm
+BackupAsPDF(draw(hm, column_title='Intensity values of ORF3a (P0DTC3) & Replicase (P0DTC1)'), prefix='ORF3a.Replicase.ints.heatmap', dimensions=c(10,8))
+
+
+
+hm <- Heatmap(subMat, 
+        na_col = 'grey',
+        name='log2(Ints + psuedocount1)',
+        column_names_gp = gpar(fontsize=6),
+        col = colorRamp2(breaks=c(0,5), c('grey','darkred')) )
+
+hm
+
+```
+
+21-12-23
+-----
+Produce a venn diagram of the filtered hits from each condition to view the spec and intensitity data overlap
+
+```{r}
+filtered.saint.list
+
+nsp6.f.list <- filtered.saint.list[c(1,3)]
+orf3a.f.list <- filtered.saint.list[c(2,4)]
+
+# create a venn diagram of these and also return the list of Venn Diagram hits
+nsp6.f.list %>%  names()
+orf3a.f.list
+
+# format correclty; extract the bait and prey cols, add a ID col for the set and rbin
+nsp6.v.dt <- lapply(seq_along(nsp6.f.list), function(x,n,i){
+  
+  x.dt  <- x[[i]][, .(Bait,Prey)]
+  x.dt <-  x.dt[, ID := n[[i]]]
+  return(x.dt)
+  
+}, x=nsp6.f.list, n=names(nsp6.f.list)) %>% rbindlist()
+
+
+nsp6.v.dt
+
+# format correclty; extract the bait and prey cols, add a ID col for the set and rbin
+orf3a.v.dt <- lapply(seq_along(orf3a.f.list), function(x,n,i){
+  
+  x.dt  <- x[[i]][, .(Bait,Prey)]
+  x.dt <-  x.dt[, ID := n[[i]]]
+  return(x.dt)
+  
+}, x=orf3a.f.list, n=names(orf3a.f.list)) %>% rbindlist()
+
+
+
+orf3a.v.dt
+```
+
+generate the venn diagrams of the data 
+
+```{r}
+g <- ggvenn(list('NSP6 Intensity' = nsp6.v.dt[ID == 'nsp6.ints', unique(Prey)],
+                 'NSP6 Spec Counts' = nsp6.v.dt[ID == 'nsp6.spc', unique(Prey)]),
+       fill_color = c("#0073C2FF", "#EFC000FF"),
+       stroke_size = 0.5, set_name_size = 2) +# + position = position_nudge(x=-0.1)
+       ggtitle('NSP6 Unique Prey overlaps')
+
+g
+
+BackupAsPDF(g, 'NSp6.allSigOverlaps.')  
+
+
+g <- ggvenn(list('ORF3a Intensity'   = orf3a.v.dt[ID == 'orf3a.ints', unique(Prey)],
+                 'ORF3a Spec Counts' = orf3a.v.dt[ID == 'orf3a.spc', unique(Prey)]),
+       fill_color = c("#0073C2FF", "#EFC000FF"),
+       stroke_size = 0.5, set_name_size = 2) +# + position = position_nudge(x=-0.1)
+       ggtitle('ORF3a Unique Prey overlaps')
+g
+
+BackupAsPDF(g, 'ORF3a.allSigOverlaps.')  
+
+```
+look at overlaps within the individual sets
+Have 8 sets in each; look at overlap for each subset
+
+```{r}
+nsp6.bait <- filtered.saint.list[[1]][, unique(Bait)]
+orf3a.bait <- filtered.saint.list[[2]][, unique(Bait)]
+
+# now have our list of baits for each; we want to loop through chr vector and plot a venn diagram for each subset to look at the overlap 
+col.pal <- randomcoloR::distinctColorPalette(k=4)
+  
+  
+for (i in orf3a.bait){
+
+  # set names
+  ints.set <- paste0(i,' Intensity')
+  spec.set <-  paste0(i,' Spec Counts')
+  
+  #create list
+  set.list <-  list(ints.set = orf3a.v.dt[ID == 'orf3a.ints' & Bait == i, Prey],
+                    spec.set = orf3a.v.dt[ID == 'orf3a.spc' & Bait == i, Prey]
+                    )
+  
+  print(set.list)
+  
+  g <- ggvenn(list(ints.set  = orf3a.v.dt[ID == 'orf3a.ints' & Bait == i, Prey],
+                   spec.set = orf3a.v.dt[ID == 'orf3a.spc' & Bait == i, Prey]),
+       fill_color = c(col.pal[1], col.pal[2]),
+       stroke_size = 0.5, set_name_size = 2) +# + position = position_nudge(x=-0.1)
+       ggtitle(paste0(i, ' Prey overlaps'))
+  print(g)
+  
+  BackupAsPDF(g, paste0('orf3a.', i, '.SigOverlaps.'))
+  
+}
+
+
+for (i in nsp6.bait){
+  # set names
+  ints.set <- paste0(i,' Intensity')
+  spec.set <-  paste0(i,' Spec Counts')
+  
+  #create list
+  set.list <-  list(ints.set = nsp6.v.dt[ID == 'nsp6.ints' & Bait == i, Prey],
+                    spec.set = nsp6.v.dt[ID == 'nsp6.spc' & Bait == i, Prey]
+                    )
+  
+  print(set.list)
+  
+  g <- ggvenn(list(ints.set  = nsp6.v.dt[ID == 'nsp6.ints' & Bait == i, Prey],
+                   spec.set =  nsp6.v.dt[ID == 'nsp6.spc' & Bait == i, Prey]),
+       fill_color = c(col.pal[3], col.pal[4]),
+       stroke_size = 0.5, set_name_size = 2) +# + position = position_nudge(x=-0.1)
+       ggtitle(paste0(i, ' Prey overlaps'))
+  print(g)
+  
+  BackupAsPDF(g, paste0('nsp6.', i, '.SigOverlaps.'))
+  
+}
+
+orf3a.v.dt
+nsp6.v.dt
+```
+extract the overlapping genes from each of the sets
+
+```{r}
+# all sig overlapping
+nsp6.all.overlaps <- intersect(nsp6.v.dt[ID == 'nsp6.ints', unique(Prey)],
+          nsp6.v.dt[ID == 'nsp6.spc', unique(Prey)]
+          ) %>% 
+  data.table() %>% 
+  .[, ID := 'NSP6.all.overlaps'] %>% 
+  setnames(old='.', new='Protein')
+
+# all sig overlapping
+orf3a.all.overlaps <- intersect(orf3a.v.dt[ID == 'orf3a.ints', unique(Prey)],
+          orf3a.v.dt[ID == 'orf3a.spc', unique(Prey)]
+          ) %>% 
+  data.table() %>% 
+  .[, ID := 'ORF3A.all.overlaps'] %>% 
+  setnames(old='.', new='Protein')
+
+
+all.overlaps <- rbind(orf3a.all.overlaps, nsp6.all.overlaps)
+
+all.overlaps[, gene := multiUniprots2multiGenes(Protein)]
+
+fwrite(all.overlaps[,.(Protein, gene, ID)], ScriptAndDatedFileName('orf3a.nsp6.all.overlaps'))
+```
+extract overlaps from the subsets
+
+```{r}
+orfa.list <- for (i in orf3a.bait){
+
+  # set names
+  ints.set <- paste0(i,' Intensity')
+  spec.set <-  paste0(i,' Spec Counts')
+  
+  
+  dt.overlaps <- intersect(orf3a.v.dt[ID == 'orf3a.ints' & Bait == i,Prey],
+                         orf3a.v.dt[ID == 'orf3a.spc' & Bait == i,Prey])
+
+  dt.overlaps <- data.table(Protein = dt.overlaps,
+                            Gene = multiUniprots2multiGenes(dt.overlaps),
+                            ID = i)
+  
+}
+
+
+# try lappy 
+
+orf3a.overlaps <- lapply(orf3a.bait, function(i){
+  
+  dt.overlaps <- intersect(orf3a.v.dt[ID == 'orf3a.ints' & Bait == i,Prey],
+                         orf3a.v.dt[ID == 'orf3a.spc' & Bait == i,Prey])
+
+  dt.overlaps <- data.table(Protein = dt.overlaps,
+                            ID = i)
+  
+  dt.overlaps[,Gene := multiUniprots2multiGenes(Protein)]
+  
+  return(dt.overlaps[, .(Protein,Gene, ID)])
+  
+}) %>%  rbindlist()
+
+
+orf3a.overlaps
+
+
+nsp6.overlaps <- lapply(nsp6.bait, function(i){
+  
+  dt.overlaps <- intersect(nsp6.v.dt[ID == 'nsp6.ints' & Bait == i, Prey],
+                           nsp6.v.dt[ID == 'nsp6.spc' & Bait == i, Prey])
+  
+  print(dt.overlaps)
+
+  dt.overlaps <- data.table(Protein = dt.overlaps,
+                            ID = i)
+  
+  return(dt.overlaps[, .(Protein, ID)])
+  
+}) %>%  rbindlist()
+
+nsp6.overlaps[, Gene := multiUniprots2multiGenes(Protein)]
+
+
+
+fwrite(nsp6.overlaps[, .(Protein,Gene,ID)],  ScriptAndDatedFileName('nsp6.bait.overlaps'))
+fwrite(orf3a.overlaps[, .(Protein,Gene,ID)],  ScriptAndDatedFileName('orf3a.bait.overlaps'))
+```
+
+

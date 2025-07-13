@@ -1,0 +1,576 @@
+---
+title: "061223_JyotiB_RNAseq"
+author: "Martin Gordon"
+date: "2023-06-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Project: Melborne Victroia subtype RNAseq comparison
+##: Date: 06/20/23
+## Contact: Jyoti Batra
+
+```{r load-packages, message=FALSE, warning=FALSE, echo=TRUE}
+library(tidyverse)
+library(ggrepel)
+library(data.table)
+library(stringr)
+library(ggplot2)
+library(tximport)
+library(DESeq2)
+library(ashr) #adaptive shrinkage estimator to improve lFC estimates in DESEq2
+library(IHW) # Independent Hypothesis Weighting 
+# visualisation
+library(ComplexHeatmap)
+library(EnhancedVolcano)
+# annotation & filtering 
+library(AnnotationHub)
+library(genefilter) # not available 
+# tables 
+library(pander)
+library(DT)
+# enrichment analysis
+library(clusterProfiler)
+library(fgsea)
+
+#Ben utils
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+```
+
+```{r functions, warning=FALSE, echo=FALSE }
+
+
+
+#function to save plots generated
+save_plot <- function(plot_func, plot_args, filename, directory) {
+  # Call the plot function with the provided arguments
+  plot <- do.call(plot_func, plot_args)
+  
+   # create the directory if it doesn't exist
+  if (!dir.exists(directory)) {
+    dir.create(directory, recursive=TRUE)
+  }
+  
+  # save the plot to file in the specified directory
+  filepath <- file.path(directory, filename)
+  ggsave(plot, file = filepath)
+  
+  message(paste0("Plot saved to file: ", filepath))
+  
+}
+
+#Plotting, Filtering & Mapping Functions 
+extract_sig_genes <- function(dds_obj, log2FC=1, p_adjust=0.05) {
+  # extract rowswith p.val (0.05) and log2FC (1) thresholds for subsetting results... adjust thresholds as desired
+  sig_key <- intersect(rownames(dds_obj)[which(abs(dds_obj$log2FoldChange) >= log2FC)], rownames(dds_obj)[which(dds_obj$padj <= p_adjust)])
+  sig_df <- as.data.frame((dds_obj)[which(rownames(dds_obj) %in% sig_key), ])
+  return(sig_df[order(sig_df$log2FoldChange, decreasing = TRUE), ]) # ordered by fold change (most upregulated at top)
+}
+
+# match gene names and entrez ids
+map_entrez_fun <- function(dds_obj, ref_genome) {
+  dds_obj$symbol <- mapIds(ref_genome, keys = rownames(dds_obj), column = "SYMBOL", keytype = "GENEID", multiVals = "first")
+  dds_obj$entrez <- mapIds(ref_genome, keys = rownames(dds_obj), column = "ENTREZID", keytype = "GENEID", multiVals = "first")
+  return(dds_obj)
+}
+
+
+PCA_fun <- function(x,grouping) {
+  
+  pcaData <- plotPCA(x, intgroup = c(grouping), returnData = TRUE)
+  percentVar <- round(100 * attr(pcaData, "percentVar"))
+  
+  
+  p <- ggplot(pcaData, aes(PC1, PC2, color = group)) +
+    geom_point(size = 2.5) +
+    geom_text_repel(aes(label = colnames(x)), size = 1.75, alpha=0.6, max.overlaps = 20) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    coord_fixed() +
+    labs(title = "PCA Plot", subtitle = "PC1 vs PC2") +
+    theme_classic() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(),
+      legend.position = "bottom",
+      legend.text = element_text(size=6),
+      legend.key.size = unit(5, 'mm'),
+      legend.title = element_text(size=9)
+    )
+}
+
+
+PCA_all <- function(x, group){
+
+  pcaOut <- prcomp(t(assay(dds_vst)))
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaDT[, type := tstrsplit(rn, "_")[[1]]] #transpose & split
+  pcaDT[, timepoint := tstrsplit(rn, "_")[[2]]] 
+  pcaDT[, group := paste0(type, '_', timepoint)]
+
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2, color = group)) + 
+    geom_point(alpha=1.0, size=3) + 
+    geom_text_repel(aes(label = colnames(x)), size = 1.75, alpha=0.6, max.overlaps = 20) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey70") +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey70") +
+    theme_bw() + 
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    ggtitle (sprintf ("PCA using %d proteins (log intensity)", nrow(assay(dds_vst)))) +
+    theme_classic() +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(),
+      legend.position = "bottom",
+      legend.text = element_text(size=6),
+      legend.key.size = unit(5, 'mm'),
+      legend.title = element_text(size=9)
+    )
+}
+
+
+sampleclust_fun <- function(dds_obj, metadata, grouping) {
+  distmat <- as.matrix(dist(t(assay(dds_obj))))
+  rownames(distmat) <- (colnames(dds_obj))
+  
+  # annotation column; create separate df
+  mat_col <- data.frame(cell_type = grouping)
+  rownames(mat_col) <- rownames(metadata) #should match rownames dist-mat
+  mat_colours <- list(cat_var = brewer.pal(length(unique(grouping)), "Set1"))
+  names(mat_colours$cat_var) <- unique(grouping)
+  
+  
+  pheatmap(distmat,
+    scale='none',
+    cluster_rows = T,
+    cluster_cols = T,
+    #clustering_distance_cols #dont specify as distance matrix is provided
+    #clustering_distance_row 
+    color = viridis(20),
+    border_color = NA,
+    fontsize = 8,
+    annotation_col = mat_col,
+    annotation_colors = mat_colours,
+    main = "Sample Euclidean Distance Heatmap")
+}
+
+
+
+MA_fun <- function(x, y) {
+  DESeq2::plotMA(x, main = y)
+}
+Volcano_fun <- function(x, y) {
+  voc_lab <- y
+
+  EnhancedVolcano(x,
+    lab = x$symbol,
+    x = "log2FoldChange",
+    y = "padj",
+  #  selectLab = c(""),
+    caption = paste0("Total Genes: ", nrow(x)),
+    title = paste(voc_lab, "DESeq2 results"),
+    subtitle = "Differential Expression",
+    FCcutoff = 2,
+    pCutoff = 1e-10,
+    colAlpha = 0.25,
+    legendLabels = c("Not Sig", "+/- 2 Log2 FC", "pval <1e-10", "pval <1e-10 & +/- 2 Log2 FC"),
+    legendLabSize = 8,
+    legendPosition = c(.80, .96),
+    legendIconSize = 3,
+    gridlines.major = FALSE,
+    gridlines.minor = FALSE
+  )
+}
+
+gene_cluster_fun = function(x) {
+  
+  # plot the rld values of the  significantly differentially expressed genes and cluster samples
+  # set thresholds 
+  log2cutoff = 2
+  padjcutoff = 0.05
+  var_genes = 500
+  
+  # get list of deferentially expressed genes above threshold
+  topVarGenes <- head(order(rowVars(assay(x)), decreasing = TRUE), var_genes) # select most variable genes  (option 2)
+  mat  <- assay(x)[ topVarGenes, ] #subset matrix for topVar genes
+  mat  <- mat - rowMeans(mat) #differnece between the value and mean
+  
+  head(topVarGenes)
+  # annotation col
+  mat_col = data.frame(cell_type = B512_meta$group)
+  rownames(mat_col) <- colnames(mat)
+  mat_colours <- list(cell_type = brewer.pal(length(unique(B512_meta$group)), "Set1"))
+  names(mat_colours$cell_type) <- unique(B512_meta$group)
+  
+  
+  #pheatmap(scale(assay(x)[sigGenes,]), # uncomment to plot DGEs nstead
+  pheatmap(mat, 
+           cluster_rows = TRUE,
+           cluster_cols = TRUE,
+           clustering_distance_rows = "correlation",
+           clustering_distance_cols = "correlation",
+           color=viridis(10),
+           border_color = NA,
+           annotation_col = mat_col,
+           annotation_colors = mat_colours,
+           annotation_row = NA,
+           show_rownames = FALSE,
+           main = paste("Heatmap of top", var_genes, "variable genes"))
+}
+p_hist_fun <- function(x, y) {
+  voc_lab <- unlist(strsplit(y, "_"))
+  voc_lab <- paste(voc_lab[1], "vs", voc_lab[2], "p-val histogram")
+  hist(x$pvalue[x$baseMean > 1], breaks = 0:20 / 20, col = "grey50", border = "white", main = voc_lab)
+}
+fract_to_dec <- function(x) {
+  x <- as.numeric(x)
+  x <- x[1] / x[2] 
+  return(round(x,3))
+}
+```
+
+Salmon quant.sf files produced using the nf-core RNAseq pipeline 
+
+Find salmon quant.sf transcript quantification files https://nf-co.re/rnaseq
+
+```{r input-files}
+path <- 'output/quant_files'
+
+# create dt
+input <- dir(path=path, pattern = "*_quant.sf$", recursive = T, full.names = TRUE) %>% 
+  as.data.table() %>% 
+  setnames( '.', 'path')
+```
+
+```{r metadata}
+# type col
+sample.meta <- input
+
+
+
+sample.meta[, names := gsub('output/quant_files/', '', path)]
+sample.meta[, type := as.factor(str_extract(path,"Mock|Brisbane|Victoria"))]
+sample.meta[, time := as.factor(str_extract(path,"0|3|6|12|24"))]
+sample.meta[, rep := as.factor(sub("_quant.sf", "", str_extract(path,"[123]_quant.sf")))]
+sample.meta[, grp := as.factor(paste0(type,'_',time))]
+
+#convert to tibble to assign rownames
+sample.meta <- sample.meta %>% 
+  as_tibble() %>% 
+  column_to_rownames('names')
+```
+
+Creating txt2gene file for tximport using the Ensembl package version 101
+Use AnnotationHub to query version 101 and recover transcript to gene mapping
+
+```{r txt2gene-create}
+#load db
+ah <- AnnotationHub()
+#download dbs matching the follwoing query (only one element matching)
+hs.embl.101 <- query(ah, c("Hsapiens", "EnsDb", "101"))[[1]]
+
+#transcript to gene mapping
+tx <- transcripts(hs.embl.101, columns =c('tx_id', 'gene_id', 'gene_name'), return.type="DataFrame")
+tx
+
+```
+
+Summarizing transcript level abundances to the gene level using tximport
+
+```{r tximport-txt2gene}
+txi_files
+txi_files <- sample.meta$path
+names(txi_files) <- rownames(sample.meta)
+
+
+#tximport: convert transcript level abundances to gene
+txi <- tximport(files = txi_files, type = "salmon", tx2gene = tx, importer=read.delim) 
+
+
+
+# safety check; assert that col in txi match order and rownames in metadata table. # TRUE
+all(rownames(sample.meta) == colnames(txi[["counts"]])) 
+```
+
+## Differential Expression Analysis using DESEq2
+
+Are we interested in individual effects of timepoint and cell-type on expression? Or do we just want compare the different groups? 
+
+For first pass, I've kept it simple and combined timepoint and cell type factors into a single factor. The drawback here is we can't tease apart effects of different co-variates (ie is timepoint or cell type driving the expression difference) but it does indicate differences between groups at a quick glance. 
+
+```{r run dds, echo=FALSE, message=FALSE, warning=FALSE}
+
+str(sample.meta)
+
+dds <- DESeqDataSetFromTximport(txi = txi, 
+                                    colData = sample.meta, 
+                                    design = ~grp)
+
+
+dds
+
+keep <- rowSums(counts(dds) >= 10) >= 2 
+dds <- dds[keep, ]
+rm(keep)
+
+
+dds <- DESeq(dds)
+
+saveRDS(dds, '/Users/martingordon/Documents/projects/061223_JyotiB_RNAseq/output/011223.dds.obj.rds')
+```
+## Exploratory Data Analysis
+
+PCA plot
+
+top n 500 datapoints show really nice seperation between the groups, custom pca with all genes shows weaker seperation between viral groups until T12 & T24 but still good
+
+
+```{r pca}
+#variance stabilising transformation to acount for heteroskedacity and mean-var relationship in RNAseq data
+dds_vst <- vst(dds)
+
+#deseq2 plotting functions only top 500 genes
+save_plot(PCA_fun, list(x=dds_vst, grouping="grp"), "PCA_groups.png", "./output/plots/EDA")
+save_plot(PCA_fun, list(x=dds_vst, grouping="type"), "PCA_celltype.png", "./output/plots/EDA")
+save_plot(PCA_fun, list(x=dds_vst, grouping="time"), "PCA_timepoint.png", "./output/plots/EDA")
+
+
+#custom pca plot - all genes
+save_plot(PCA_all, list(x=dds_vst, group='grp'), "PCA_groups_all.png", "./output/plots/EDA")
+
+```
+
+Heatmaps of clustered samples using complexHeatmap
+Annotations colored by celltype, timepoint, grp
+Two distinct clusters: virus T12/T24 & other timepoints/groups
+
+```{r complex-heatmaps}
+
+#sub in 0 for NA val
+rowClusterWithNA <- function(mat, na.value = 0, ...){
+  mat[is.na(mat)] <- na.value
+  hclust(dist(mat), ...) #euclidean
+}
+
+#convert to matrix and take a subsample
+quant.mat <- assay(dds_vst)
+subMat <- quant.mat[sample.int(nrow(quant.mat), 2000),]
+
+#create heatmap annotation col
+ann <- data.frame(sample.meta$time, sample.meta$type)
+colnames(ann) <- c('timepoint(h)', 'celltype')
+colours <- list('timepoint(h)' = c('0' = '#4477AA', '3'='#66CCEE', '6'="#228833", '12'="#CCBB44",'24'='#EE6677'),
+                'celltype' = c("Mock" = "#BBBBBB", "Brisbane" = "#1965B0", "Victoria" = "#DC050C"))
+colAnn <- HeatmapAnnotation(df = ann,
+  which = 'col',
+  col = colours,
+  annotation_width = unit(c(1, 4), 'cm'),
+  gap = unit(1, 'mm'))                
+        
+
+# draw heatmap
+hm <- Heatmap(subMat,
+              #col = greenred(75),
+        top_annotation = colAnn,
+        cluster_rows = rowClusterWithNA(subMat),
+        show_column_dend = TRUE,
+        show_row_dend = TRUE,
+        show_row_names = FALSE,
+        column_names_gp = gpar(fontsize = 8),
+        row_title = sprintf("%d subsampled genes", nrow(subMat)),
+        name = "Counts (vst transformed)")
+
+BackupAsPDF(draw(hm), 'heatmap_subsample')
+```
+
+Subtract row intensities to see sample-to-sample variances
+Again can see at early timepoints, very little difference between mock and virus, but at later timepoints we can see how virus has distinct expression patterns
+I would say the two viruses have pretty similar expression patterns even at late timepoints
+At 6 hrs we can see some activation in both viral samples not observed in others
+
+```{r}
+#row median - median prot exp value across experiment
+
+# sweep subtracts a vector of values from either rows (dimension = 1) or columns (dimension = 2)
+# apply applies a function (median here) to each row (dimension = 1 )
+# used together here we are subtracting row medians
+scaled.mat <- sweep(quant.mat, 1, apply(quant.mat, 1, median, na.rm = TRUE))
+
+scaled.subMat <- scaled.mat[sample.int(nrow(scaled.mat), 2000),]
+
+hm <- Heatmap(scaled.subMat,
+        top_annotation = colAnn,
+        cluster_rows = rowClusterWithNA(scaled.subMat),
+        show_row_names = FALSE,
+        row_title = sprintf("%d subsampled genes", nrow(scaled.subMat)),
+        column_names_gp = gpar(fontsize = 8),
+        name = "Counts (vst transformed) \n vs Median")
+
+hm
+BackupAsPDF(draw(hm), 'heatmap_subsample_scaled')
+
+```
+Generate matrix to track pairwise comparisons for each sample group
+```{r create-contrast-matrix}
+
+comparison.matrix <- data.frame(Denom=as.character(c(rep(c('Mock_0', 'Mock_3', 'Mock_6', 'Mock_12', 'Mock_24'),2),'Victoria_0', 'Victoria_3', 'Victoria_6', 'Victoria_12', 'Victoria_24')),
+                                     Num=as.character(c('Brisbane_0', 'Brisbane_3', 'Brisbane_6', 'Brisbane_12', 'Brisbane_24', 'Victoria_0', 'Victoria_3', 'Victoria_6', 'Victoria_12',
+                                           'Victoria_24','Brisbane_0','Brisbane_3','Brisbane_6', 'Brisbane_12', 'Brisbane_24')))
+
+```
+
+Function to run deseq2 on each of the comparisons listed. Will let Adrian decide on the Relevant group comparisons
+Denominator is the first group
+
+```{r}
+
+# lfcShrink gives more accurate estimate of fold changes - recommended by authors to both visualise and rank lfc 
+# Use ashr as works with contrast and also preserves large lfc values
+# the reference is the denominator value (ie the baseline expression, so either up or downreg compred to this group )
+
+
+run_deseq2 <- function(contrast_df,dds_obj,group_col) {
+  denominator=contrast_df[1]
+  numerator=contrast_df[2]
+
+  # log2FC > 0 overexpressed in numerator 
+  dds_res <- results(dds_obj, contrast = c(group_col, numerator, denominator), independentFiltering = T, alpha = 0.05, pAdjustMethod = "BH")
+  
+  #shrinkage of lfc useful for visualisation and gene ranking
+  dds_lfcs <- lfcShrink(dds_obj, contrast = c(group_col, numerator, denominator), res=dds_res, type="ashr")
+
+  
+  # Return the results as a data frame
+  return(dds_res)
+}
+
+dds_lfcs_list <- apply(comparison.matrix, MARGIN=1, run_deseq2, dds_obj = dds, group_col = "grp")
+
+
+# Name each element of the list after the function call
+dds_lfcs_list  <- setNames(dds_lfcs_list, apply(comparison.matrix, 1, paste, collapse = "-"))
+
+```
+
+Quick look at the summary
+```{r}
+lapply(seq_along(dds_lfcs_list), function(x, n, i){ 
+  print(paste(n[[i]], "results summary")) 
+  DESeq2::summary(x[[i]]) }, x=dds_lfcs_list, n=names(dds_lfcs_list))
+```
+
+Add gene names & extract dfs of significant genes 
+```{r}
+
+# map gene id to gene symbol and entrez id
+dds_lfcs_list <- lapply(dds_lfcs_list, function(x) map_entrez_fun(dds_obj=x, ref_genome = hs.embl.101))
+
+
+# extract significant genes
+dds_siggenes_list <- lapply(dds_lfcs_list, function(x) extract_sig_genes(dds_obj=x, log2FC=1, p_adjust=0.05))
+
+```
+
+Add significant res col and create col recording the geometric mean of the padj & log2FC for plotting
+
+```{r filtervalues}
+
+dds_lfcs_list_dt <- lapply(dds_lfcs_list, function(x){
+  
+  x$geneid <- rownames(x)
+  x <- as.data.table(x) 
+  x[, gm.pval.log2fc := sqrt(padj*abs(log2FoldChange))]
+  x[, sig := "Not"]
+  x[padj < 0.05 & abs(log2FoldChange) > 1,
+         sig := ifelse (log2FoldChange  > 0, "Up", "Down")]
+})
+
+```
+
+Export the data as dfs & write to file
+
+```{r}
+
+lapply(seq_along(dds_lfcs_list_dt), function(x,n,i){
+  setcolorder(x[[i]], c(7,10,1,2,3,4,5,6,8,9))
+  fwrite(x[[i]][order(padj),], file = paste0("./output/", n[[i]] , "_dds_output.csv"), col.names=T, row.names =F) 
+}, x=dds_lfcs_list_dt, n=names(dds_lfcs_list_dt))
+
+```
+Write out the significant results for each comparison (padj < 0.05 & log2FC > 1)
+```{r}
+lapply(seq_along(dds_lfcs_list_dt), function(x,n,i){
+  #setcolorder(x[[i]], c(7,10,1,2,3,4,5,6,8,9))
+  fwrite(x[[i]][sig != 'Not' & padj != 0,], file = paste0("./output/", n[[i]] , "_sig_genes.csv"), col.names=T, row.names =F) 
+}, x=dds_lfcs_list_dt, n=names(dds_lfcs_list_dt))
+```
+
+Volcano plots for each group
+Adrian suggests a huge number of immune respsone related genes involved, near 0 in control & v high in 
+
+```{r filtervalues}
+
+lapply(seq_along(dds_lfcs_list_dt), function(x,n,i){
+  
+ p <- ggplot(data=x[[i]][padj != 0,], aes(x=log2FoldChange, y=-log10(padj), color=sig, label=symbol)) +
+       geom_point(show.legend = FALSE) +
+       scale_color_manual(values = c(Not = "gray", Down = "blue", Up = "red")) +
+       ggrepel::geom_text_repel(data = x[[i]][sig != "Not" & padj != 0][order(gm.pval.log2fc)][1:50], aes(label=symbol), size = 2, max.overlaps = 20) +
+       ggtitle(paste0(n[[i]], ' Volcano plot')) +
+       coord_cartesian( xlim = c(-10,10)) +
+       theme_minimal()
+ p
+ BackupAsPDF(p, paste0(n[[i]],"-volcano-plots_"))
+ 
+ }, x=dds_lfcs_list_dt, n=names(dds_lfcs_list_dt))
+  
+```
+
+ Enrichment Analysis plots for each group
+ Best maybe to create a seperate list for each comparison (ctrl-vic, ctrl-br, vic-br) & look at enrichment plots overtime
+ 
+ First collapse the seperate datatables into one, then split into 3 based on the cell comparison type
+ Or just run comparison on each seperately?
+```{r}
+comb.res.dt <- rbindlist(dds_lfcs_list_dt, idcol = 'contrast')
+comb.res.dt[,comparison := as.factor(gsub('_[0361224]{1,2}','',contrast))]
+
+#now create 3 separate tables of the comparisons
+comb.res.dt.list <- split(comb.res.dt, comb.res.dt$comparison)
+
+# create a new timepoint colunmn
+lapply(comb.res.dt.list, function(x){
+  x[, time := as.factor(paste0(str_extract(contrast,"0|3|6|12|24"),'_hrs'))]
+})
+```
+ 
+ 
+ 
+## GO enrichment heatmap with six columns: 5 timepoints two directions for each comparison
+
+```{r comb-go-enrichment}
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL")
+
+# define the universe, the total set of identified genes in our study
+universe <- unique(comb.res.dt$symbol)
+
+
+lapply(seq_along(comb.res.dt.list), function(x,n,i){
+  #perform enrihcment analysis on each of the groups
+  enrich.comb <- enricherOnGroups(x[[i]][sig != 'Not',], geneColumn = "symbol", groupColumns = c("time","sig"), universe=universe, term2gene.gmt = gmt.go, numProcessors = 6)
+  # best per group enrichment heatmap
+  hm <- enrichHeatmapBestPerGroup(enrich.comb, NULL, groupColumn = 'time.sig', topN=15, upperThreshold=8, title=n[[i]],
+                                 row_names_gp = gpar(fontsize = 6), column_names_gp = gpar(fontsize = 8), negCols = unique(enrich.comb$time.sig[grep("down", enrich.comb$time.sig)]) )
+  BackupAsPDF(hm, paste0(n[[i]],"-GO.enrichment_"), dimensions=c(13,11.5))
+}, x=comb.res.dt.list, n=names(comb.res.dt.list))
+
+```
+

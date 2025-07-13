@@ -1,0 +1,585 @@
+---
+title: "040425_matchedTranscriptSiteComparison"
+author: "Martin Gordon"
+date: "2025-04-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Matched and subset bams to the same transcripts. lets look and see if we can find differences in the edit sites 
+Rerun of the eariler work; identify the p and a sites and see if the codons fall off the diagonal between the edited and non-edited
+
+## libraries
+```{r}
+library(data.table)
+library(Rsamtools)
+library(magrittr)
+library(ggplot2)
+library(devtools)
+library(riboWaltz)
+library(hrbrthemes)
+library(ComplexHeatmap)
+library(viridis)
+library(scales)
+library(ggsankey) #sankey/alluvlai plots in ggplot syntax
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/bamProcessing.R")
+
+# de testing of codons
+source("../../utils/bp_utils/LinearModels.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+customTheme <- theme_ipsum_rc(base_family = "serif") +
+  theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1),
+        axis.text.x = element_text(angle=90)
+        )
+```
+
+read in the subset edits based on coverage
+```{r}
+hq.edits <- fread('040225_EditsVsNoEdits_highConfSubset_data/2025_04_02_OL.edits.highQuality.csv.gz')
+```
+
+load the bam files filtered to the same set of transcripts
+
+```{r}
+reads_list <- bamtolist(bamfolder = "./output/riboseq_bamfiles_firstPass/filtered/riboseq/editTranscriptsSubset", transcript_align = T, annotation = anno.dt)
+# custom names 
+names(reads_list) <- c('altprep_optic_noEdits_1','altprep_optic_Edits_1','optic_noEdits_1', 'optic_Edits_1',
+                       'optic_noEdits_2', 'optic_Edits_2', 'optic_noEdits_3', 'optic_Edits_3')
+```
+
+this time we filter by length only keep things within range 28-33
+Filter by length and periodicity
+
+```{r}
+filter_list <- length_filter(data = reads_list,
+ 				length_filter_mode = "custom",
+ 				length_range = seq(28,33))
+
+filtered_list <- length_filter(data = filter_list,
+ 				length_filter_mode = "periodicity",
+ 				periodicity_threshold = 60) #lets go with higher threshold 2/3 should fall in one frame
+```
+
+```{r}
+lapply(filter_list, function(x){
+  ggplot(x, aes(x=length)) +
+    geom_density() +
+    geom_vline(xintercept=34) +
+    scale_x_continuous(breaks=seq(1,150,2))
+})
+```
+
+
+```{r}
+lapply(filtered_list, function(x){
+  
+  ggplot(x, aes(x=length)) +
+    geom_density() +
+    geom_vline(xintercept=c(28,33)) +
+    scale_x_continuous(breaks=seq(1,150,2))
+})
+```
+
+Lets run ribowalktz on the output and see what we recover
+12 nt offset seems correct for all the samples
+```{r}
+psite_offset <- psite(filtered_list, flanking = 5, extremity = "5end", plot=F)
+```
+This is the key function; add the psite information to the table 
+
+```{r}
+reads_psite_list <- psite_info(filtered_list,
+                               psite_offset, 
+                               site=c('psite','asite', 'esite'), 
+                               fastapath = './data/wynton_downloads/dpea.pipelineProcessed.genome.transcripts.fa', 
+                               fasta_genome=F)
+
+
+pa.site.info <- rbindlist(reads_psite_list, idcol='sample')
+#fwrite(pa.site.info, ScriptAndDatedFileName('pa.site.info.csv'))
+```
+Lets do a very simple codon usage comparison. Just count the amount of codons (in cds?) for each sample, get a proportion, avg over reps and 
+```{r}
+pa.site.info <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040425_matchedTranscriptSiteComparison_data/2025_04_04_pa.site.info.csv')
+pa.site.info <- pa.site.info[sample != 'altprep_optic_noEdits_1',]
+
+summary.dt <- pa.site.info[, .N, by=.(sample, p_site_codon)]
+summary.dt <- summary.dt[, .(p_site_codon, counts=N, prop=N/sum(N)), by=.(sample)]
+
+summary.dt[, condition := gsub('_[123]','', sample)]
+summary.dt[, meanProp := mean(prop), by=.(condition, p_site_codon)]
+summary.dt[, meanCounts := mean(counts), by=.(condition, p_site_codon)]
+```
+p-site... v consistent across all...
+```{r}
+summary.wide <- dcast(summary.dt, p_site_codon~condition, value.var = c('meanCounts','meanProp'), fun.aggregate = unique)
+
+ggplot(summary.wide, aes(x=meanProp_optic_Edits, y=meanProp_optic_noEdits, label=p_site_codon)) +
+  geom_point() +
+  geom_abline(slope=1) +
+  ggrepel::geom_label_repel() +
+  labs(xlab='% OL no edits', ylab='% OL edits') +
+  theme_bw()
+```
+What about the a-site? Check it out...
+
+```{r}
+summary.dt <- pa.site.info[, .N, by=.(sample, a_site_codon)]
+summary.dt <- summary.dt[, .(a_site_codon, counts=N, prop=N/sum(N)), by=.(sample)]
+
+summary.dt[, condition := gsub('_[123]','', sample)]
+summary.dt[, meanProp := mean(prop), by=.(condition, a_site_codon)]
+summary.dt[, meanCounts := mean(counts), by=.(condition, a_site_codon)]
+```
+
+```{r}
+summary.wide <- dcast(summary.dt, a_site_codon~condition, value.var = c('meanCounts','meanProp'), fun.aggregate = unique)
+summary.wide[, lab := ifelse(a_site_codon == 'ATT', 'ATT', '')]
+
+ggplot(summary.wide, aes(x=meanProp_optic_Edits*100, y=meanProp_optic_noEdits*100, label=a_site_codon, color=lab)) +
+  geom_point() +
+  geom_abline(slope=1) +
+  ggrepel::geom_label_repel() +
+  ggtitle('A site occupancy: edited transcripts vs non-edited transcripts') +
+  labs(x='% OL edits', y='% OL no edits') +
+  theme_bw()
+```
+Look at the subset to edits overlapping a and p-sites and compare to matched background
+
+```{r}
+overlapEdits <- fread('./040225_EditsVsNoEdits_highConfSubset_data/2025_04_02_OL.highQualEdits.overlapping.AorPsites.csv.gz')
+edits.summary <- overlapEdits[overlapSite == 'aSite', .N, by=.(sample, a_site_codon)]
+edits.summary <- edits.summary[, .(a_site_codon, counts=N, prop=N/sum(N)), by=.(sample)]
+edits.summary[, `:=`(meanProp = mean(prop), meanCounts=mean(counts)), by=.(a_site_codon)]
+edits.summary[, condition := paste0(gsub('_[123]','', sample), '_AsiteOverlap')]
+```
+
+
+```{r}
+# match col order in summary.dt
+setcolorder(edits.summary, colnames(summary.dt))
+summary.dt <- rbind(summary.dt, edits.summary)
+
+# write out the summary dt to file as using it for all our plotting
+fwrite(summary.dt, ScriptAndDatedFileName('aSiteOccupancy.counts.csv.gz'))
+summary.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040425_matchedTranscriptSiteComparison_data/2025_04_07_aSiteOccupancy.counts.csv.gz')
+
+summary.wide <- dcast(summary.dt, a_site_codon~condition, value.var = c('meanCounts','meanProp'),  fun.aggregate = mean, na.rm = TRUE)
+summary.wide[, lab := ifelse(a_site_codon == 'ATT', 'ATT', '')]
+
+
+g <- ggplot(summary.wide, aes(x=meanProp_optic_Edits*100, y=meanProp_optic_noEdits*100)) +
+  geom_abline(slope=1, alpha=0.5) +
+  geom_segment(aes(x = meanProp_optic_Edits*100, xend = meanProp_optic_Edits_AsiteOverlap*100, 
+                   y = meanProp_optic_noEdits*100, yend = meanProp_optic_noEdits*100,
+                   color = (meanProp_optic_Edits_AsiteOverlap - meanProp_optic_Edits)*100,
+                   ), 
+               size = 0.2) +
+  geom_point(size=2, alpha=0.7, color= "#DCE318FF") +
+  geom_point(data=summary.wide,  aes(x=meanProp_optic_Edits_AsiteOverlap*100, y=meanProp_optic_noEdits*100, label=a_site_codon), alpha=0.8, color="#287D8EFF", size=3) +
+  scale_color_gradient_colorRamp2(colors=c('dodgerblue2', 'white', '#E31A1C'), breaks=c(-2,0,2)) +
+  ggrepel::geom_text_repel(aes(label=a_site_codon)) +
+  ggtitle('A-site codon usage', 'Edited vs non-edited sites') +
+  labs(x='% OL edits', y='% no edits') +
+  theme_bw() +
+  guides(color=guide_colorbar(title="% edited a-site - edited transcripts"))
+
+g
+BackupAsPDF(g, 'aSite.enrichment.editsVsaSiteEdits.dotplot', dimensions = c(12,8))
+```
+
+
+```{r}
+summary.dt[, condition := factor(condition, levels=c("optic_noEdits","optic_Edits","optic_Edits_AsiteOverlap","altprep_optic_Edits"))]
+#summary.dt[, vsUnEdited := meanProp - meanProp[condition == 'optic_noEdits'], by=.(a_site_codon)]
+
+# could probably summarise the lines to make it show the SE, but ok for now..
+g <- ggplot(summary.dt[condition != 'altprep_optic_Edits' & !a_site_codon %in% codon.oi,], aes(x=condition, y=meanProp*100, group=a_site_codon, color = meanProp * 100)) +
+  geom_line(aes(color=meanProp*100), alpha=0.1, lineend = "square") +
+  geom_point(aes(color=meanProp*100), alpha=0.1) +
+  geom_line(data=summary.dt[condition != 'altprep_optic_Edits' & a_site_codon %in% codon.oi,],  lineend = "square") +
+  geom_point(data=summary.dt[condition != 'altprep_optic_Edits' & a_site_codon %in% codon.oi,]) +
+  ggrepel::geom_label_repel(data=unique(summary.dt[condition == 'optic_Edits_AsiteOverlap' & a_site_codon %in% codon.oi, .(a_site_codon, condition, meanProp)]), aes(label=a_site_codon)) +
+  scale_color_viridis(option='D', direction = -1) +
+  scale_x_discrete(expand = c(0.02, 0.02)) +
+  #scale_color_gradient_colorRamp2(colors=c('dodgerblue2', 'white', '#E31A1C'), breaks=c(-2,0,2)) +
+  ggtitle('A-site codon usage', 'Edited vs non-edited sites') +
+  labs(x='Transcript set', y='% of total edits') +
+  theme_bw()
+
+BackupAsPDF(g, 'aSiteEnrichment.Frequency.linechart')
+```
+
+alleuvial/sankey plot
+I guess this plot shows the issues with our proportional data; looks like the others are increasing in proportion due to drop-outs...
+Question is, are these drop outs interesting or just due to small numbers
+Need to compare proportions of the same set...
+
+```{r}
+collapse.dt <- summary.dt[condition %in% c("optic_noEdits","optic_Edits","optic_Edits_AsiteOverlap"), .(condition, a_site_codon, meanProp)]  %>% 
+  unique()
+
+
+codon.oi <- c('AAA', 'AAG', 'ATT', 'GAA', 'GAG')
+
+# plot everything, but only color the key sets we are interested in
+collapse.dt[, lab := ifelse(a_site_codon %in% codon.oi, a_site_codon, '')]
+
+g <- ggplot(collapse.dt,
+       aes(x = condition, stratum = a_site_codon, alluvium = a_site_codon,
+           y = meanProp, fill = lab, label=lab)) +
+  geom_flow() +
+  geom_lode() +
+  geom_stratum(color='grey70') +
+  geom_text(stat = "stratum") +
+  scale_x_discrete(expand=c(0.1, 0.1)) +
+  scale_fill_manual(values=c("grey90","AAA"=col.pal[7], "AAG"=col.pal[8], "ATT"=col.pal[9], "GAA"=col.pal[10], "GAG"=col.pal[11])) +
+  labs(title = 'A-site codon usage', 
+       subtitle='Edited vs non-edited sites',
+       x='Transcript set', y='Proportion of all edits') +
+  guides(fill='none') +
+  theme_bw()
+g
+BackupAsPDF(g,'aSiteEnrichment.alleuvial', dimensions=c(8,9))
+```
+# col pal
+```{r}
+"dodgerblue2" "#E31A1C"     "green4"      "#6A3D9A"     "#FF7F00"     "black"       "gold1"       "skyblue2"    "#FB9A99"     "palegreen2"  "#CAB2D6"    
+[12] "#121111"     "gray70"
+```
+
+Can we use t-tests/anova to test for codons that are significantly different across groups? lets use the lm models functions and plot the -log10 pvalues of the codons and highlight our set
+
+```{r}
+# just to perform all pw contrasts
+# estimate marginal means and run a pw comparison across groups
+# no adjustment; will do manually controlling at the level of the contrast
+emmeans.contrasts <- function (l, factorFormula = ~condition){  
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- data.frame(emmeans::contrast(emm, method='pairwise', adjust='none'))
+  return (as.data.table(contrast1))
+}
+
+# for some reason postproc fails if not all of the splitCol (protein/in this case codon) is in the set...
+codon.oi <- summary.dt[condition == 'optic_Edits', unique(a_site_codon)]
+
+lm.out <- linearModelsAllProteins(fullDataTable = summary.dt[condition != 'altprep_optic_Edits' & a_site_codon %in% codon.oi,], 
+                                  splitColumn = 'a_site_codon', 
+                                  formulaList = list(basic=prop~condition),
+                                  postProcessFunction = emmeans.contrasts, cl = 6)
+
+lm.out$coef[, padj := p.adjust(p.value, method='BH'), by=term]
+lm.out$postProcess[, padj := p.adjust(p.value, method='BH'), by=contrast]
+```
+Take the contrast output and look at the significant movers across conditions
+May need to recalculate proportion; subset to the same set of codons ?
+
+```{r}
+ggplot(lm.out$postProcess, aes(x=reorder(a_site_codon,log10(padj)), y=-log10(padj))) +
+  geom_hline(yintercept=-log10(0.05), color='darkred', linetype=2) +
+  geom_bar(stat='Identity') +
+  facet_grid(contrast~.) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+```
+Suspicious of these results; lets try recalc proportions within the shared set only and look at changes.. I think composition bias may be affecting this set of results
+
+```{r}
+codon.subset <- summary.dt[condition == 'optic_Edits_AsiteOverlap', unique(a_site_codon)]
+
+subset.dt <- summary.dt[a_site_codon %in% codon.subset & condition != 'altprep_optic_Edits',]
+subset.dt[, rep := stringr::str_extract(sample, '[123]$')]
+subset.dt <- subset.dt[, .(a_site_codon, counts, prop=counts/sum(counts)), by=.(condition, rep)]
+
+subset.dt[, meanProp := mean(prop), by=.(condition, a_site_codon)]
+subset.dt[, meanCounts := mean(counts), by=.(condition, a_site_codon)]
+
+```
+```{r}
+collapse.dt <- subset.dt[, .(condition, a_site_codon, meanProp)]  %>% 
+  unique()
+
+# plot everything, but only color the key sets we are interested in
+collapse.dt[, lab := ifelse(a_site_codon %in% codon.oi, as.character(a_site_codon), '')]
+collapse.dt[, condition := factor(condition, levels=c('optic_noEdits', 'optic_Edits', 'optic_Edits_AsiteOverlap'))]
+
+g <- ggplot(collapse.dt,
+       aes(x = condition, stratum = a_site_codon, alluvium = a_site_codon,
+           y = meanProp, fill = lab, label=lab)) +
+  geom_flow() +
+  geom_lode() +
+  geom_stratum(color='grey70') +
+  geom_text(stat = "stratum") +
+  scale_x_discrete(expand=c(0.1, 0.1)) +
+  scale_fill_manual(values=c("grey90","AAA"=col.pal[7], "AAG"=col.pal[8], "ATT"=col.pal[9], "GAA"=col.pal[10], "GAG"=col.pal[11])) +
+  labs(title = 'A-site codon usage', 
+       subtitle='Edited vs non-edited sites',
+       x='Transcript set', y='Proportion of all edits') +
+  guides(fill='none') +
+  theme_bw()
+g
+BackupAsPDF(g,'aSiteEnrichment.sharedCodonSubset.alleuvial', dimensions=c(8,9))
+```
+T-tests not suitable as not normally distributed; instead look at chi-sq test; do this for the subset of shared codons
+For each codon;
+Create a contingency table of counts x condition
+Run the chisq test take mean of the groups (sum will inflate the test)
+
+Wilcoxon rank-sum test; t-test that makes no assumption on distribution; I think our sample size is a little low for this
+```{r}
+collapse.dt <- subset.dt[,.(condition, a_site_codon, meanCounts, meanProp)]
+
+subset.dt$condition %>% unique()
+
+subset.dt[condition == 'optic_noEdits' & a_site_codon == 'AAA', prop]
+subset.dt[condition == 'optic_Edits_AsiteOverlap' & a_site_codon == 'AAA', prop]
+subset.dt[condition == 'optic_noEdits' & a_site_codon == 'AAG', counts]
+subset.dt[condition == 'optic_Edits' & a_site_codon == 'AAG', counts]
+```
+Try chi-sq test
+Again, problem here is counts.. I think we inflate statistical significance looking at really large samplings..
+Try an RNAseq normalization method instead?
+
+```{r}
+# 
+pairwiseProportionalZtest <- function(dt, variable, group, value){
+
+  # get: returns value of a named object
+  dt.wide <- data.table::dcast(dt, get(variable)~get(group), value.var=value, fun.aggregate = mean, na.rm=T) %>% 
+    as.matrix(rownames=1)
+  all.counts <- apply(dt.wide, 2, sum, na.rm=T)
+  
+  tests.comb <- lapply(rownames(dt.wide), function(i){
+    
+    aa <- dt.wide[rownames(dt.wide) == i,]
+    all.counts <- all.counts - aa
+    print(all.counts)
+    test.out <- prop.test(x=aa, n=all.counts, correct = F)
+
+    out.dt <- data.table(codon = i, 
+                         p.value = test.out$p.value,
+                         df = test.out$df)
+  }) %>%  
+    rbindlist()
+  
+  return(tests.comb)
+}
+
+pairwiseChiSquaretest <- function(dt, variable, group, value){
+
+  # get: returns value of a named object
+  dt.wide <- data.table::dcast(dt, get(variable)~get(group), value.var=value, fun.aggregate = mean, na.rm=T) %>% 
+    as.matrix(rownames=1)
+  all.counts <- apply(dt.wide, 2, sum, na.rm=T)
+  
+  
+  
+  tests.comb <- lapply(rownames(dt.wide), function(i){
+    
+    aa <- dt.wide[rownames(dt.wide) == i,]
+    all.counts <- all.counts - aa
+    test.out <- chisq.test(rbind(aa, all.counts))
+
+    out.dt <- data.table(codon = i, 
+                         p.value = test.out$p.value,
+                         df = test.out$df)
+  }) %>%  
+    rbindlist()
+  
+  return(tests.comb)
+}
+
+# they are basically equivalent using the raw counts
+testa <- pairwiseProportionalZtest(subset.dt[condition %in% c("optic_noEdits","optic_Edits")], variable='a_site_codon', group='condition', value='counts')
+testb <- pairwiseChiSquaretest(subset.dt[condition %in% c("optic_noEdits","optic_Edits")], variable='a_site_codon', group='condition', value='counts')
+
+
+noEditsvsEdits <- pairwiseProportionalZtest(subset.dt[condition %in% c("optic_noEdits","optic_Edits")], variable='a_site_codon', group='condition', value='counts')
+noEditsvsEdits[, contrast := 'OL noEdits vs OL Edits']
+noEditsvsAsite <- pairwiseProportionalZtest(subset.dt[condition %in% c("optic_noEdits","optic_Edits_AsiteOverlap")], variable='a_site_codon', group='condition', value='counts')
+noEditsvsAsite[, contrast := 'OL noEdits vs OL A-site Edits']
+
+EditsvsAsite <- pairwiseProportionalZtest(subset.dt[condition %in% c("optic_Edits","optic_Edits_AsiteOverlap")], variable='a_site_codon', group='condition', value='counts')
+EditsvsAsite[, contrast := 'OL Edits vs OL A-site Edits']
+
+zscore.comb <- rbind(noEditsvsAsite,
+                    noEditsvsEdits,
+                    EditsvsAsite)
+
+zscore.comb[,padj := p.adjust(p.value, method='BH'), by=contrast]
+zscore.comb[, sig := ifelse(padj < 0.05, 'yes', 'no')]
+
+#fwrite(zscore.comb, ScriptAndDatedFileName('codonUsage.proportionalZtest.csv'))
+zscore.comb <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040425_matchedTranscriptSiteComparison_data/2025_04_08_codonUsage.proportionalZtest.csv')
+```
+
+
+save the output and generate the plots
+
+```{r}
+fwrite(chiSq.comb, ScriptAndDatedFileName('codonUsage.chiSqtest.csv.gz'))
+fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040425_matchedTranscriptSiteComparison_data/2025_04_08_codonUsage.chiSqtest.csv.gz')
+```
+plots.. most things moving, not very helpful
+Dont thnk the test is 'wrong' but it is not useful if everything is different...
+```{r}
+g <- ggplot(chiSq.comb, aes(x=codon, y=-log10(padj), fill=sig)) +
+  geom_hline(yintercept=-log10(0.05), color='red', linetype=2) +
+  geom_bar(stat='identity') +
+  facet_grid(contrast~.) +
+  scale_fill_manual(values=c('no'='grey70', 'yes'='cornflowerblue')) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+g
+
+g <- ggplot(chiSq.comb, aes(x=codon, y=-log10(padj), fill=sig)) +
+  geom_hline(yintercept=-log10(0.05), color='red', linetype=2) +
+  geom_bar(stat='identity') +
+  facet_grid(contrast~.) +
+  scale_fill_manual(values=c('no'='grey70', 'yes'='cornflowerblue')) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90)) +
+  coord_cartesian(ylim=c(0,10))
+
+BackupAsPDF(g, 'chiSqTest.padj.ythrehold.barplot', dimensions=c(8,8))
+
+g <- ggplot(chiSq.comb, aes(x=codon, y=-log10(padj), fill=sig)) +
+  geom_hline(yintercept=-log10(0.05), color='red', linetype=2) +
+  geom_bar(stat='identity') +
+  facet_grid(contrast~.) +
+  scale_fill_manual(values=c('no'='grey70', 'yes'='cornflowerblue')) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90))
+
+BackupAsPDF(g, 'chiSqTest.padj.barplot', dimensions=c(8,8))
+```
+
+RNAseq CPM normalization scale the proportion of counts to 1 million and test
+```{r}
+subset.dt[, cpm := prop*(1000000)]
+subset.dt[, meanCPM := mean(cpm, na.rm=T), by=.(condition, a_site_codon)]
+```
+
+Try linear model with log2 CPM and see how the output looks
+
+```{r}
+# just to perform all pw contrasts
+# estimate marginal means and run a pw comparison across groups
+# no adjustment; will do manually controlling at the level of the contrast
+emmeans.contrasts <- function (l, factorFormula = ~condition){  
+  emm <- emmeans::emmeans(l, factorFormula)
+  contrast1 <- data.frame(emmeans::contrast(emm, method='pairwise', adjust='none'))
+  return (as.data.table(contrast1))
+}
+
+# for some reason postproc fails if not all of the splitCol (protein/in this case codon) is in the set...
+codon.oi <- summary.dt[condition == 'optic_Edits', unique(a_site_codon)]
+
+lm.out <- linearModelsAllProteins(fullDataTable = subset.dt, 
+                                  splitColumn = 'a_site_codon', 
+                                  formulaList = list(basic=log2(cpm+1)~condition),
+                                  postProcessFunction = emmeans.contrasts, cl = 6)
+
+lm.out$coef[, padj := p.adjust(p.value, method='BH'), by=term]
+lm.out$postProcess[, padj := p.adjust(p.value, method='BH'), by=contrast]
+```
+
+Not sure if this is correct... maybe need to speak to Ben.. could try some kind of z-transformation; median normalization etc and then test? Leave as is for now...
+```{r}
+lm.out$postProcess[, sig := ifelse(padj < 0.05, 'yes', 'no')]
+
+ggplot(lm.out$postProcess, aes(x=reorder(a_site_codon,log10(padj)), y=-log10(padj))) +
+  geom_hline(yintercept=-log10(0.05), color='darkred', linetype=2) +
+  geom_bar(stat='Identity') +
+  facet_grid(contrast~.) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+```
+
+**leave for now**
+Other approahces? bootstrap resamplign? speak to BP, for now do the differential translation test
+Seperate the edited vs the unedited transcripts
+```{r}
+lm.subset.out <- linearModelsAllProteins(fullDataTable = subset.dt, 
+                                  splitColumn = 'a_site_codon', 
+                                  formulaList = list(basic=prop~condition),
+                                  postProcessFunction = emmeans.contrasts, cl = 6)
+
+lm.subset.out$coef[, padj := p.adjust(p.value, method='BH'), by=term]
+lm.subset.out$postProcess[, padj := p.adjust(p.value, method='BH'), by=contrast]
+```
+
+plot the subset codons p-values
+```{r}
+ggplot(lm.subset.out$postProcess, aes(x=reorder(a_site_codon,log10(padj)), y=-log10(padj))) +
+  geom_hline(yintercept=-log10(0.05), color='darkred', linetype=2) +
+  geom_bar(stat='Identity') +
+  facet_grid(contrast~.) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90))
+
+
+# I think these results are an artifact of the variance/SE within the group being v low compared to the difference in means between the groups; counts are v stable across conditions, so lots of stuff significantly different
+# basically looking at difference in estimate vs SE..
+
+# I wonder if a better way to look at this is to use some kind of read count normalization?
+
+lm.subset.out$postProcess
+```
+```{r}
+lm.out$postProcess
+
+```
+
+*not used*
+
+```{r}
+# subset to the codons we are looking at 
+codon.oi <- summary.dt[condition == 'optic_Edits', unique(a_site_codon)]
+
+subdt <- summary.dt[condition != 'altprep_optic_Edits' & a_site_codon == 'AAA']
+lm.test <- lm(prop~condition+sample, subdt)
+
+subdt
+as.data.table(lm.test$coefficients, keep.rownames = T)
+
+
+emmeans.contrastOfContrasts(lm.test, factorFormula = ~condition)
+
+
+lm.test
+emm<- emmeans::emmeans(lm.test, pairwise~condition)
+# estimate is effect size
+# the residual degrees of freedom are the n observations (all groups) - n params exc intercept (so 6 here)
+# t-ratio: num SE a coefficient is away from zero
+# SE shared as assuming equal variance
+data.frame(emmeans::contrast(emm, method='pairwise', adjust='none'))
+```
+
+
+
+**todo**
+Look at the set of transcripts that have edits and those that dont (globally) nd see differences - we did do this; think issue is the bg is different; not sure if its a good comparison? Maybe tranlation efficiency but not sure otherwise...
+Look at edits in ap sites vs same transcripts background - done
+
+

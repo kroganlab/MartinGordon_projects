@@ -1,0 +1,1791 @@
+---
+title: "080125_AB_PWcomparisons"
+author: "Martin Gordon"
+date: "2025-01-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## reprocessing the abundance proteomics data researched with the viral proteins included
+```{r packages}
+library(data.table)
+library(ggplot2)
+library(magrittr)
+library(ggrepel)
+library(stringr)
+library(ComplexHeatmap)
+library(circlize)
+library(MSstats)
+library(viridis)
+library(ggbeeswarm)
+library(RColorBrewer)
+library(hrbrthemes) # visually nice set of themes
+library(patchwork)
+library(showtext)
+library(seqinr)
+library(readxl)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+
+
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/msstats_helperFunctions.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+#set one
+col.pal <- getQualitativePalette(n=13)
+#col.pal <- randomcoloR::distinctColorPalette(k=13)
+
+# fonts needed for hrbrthemes
+library(extrafont)
+font_import()
+loadfonts()
+
+# directly from google font
+sysfonts::font_add_google("Roboto Condensed")
+showtext_auto()
+```
+
+Read in the researched data
+```{r}
+hu.list <- list(msstats=fread('./data/010425_ViralProtsInDBSearch/MRC5_AB/MSstats_20250104_141826_JB_MRC5_AB_rerun_010425_Report.tsv'),
+                keys=fread('./data/010425_ViralProtsInDBSearch/MRC5_AB/JB_MRC5_AB_rerun_010425_ConditionSetup.tsv'))
+
+bat.list <-  list(msstats=fread('./data/010425_ViralProtsInDBSearch/RFe_AB/MSstats_20250104_152307_JB_RFe_AB_rerun_010425_Report.tsv'),
+                  keys=fread('./data/010425_ViralProtsInDBSearch/RFe_AB/JB_RFe_AB_rerun_010425_ConditionSetup.tsv'))
+```
+
+3 reps per group
+```{r}
+hu.list[[2]][,.N, by=Condition][order(Condition)]
+bat.list[[2]][,.N, by=Condition][order(Condition)]
+
+# sanity check to ensure the metadata keys match the msstats file....
+# TRUE for both... can drop the metadata after ormating
+identical(hu.list[[2]][,.(Run=`Run Label`, Condition, BioReplicate=Replicate)], unique(hu.list[[1]][,.(Run, Condition, BioReplicate)]))
+identical(bat.list[[2]][,.(Run=`Run Label`, Condition, BioReplicate=Replicate)], unique(bat.list[[1]][,.(Run, Condition, BioReplicate)]))
+```
+
+```{r}
+# bioreps only unique per group
+hu.list[[1]]$Condition %>% unique()
+bat.list[[1]]$Condition %>% unique()
+```
+
+N features per cell-line; recovery seems good
+```{r}
+# MRC5 features
+g <- ggplot(hu.list[[1]][,.N, by=.(Condition,BioReplicate,Run)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('MRC5 Features') +
+  xlab('Condition.Replicate') +
+  ylab('Number of Features') +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90, size=8))
+g
+BackupAsPDF(g, 'MRC5.nFeatures.barplot', format='png')
+
+
+#RFe features
+g <- ggplot(bat.list[[1]][,.N, by=.(Condition,BioReplicate,Run)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat = 'Identity') +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('RFe Features') +
+  xlab('Condition.Replicate') +
+  ylab('Number of Features') +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90, size=8))
+g
+BackupAsPDF(g, 'RFe.nFeatures.barplot', format='png')
+```
+Intensity histograms of the RFe and MRC5 set
+
+```{r}
+g <-  ggplot(bat.list[[1]], aes(x=log2(Intensity))) +
+  geom_histogram(bins=100, fill="palegreen2") +
+  ggtitle('RFe feature ints.') +
+  theme_ipsum_rc()
+g
+
+p <- ggplot(hu.list[[1]], aes(x=log2(Intensity))) +
+  geom_histogram(bins=100, fill="#CAB2D6") +
+  ggtitle('MRC5 feature ints.') +
+  theme_ipsum_rc()
+p
+
+BackupAsPDF(g, 'MRC5.feature.intensity.histograms')
+BackupAsPDF(p, 'RFe.feature.intensity.histograms')
+```
+Tidy the species names 
+
+```{r}
+spec.list <- list('MRC5'=hu.list[[1]],
+                  'Rfe'=bat.list[[1]])
+
+spec.list <- lapply(spec.list, function(x){
+  
+  unique(x$Condition) %>%  print()
+  x[, strain := factor(gsub('_12hpi|_24hpi|_48hpi|_6hpi', '', Condition), levels=c('Mock', 'WT', 'N_P80T', '9b_T72I_N_P80T'))]
+  x[, timepoint := factor(ifelse(grepl('Mock', Condition), 'na', str_extract(Condition, '[12468]+hpi')), levels=c('na', '6hpi', '12hpi','24hpi', '48hpi'))]
+})
+
+
+lapply(spec.list, function(x){
+  
+  x$Condition %>% unique()
+  x[,.N, by=.(Condition, strain, timepoint)]
+})
+```
+Drop the larger list with keys 
+```{r}
+# rm from memory
+rm(bat.list)
+rm(hu.list)
+```
+
+Check both sets for the viral proteins
+
+```{r}
+sars.prots <- read.fasta(file='./data/DB_fasta files/JB_SARS-CoV-2_FASTA_20200305.fasta', seqtype = 'AA', as.string = T) %>% 
+  names(.) %>% 
+  gsub("SARS_CoV_2_", "", .)
+sars.prots
+
+
+spec.list[['MRC5']][ProteinName %in% sars.prots, unique(ProteinName)]
+spec.list[['MRC5']][ProteinName %in% sars.prots, unique(ProteinName)] %>% length()
+
+spec.list[['MRC5']][ProteinName %like% "Protein14", ] #not found
+spec.list[['MRC5']][ProteinName %like% "Orf9c", ] #not found
+
+spec.list[['MRC5']][ProteinName %like% "orf", unique(ProteinName) ]
+spec.list[['MRC5']][ProteinName %like% "nsp", unique(ProteinName) ]
+
+spec.list[['Rfe']][ProteinName %in% sars.prots, unique(ProteinName)]
+spec.list[['Rfe']][ProteinName %in% sars.prots, unique(ProteinName)] %>% length()
+spec.list[['Rfe']][ProteinName %like% "Orf9c", ] #
+
+# get the complete list of viral proteins in the data
+viral.prots <- c(sars.prots, 
+  spec.list[['MRC5']][ProteinName %like% "orf", unique(ProteinName) ], 
+  spec.list[['MRC5']][ProteinName %like% "nsp", unique(ProteinName) ]) %>% 
+  unique()
+
+ #use this for our search
+fwrite(data.table(viral.prots), ScriptAndDatedFileName('viralproteins.csv'))
+```
+
+flag proteins with these labels
+
+```{r}
+lapply(spec.list, function(x){
+  
+  x[, viralProtein := ifelse(ProteinName %in% viral.prots, 'yes', 'no')]
+})
+```
+Check the elution of features; any features eluting at more than one charge?
+
+```{r}
+spec.list[['MRC5']][,.N, by=.(ProteinName, PeptideSequence, PrecursorCharge)]
+
+# no duplicate feature (each row is a uniwue feature) 
+spec.list[['MRC5']][, .N, by = .(Run, PeptideSequence, PrecursorCharge)][N > 1]
+spec.list[['Rfe']][, .N, by = .(Run, PeptideSequence, PrecursorCharge)][N > 1]
+```
+
+```{r}
+lapply(spec.list, function(x){
+  
+  
+  fname <- ifelse(any(x$timepoint == '6hpi'), 'RFe','MRC5')
+  print(fname)
+  
+  message('creating matrix...')
+  spec.mat <- dcast(x, paste(ProteinName,PeptideSequence,PrecursorCharge, sep='_')~paste(strain,timepoint,BioReplicate, sep='.'), value.var = 'Intensity') %>% 
+    as.matrix(rownames=1)
+  
+  dim(spec.mat) %>% print()
+  message('Subsetting to complete cases for PCA...')
+  submat <- spec.mat[complete.cases(spec.mat),]
+  dim(spec.mat) %>% print()
+  submat <- log2(submat)
+
+  pcaOut <- prcomp(t(submat))
+
+  message('Setting up col info')
+  colInfo <- data.table(colname = colnames(spec.mat))
+  colInfo[, c("strain", "timepoint", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2,3)) ]
+
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  
+  #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = strain, shape = timepoint)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(fname, "PCA using",  nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(fname,'.features.strainCol.pca'), dimensions=c(8,6))
+  
+    #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = timepoint, shape = strain)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(fname, "PCA using",  nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey", 
+                                    fill = NA, 
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(fname,'.features.timepointCol.pca'), dimensions=c(8,6))
+  
+      #plot first two components
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = biorep, shape = strain)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(fname, "PCA using", nrow(submat), "features (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(fname,'.features.biorepCol.pca'), dimensions=c(8,6))
+})
+```
+Heatmaps of the intensity values for each of the samples; check if there are problematic samples we need to remove
+
+```{r}
+lapply(seq_along(names(spec.list)), function(x,n,i){
+  
+  spec <- n[[i]]
+
+  spec.mat <- dcast(x[[i]], paste(ProteinName,PeptideSequence,PrecursorCharge, sep='_')~paste(strain,timepoint,BioReplicate, sep='.'), value.var = 'Intensity') %>% 
+    as.matrix(rownames=1)
+  
+  spec.mat <- log2(spec.mat)
+  submat <- spec.mat[sample(rownames(spec.mat),3000),]
+  #submat <- spec.mat[complete.cases(p.mat),]
+  
+  submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+  
+  hm <- Heatmap(submat,
+          border=T,
+          name='log2(Ints)/\nMedian',
+          cluster_rows = clusterWNA(submat),
+          show_row_names = F,
+          show_column_names = F,
+          cluster_columns = F,
+          column_title_gp = gpar(fontsize=5),
+          column_names_gp = gpar(fontsize=7),
+          #col=colorRamp2(colors=c("dodgerblue2","white","#E31A1C")),
+          row_title = sprintf('%s sampled features', nrow(submat)),
+          column_split = list(str_extract(colnames(submat), '[0-9]{1,2}hpi'),
+                              gsub('_[0-9]{1,2}hpi', '', gsub('[.][123]', '', colnames(submat)))
+                              )
+          )
+  
+  BackupAsPDF(draw(hm, column_title=paste0(spec)), paste0(spec, 'raw.features.subsample.medScale.heatmap'), format='png')
+  
+},x=spec.list, n=names(spec.list))
+```
+Looks like quite a bit of noise, but these are raw features so lets process and then inspect...
+
+```{r}
+
+lapply(spec.list, function(x){
+  x[, IsotopeLabelType := 'L']
+})
+
+dp.out.list <- lapply(spec.list, function(x){
+  
+  dp.out <- MSstats::dataProcess(x, 
+                                MBimpute =  FALSE, 
+                                normalization = 'equalizeMedians',
+                                summaryMethod = "TMP",
+                                featureSubset = 'highQuality',
+                                remove_uninformative_feature_outlier=T)
+
+  return(dp.out)
+})
+```
+
+Save the output and lets look at the protein intensities;
+Do we want to remove proteins Identified by only one peptide in the run? Possibly...
+
+```{r}
+dp.out.list[['MRC5']]
+dp.out.list[['Rfe']]
+#saveRDS(dp.out.list[['MRC5']], './080125_AB_PWcomparisons_data/MRC5.rds')
+#saveRDS(dp.out.list[['Rfe']], './080125_AB_PWcomparisons_data/Rfe.rds')
+```
+
+```{r}
+lapply(names(dp.out.list), function(x){
+
+  fwrite(dp.out.list[[x]]$ProteinLevelData, ScriptAndDatedFileName(paste0(x, '.proteinlvl.csv')))
+  fwrite(dp.out.list[[x]]$FeatureLevelData, ScriptAndDatedFileName(paste0(x, '.featurelvl.csv')))
+})
+```
+read in the pquant data 
+```{r}
+ms.list <- list(MRC5 = readRDS('./080125_AB_PWcomparisons_data/MRC5.rds'),
+                RFe = readRDS('./080125_AB_PWcomparisons_data/Rfe.rds'))
+```
+
+Add the n peptide info to the protein lvl data tables
+
+```{r}
+ms.list <- lapply(names(ms.list), function(x){
+
+  ms.list[[x]]$ProteinLevelData <-  getNPeptidesPerProtein(setDT(ms.list[[x]]$ProteinLevelData),  setDT(ms.list[[x]]$FeatureLevelData), peptideThreshold = 1)
+  return(ms.list[[x]])
+})
+```
+```{r}
+contrast.list <- list(MRC5= makeContrast.AllByAll(ms.list[[1]]),
+                      RFe =  makeContrast.AllByAll(ms.list[[2]]))
+```
+
+Run the PW comparisons on the Abundance data 
+```{r}
+names(ms.list) <- c('MRC5', 'RFe')
+
+ms.contrast.list <- lapply(names(contrast.list), function(x,y,i){
+  
+  p.quant <- setDT(x[[i]]$ProteinLevelData)
+  p.quant[, SUBJECT := paste0(GROUP,'.',SUBJECT)]
+  
+  f.quant <- setDT(x[[i]]$FeatureLevelData)
+  f.quant[, SUBJECT := paste0(GROUP,'.',SUBJECT)]
+  
+  x[[i]]$FeatureLevelData <- f.quant
+  x[[i]]$ProteinLevelData <- p.quant
+  
+  message('runnning MS contrasts on ', i)
+  
+  mss <- groupComparison(contrast.matrix=y[[i]], data=x[[i]])
+  mss.dt <- setDT(mss$ComparisonResult)
+  return(mss.dt)
+  
+}, x=ms.list, y=contrast.list)
+
+names(ms.contrast.list) <- c('MRC5', 'RFe')
+```
+
+```{r}
+contrast.oi <- c( #vs mock contrasts
+                 "Mock-N_P80T_6hpi","Mock-N_P80T_12hpi","Mock-N_P80T_24hpi","Mock-N_P80T_48hpi",
+                 "Mock-WT_6hpi","Mock-WT_12hpi", "Mock-WT_24hpi","Mock-WT_48hpi",
+                 "9b_T72I_N_P80T_6hpi-Mock", "9b_T72I_N_P80T_12hpi-Mock","9b_T72I_N_P80T_24hpi-Mock","9b_T72I_N_P80T_48hpi-Mock",
+                 #time matched contrasts
+                 "9b_T72I_N_P80T_6hpi-N_P80T_6hpi","9b_T72I_N_P80T_12hpi-N_P80T_12hpi","9b_T72I_N_P80T_24hpi-N_P80T_24hpi","9b_T72I_N_P80T_48hpi-N_P80T_48hpi",
+                 "N_P80T_6hpi-WT_6hpi","N_P80T_12hpi-WT_12hpi","N_P80T_24hpi-WT_24hpi","N_P80T_48hpi-WT_48hpi",
+                 "9b_T72I_N_P80T_6hpi-WT_6hpi","9b_T72I_N_P80T_12hpi-WT_12hpi","9b_T72I_N_P80T_24hpi-WT_24hpi","9b_T72I_N_P80T_48hpi-WT_48hpi"
+                 )
+```
+
+```{r}
+mss.dt <- rbindlist(ms.contrast.list, idcol='cell_line')
+mss.dt <- mss.dt[Label %in% contrast.oi,]
+
+mss.dt[, c('numerator', 'denominator') := tstrsplit(Label, '-', keep = c(1,2))]
+mss.dt[numerator == 'Mock', log2FC := log2FC*-1]
+mss.dt[numerator == 'Mock', Label := paste(denominator, numerator, sep='-')]
+
+# fix the numerator and denominator label for the vs Mock comparison
+mss.dt[, c('numerator', 'denominator') := tstrsplit(Label, '-', keep = c(1,2))]
+
+mss.dt[, gene := multiUniprots2multiGenes(Protein, species='HUMAN')]
+
+mss.dt[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label, cell_line)]
+mss.dt[, sig := 'not']
+mss.dt[abs(log2FC) > 0.58 & p.adj < 0.05 & !issue %in% c("oneConditionMissing","completeMissing"), sig := ifelse(log2FC > 0, 'up', 'down')]
+```
+We want to get the counts of proteins that went into each t-test; will include in the heatmap plots of LFC
+
+```{r}
+# merge the counts per protein/species
+ms.list[[1]]$ProteinLevelData[, cell_line := 'MRC5']
+ms.list[[2]]$ProteinLevelData[, cell_line := 'RFe']
+
+# just tbind the protein level quantification in eaqch
+p.quant.dt <- rbind(ms.list[[1]]$ProteinLevelData, ms.list[[2]]$ProteinLevelData)
+#fwrite(p.quant.dt, ScriptAndDatedFileName('merged.proteinlvldata.csv'))
+p.quant.dt
+summary.dt <- p.quant.dt[, .(nProteinPerGroup=.N),.(GROUP, Protein, cell_line)]
+
+mss.dt <- merge(mss.dt, summary.dt[, .(GROUP, Protein, cell_line, numerator_nProteinPerGroup=nProteinPerGroup)], by.x=c("Protein","numerator","cell_line"), by.y=c("Protein","GROUP", "cell_line"), all.x=T)
+mss.dt <- merge(mss.dt, summary.dt[, .(GROUP, Protein, cell_line, denominator_nProteinPerGroup=nProteinPerGroup)], by.x=c("Protein","denominator","cell_line"), by.y=c("Protein","GROUP", "cell_line"), all.x=T)
+
+
+# looks good
+mss.dt[issue %in% c('oneConditionMissing')]
+mss.dt[issue %in% c('oneConditionMissing', 'completeMissing'),]
+
+fwrite(mss.dt, ScriptAndDatedFileName('mss.pwcomparisons.csv'))
+```
+
+```{r}
+mss.dt[, timepoint := str_extract(numerator,'[0-9]{1,2}hpi$')]
+col.pal <- getQualitativePalette(n=2)
+
+g <- ggplot(mss.dt[sig != 'not', .N, by=.(cell_line, sig, numerator, Label)], aes(x=sig, y=N, fill=cell_line)) +
+  geom_bar(stat='Identity', position='dodge') +
+  ggtitle('Number of significant proteins per contrast') +
+  scale_fill_ipsum() +
+  facet_wrap(~Label, scales='free') +
+  #scale_fill_manual(values=c('down'=muted('blue'), 'up'=muted('red'))) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'N.sigHits.perContrast.barplots', dimensions=c(16,10))
+
+
+# plot the N hits per contrast and facet by species
+g <- ggplot(mss.dt[sig != 'not', .N, by=.(cell_line, sig, numerator, timepoint, Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity', position='dodge') +
+  ggtitle('Number of significant proteins per contrast') +
+  scale_fill_ipsum() +
+  facet_grid(~cell_line, scales='free') +
+  scale_fill_manual(values=c('down'=col.pal[1], 'up'=col.pal[2])) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'N.sigHits.allContrasts.barplots', dimensions=c(11,8))
+
+
+g <- ggplot(mss.dt[sig != 'not' & cell_line == 'MRC5', .N, by=.(cell_line, sig, numerator, timepoint, Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity', position='dodge') +
+  ggtitle('MRC5 Number of significant proteins per contrast') +
+  scale_fill_ipsum() +
+  facet_grid(~cell_line, scales='free') +
+  scale_fill_manual(values=c('down'=col.pal[1], 'up'=col.pal[2])) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'N.sigHits.MRC5.barplots', dimensions=c(11,8))
+
+g <- ggplot(mss.dt[sig != 'not' & cell_line == 'RFe', .N, by=.(cell_line, sig, numerator, timepoint, Label)], aes(x=reorder(Label,-N), y=N, fill=sig)) +
+  geom_bar(stat='Identity', position='dodge') +
+  ggtitle('RFe Number of significant proteins per contrast') +
+  scale_fill_ipsum() +
+  facet_grid(~cell_line, scales='free') +
+  scale_fill_manual(values=c('down'=col.pal[1], 'up'=col.pal[2])) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+
+g
+BackupAsPDF(g, 'N.sigHits.RFe.barplots', dimensions=c(11,8))
+```
+```{r}
+levels.oi <- c( #vs mock contrasts
+                 "N_P80T_6hpi-Mock","N_P80T_12hpi-Mock","N_P80T_24hpi-Mock","N_P80T_48hpi-Mock",
+                 "WT_6hpi-Mock","WT_12hpi-Mock", "WT_24hpi-Mock","WT_48hpi-Mock",
+                 "9b_T72I_N_P80T_6hpi-Mock", "9b_T72I_N_P80T_12hpi-Mock","9b_T72I_N_P80T_24hpi-Mock","9b_T72I_N_P80T_48hpi-Mock",
+                 #time matched contrasts
+                 "9b_T72I_N_P80T_6hpi-N_P80T_6hpi","9b_T72I_N_P80T_12hpi-N_P80T_12hpi","9b_T72I_N_P80T_24hpi-N_P80T_24hpi","9b_T72I_N_P80T_48hpi-N_P80T_48hpi",
+                 "N_P80T_6hpi-WT_6hpi","N_P80T_12hpi-WT_12hpi","N_P80T_24hpi-WT_24hpi","N_P80T_48hpi-WT_48hpi",
+                 "9b_T72I_N_P80T_6hpi-WT_6hpi","9b_T72I_N_P80T_12hpi-WT_12hpi","9b_T72I_N_P80T_24hpi-WT_24hpi","9b_T72I_N_P80T_48hpi-WT_48hpi"
+                 )
+
+mss.dt[, Label := factor(Label, levels=levels.oi)]
+```
+
+```{r}
+contrasts.oi <- unique(grep('-Mock', mss.dt$Label, value=T))
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi & cell_line == 'MRC5' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], aes(x=log2FC, y=-log10(p.adj), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 contrasts vs Mock') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & cell_line == 'MRC5' & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+g
+BackupAsPDF(g, 'MRC5.contrasts.vs.mock.volcano', dimensions=c(16,14))
+```
+plot the same with the viral proteins labelled on the heatmap
+Why are viral proteins appearing in the vs Mock comparisons
+```{r}
+mss.dt[, lab := sig]
+mss.dt[Protein %in% viral.prots, lab := 'SARS-CoV-2']
+mss.dt[, lab := factor(lab, levels=c('SARS-CoV-2', 'up', 'down', 'not'))]
+
+
+mss.dt <- mss.dt[order(lab)]
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi & cell_line == 'MRC5' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], aes(x=log2FC, y=-log10(p.adj), col=lab, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 contrasts vs Mock') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & cell_line == 'MRC5' & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('SARS-CoV-2'="#6A3D9A", 'up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+g 
+BackupAsPDF(g, 'MRC5.contrasts.vs.mock.volcano', dimensions=c(16,14))
+```
+Get matrices for both species; lets look at how the sequences look
+```{r}
+# set levesl of the groups for heatmaps
+timeMatched.levels <- levels.oi 
+strainMatched.levels <- c( #vs mock contrasts
+                         "Mock","WT_6hpi", "N_P80T_6hpi", "9b_T72I_N_P80T_6hpi",
+                         "WT_12hpi", "N_P80T_12hpi","9b_T72I_N_P80T_12hpi",
+                         "WT_24hpi", "N_P80T_24hpi","9b_T72I_N_P80T_24hpi",
+                         "WT_48hpi", "N_P80T_48hpi","9b_T72I_N_P80T_48hpi")
+
+p.quant.dt[, GROUP := factor(GROUP, levels=c(levels.oi))]
+
+hu.viral.mat <- dcast(p.quant.dt[cell_line == 'MRC5',], Protein~paste0(SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+bat.viral.mat <- dcast(p.quant.dt[cell_line == 'RFe',], Protein~paste0(SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- hu.viral.mat[rownames(hu.viral.mat) %in% viral.prots,]
+
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        cluster_columns = F,
+        cluster_column_slices = T,
+        border=T,
+        name='log2 Ints/\nmedian',
+        col=colorRamp2(colors=c(col.pal[1], 'white', col.pal[2]), breaks=c(-2,0,2)),
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=6),
+       # cluster_columns = clusterWNA(t(submat)),
+        column_split = factor(gsub('[.][123]$','', colnames(submat)), levels=c(strainMatched.levels)))
+hm
+BackupAsPDF(draw(hm, column_title='MRC5 SARS-CoV-2 proteins'), 'MRC5.all.viralProts.medianScaled.heatmap', dimensions = c(10.5,4))
+```
+plot the same heatmap with the N mutant removed (leave ORF9b for now)
+```{r}
+hm <- Heatmap(submat[!rownames(submat) %in% c('N_P80T'),], 
+        cluster_rows = clusterWNA(submat[!rownames(submat) %in% c('N_P80T'),]),
+        cluster_columns = F,
+        cluster_column_slices = T,
+        border=T,
+        name='log2 Ints/\nmedian',
+        col=colorRamp2(colors=c(col.pal[1], 'white', col.pal[2]), breaks=c(-2,0,2)),
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=6),
+       # cluster_columns = clusterWNA(t(submat)),
+        column_split = factor(gsub('[.][123]$','', colnames(submat[!rownames(submat) %in% c('N_P80T'),])), levels=c(strainMatched.levels)))
+hm
+BackupAsPDF(draw(hm, column_title='MRC5 SARS-CoV-2 proteins'), 'MRC5.noNmut.viralProts.medianScaled.heatmap', dimensions = c(10.5,4))
+
+```
+WT fails to establish infection in bat
+```{r}
+submat <- bat.viral.mat[rownames(bat.viral.mat) %in% viral.prots,]
+
+submat <- sweep(submat, 1, apply(submat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        cluster_columns = F,
+        cluster_column_slices = T,
+        border=T,
+        name='log2 Ints/\nmedian',
+        col=colorRamp2(colors=c(col.pal[1], 'white', col.pal[2]), breaks=c(-4,0,4)),
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=6),
+        column_split = factor(gsub('[.][123]$','', colnames(submat)), levels=c(strainMatched.levels)))
+hm
+BackupAsPDF(draw(hm, column_title='RFe SARS-CoV-2 proteins'), 'RFe.viralProts.medianScaled.heatmap', dimensions = c(13,5))
+```
+Want to look at the PCA of the different viral proteins in the two species;
+Lets color the PCA by a marker for viral load 
+
+```{r}
+lapply(seq_along(names(ms.list)), function(x,n,i){
+  spec <- n[[i]]
+  
+  p.quant <- as.data.table(x[[spec]]$ProteinLevelData)
+  
+  p.mat <- dcast(p.quant, Protein~paste0(SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+  
+  sMarker.dt <- p.quant[Protein == 'S', .(rn=paste0(SUBJECT), S=LogIntensities)]
+  sMarker.dt[, vsMock := S - mean(S[rn %like% 'WT'], na.rm=T)]
+  
+  
+  p.mat <- p.mat[complete.cases(p.mat),]
+  
+  pcaOut <- prcomp(t(p.mat))
+  colInfo <- data.table(colname = colnames(p.mat))
+  colInfo[, c("group", "biorep") := tstrsplit(colname, "[.]", keep = c(1,2)) ]
+  colInfo[, strain := gsub('_[12468]+hpi', '', group)]
+  colInfo[, timepoint := ifelse(strain == 'Mock', 'na', str_extract(group, '[12468]{1,2}hpi'))]
+
+  pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+  pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+  pcaDT <- merge(pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+  pcaDT <- merge(pcaDT, sMarker.dt, by='rn', all.x = TRUE)
+  
+
+  p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = strain, shape = timepoint)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(spec, "PCA using", nrow(p.mat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(spec,'.proteins.strainCol.pca'), dimensions=c(8,6))
+
+  
+   p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = timepoint, shape = strain)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+   scale_fill_ipsum() +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(spec, "PCA using", nrow(p.mat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  BackupAsPDF(p, paste0(spec,'.proteins.timepoint.pca'), dimensions=c(8,6))
+  
+    
+    p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = S, shape = timepoint)) + 
+    geom_point(alpha=1.0, size=4) + 
+    ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+    xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+    ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+    #scale_color_brewer(type = "qual", palette = "Dark2") +
+    scale_shape_manual(values = c(21:27)) +
+    scale_fill_viridis_c(option='A') +
+    theme_ipsum_rc(grid = "XY") + 
+    ggtitle(paste(spec, "PCA using", nrow(p.mat), "proteins (log intensity)", sep=' ')) +
+    theme(panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(title='S log2 Ints.', override.aes = list(shape =21) ) ,
+           color = guide_legend(override.aes = list(shape =21) ) )
+  p
+  
+  
+
+  BackupAsPDF(p, paste0(spec,'.proteins.SprotCol.pca'), dimensions=c(8,6))
+},x=ms.list, n=names(ms.list))
+```
+
+Bat id mapping; for now stay using Medhi file, for legacy reasons (the RNAseq data)
+
+
+```{r}
+id.mapping.dt <- read_xlsx('../080624_JBatra_SARS2RNAseqHuBat/docs/human_to_RFE_gene_conversion_table_FINAL.xlsx') %>% 
+  as.data.table()
+
+id.dt <- id.mapping.dt[,.(RFE_uniprot_ID, RFE_gene_name, Human_gene_name)] %>% 
+  unique()
+
+# get rid of empty annos 
+id.dt <- id.dt[!(is.na(RFE_gene_name) & is.na(Human_gene_name))]
+
+# just take the first annotation
+id.dt <- id.dt[, head(.SD, 1), by=RFE_uniprot_ID]
+
+
+mss.dt <- merge(x=mss.dt, y=id.dt, by.x='Protein', by.y='RFE_uniprot_ID', all.x=T, all.y=F)
+
+#set the name; so if no gene name exists, set it to protein, leave as protein, otherwise set as bat gene name
+mss.dt[cell_line == 'RFe', gene := ifelse(is.na(RFE_gene_name), gene, RFE_gene_name)]
+
+
+# now create a col with the human gene name will use this for the species scatterplots
+mss.dt[, human_symbol := gene]
+mss.dt[cell_line == 'RFe' & !is.na(Human_gene_name), human_symbol := Human_gene_name]
+mss.dt[, p.adj := p.adjust(pvalue, method = 'BH'), by=.(Label, cell_line)]
+#fwrite(mss.dt, ScriptAndDatedFileName('mss.pwcomparisons.ortholog.annotations.csv'))
+```
+Add some gene level information to the pqautn table from mss.dt and save
+
+```{r}
+p.quant.dt <- merge(p.quant.dt, unique(mss.dt[,.(cell_line, Protein, gene, RFE_gene_name, human_symbol)]), by=c('cell_line', 'Protein'), all.x=T, all.y=F)
+p.quant.dt[, strain := factor(gsub('_12hpi|_24hpi|_48hpi|_6hpi', '', GROUP), levels=c('Mock', 'WT', 'N_P80T', '9b_T72I_N_P80T'))]
+p.quant.dt[, timepoint := factor(ifelse(grepl('Mock', GROUP), 'na', str_extract(GROUP, '[12468]+hpi')), levels=c('na', '6hpi', '12hpi','24hpi', '48hpi'))]
+
+#fwrite(p.quant.dt, ScriptAndDatedFileName('merged.proteinlvldata.csv'))
+p.quant.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_09_merged.proteinlvldata.csv')
+mss.dt <-  fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_08_mss.pwcomparisons.ortholog.annotations.csv')
+viral.prots <- read.csv('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_08_viralproteins.csv')
+
+```
+
+Some of the proteins have an adjusted pvalue of 0... why? 
+because the pvalue is 0... 
+ 
+```{r}
+# how can I ger a pvalue of 0 for these things?
+odd.prots <- mss.dt[p.adj == 0 & cell_line == 'MRC5', gene] %>%  
+  unique()
+
+mss.dt[p.adj == 0, unique(Label)]
+
+# lets look at these proteins...a re they obviously different between the groups?
+p.mat <- dcast(p.quant.dt[gene %in% odd.prots & cell_line == 'MRC5',], gene~paste0(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='gene')
+
+p.mat <- sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T))
+Heatmap(p.mat)
+
+odd.prots <- mss.dt[p.adj == 0 & cell_line == 'RFe', gene] %>%  
+  unique()
+
+# lets look at these proteins...a re they obviously different between the groups?
+p.mat <- dcast(p.quant.dt[gene %in% odd.prots & cell_line == 'RFe',], gene~paste0(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='gene')
+
+p.mat <- sweep(p.mat, 1, apply(p.mat, 1, median, na.rm=T))
+Heatmap(p.mat)
+```
+Ok, well the sets of proteins clearly look very different from the others.. lets just set them to max adjusted pval detected in that contrast
+
+
+```{r}
+levels.oi <- c( #vs mock contrasts
+                 "N_P80T_6hpi-Mock","N_P80T_12hpi-Mock","N_P80T_24hpi-Mock","N_P80T_48hpi-Mock",
+                 "WT_6hpi-Mock","WT_12hpi-Mock", "WT_24hpi-Mock","WT_48hpi-Mock",
+                 "9b_T72I_N_P80T_6hpi-Mock", "9b_T72I_N_P80T_12hpi-Mock","9b_T72I_N_P80T_24hpi-Mock","9b_T72I_N_P80T_48hpi-Mock",
+                 #time matched contrasts
+                 "9b_T72I_N_P80T_6hpi-N_P80T_6hpi","9b_T72I_N_P80T_12hpi-N_P80T_12hpi","9b_T72I_N_P80T_24hpi-N_P80T_24hpi","9b_T72I_N_P80T_48hpi-N_P80T_48hpi",
+                 "N_P80T_6hpi-WT_6hpi","N_P80T_12hpi-WT_12hpi","N_P80T_24hpi-WT_24hpi","N_P80T_48hpi-WT_48hpi",
+                 "9b_T72I_N_P80T_6hpi-WT_6hpi","9b_T72I_N_P80T_12hpi-WT_12hpi","9b_T72I_N_P80T_24hpi-WT_24hpi","9b_T72I_N_P80T_48hpi-WT_48hpi"
+                 )
+
+mss.dt[, Label := factor(Label, levels=levels.oi)]
+
+# fix the 0 pvals.. investigate later..
+min.padj.dt <- mss.dt[p.adj != 0, .(mod.adj.pval=min(p.adj)), by=.(cell_line, Label)]
+mss.dt <- merge(mss.dt, min.padj.dt, by=c('cell_line', 'Label'))
+mss.dt[p.adj != 0 , mod.adj.pval := p.adj]
+```
+
+```{r}
+g <- ggplot(mss.dt[Label %in% contrasts.oi & cell_line == 'MRC5' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(mod.adj.pval), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 contrasts vs Mock') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & cell_line == 'MRC5' & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, scales='free', ncol=3) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+
+BackupAsPDF(g, 'MRC5.contrasts.vs.mock.freeScales.volcano', dimensions=c(16,14), format='png')
+```
+Now lets plot the bat with the human homologs
+```{r}
+g <- ggplot(mss.dt[Label %in% contrasts.oi & cell_line == 'RFe'  & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(mod.adj.pval), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('RFe contrasts vs Mock') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & cell_line == 'RFe' & sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, scales='free', ncol=4) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+
+BackupAsPDF(g, 'RFe.contrasts.vs.mock.freeScales.volcano', dimensions=c(16,14), format='png')
+
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi & cell_line == 'RFe'  & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(mod.adj.pval), col=sig, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('RFe contrasts vs Mock') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & cell_line == 'RFe' & sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=4) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+
+BackupAsPDF(g, 'RFe.contrasts.vs.mock.fixedScales.volcano', dimensions=c(16,14))
+```
+
+ok, now plot the contrasts within each strain (drop the Mock comparisons)
+
+```{r}
+contrasts.oi <- unique(grep('-Mock', mss.dt$Label, value=T, invert = T))
+
+mss.dt[, lab := factor(lab, levels=c('SARS-CoV-2', 'up', 'down', 'not'))]
+
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi & cell_line == 'MRC5' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(mod.adj.pval), col=lab, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 SARS-CoV-2 strain contrasts') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & cell_line == 'MRC5' & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('SARS-CoV-2'=col.pal[4], 'up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label,scales='free', ncol=3) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+g
+BackupAsPDF(g, 'MRC5.contrasts.strainComparisons.freeScales.volcano', dimensions=c(16,14), format='png')
+
+g <- ggplot(mss.dt[Label %in% contrasts.oi & cell_line == 'MRC5' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(mod.adj.pval), col=lab, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('MRC5 SARS-CoV-2 strain contrasts') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & cell_line == 'MRC5' & sig != 'not' & !grepl('6hpi', Label) & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('SARS-CoV-2'=col.pal[4], 'up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+g
+BackupAsPDF(g, 'MRC5.contrasts.strainComparisons.fixedScales.volcano', dimensions=c(16,14), format='png')
+```
+plot the same for the bat proteins
+
+```{r}
+g <- ggplot(mss.dt[Label %in% contrasts.oi & cell_line == 'RFe'  & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(mod.adj.pval), col=lab, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('RFe SARS-CoV-2 strain contrasts') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & cell_line == 'RFe' & sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('SARS-CoV-2'=col.pal[4], 'up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, scales='free', ncol=4) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+g
+BackupAsPDF(g, 'RFe.contrasts.strainComparison.freeScales.volcano', dimensions=c(16,14), format='png')
+```
+
+```{r}
+g <- ggplot(mss.dt[Label %in% contrasts.oi & cell_line == 'RFe'  & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(mod.adj.pval), col=lab, label=gene)) +
+  geom_point() + 
+  ylab('-log10 adjusted p-value') +
+  ggtitle('RFe SARS-CoV-2 strain contrasts') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & cell_line == 'RFe' & sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% contrasts.oi & cell_line == 'RFe' & Protein %in% viral.prots,], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('SARS-CoV-2'=col.pal[4], 'up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=4) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+
+BackupAsPDF(g, 'RFe.contrasts.strainComparison.fixedScales.volcano', dimensions=c(16,14))
+```
+For the volcanoplots; focus on the double mutant vs single mutant and the double mut vs WT (human)
+
+```{r}
+final.contrasts.oi <- c(grep('9b_T72I_N_P80T.+N_P80T', unique(mss.dt$Label), value = T), grep('9b_T72I_N_P80T.+WT', unique(mss.dt$Label), value=T))
+```
+
+We also need to create a new pvalue threshold for the MRC5 strains; create a new col and declare sig at |lfc| > 0.5 & pval < 0.005
+
+```{r}
+mss.dt[, reduced.sig := 'not']
+mss.dt[abs(log2FC) > 0.58 & pvalue < 0.005 & !issue %in% c("oneConditionMissing","completeMissing"), reduced.sig := ifelse(log2FC > 0, 'up', 'down')]
+mss.dt[, reduced.lab := reduced.sig]
+mss.dt[Protein %in% viral.prots$viral.prots, reduced.lab := 'SARS-CoV-2']
+```
+
+plot the reduced sig thresholds for the contrasts we are interested in 
+
+MRC5
+Why is NP80T so much higher in the double mutant than wildtype
+```{r}
+g <- ggplot(mss.dt[Label %in% final.contrasts.oi & cell_line == 'MRC5'  & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(pvalue), col=reduced.lab, label=gene)) +
+  geom_point() + 
+  ylab('-log10 p-value') +
+  ggtitle('MRC5 contrasts') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% final.contrasts.oi & cell_line == 'MRC5' & reduced.sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% final.contrasts.oi & cell_line == 'MRC5' & Protein %in% viral.prots,], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('SARS-CoV-2'=col.pal[4], 'up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=3) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+g
+BackupAsPDF(g, 'MRC5.finalcontrasts.strainComparison.fixedScales.volcano', dimensions=c(14,9))
+```
+```{r}
+g <- ggplot(mss.dt[Label %in% grep('WT', final.contrasts.oi, invert=T, value=T)  & cell_line == 'RFe'  & !issue %in% c("oneConditionMissing","completeMissing")], 
+            aes(x=log2FC, y=-log10(pvalue), col=reduced.lab, label=gene)) +
+  geom_point() + 
+  ylab('-log10 p-value') +
+  ggtitle('RFe contrasts') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% grep('WT', final.contrasts.oi, invert=T, value=T) & cell_line == 'MRC5' & reduced.sig != 'not' & !issue %in% c("oneConditionMissing","completeMissing")], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  ggrepel::geom_text_repel(data=mss.dt[Label %in% grep('WT', final.contrasts.oi, invert=T, value=T) & cell_line == 'MRC5' & Protein %in% viral.prots,], 
+                           show.legend = FALSE, size = 2, max.overlaps = 20, segment.linetype = 3, segment.alpha=0.8, segment.color='grey') +
+  geom_vline(xintercept = c(-0.58,0.58), linetype=2, alpha=0.4) +
+  geom_hline(yintercept = -log10(0.005), linetype=2, alpha=0.4) +
+  scale_color_manual(values=c('SARS-CoV-2'=col.pal[4], 'up'=col.pal[2], 'down'=col.pal[1], 'not'='grey')) +
+  facet_wrap(~Label, ncol=4) +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+g
+BackupAsPDF(g, 'RFe.finalcontrasts.strainComparison.fixedScales.volcano', dimensions=c(18,5))
+```
+
+*Todo*
+Enrichment
+ISG plots:
+heatmaps
+barplots
+distributions of intensity values for all
+Heatmaps of the sig genes in the contrasts we are interested in 
+
+
+Load in the ISGs
+```{r}
+isGenes <- fread('/Users/martingordon/Documents/projects/022624_AViDD_AB_PH_data/docs/ISGs.txt', header=F) %>% 
+  .[,V1]
+```
+
+ISG heatmaps; plot the S protein log2 intensity as a barplot along the top
+```{r}
+# set levesl of the groups for heatmaps
+timeMatched.levels <- levels.oi 
+strainMatched.levels <- c( #vs mock contrasts
+                         "Mock","WT_6hpi", "N_P80T_6hpi", "9b_T72I_N_P80T_6hpi",
+                         "WT_12hpi", "N_P80T_12hpi","9b_T72I_N_P80T_12hpi",
+                         "WT_24hpi", "N_P80T_24hpi","9b_T72I_N_P80T_24hpi",
+                         "WT_48hpi", "N_P80T_48hpi","9b_T72I_N_P80T_48hpi")
+
+
+hu.mat <- dcast(p.quant.dt[cell_line == 'MRC5'  & human_symbol  %in% isGenes,], human_symbol~paste0(GROUP,'.',SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='human_symbol')
+
+bat.mat <- dcast(p.quant.dt[cell_line == 'RFe' & human_symbol  %in% isGenes,], human_symbol~paste0(GROUP,'.',SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='human_symbol')
+
+hu.S <-  dcast(p.quant.dt[cell_line == 'MRC5'  & gene %in% c('S', 'ISG15'),], gene~paste0(GROUP,'.',SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='gene')
+
+bat.S <- dcast(p.quant.dt[cell_line == 'RFe'  & gene == 'S',], gene~paste0(GROUP,'.',SUBJECT), value.var='LogIntensities') %>% 
+  as.matrix(rownames='gene')
+
+# plot the human ISG response
+submat <- sweep(hu.mat, 1, apply(hu.mat[,grepl('Mock', colnames(hu.mat))], 1, mean, na.rm=T)) # mock sweep
+submat <- sweep(hu.mat, 1, apply(hu.mat, 1, median, na.rm=T)) # median sweep
+
+hu.S <- sweep(hu.S, 1, apply(hu.S, 1, median, na.rm=T))
+hu.S <- hu.S[rownames(hu.S) == 'S',]
+
+barColors <- ifelse(hu.S > 0, col.pal[2], col.pal[1])
+names(barColors) <- names(hu.S)
+
+column_ha <- HeatmapAnnotation('Spike protein/\nmedian' = anno_barplot(hu.S,
+                               gp = gpar(col=barColors, fill=barColors)))
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        cluster_columns = F,
+        cluster_column_slices = T,
+        border=T,
+        top_annotation = column_ha,
+        name='log2 Ints/\nmedian',
+        col=colorRamp2(colors=c(col.pal[1], 'white', col.pal[2]), breaks=c(-2,0,2)),
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=9, fontface='bold'),
+       # cluster_columns = clusterWNA(t(submat)),
+        column_split = factor(gsub('[.][123]$','', colnames(submat)), levels=c(strainMatched.levels)))
+hm
+BackupAsPDF(draw(hm, column_title='MRC5 ISGs'), 'MRC5.all.ISGs.medianScaled.heatmap', dimensions = c(14,8))
+
+# w/o anno
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        cluster_columns = F,
+        cluster_column_slices = T,
+        border=T,
+       # top_annotation = column_ha,
+        name='log2 Ints/\nmedian',
+        col=colorRamp2(colors=c(col.pal[1], 'white', col.pal[2]), breaks=c(-2,0,2)),
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=9, fontface='bold'),
+       # cluster_columns = clusterWNA(t(submat)),
+        column_split = factor(gsub('[.][123]$','', colnames(submat)), levels=c(strainMatched.levels)))
+hm
+BackupAsPDF(draw(hm, column_title='MRC5 ISGs'), 'MRC5.all.ISGs.noAnno.medianScaled.heatmap', dimensions = c(14,8))
+```
+ISG heatmaps
+```{r}
+# plot the human ISG response
+submat <- sweep(bat.mat, 1, apply(bat.mat[,grepl('Mock', colnames(bat.mat))], 1, mean, na.rm=T)) # mock sweep
+submat <- sweep(bat.mat, 1, apply(bat.mat, 1, median, na.rm=T)) # median sweep
+
+bat.S <- sweep(bat.S, 1, apply(bat.S, 1, median, na.rm=T))
+bat.S <- bat.S[rownames(bat.S) == 'S',]
+
+barColors <- ifelse(bat.S > 0, col.pal[2], col.pal[1])
+names(barColors) <- names(bat.S)
+
+column_ha <- HeatmapAnnotation('Spike protein/\nmedian' = anno_barplot(bat.S,
+                               gp = gpar(col=barColors, fill=barColors)))
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        cluster_columns = F,
+        cluster_column_slices = T,
+        border=T,
+        top_annotation = column_ha,
+        name='log2 Ints/\nmedian',
+        col=colorRamp2(colors=c(col.pal[1], 'white', col.pal[2]), breaks=c(-2,0,2)),
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+       # cluster_columns = clusterWNA(t(submat)),
+        column_split = factor(gsub('[.][123]$','', colnames(submat)), levels=c(strainMatched.levels)))
+hm
+BackupAsPDF(draw(hm, column_title='RFe ISGs'), 'RFe.ISGs.medianScaled.heatmap', dimensions = c(16,8))
+
+#w/o annotation
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        cluster_columns = F,
+        cluster_column_slices = T,
+        border=T,
+        #top_annotation = column_ha,
+        name='log2 Ints/\nmedian',
+        col=colorRamp2(colors=c(col.pal[1], 'white', col.pal[2]), breaks=c(-2,0,2)),
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+       # cluster_columns = clusterWNA(t(submat)),
+        column_split = factor(gsub('[.][123]$','', colnames(submat)), levels=c(strainMatched.levels)))
+hm
+BackupAsPDF(draw(hm, column_title='RFe ISGs'), 'RFe.ISGs.noAnno.medianScaled.heatmap', dimensions = c(16,8))
+```
+barplots of the ISGs
+*human*
+
+I think we need to summarise to the median in each of the replicates and then plot those..
+
+```{r}
+summary.dt <- p.quant.dt[cell_line == 'MRC5' & human_symbol %in% isGenes, .(medianISG = median(LogIntensities, na.rm=T)), by=.(GROUP, SUBJECT, strain, timepoint)]
+summary.dt[, strain := as.factor(strain)]
+summary.dt[, timepoint := factor(timepoint, levels=c('na', '6hpi', '12hpi', '24hpi', '48hpi'))]
+summary.dt[, SUBJECT := as.factor(SUBJECT)]
+summary.dt[, GROUP := factor(GROUP, levels=strainMatched.levels)]
+
+library(scales)
+
+g <- ggplot(summary.dt, aes(x=timepoint, y=medianISG, group=strain, fill=strain, color=strain, shape=SUBJECT)) +
+  geom_bar(position = "dodge", stat='summary', fun = "median", color='black', show.legend = F) +
+  geom_point(position = position_jitterdodge(jitter.width = .25), size=2, alpha=1, color='black') +
+  scale_shape_manual(values=c(21,22,23)) +
+  ggtitle('MRC5 ISG median expression') +
+  labs(x='timepoint (hrs)', y="ISG median intensity (log2)") +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+BackupAsPDF(g, 'MRC5.ISG.median.barplot')
+
+
+g <- ggplot(summary.dt[GROUP != 'Mock'], aes(x=timepoint, y=medianISG, group=strain, fill=strain, color=strain, shape=SUBJECT)) +
+  geom_bar(position = "dodge", stat='summary', fun = "median", color='black', show.legend = F) +
+  geom_point(position = position_jitterdodge(jitter.width = .25), size=2, alpha=1, color='black') +
+  scale_shape_manual(values=c(21,22,23)) +
+  ggtitle('MRC5 ISG median expression') +
+  labs(x='timepoint (hrs)', y="ISG median intensity (log2)") +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+BackupAsPDF(g, 'MRC5.ISG.median.noMock.barplot')
+
+
+g <- ggplot(summary.dt[GROUP != 'Mock'], aes(x=timepoint, y=medianISG, group=strain, fill=strain, color=strain, shape=SUBJECT)) +
+  geom_point(position = position_jitterdodge(jitter.width = .2), size=2, alpha=1, color='black') +
+  scale_shape_manual(values=c(21,22,23)) +
+  ggtitle('MRC5 ISG median expression') +
+  labs(x='timepoint (hrs)', y="ISG median intensity (log2)") +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+BackupAsPDF(g, 'MRC5.ISG.median.noMock.dotplot')
+```
+Now generate the same plots for the RFe data 
+
+```{r}
+summary.dt <- p.quant.dt[cell_line == 'RFe' & human_symbol %in% isGenes, .(medianISG = median(LogIntensities, na.rm=T)), by=.(GROUP, SUBJECT, strain, timepoint)]
+summary.dt[, strain := as.factor(strain)]
+summary.dt[, timepoint := factor(timepoint, levels=c('na', '6hpi', '12hpi', '24hpi', '48hpi'))]
+summary.dt[, SUBJECT := as.factor(SUBJECT)]
+summary.dt[, GROUP := factor(GROUP, levels=strainMatched.levels)]
+```
+
+
+```{r}
+g <- ggplot(summary.dt, aes(x=timepoint, y=medianISG, group=strain, fill=strain, color=strain, shape=SUBJECT)) +
+  geom_bar(position = "dodge", stat='summary', fun = "median", color='black', show.legend = F) +
+  geom_point(position = position_jitterdodge(jitter.width = .25), size=2, alpha=1, color='black') +
+  scale_shape_manual(values=c(21,22,23)) +
+  ggtitle('RFe ISG median expression') +
+  labs(x='timepoint (hrs)', y="ISG median intensity (log2)") +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+BackupAsPDF(g, 'RFe.ISG.median.barplot')
+
+
+g <- ggplot(summary.dt[GROUP != 'Mock'], aes(x=timepoint, y=medianISG, group=strain, fill=strain, color=strain, shape=SUBJECT)) +
+  geom_bar(position = "dodge", stat='summary', fun = "median", color='black', show.legend = F) +
+  geom_point(position = position_jitterdodge(jitter.width = .25), size=2, alpha=1, color='black') +
+  scale_shape_manual(values=c(21,22,23)) +
+  ggtitle('RFe ISG median expression') +
+  labs(x='timepoint (hrs)', y="ISG median intensity (log2)") +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+BackupAsPDF(g, 'RFe.ISG.median.noMock.barplot')
+
+
+g <- ggplot(summary.dt[GROUP != 'Mock'], aes(x=timepoint, y=medianISG, group=strain, fill=strain, color=strain, shape=SUBJECT)) +
+  geom_point(position = position_jitterdodge(jitter.width = .2), size=2, alpha=1, color='black') +
+  scale_shape_manual(values=c(21,22,23)) +
+  ggtitle('RFe ISG median expression') +
+  labs(x='timepoint (hrs)', y="ISG median intensity (log2)") +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+g
+BackupAsPDF(g, 'RFe.ISG.median.noMock.dotplot')
+```
+*Enrichment Analaysis*
+
+Run enrichment on the different genesets; lets look at the top terms recovered for each 
+
+Important note: 
+https://www.biostars.org/p/204939/
+The data source of KEGG was from NCBI. A rule of thumb for the ‘kegg’ ID is entrezgene ID for eukaryote species and Locus ID for prokaryotes.
+Rule of thumb is KEGG uses entrezID as kegg ID for eukaryotes and Locus ID for prokaryotes.
+BUT this is not guaranteed and KEGG can use different ID types (see post above) The kegg ID can be entrezgene (as in your example) or Locus or other types. Different species may use different type. We don't make assumption of it and keyType = "ENTREZID" is not accepted.
+
+Get the orgDB from `AnnotaitonHUb`
+```{r}
+library(AnnotationDbi)
+library(AnnotationHub) #provides access to large collections of publicly available whole genome resources, e.g,. ENSEMBL genome fasta or gtf files, UCSC chain resources, ENCODE data tracks at UCSC, etc.
+
+# create anno hu object
+ah <- AnnotationHub()
+dm <- query(ah, c("TxDb", "Ensembl", "Rhinolophus ferrumequinum"))
+
+# if all you know is species name etc, you can recover this record, get metadata and search
+# Find an orgDB for this exotic species and retrieve specific info
+dm <- query(ah, c("Rhinolophus ferrumequinum"))
+
+# get the metadata cols and grep to find file tpyes you want
+mcols(dm) %>% as.data.table(keep.rownames=T) %>% 
+  .[grep('OrgDb', rdataclass), rn] # id AH108239
+
+# dowload the file; use double brackets notation
+org.rt.db <- dm[['AH108239']] # orgDB
+
+```
+
+```{r}
+# get human DBs ready
+gmt.hs.go.bp <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='BP', keyType='SYMBOL')
+gmt.hs.go.cc <- loadGmtFromBioconductor(dbName='org.Hs.eg.db', ontology='CC', keyType='SYMBOL')
+gmt.hs.kegg <-  loadKegg(organism='hsa', keyType = 'kegg') # map to entrez ID
+
+# human kegg to symbol and can merge these tables and
+hsKeggMap.dt <- clusterProfiler:::bitr(gmt.hs.kegg$gene, fromType='ENTREZID', toType='SYMBOL', OrgDb='org.Hs.eg.db')
+gmt.hs.kegg <- merge(x=gmt.hs.kegg, y=hsKeggMap.dt, by.x="gene", by.y="ENTREZID", all.x=T)
+gmt.hs.kegg <- gmt.hs.kegg[, .(ont, gene = ifelse(SYMBOL == '', gene, SYMBOL), ont.id)]
+
+# get bat DBs ready
+# two approaches; load the terms directly from GO for that species (using bioMart)
+# or map bat/hu gene Ids and filter the human Go annotations
+# i think the first approach safer; not assuming homolgy and function are equivalent?
+gmt.bat.kegg <-  loadKegg(organism='rfq', keyType = 'kegg') 
+
+# convert kegg/entrez ID to gene
+# issue iwth this anno DB; seems mapping to SYMBOL is broken, so use alias, collapse and simplify
+batMap.dt <- data.table(clusterProfiler:::bitr(gmt.bat.kegg$gene, fromType='ENTREZID', toType='ALIAS', OrgDb=org.rt.db)) %>% 
+  .[, .(SYMBOL =  paste(ALIAS,collapse=';')), by=ENTREZID] %>%   # simplify names
+  .[, SYMBOL := ifelse(grepl(';', SYMBOL), gsub('[;].+','', SYMBOL), SYMBOL)]
+
+gmt.bat.kegg <- merge(x=gmt.bat.kegg, y=batMap.dt, by.x="gene", by.y="ENTREZID", all.x=T)
+gmt.bat.kegg <- gmt.bat.kegg[, .(ont = gsub('\\s[-].+', '', ont), gene = ifelse(SYMBOL == '', gene, SYMBOL), ont.id)]
+
+# previously created for another project...
+bat.GO.dt <- fread('~/Documents/projects/080624_JBatra_SARS2RNAseqHuBat/080824_PWcomparisons_data/2024_08_09_rferrumequinumGOpathways.csv')
+```
+tidy the bat GO gmt files
+```{r}
+gmt.bat.go.cc <- bat.GO.dt[ontology == 'cellular_component', .(ont=description, gene, ont.id=go.id)]
+gmt.bat.go.bp <-bat.GO.dt[ontology == 'biological_process', .(ont=description, gene, ont.id=go.id)]
+```
+
+```{r}
+
+mss.dt %>% colnames()
+runEnrichment <- function(dt, ont, keepCl='MRC5', title, isKEGG=F){
+  
+  sub.dt <-dt[cell_line==keepCl, ]
+  print(sub.dt)
+  
+  # pull out bg
+  universe <-  unique(sub.dt$gene)
+  
+  # create enrichment groups
+  sub.dt[, enrich.grp := interaction(Label, sig)]
+  #sub.dt[, enrich.grp := interaction(Label, reduced.sig)]
+  
+  # run GO enrichment on each group seperately
+  enrich.dt <- enricherOnGroups(sub.dt[sig != 'not'], 
+                              groupColumns = 'enrich.grp', 
+                              geneColumn = "gene", 
+                              term2gene.gmt = ont, 
+                              universe = universe)
+  
+  if (isKEGG) {
+    
+    return(list(
+              enrich=enrich.dt))
+    
+  } else {
+    simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, 
+                                                           gmt=ont, 
+                                                           groupColumn = 'enrich.grp',
+                                                           max_pAdjust = 0.1)
+    
+    return(list(
+              enrich=enrich.dt,
+              simpenrich=simp.enrich))
+  }
+}
+```
+
+I think for now, stay suspecious of the bat enrichments, focus on the human set and see if these behave differently in bat also; highlight these in the volcano plot
+```{r}
+# 
+hm.bp <- runEnrichment(mss.dt, ont=gmt.hs.go.bp, keepCl ='MRC5', title='GO Biological Process', isKEGG=F)
+hm.cc <- runEnrichment(mss.dt, ont=gmt.hs.go.cc, keepCl='MRC5', title='GO Biological Process', isKEGG=F)
+hm.kegg <- runEnrichment(mss.dt, ont=gmt.hs.kegg, keepCl='MRC5', title='GO KEGG Pathways', isKEGG = T) 
+
+fwrite(hm.bp$enrich, ScriptAndDatedFileName('human.GO.BP.enrichment.csv'))
+fwrite(hm.bp$simpenrich$simplified, ScriptAndDatedFileName('human.GO.BP.enrichment.simplified.csv'))
+fwrite(hm.cc$enrich, ScriptAndDatedFileName('human.GO.CC.enrichment.csv'))
+fwrite(hm.cc$simpenrich$simplified, ScriptAndDatedFileName('human.GO.CC.enrichment.simplified.csv'))
+fwrite(hm.kegg$enrich, ScriptAndDatedFileName('human.KEGG.enrichment.csv'))
+# find out what is happening with the kegg enrichment
+
+bat.bp <- runEnrichment(mss.dt, ont=gmt.bat.go.bp, keepCl='RFe', title='GO Biological Process', isKEGG=F)
+bat.cc <- runEnrichment(mss.dt, ont=gmt.bat.go.cc, keepCl='RFe', title='GO Biological Process', isKEGG=F)
+bat.kegg <- runEnrichment(mss.dt, ont=gmt.bat.kegg, keepCl='RFe', title='GO KEGG Pathways', isKEGG = T) 
+
+fwrite(bat.bp$enrich, ScriptAndDatedFileName('bat.GO.BP.enrichment.csv'))
+fwrite(bat.bp$simpenrich$simplified, ScriptAndDatedFileName('bat.GO.BP.enrichment.simplified.csv'))
+fwrite(bat.cc$enrich, ScriptAndDatedFileName('bat.GO.CC.enrichment.csv'))
+fwrite(bat.cc$simpenrich$simplified, ScriptAndDatedFileName('bat.GO.CC.enrichment.simplified.csv'))
+fwrite(bat.kegg$enrich, ScriptAndDatedFileName('bat.KEGG.enrichment.csv'))
+```
+Plot the vs Mock heatmaps
+
+```{r}
+
+plotHeatmap <- function(dt, keepCl='MRC5', pThresh=8, nTerms=4){
+  
+  subDT <- copy(dt) # create cp for modifying
+  enrich.grp.lvls <- c(paste0(levels.oi, '.up'), paste0(levels.oi, '.down'))
+  
+  if (keepCl == 'MRC5'){
+    
+      subDT[, enrich.grp := factor(enrich.grp, levels=grep('06hpi', enrich.grp.lvls, value=T, invert=T))]
+    
+  } else {
+    
+    subDT[, enrich.grp := factor(enrich.grp, levels=enrich.grp.lvls)]
+    #subDT[, enrich.grp := gsub('_6hpi', '_06hpi', enrich.grp, levels=enrich.grp.lvls)]
+    subDT[, enrich.grp := gsub('_6hpi', '_06hpi', enrich.grp)]
+    print(unique(subDT$enrich.grp))
+  }
+  
+  ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = subDT,
+                                  groupColumn = 'enrich.grp', 
+                                  cluster_columns=F,
+                                  cluster_column_slices=F,
+                                  #column_split=str_extract(levels(subDT),'down|up'),
+                                  #column_split=list(str_extract(levels(subDT$enrich.grp), '[0-9]{1,2}hpi'),
+                                  #                  str_extract(levels(subDT$enrich.grp),'down|up')),
+                                  negCols=unique(grep('down', subDT$enrich.grp, value=T)),
+                                  topN=nTerms,
+                                  row_names_gp = gpar(fontsize = 7), 
+                                  column_names_gp= gpar(fontsize = 8), 
+                                  upperThreshold = pThresh)
+  
+  return(ht)
+}
+
+```
+
+
+All the human enrichment heatmaps are good, but what is up with the others..
+```{r}
+BackupAsPDF(plotHeatmap(hm.bp$simpenrich$simplified[grepl('Mock', enrich.grp)], keepCl = 'MRC5'),'human.GO.BP.vsMock.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.cc$simpenrich$simplified[grepl('Mock', enrich.grp)], keepCl = 'MRC5'),'human.GO.CC.vsMock.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.kegg$enrich[grepl('Mock', enrich.grp)], keepCl = 'MRC5'),'human.kegg.vsMock.heatmap', dimensions = c(9,6))
+```
+Plot the same for bat
+
+```{r}
+BackupAsPDF(plotHeatmap(bat.bp$simpenrich$simplified[grepl('Mock', enrich.grp)], keepCl = 'RFe'),'bat.vsMock.GO.BP.heatmap', dimensions = c(11,8))
+BackupAsPDF(plotHeatmap(bat.cc$simpenrich$simplified[grepl('Mock', enrich.grp)], keepCl = 'RFe'),'bat.vsMock.GO.CC.heatmap', dimensions = c(11,8))
+BackupAsPDF(plotHeatmap(bat.kegg$enrich[grepl('Mock', enrich.grp)], keepCl = 'RFe'), 'bat.vsMock.kegg.heatmap', dimensions = c(11,8))
+```
+Move on to the strain level comparison
+
+```{r}
+BackupAsPDF(plotHeatmap(hm.bp$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T),], keepCl = 'MRC5'),'human.GO.BP.vsStrains.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.cc$simpenrich$simplified[grep('-Mock', enrich.grp, invert = T),], keepCl = 'MRC5'),'human.GO.CC.vsStrains.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.kegg$enrich[grep('-Mock', enrich.grp, invert=T),], keepCl = 'MRC5'),'human.kegg.vsStrains.heatmap', dimensions = c(9,6))
+
+BackupAsPDF(plotHeatmap(bat.bp$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T),], keepCl = 'RFe'),'bat.GO.BP.vsStrains.heatmap', dimensions = c(14,6))
+BackupAsPDF(plotHeatmap(bat.cc$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T),], keepCl = 'RFe'),'bat.GO.CC.vsStrains.heatmap', dimensions = c(14,6))
+BackupAsPDF(plotHeatmap(bat.kegg$enrich[grep('-Mock', enrich.grp, invert=T),], keepCl = 'RFe'),'bat.kegg.vsStrains.heatmap', dimensions = c(14,6))
+```
+problem with the human strain comparisons is very few genes are moving...
+lets look at using the reduced threshold and running the analysis again (chage to reduce threshold string in the function)
+
+```{r}
+mss.dt[, reduced.sig := 'not']
+mss.dt[abs(log2FC) > 0.58 & pvalue < 0.005 & !issue %in% c("oneConditionMissing","completeMissing"), reduced.sig := ifelse(log2FC > 0, 'up', 'down')]
+
+# rerun on the reduced thresholds
+hm.bp <- runEnrichment(mss.dt, ont=gmt.hs.go.bp, keepCl ='MRC5', title='GO Biological Process', isKEGG=F)
+hm.cc <- runEnrichment(mss.dt, ont=gmt.hs.go.cc, keepCl='MRC5', title='GO Cellular Component', isKEGG=F)
+hm.kegg <- runEnrichment(mss.dt, ont=gmt.hs.kegg, keepCl='MRC5', title='GO KEGG Pathways', isKEGG = T) 
+
+fwrite(hm.bp$enrich, ScriptAndDatedFileName('human.GO.BP.reducedThresholds.enrichment.csv'))
+fwrite(hm.bp$simpenrich$simplified, ScriptAndDatedFileName('human.GO.BP.reducedThresholds.enrichment.simplified.csv'))
+fwrite(hm.cc$enrich, ScriptAndDatedFileName('human.GO.CC.reducedThresholds.enrichment.csv'))
+fwrite(hm.cc$simpenrich$simplified, ScriptAndDatedFileName('human.GO.CC.reducedThresholds.enrichment.simplified.csv'))
+fwrite(hm.kegg$enrich, ScriptAndDatedFileName('human.KEGG.reducedThresholds.enrichment.csv'))
+```
+*Todo*
+Redo enrichment heatmaps of the human strain comparisons, but v little differnece
+Plot heatmaps of the sig genes from the different contrasts
+Maybe run GSEA on the different comparisons
+
+```{r}
+hm.bp$simpenrich$simplified[!grepl('Mock', enrich.grp) & p.adjust < 0.05]
+
+mss.dt[cell_line == 'MRC5' & !grepl('Mock', Label) &sig != 'not',.N, by=Label]
+mss.dt[cell_line == 'MRC5' & !grepl('Mock', Label) & reduced.sig != 'not',.N, by=Label]
+```
+
+
+plot the heatmaps of the reduced threshold runs
+
+```{r}
+plotHeatmap(hm.bp$simpenrich$simplified, keepCl = 'MRC5')
+BackupAsPDF(plotHeatmap(hm.bp$simpenrich$simplified[grep('-Mock', enrich.grp, invert=T),], keepCl = 'MRC5'),'human.GO.BP.vsStrains.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.cc$simpenrich$simplified[grep('-Mock', enrich.grp, invert = T),], keepCl = 'MRC5'),'human.GO.CC.vsStrains.heatmap', dimensions = c(9,6))
+BackupAsPDF(plotHeatmap(hm.kegg$enrich[grep('-Mock', enrich.grp, invert=T),], keepCl = 'MRC5'),'human.kegg.vsStrains.heatmap', dimensions = c(9,6))
+```
+
+plot the boxplots of ISGs for each of the strains/timepoints
+
+```{r}
+p.quant.dt <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_09_merged.proteinlvldata.csv')
+mss.dt <-  fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_08_mss.pwcomparisons.ortholog.annotations.csv')
+viral.prots <- read.csv('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_08_viralproteins.csv')
+```
+
+
+```{r}
+
+contrasts.oi <- grep('9b_T72I_N_P80T.+N_P80T|9b_T72I.+WT', mss.dt$Label, value=T) %>%  unique()
+
+mss.dt[, denominator_strain := gsub('_[0-9]{1,2}hpi', '', denominator)]
+mss.dt[, numerator_strain := gsub('_[0-9]{1,2}hpi', '', numerator)]
+mss.dt[, strainComparison := paste0(numerator_strain, '-', denominator_strain)]
+
+
+g <- ggplot(mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & human_symbol %in% isGenes & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, fill=strainComparison, label=human_symbol)) +
+  geom_boxplot(outliers=F) +
+#  geom_point(aes(fill = strainComparison), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge()) +
+  geom_jitter(aes(fill = strainComparison), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge(seed = 1)) +
+  geom_text(data=mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & human_symbol %in% isGenes & abs(log2FC) > 1 & !is.infinite(abs(log2FC)),], position = position_jitterdodge(seed = 1), size=2) +
+  ggtitle('MRC5 ISGs') +
+ # geom_text_repel(data=mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & human_symbol %in% isGenes & abs(log2FC) > 1,], position = position_jitter(seed = 1)) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+BackupAsPDF(g, 'MRC5.ISGs.boxplots', format='png')
+
+
+mss.dt$timepoint %>% unique()
+mss.dt[, timepoint := factor(timepoint, levels=c("6hpi","12hpi", "24hpi", "48hpi"))]
+
+g <- ggplot(mss.dt[cell_line == 'RFe' & Label %in% contrasts.oi & human_symbol %in% isGenes & !is.infinite(abs(log2FC)),], aes(x=timepoint, y=log2FC, fill=strainComparison, label=human_symbol)) +
+  geom_boxplot(outliers=F) +
+#  geom_point(aes(fill = strainComparison), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge()) +
+  geom_jitter(aes(fill = strainComparison), size = 1, shape = 21, alpha=0.7, position = position_jitterdodge(seed = 1)) +
+  geom_text(data=mss.dt[cell_line == 'RFe' & Label %in% contrasts.oi & human_symbol %in% isGenes & abs(log2FC) > 1 & !is.infinite(abs(log2FC)),], position = position_jitterdodge(seed = 1), size=2) +
+  ggtitle('RFe ISGs') +
+ # geom_text_repel(data=mss.dt[cell_line == 'MRC5' & Label %in% contrasts.oi & human_symbol %in% isGenes & abs(log2FC) > 1,], position = position_jitter(seed = 1)) +
+  labs(x='timepoint (hrs)', y="Log2 Fold Change") +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+    guides(fill = guide_legend(override.aes = list(shape =21)),
+           shape = guide_legend(title='replicate')) 
+
+
+g
+BackupAsPDF(g, 'RFe.ISGs.boxplots', format='png')
+```
+
+
+
+
+
+*not used*
+Need to plot nicer viral and ISG plots; try linecharts when have the time.... could do linecharts with different linetype per rep, but with colors the same
+
+```{r}
+g <- ggplot(p.quant.dt[cell_line == 'MRC5' & human_symbol %in% isGenes,], aes(x=timepoint, y=LogIntensities, color=strain)) +
+  geom_smooth(stat = 'summary', fun.y = median, se =TRUE, show.legend = T, aes(fill=strain), alpha=0.4) +
+  geom_point() +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+g
+```
+
+```{r}
+g <- ggplot(p.quant.dt[cell_line == 'MRC5' & human_symbol %in% isGenes & timepoint != 'na',], aes(x=timepoint, y=LogIntensities, color=strain, group=strain)) +
+  geom_smooth(stat = 'summary', fun.y = median, se =TRUE, show.legend = T, aes(fill=strain), alpha=0.4) +
+  scale_fill_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+g
+```
+# first try an ISG linechart to compare the different strains across time
+
+```{r}
+g <- ggplot(p.quant.dt[cell_line == 'MRC5' & human_symbol %in% isGenes,], aes(x=GROUP, y=LogIntensities, color=strain, shape=SUBJECT)) +
+  geom_smooth(stat = 'summary', fun.y = median, se =TRUE, show.legend = T, aes(fill=strain), alpha=0.4) +
+  ggtitle('MRC5 Median ISG expression') +
+  labs(x='timepoint (mins)', y="Intensity (log2)") +
+  scale_fill_ipsum() +
+  scale_color_ipsum() +
+  theme_ipsum_rc() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1)) +
+  guides(color=guide_legend(title='label'))
+
+g
+```
+
+```{r}
+# p quant data for both
+fwrite(dcast(p.quant.dt[cell_line == 'MRC5',], Protein+gene+human_symbol~paste0(GROUP,'.', SUBJECT), value.var='LogIntensities'), 'MRC5.pquant.wide.csv')
+fwrite(dcast(p.quant.dt[cell_line == 'RFe',], Protein+gene+human_symbol~paste0(GROUP,'.', SUBJECT), value.var='LogIntensities'), 'RFe.pquant.wide.csv')
+
+# wirte out the MSstat file
+fwrite(dcast(mss.dt[cell_line == 'MRC5',], Protein+gene+human_symbol~Label, value.var = c('log2FC', 'pvalue', 'p.adj')), 'MRC5.mss.pwComparisons.wide.csv')
+fwrite(dcast(mss.dt[cell_line == 'RFe',], Protein+gene+human_symbol~Label, value.var = c('log2FC', 'pvalue', 'p.adj')), 'RFe.mss.pwComparisons.wide.csv')
+```
+
+
+
+```{r}
+hu.S[rownames(hu.S) == 'S',]
+```
+```{r}
+
+
+hm <- Heatmap(submat, 
+        cluster_rows = clusterWNA(submat),
+        cluster_columns = F,
+        cluster_column_slices = F,
+        border=T,
+        top_annotation = column_ha,
+        name='log2 Ints/\nmedian',
+        col=colorRamp2(colors=c(col.pal[1], 'white', col.pal[2]), breaks=c(-2,0,2)),
+        column_names_gp = gpar(fontsize=6),
+        show_column_names = F,
+        column_title_gp = gpar(fontsize=8, fontface='bold'),
+       # cluster_columns = clusterWNA(t(submat)),
+        column_split = factor(gsub('[.][123]$','', colnames(submat)), levels=c(strainMatched.levels)))
+hm
+BackupAsPDF(draw(hm, column_title='MRC5 ISGs'), 'MRC5.all.ISGs.meanScaled.heatmap', dimensions = c(13,8))
+```
+
+*not used*
+
+To handle the one condition missing info, first lets 
+
+```{r}
+A1L4H1
+ms.list[[1]] %>% str()
+ms.list[[1]]$ProteinLevelData[Protein == 'A1L4H1' & GROUP %in% c('9b_T72I_N_P80T_12hpi', 'WT_12hpi')]
+
+
+ms.list[[1]]$ProteinLevelData[,.(nProteinPerGroup=.N), by=.(Protein, GROUP)]
+```
+
+
+Now pick out the contrasts that we need to run 
+
+```{r}
+lapply(ms.contrast.list, function(x){
+  
+  x[, p.adj := p.adjust(pvalue, method='BH'), by=.(Label)]
+  x[, sig := 'not']
+  x[abs(log2FC) > 0.58 & p.adj < 0.05 & !issue %in% c("oneConditionMissing","completeMissing"), sig := ifelse(log2FC > 0, 'up', 'down')]
+})
+```
+
+QC plots of the protein quant data and the 
+
+*not used*
+For writing functions...
+```{r}
+mrc5.peps <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_08_MRC5.featurelvl.csv')
+mrc5.prots <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_08_MRC5.proteinlvl.csv')
+rfe.peps <- fread('~/Documents/projects/121924_JBatra_SARS2_HuBatComparison_ABPHProteomics/080125_AB_PWcomparisons_data/2025_01_08_Rfe.featurelvl.csv')
+
+# get the  withpeptides with 
+mrc5.peps[, .(nPeptides=.N), .(PROTEIN, GROUP,SUBJECT)][nPeptides == 1]
+
+getNPeptidesPerProtein <- function(proteinlvlDT,petidelvlDT, peptideThreshold){
+  
+  npeptides.dt <- petidelvlDT[!is.na(ABUNDANCE), .(nPeptides=.N), .(PROTEIN, GROUP,SUBJECT)]
+  low.peptides.dt <- npeptides.dt[nPeptides <= peptideThreshold,]
+  
+  message('Recovered ', length(unique(low.peptides.dt$PROTEIN)), ' unique proteins identified by <= ', peptideThreshold, ' peptides in total')  
+  message('Number of proteins per sample supported by <= ', peptideThreshold, ' peptides:\n')  
+  print(table(low.peptides.dt[,.(GROUP,SUBJECT)]))
+  
+  merge.dt <- merge(x=proteinlvlDT, y=npeptides.dt, by.x=c('Protein', 'GROUP', 'SUBJECT'), by.y=c('PROTEIN', 'GROUP', 'SUBJECT'), all.x=T)
+  stopifnot(nrow(merge.dt) == nrow(proteinlvlDT))
+    message('mismatch in peptide table and protein level table')
+  
+  return(merge.dt)
+}
+```
+

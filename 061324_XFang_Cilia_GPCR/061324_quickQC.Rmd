@@ -1,0 +1,831 @@
+---
+author: "Martin Gordon"
+date: "2024-06-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Overview
+APEX_MS GPCR study in Cilia cells
+
+## quick QC of files
+# looks like 4 bioreplicates per group
+Q. what do the groups look like?
+Conditions:
+
+How many variables do we have here?
+1 +/- cilia (2 lvls)
+2 treatments
+
+
+Options:
+For normalization, look at biorep 2 and 4 and lets see how the output looks
+Could also take the average? (maybe diluting the volume effect?)
+Question: clustering on the PCA looks a lot better than clustering with all vals.... is missingness driving the clustering? (in addiiton to magnitude, extra normalization needed)
+Dont think batch will be a major problem as will be controlling for this in the linear model.. could rm batch and then view the heatmaps? may need to think of alt norm method (analyse by group/biological question)
+Quantile normalization may help here. Why equilizeMedians just focues on making medians across sampples the same, but if there are a lot of outliers (as there are here)
+Quantile normalization aims to make distribtuion of exp values the same across groups... do we expect this in an apex experiment? What about with our background labelling for example?
+Not sure if this will work..
+
+What about normalizing to an endogeonously biotinylating Protein set?
+
+```{r}
+library(magrittr)
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+library(ggplot2)
+library(stringr)
+library(randomcoloR)
+library(MSstats)
+library(ggrepel)
+library(readxl)
+library(usedist) #package for working with distances
+library(ggh4x) # additional functionality for ggplot2 obj
+library(scales)
+library(patchwork)
+
+source("../../utils/bp_utils/MSstats_Helper_Functions.R")
+source("../../utils/bp_utils/ManageScriptData.R")
+source ("../../utils/bp_utils/MSstats_V4_Functions.R")
+source ("../../utils/bp_utils/UniprotIDMapping.R") #uniprot to gene id mapping
+source ("../../utils/bp_utils/enrichmentTestFunctions.R")
+
+source ("../../utils/mg_utils/r_utils/IDmapping.R")
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0,...){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+```
+read in the raw files 
+
+```{r}
+spec <-  fread('./data/CR1/20240611_105801_CR1_directDIA_Report.tsv')
+spec[,.N, by=.(BioReplicate)]
+
+# create some new ID columns 
+spec[, agonist := ifelse(grepl('_ag$', Condition), 'Yes','No')]
+spec %>%  str()
+```
+
+read in metadata..
+Dont need as already mapped to Conditions
+
+```{r}
+keys <- fread('./data/CR1/CR1_directDIA_ConditionSetup.tsv')
+keys[, unique(Condition)]
+rm(keys)
+```
+
+Look at the intensity distributions
+
+```{r}
+# no multiple feature peptide ions detected.. proceed as is
+spec[,.N, by=.(PeptideSequence,PrecursorCharge,Run)][N >1]
+
+
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram()
+
+spec <- spec[Intensity > 2^4,]
+
+ggplot(spec, aes(x=log2(Intensity))) +
+  geom_histogram()
+```
+Define a base directory for the plots and color palette
+
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(k=length(unique(spec$Condition)))
+
+baseDir <- "~/Documents/projects/061324_XFang_Cilia_GPCR/061324_quickQC_data/pdfs/"
+```
+
+
+A couple of the samples are poor quality.. lets look at feature counts
+```{r}
+png(filename=paste0(baseDir, 'peptide.Ints.boxplots.png'), width=14, height=8, units = 'in', res=200)
+g <- ggplot(spec, aes(x=paste0(Condition,'.',BioReplicate), y=log2(Intensity), fill=Condition)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  ggtitle('Peptide Intensity Distribution') +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90,size=6))
+g
+dev.off()
+#BackupAsPDF(g, 'peptide.Ints.boxplots', dimensions=c(12,7))
+```
+
+Looks like there is a lot of variability within the groups...
+```{r}
+png(filename=paste0(baseDir, 'features.rawCounts.png'), width=14, height=8, units = 'in', res=200)
+g <- ggplot(spec[,.N, by=.(Condition,BioReplicate)], aes(x=reorder(interaction(Condition,BioReplicate)), y=N, fill=Condition)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=5))
+
+g
+dev.off()
+```
+Lets replot this and order by run to see what we recover 
+No obvious trend to low counts for a given run order... issues seem pretty evenly dispersed
+
+```{r}
+png(filename=paste0(baseDir, 'features.rawCounts.runOrder.png'), width=14, height=8, units = 'in', res=200)
+g <- ggplot(spec[,.(.N, Run = as.numeric(gsub('exD|[.]raw','', Run))), by=.(Condition,BioReplicate)], 
+            aes(x=reorder(paste0(Condition,'.',BioReplicate,'.run',Run), Run), y=N)) +
+  geom_bar(stat='Identity') +
+  ggtitle('N features per sample') +
+  scale_fill_manual(values= col.pal) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=90, size=5))
+
+g
+dev.off()
+```
+
+PCA features 
+----
+ 
+```{r}
+featureMat <- dcast(spec, paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") %>% 
+  as.matrix(rownames = "PeptideSequence")
+dim(featureMat)
+
+featureMat <- featureMat[complete.cases(featureMat), ]
+dim(featureMat)
+```
+
+So many conditions it makes comparisons v difficult between the groups..
+Also, this clustering might be very different in hierarchical as driven by missingness not captured in PCA
+
+No obvious seperation along PC1 nad PC2 by presence of cilia, however does look to be clustering by status/GPCR
+Seems that replicate number (batch right?) is a big driver of variation in the data
+
+```{r}
+pcaOut <- prcomp(t(log2(featureMat)))
+
+colInfo <- data.table(colname = colnames(featureMat))
+colInfo[, cilia_present := ifelse(grepl('-cilia', colname), 'No', 'Yes')]
+colInfo[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', colname), 'Yes', 'No')]
+colInfo[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', colname)]
+colInfo[, rep := str_extract(colname, '[0-9]$')]
+colInfo
+#PCA
+pcaDT <- as.data.table(pcaOut$x, keep.rownames=TRUE)
+pcaPercentVar <- round(100 * (pcaOut$sdev^2)/sum(pcaOut$sdev^2), 1)
+pcaDT <- merge (pcaDT, colInfo, by.x = "rn", by.y = "colname", all.x = TRUE)
+
+#plot first two components
+p <- ggplot (pcaDT, aes(x=PC1, y=PC2,  fill = rep, shape = cilia_present)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, "features.repCol.pca", dimensions = c(12,9))
+```
+Feature heatmap
+
+```{r}
+featureMat <- dcast(spec,
+                     paste0(PeptideSequence, PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") %>% 
+  as.matrix(rownames = "PeptideSequence")
+
+#  log transform
+featureMat <-  log2(featureMat)
+
+# create annotation
+ann <- data.table(group = colnames(featureMat))
+ann[, cilia_present := ifelse(grepl('-cilia', group), 'No', 'Yes')]
+ann[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', group), 'Yes', 'No')]
+ann[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', group)]
+ann[, rep := str_extract(group, '[0-9]$')]
+
+# unique col palette
+col.subset <- (col.pal[1:10])
+names(col.subset) <- unique(ann$status)   
+
+colours <- list('cilia_present' = c('Yes' = '#4477AA', 'No'="#CCBB44"),
+                'agonist_present' = c('Yes' = '#EE6677', 'No'='#228833'),
+                'rep' = c('1'=muted('green'), '2'=muted('yellow'), '3'=muted('pink'), '4'=muted('orange')),
+                'status' = col.subset)
+   
+      
+colAnn <- HeatmapAnnotation(df = ann[,.(status,cilia_present, agonist_present,rep)], col= colours)
+
+# subset the data
+submat <- featureMat[sample(rownames(featureMat), 3000), ]
+
+submat <- sweep(submat,1, STATS=apply(submat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+              cluster_rows=clusterWNA(submat), 
+              show_row_names = F, 
+              row_title = sprintf('%s features', nrow(submat)),
+              cluster_columns = T, 
+              top_annotation = colAnn, 
+              name='LogIntensities/Median',  
+              column_names_gp = gpar(fontsize=5))
+hm
+BackupAsPDF(hm, 'features.clustered.medianscaled.heatmap', dimensions = c(10,10))
+```
+
+Plot a heatmap of all the cluster samples
+
+```{r}
+#  log transform
+featureMat <-  featureMat[complete.cases(featureMat),]
+
+# create annotation
+ann <- data.table(group = colnames(featureMat))
+ann[, cilia_present := ifelse(grepl('-cilia', group), 'No', 'Yes')]
+ann[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', group), 'Yes', 'No')]
+ann[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', group)]
+ann[, rep := str_extract(group, '[0-9]$')]
+
+colours <- list('cilia_present' = c('Yes' = '#4477AA', 'No'="#CCBB44"),
+                'agonist_present' = c('Yes' = '#EE6677', 'No'='#228833'),
+                'rep' = c('1'=muted('green'), '2'=muted('yellow'), '3'=muted('pink'), '4'=muted('orange')),
+                'status' = col.subset)
+
+colAnn <- HeatmapAnnotation(df = ann[,.(status,cilia_present, agonist_present,rep)])
+
+# subset the data
+submat <- featureMat[sample(rownames(featureMat), 3000), ]
+
+submat <- sweep(submat,1, STATS=apply(submat, 1, median, na.rm=T))
+
+hm <- Heatmap(submat, 
+              cluster_rows=clusterWNA(submat), 
+              show_row_names = F, 
+              cluster_columns = T, 
+              row_title = sprintf('%s features', nrow(submat)),
+              top_annotation = colAnn, 
+              name='LogIntensities/Median',  
+              column_names_gp = gpar(fontsize=5))
+hm
+BackupAsPDF(hm, 'features.clustered.medianscaled.complete.cases.heatmap', dimensions = c(10,10))
+```
+What samples to drop
+
+## Summarisation & Normalisation
+Running MSstats processing
+
+```{r}
+mssInput <- spec[, IsotopeLabelType := 'L']
+```
+
+Run MSStats dataProcess
+
+```{r}
+dp.out <- MSstats::dataProcess(mssInput, 
+                               MBimpute =  FALSE, 
+                               normalization = 'EQUALIZEMEDIANS',
+                               featureSubset = "highQuality", 
+                               remove_uninformative_feature_outlier = TRUE)
+
+
+saveRDS(dp.out, ScriptAndDatedFileName('dp.out.rds'))
+```
+
+plot the 
+
+```{r}
+p.quant <- setDT(dp.out$ProteinLevelData)
+
+ggplot(p.quant, aes(x=paste0(SUBJECT, '.',GROUP), y=LogIntensities, fill=SUBJECT)) +
+  geom_boxplot()
+```
+```{r}
+p.mat <-dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- sweep(p.mat, 1, STAT=apply(p.mat,1, median, na.rm=T))
+
+submat <- submat[sample(rownames(submat), 3000),]
+
+Heatmap(submat, 
+        show_row_names = F,
+        cluster_rows = clusterWNA(submat),
+        column_split=gsub('[.][1-6]$','', colnames(submat)))
+
+# create annotation
+ann <- data.table(group = colnames(featureMat))
+ann[, cilia_present := ifelse(grepl('-cilia', group), 'No', 'Yes')]
+ann[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', group), 'Yes', 'No')]
+ann[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', group)]
+ann[, rep := str_extract(group, '[0-9]$')]
+
+# unique col palette
+col.subset <- (col.pal[1:10])
+names(col.subset) <- unique(ann$status)   
+
+colours <- list('cilia_present' = c('Yes' = '#4477AA', 'No'="#CCBB44"),
+                'agonist_present' = c('Yes' = '#EE6677', 'No'='#228833'),
+                'rep' = c('1'=muted('green'), '2'=muted('yellow'), '3'=muted('pink'), '4'=muted('orange')),
+                'status' = col.subset)
+   
+      
+colAnn <- HeatmapAnnotation(df = ann[,.(status,cilia_present, agonist_present,rep)], col= colours)
+   
+Heatmap(submat,
+        cluster_rows = clusterWNA(submat),
+        top_annotation = colAnn)
+```
+```{r}
+p.mat <- p.mat[complete.cases(p.mat),]
+
+pca <- prcomp(t(p.mat))
+
+pca.dt <- data.table(pca$x, keep.rownames = T)
+pca.dt <- merge(x=pca.dt, y=ann, by.x='rn', by.y='group')
+
+
+# calculate variance explained
+
+pcaPercentVar <- round(100 * (pca$sdev^2)/sum(pca$sdev^2), 1)
+pcaPercentVar
+
+data.table(VarExplained=pcaPercentVar, PC=factor(1:length(pcaPercentVar)))
+
+g <- ggplot(data.table(VarExplained=pcaPercentVar, PC=factor(1:length(pcaPercentVar[])))[1:10,],
+       aes(x=PC, y=VarExplained)) +
+  geom_bar(stat='Identity')
+
+BackupAsPDF(g, 'PCs.varExplained.protein.allSamples.barplot')
+
+
+#plot first two components
+pca.dt[, group := gsub('.[0-9]$','', rn)]
+
+p <- ggplot (pca.dt, aes(x=PC1, y=PC2,  fill = group, shape = cilia_present)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'proteins.statusCol.pac', dimensions=c(10,10))
+```
+
+Or take the average of the two reps.. lets try take the average
+Tried estimating avg, maybe better just take rep 2 for now
+
+```{r}
+# create backup copy
+#mssInput.bak <- copy(mssInput)
+
+mssInput <- copy(mssInput.bak)
+# convert it to biorep2 and take the average
+mssInput <- mssInput[BioReplicate != 4, ]
+```
+
+Run MSStats data process and plot again
+
+```{r}
+dp.out <- MSstats::dataProcess(mssInput, 
+                               MBimpute =  FALSE, 
+                               normalization = 'EQUALIZEMEDIANS',
+                               featureSubset = "highQuality", 
+                               remove_uninformative_feature_outlier = TRUE)
+```
+
+```{r}
+saveRDS(dp.out, ScriptAndDatedFileName('dp.out.rmBR4.rds'))
+```
+
+Lets plots the above heatmaps and PCAs and see how things look
+Still needs some tidying...
+
+```{r}
+p.quant <- setDT(dp.out$ProteinLevelData)
+
+ggplot(p.quant, aes(x=paste0(SUBJECT, '.',GROUP), y=LogIntensities, fill=SUBJECT)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90))
+```
+
+```{r}
+p.mat <-dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- sweep(p.mat, 1, STAT=apply(p.mat,1, median, na.rm=T))
+submat <- submat[sample(rownames(submat), 3000),]
+
+Heatmap(submat, 
+        show_row_names = F,
+        cluster_rows = clusterWNA(submat),
+        column_split=gsub('[.][1-6]$','', colnames(submat)))
+
+# create annotation
+ann <- data.table(group = colnames(submat))
+ann[, cilia_present := ifelse(grepl('-cilia', group), 'No', 'Yes')]
+ann[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', group), 'Yes', 'No')]
+ann[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', group)]
+ann[, rep := str_extract(group, '[0-9]$')]
+
+# unique col palette
+col.subset <- (col.pal[1:10])
+names(col.subset) <- unique(ann$status)   
+
+colours <- list('cilia_present' = c('Yes' = '#4477AA', 'No'="#CCBB44"),
+                'agonist_present' = c('Yes' = '#EE6677', 'No'='#228833'),
+                'rep' = c('1'=muted('green'), '2'=muted('yellow'), '3'=muted('pink'), '4'=muted('orange')),
+                'status' = col.subset)
+   
+colAnn <- HeatmapAnnotation(df = ann[,.(status,cilia_present, agonist_present,rep)], col= colours)
+   
+hm <- Heatmap(submat,
+        cluster_rows = clusterWNA(submat),
+        show_row_names = F,
+        column_names_gp = gpar(fontsize=6),
+        top_annotation = colAnn)
+
+BackupAsPDF(hm, 'prots.rmBR4.heatmap', dimensions=c(10,8))
+```
+
+pca
+1303 proteins when using samples 1-3..
+1598 proteins when using samples 134... maybe keep as recovering more?
+lets try 134 and see how many proteins we recover
+
+```{r}
+p.mat <- p.mat[complete.cases(p.mat),]
+dim(p.mat)
+pca <- prcomp(t(p.mat))
+
+pca.dt <- data.table(pca$x, keep.rownames = T)
+pca.dt <- merge(x=pca.dt, y=ann, by.x='rn', by.y='group')
+
+
+# calculate variance explained
+
+pcaPercentVar <- round(100 * (pca$sdev^2)/sum(pca$sdev^2), 1)
+pcaPercentVar
+
+data.table(VarExplained=pcaPercentVar, PC=factor(1:length(pcaPercentVar)))
+
+g <- ggplot(data.table(VarExplained=pcaPercentVar, PC=factor(1:length(pcaPercentVar[])))[1:10,],
+       aes(x=PC, y=VarExplained)) +
+  geom_bar(stat='Identity')
+g
+BackupAsPDF(g, 'PCs.varExplained.protein.rmBR4.barplot')
+
+
+#plot first two components
+# 
+pca.dt[, group := gsub('.[0-9]$','', rn)]
+
+p <- ggplot (pca.dt, aes(x=PC1, y=PC2,  fill = agonist_present, shape = cilia_present)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'proteins.ciliaCol.rmBR4.pca', dimensions=c(10,10))
+```
+Lets drop 2, more issues with data quality looking at boxplots and counts and aslo +cilia_ARL13b.1 as seems an outlier sample
+```{r}
+# create backup copy
+#mssInput.bak <- copy(mssInput)
+mssInput <- copy(mssInput.bak)
+
+# convert it to biorep2 and take the average
+mssInput <- mssInput[BioReplicate != 4, ]
+
+mssInput <- mssInput[!(Condition == '+cilia_ARL13b' & BioReplicate == 1),]
+```
+
+Run MSStats data process and plot again
+
+```{r}
+dp.out <- MSstats::dataProcess(mssInput, 
+                               MBimpute =  FALSE, 
+                               normalization = 'QUANTILE',
+                               featureSubset = "highQuality", 
+                               remove_uninformative_feature_outlier = TRUE)
+```
+
+```{r}
+saveRDS(dp.out, ScriptAndDatedFileName('dp.out.rmBR2.andOutlier.rds'))
+```
+
+Lets plots the above heatmaps and PCAs and see how things look
+Still needs some tidying...
+
+```{r}
+p.quant <- setDT(dp.out$ProteinLevelData)
+
+p.quant[,.N, by=.(GROUP,SUBJECT)][order(GROUP)]
+
+ggplot(p.quant, aes(x=paste0(SUBJECT, '.',GROUP), y=LogIntensities, fill=SUBJECT)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle=90))
+```
+
+
+```{r}
+p.mat <-dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- sweep(p.mat, 1, STAT=apply(p.mat,1, median, na.rm=T))
+submat <- submat[sample(rownames(submat), 3000),]
+
+Heatmap(submat, 
+        show_row_names = F,
+        cluster_rows = clusterWNA(submat),
+        column_split=gsub('[.][1-6]$','', colnames(submat)))
+
+# create annotation
+ann <- data.table(group = colnames(submat))
+ann[, cilia_present := ifelse(grepl('-cilia', group), 'No', 'Yes')]
+ann[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', group), 'Yes', 'No')]
+ann[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', group)]
+ann[, rep := str_extract(group, '[0-9]$')]
+
+# unique col palette
+col.subset <- (col.pal[1:10])
+names(col.subset) <- unique(ann$status)   
+
+colours <- list('cilia_present' = c('Yes' = '#4477AA', 'No'="#CCBB44"),
+                'agonist_present' = c('Yes' = '#EE6677', 'No'='#228833'),
+                'rep' = c('1'=muted('green'), '2'=muted('yellow'), '3'=muted('pink'), '4'=muted('orange')),
+                'status' = col.subset)
+   
+colAnn <- HeatmapAnnotation(df = ann[,.(status,cilia_present, agonist_present,rep)], col= colours)
+   
+hm <- Heatmap(submat,
+        cluster_rows = clusterWNA(submat),
+        show_row_names = F,
+        column_names_gp = gpar(fontsize=6),
+        top_annotation = colAnn)
+
+hm
+BackupAsPDF(hm, 'prots.rmBR2.rmOutlier.heatmap', dimensions=c(10,8))
+```
+
+```{r}
+p.mat <- p.mat[complete.cases(p.mat),]
+pca <- prcomp(t(p.mat))
+
+pca.dt <- data.table(pca$x, keep.rownames = T)
+pca.dt <- merge(x=pca.dt, y=ann, by.x='rn', by.y='group')
+
+
+# calculate variance explained
+
+pcaPercentVar <- round(100 * (pca$sdev^2)/sum(pca$sdev^2), 1)
+pcaPercentVar
+
+data.table(VarExplained=pcaPercentVar, PC=factor(1:length(pcaPercentVar)))
+
+g <- ggplot(data.table(VarExplained=pcaPercentVar, PC=factor(1:length(pcaPercentVar[])))[1:10,],
+       aes(x=PC, y=VarExplained)) +
+  geom_bar(stat='Identity')
+g
+BackupAsPDF(g, 'PCs.varExplained.protein.rmBR2.rmOutlier.barplot')
+
+
+#plot first two components
+# 
+pca.dt[, group := gsub('.[0-9]$','', rn)]
+
+p <- ggplot (pca.dt, aes(x=PC1, y=PC2,  fill = agonist_present, shape = cilia_present)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'proteins.repCol.rmBR2.rmOutlier.pca', dimensions=c(10,10))
+```
+Maybe remove -cilia_PM.1? seems to be closer to the -cilia-marker group
+
+Try another round of normalisation
+Assuming most things not DE, so lets try additional correction to adjust intensites 
+
+```{r}
+p.mat <-dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+tmp <- medpolish(p.mat, na.rm=T)
+tmp.dt <- data.table(sample = names(tmp$col),
+                     offSet = tmp$col)
+
+
+# merge this with p.quant and subtrac
+p.quant[, sample := interaction(GROUP,SUBJECT)]
+p.quant <- merge(p.quant, tmp.dt, by='sample')
+
+p.quant[, newLogInts :=  LogIntensities - offSet]
+
+```
+
+
+Try additional round of normalisation and save the output
+```{r}
+g <- ggplot(p.quant, aes(x=paste0(GROUP, '.', SUBJECT), y=newLogInts, fill=GROUP)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90, size=6))
+
+BackupAsPDF(g, 'protein.tmp.ints.boxplot', dimensions=c(10,7))
+
+g <- ggplot(p.quant, aes(x=paste0(GROUP, '.', SUBJECT), y=LogIntensities, fill=GROUP)) +
+  geom_boxplot() +
+  scale_fill_manual(values=col.pal) +
+  theme(axis.text.x = element_text(angle=90, size=6))
+
+BackupAsPDF(g, 'protein.ints.boxplot', dimensions=c(10,7))
+```
+lets see the tmp PCA and alos the heatmap
+```{r}
+p.mat <-dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = 'newLogInts') %>% 
+  as.matrix(rownames='Protein')
+
+submat <- sweep(p.mat, 1, STAT=apply(p.mat,1, median, na.rm=T))
+submat <- submat[sample(rownames(submat), 3000),]
+
+Heatmap(submat, 
+        show_row_names = F,
+        cluster_rows = clusterWNA(submat),
+        column_split=gsub('[.][1-6]$','', colnames(submat)))
+
+# create annotation
+ann <- data.table(group = colnames(submat))
+ann[, cilia_present := ifelse(grepl('-cilia', group), 'No', 'Yes')]
+ann[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', group), 'Yes', 'No')]
+ann[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', group)]
+ann[, rep := str_extract(group, '[0-9]$')]
+
+# unique col palette
+col.subset <- (col.pal[1:10])
+names(col.subset) <- unique(ann$status)   
+
+colours <- list('cilia_present' = c('Yes' = '#4477AA', 'No'="#CCBB44"),
+                'agonist_present' = c('Yes' = '#EE6677', 'No'='#228833'),
+                'rep' = c('1'=muted('green'), '2'=muted('yellow'), '3'=muted('pink'), '4'=muted('orange')),
+                'status' = col.subset)
+   
+colAnn <- HeatmapAnnotation(df = ann[,.(status,cilia_present, agonist_present,rep)], col= colours)
+   
+hm <- Heatmap(submat[complete.cases(submat),],
+        cluster_rows = clusterWNA(submat[complete.cases(submat),], method='pearson'),
+        show_row_names = F,
+        column_names_gp = gpar(fontsize=6),
+        top_annotation = colAnn)
+
+hm
+BackupAsPDF(hm, 'prots.tmp.rmBR2.rmOutlier.pearson.heatmap', dimensions=c(10,8))
+```
+Looks worse if anything... seems to be more clustering by batch.. look at PCA
+
+```{r}
+p.mat <- p.mat[complete.cases(p.mat),]
+pca <- prcomp(t(p.mat))
+
+pca.dt <- data.table(pca$x, keep.rownames = T)
+pca.dt <- merge(x=pca.dt, y=ann, by.x='rn', by.y='group')
+
+
+# calculate variance explained
+
+pcaPercentVar <- round(100 * (pca$sdev^2)/sum(pca$sdev^2), 1)
+pcaPercentVar
+
+data.table(VarExplained=pcaPercentVar, PC=factor(1:length(pcaPercentVar)))
+
+g <- ggplot(data.table(VarExplained=pcaPercentVar, PC=factor(1:length(pcaPercentVar[])))[1:10,],
+       aes(x=PC, y=VarExplained)) +
+  geom_bar(stat='Identity')
+g
+BackupAsPDF(g, 'PCs.varExplained.protein.rmBR2.rmOutlier.barplot')
+
+
+#plot first two components
+# 
+pca.dt[, group := gsub('.[0-9]$','', rn)]
+
+p <- ggplot (pca.dt, aes(x=PC1, y=PC2,  fill = status, shape = cilia_present)) + 
+  geom_point(alpha=1.0, size=4) + 
+  ggrepel::geom_text_repel(aes(label=rn), show.legend = FALSE, size = 3) +
+  theme_bw() + 
+  xlab (sprintf ("PC1, %.1f%%", pcaPercentVar[1])) + 
+  ylab (sprintf ("PC2, %.1f%%", pcaPercentVar[2])) + 
+  ggtitle (sprintf ("PCA %s using %d features (log intensity)", title, nrow(pcaOut))) +
+  scale_color_brewer(type = "qual", palette = "Dark2") +
+  scale_shape_manual(values = c(21:26)) +
+  scale_fill_manual(values = col.pal) +
+  guides(fill = guide_legend(override.aes = list(shape =21) ) ,
+         color = guide_legend(override.aes = list(shape =21) ) )
+
+p
+BackupAsPDF(p, 'proteins.tmp.rmBR2.rmOutlier.pca', dimensions=c(10,10))
+```
+Diagnose why the normalization may not work very well
+Investigate CV within samples before and after normalization
+
+Compare the spec and postnormalised data
+
+```{r}
+library(RColorBrewer)
+col.pal <- brewer.pal(n=length(unique(spec$Condition)),name='Set3')
+
+feat.mat <- dcast(spec[BioReplicate != 4,], paste0(PeptideSequence,'.',PrecursorCharge)~interaction(Condition,BioReplicate), value.var = "Intensity") %>% 
+  as.matrix(rownames='PeptideSequence')
+
+feat.mat <-  log2(feat.mat)
+
+dp.out <- readRDS('~/Documents/projects/061324_XFang_Cilia_GPCR/061324_quickQC_data/2024_06_14_dp.out.rmBR4.rds')
+f.quant <- setDT(dp.out$FeatureLevelData)
+p.quant <- setDT(dp.out$ProteinLevelData)
+
+#f.mat <- dcast(f.quant[SUBJECT != 4,], paste0(FEATURE)~interaction(GROUP,SUBJECT), value.var = "INTENSITY") %>% 
+#  as.matrix(rownames='FEATURE')
+#f.mat <- log2(f.mat)
+
+p.mat <- dcast(p.quant, Protein~interaction(GROUP,SUBJECT), value.var = "LogIntensities") %>% 
+  as.matrix(rownames='Protein')
+
+spec.cv <- apply(feat.mat, 2, function(x){sd(x, na.rm=T)/mean(x, na.rm=T)})
+proc.cv <- apply(p.mat, 2, function(x){sd(x, na.rm=T)/mean(x, na.rm=T)})
+
+spec.dt <- data.table(CV=spec.cv,
+                      sample=names(spec.cv))
+
+spec.dt[, cilia_present := ifelse(grepl('-cilia', sample), 'No', 'Yes')]
+spec.dt[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', sample), 'Yes', 'No')]
+spec.dt[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', sample)]
+spec.dt[, rep := str_extract(sample, '[0-9]$')]
+
+proc.dt <- data.table(CV=proc.cv,
+                      sample=names(proc.cv))
+
+proc.dt[, cilia_present := ifelse(grepl('-cilia', sample), 'No', 'Yes')]
+proc.dt[, agonist_present := ifelse(grepl('_ag[.][0-9]{1}$', sample), 'Yes', 'No')]
+proc.dt[, status := gsub("[-+]{1}cilia_|_ag[.][0-9]{1}$|[.][0-9]{1}$",'', sample)]
+proc.dt[, rep := str_extract(sample, '[0-9]$')]
+
+# all the samples seem to have more CV before normalisation, so good indication to keep the data
+sum(spec.cv > proc.cv)
+```
+Plot the coefficient of variation before and after normalization
+```{r}
+g <- ggplot(spec.dt, aes(x=sample, y=CV, fill=status)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90,size=6))
+
+BackupAsPDF(g, 'CV.rawData.barplot', dimensions = c(10,8))
+
+
+g <- ggplot(proc.dt, aes(x=sample, y=CV, fill=status)) +
+  geom_bar(stat='Identity') +
+  scale_fill_manual(values=col.pal) +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=90,size=6))
+g
+BackupAsPDF(g, 'CV.procData.peptides.barplot', dimensions = c(10,8))
+
+```
+
+I think best approach is to drop BR4 and also some of the low quality sampless

@@ -1,0 +1,245 @@
+---
+title: "042525_sanityCheckFiles"
+author: "Martin Gordon"
+date: "2025-04-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## packages
+
+Suggest fix to Jack is to filter reads beyond a certain length; we can't be certain of psites of the coverage is low
+```{r}
+library(data.table)
+library(Rsamtools)
+library(magrittr)
+library(ggplot2)
+library(devtools)
+library(riboWaltz)
+library(hrbrthemes)
+library(seqinr)
+library(Biostrings)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/mg_utils/r_utils/plottingHelperFunctions.R")
+source("../../utils/mg_utils/r_utils/bamProcessing.R")
+
+
+# function to cluster w NA values
+clusterWNA <-  function(mat, na.value=0){
+  
+  mat[is.na(mat)] <- na.value
+  return(hclust(dist(mat)))
+}
+
+col.pal <- getQualitativePalette(n=13)
+
+
+```
+
+## Outline
+Jack has menitoned that the psites annotated in my analysis (from the RSEM generated transcirpt.fa: see detial in the Obsidian notes) do not match the positions he highlighted in his CDS regions
+Jack has shared the files and the code used to generate
+Easiest way to do this is to align, create the sam and then find the alignment
+
+As far as I can see, in both transcript files, we can see there is a match 
+Read in Jacks cDNA fasta; align our transcript to this to find the site
+
+Pull in our edits.dt and the psite annotation information and see if we can 
+
+Alignemtns look good to me....
+```{r}
+edits.dt <- fread('./040825_splitBulkRNA_bamFiles_data/2025_04_24_combined.riboAndrnaEdits.strandFiltered.csv.gz')
+edits.dt[sample == 'RIBO_OPTIC_5' &  Region == 'PAC4GC:38551344'] #edits in these postions of the transcripts; 1 in pos 759
+
+psite.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040225_EditsVsNoEdits_highConfSubset_data/2025_04_02_OL.highQualEdits.overlapping.AorPsites.csv.gz')
+suspect.psite <- psite.dt[Region == 'PAC4GC:38551344' & !grepl('noEdits', sample)][p_site_codon == 'TAG']
+suspect.psite # edit is in 758 so sits in the psite of RIBO optic rep 2
+```
+Get the transcript seq from the fasta I used with the pipeline
+
+```{bash, eval=FALSE}
+# bash cmd to pull transcript seq
+grep 'PAC4GC:38551344' -A1 output/dpea.pipelineProcessed.genome.transcripts.fa
+```
+
+Read in the transcript seq from Jacks fasta and recover the seq
+```{r}
+# taken from grep cmd output above
+transcript.test <- 'CTCAACTAAATATGGCTGCCCCCACTAAGTTATGACGGAAGGCTAAAACGTTGTTTAGTTATTTTATGAGGTTGAATTGTTCTTTTATCAATTGTTTCCTTTCGGCAGATTGCACGTCTACTTTGTGAATTCCCTAAACAATTCATCAGTAAAGTGGAAAGCCGTGTCTTTCGCCAGCTTCCCGcctgcaatttttttttttctgcctcacGTCTTAATCTGTGCCTACTAAACGTGTCCTGAGCACCATGTTGCGGGAAGTCTTTAAAAACCTGGCTGTAATGATGTCCACTGCAGTGGCCATCCCTTATACAATTGCCATCCTTTGCAATGTTCTATATGGATGGCCAATGTCTCGTGAACGCCTAAAAGATTCACTGAGTGTGAAGAAAGTTTGTGCTCTCAATTTTGCTGTTATccaacaaatgaaactcctcaaATATGTTGCTCTGTACATTCGATGGAAATGTTTCTACAAATATTTTGACTCTTCTCATCTTGTTAAGGATATTTCATTTGGTCGAAATGATAAACATCTGGATGTGTATGTTCCAGCTGGCCGACATCGGCAAGAGTCTCCCAAGCCTGTactgatttatatttttggtggAGGTTGGAGTTCAGGAGATAAAAGCATGTGTGGTTTAGTTTGTTCTCAAATTGCCAATCAATTAGGAGCTGTGGTTTGCTGCCCTAACTATTCACTTTATCCCCAGggTTGTGTTGATGACATGATTCAAGATGTGGTGGACAGCATTAGTTGGGTACACAATAATATCCACACATATGGCGGAGACAAGGAGAAAATAATGCTTGTTGGTCACTCGGCTGGAGCCCACCTCTCTGTCATGGCTGTCCTTGAACTCCTTCATGACCAATTGATGCTCGGTCGAGAAGATTTCTCTCGTCGTCTAGAAGAAAACATGGACAGCAATGCCTTTCATTTTGAAGACAGACACTATGCAGTCGTGTCACAGCCattcgaaggaaagaaagacattgaAGCTGCCGACGGTTTTTGTATTGTGAACTCAGTCAATGTAAATGAAATGGGTCACGAACCAATGGATGTGGACACACCGGAAAGTGACAATGGTCAGGGAATTGGCCACATAGCTGCTACAGAGGCACAGTCTTCACAAATTCATATGGAAGCTGATGGTGAAGATGACTGCTCTGATAATGACTCTGTGGTAACTGTGCGGCCAAAGGATTCTGACACAGGTCCTAGTTTGAGCGACATGTGCAAATCAATTAAGGCAATAATAGGACTTGCTGGAGTCTATCATATTAAGGACCACTATGAACATGAAAAGTTACGGGGTCTAGAAGATGTTAGCTGTATGCATCGAGCTATGTATGGAGATGATCATTTTGGACGATTTTCTCCAACAGTCATCATCATGAGTATGAAAAGGAACATCAAATTACCAAAAATGGTACTTGTGCATGGTACTGAGGATTATGTTGTTCCATTGGTGTCTTCAACTAAATTTGGAGAAGCTCTCAGTGAGATTTTTGCAGATGTAACAGTGCGTGTGATTCCTGACTGTGACCATTATAAGCATCTTCTTGACTTGATGTCCAAGACAGACGTTTACATGAATGTTATCATGGGAATTATTCTTGAAACTGCCAGGCGTGTGTTttagagatttctttctttttttttttttttttctccctaatATCAATAGGAAATAAGCACATTGAAAGAAGACAGTTGTGTTTGTCTTTGttgactttttttaattaaaaaaaaaaaaaaaagagagagagcaaaatttCCATTGTGCAGAGACTGAAATTGGTTGCACATTTGAAAAAACAGAACTTGAGGCTAATCCATAAGTTTCTCATTTCCACTGttataatacgagggtgagtcaaaaagtaatgccattttgtttaggacagatataatt'
+
+cDNA.fa <- readDNAStringSet("~/Downloads/Dpealeiiv2_cDNA.fasta")
+'PAC4GC:38551344' %in% names(cDNA.fa) # name not in the cDNA fasta; do align to fasta to discover
+```
+
+`bbmap` to align fasta records and 
+
+```{bash, eval=FALSE}
+# align above fasta to this
+bbmap.sh -Xmx24g -in=testTranscripts.fa ref=./Dpealeiiv2_cDNA.fasta out=testTranscript.sam
+```
+get the name of the mapped gene
+```{r}
+matchID <- fread(cmd='grep -v "@" ./042525_sanityCheckFiles_data/testTranscript.sam')$V3 %>% 
+  unique()
+```
+
+Align the query to the db; see where we find a match and confirm vs the gtf
+
+```{r}
+# perfect match
+matchPattern(query.fa, test.fa)
+
+psite.dt[Region == 'PAC4GC:38551344' & sample == 'optic_Edits_2',]# psite in 758
+
+# confirm the codons match in both references in both positions
+unlist(strsplit(as.character(query.fa), ''))[758:760] == unlist(strsplit(as.character(test.fa), ''))[758:760]
+
+# there is a T at position 758
+unlist(strsplit(as.character(query.fa), ''))[758]
+unlist(strsplit(as.character(test.fa), ''))[758]
+```
+
+TAG lies at these bases in both transcriptome files
+```{r}
+unlist(strsplit(as.character(query.fa), ''))[758:760]
+unlist(strsplit(as.character(test.fa), ''))[758:760]
+```
+Last thing to do is just confirm an edited read that maps here 
+
+```{r}
+# reads with edits
+readsQedits.dt <- fread('output/reditools/032825_transcriptomeMap/RIBO_OPTIC_5/DnaRna_327412032/outReads_327412032', header=F)
+readsQedits.dt[, c('read', 'region', 'position') := tstrsplit(V1, '[$]', keep=c(1,2,3))]
+readsQedits.dt <- readsQedits.dt[!is.na(region)]
+
+
+edits.dt[sample == 'RIBO_OPTIC_5' &  Region == 'PAC4GC:38551344']
+readNameOI <- readsQedits.dt[region == 'PAC4GC:38551344' & position == 759, read]
+readNameOI # 
+```
+
+Search bam file for this read...
+
+```{bash, eval=FALSE}
+samtools view  output/riboseq_bamfiles_firstPass/filtered/riboseq/editTranscriptsSubset/RIBO_OPTIC_5_proteinCodingEdits.mdTags.bam | awk "BEGIN{FS="\t";OFS="\t"} /LH00587:87:22HHJ5LT4:8:2461:24427:17095/ {print}"
+```
+
+Output....
+
+LH00587:87:22HHJ5LT4:8:2461:24427:17095_GAACCATT        0       PAC4GC:38551344 738     255     30M     *       0       0       =====================G========  IIIIIIIIIIIIIIIIIIIIIIIIIIIIII    NH:i:1  HI:i:1  RG:Z:RIBO_OPTIC_5       NM:i:1  MD:Z:21A8
+
+Can see the g edit in the file at pos 759...
+
+## 04-29-25
+Get the GTF, and look at the annotations of the different genes
+First, get the human gtf and plot the reading frame of the difffernet proteins; are the frames similar?
+
+```{r}
+anno.ori <-  fread('./output/Dpea_1_genomic_cleanheaders_final.pipelineFiltered.gtf')
+anno.ori
+# if the gene is on the + strand, 
+anno.ori[grepl('PAC4GC:38551344', V9)]
+# position is relative to the transcript; 1-based
+
+psite.dt[Region == 'PAC4GC:38551344' &  sample == 'optic_Edits_2']
+anno.ori
+anno.ori[, c('gid', 'tid') := tstrsplit(V9, ';', keep=c(1,2))]
+
+anno.ori[grepl('PAC4GC:38551344', V9) & V3 == 'CDS']
+anno.ori[V3 == 'CDS',.N, by=.(gid, V8)][,.N, by=gid]
+```
+Suggest to get good quality an
+
+Look at a subset of highly conserved eukaryotic genes and see how these behave?
+
+Pull in the sequence we are looking at, get the cds for the gene 
+How does Ribowaltz decide on the CDS to use if multiple and overlapping? Maybe ask developers?
+
+```{r}
+anno.dt <- fread('./docs/dorPea.gtf')
+
+query.fa <- cDNA.fa[[matchID]]
+test.fa <- DNAString(transcript.test)
+
+# heres the transcript ID
+transcript.id <- unlist(strsplit(as.character(query.fa), ''))
+
+psite.dt[Region == 'PAC4GC:38551344' & sample == 'optic_Edits_2',]
+coords <- psite.dt[Region == 'PAC4GC:38551344' & sample == 'optic_Edits_2', c(cds_start, cds_stop)]
+coords
+# use the generate
+```
+```{r}
+# this is cds seq for the coords given by riboWaltz; get the protein seq
+riboWaltzProt <- translate(transcript.id[coords[1]:coords[2]])
+riboWaltzProt
+
+coords
+
+grep('[*]',translate(transcript.id[coords[1]:coords[2]]))
+# take the first 217AA.. your sequences?
+jackProt <- translatedProt[1:217]
+
+# BLAST both sequences
+paste0(riboWaltzProt, collapse = '')
+paste0(jackProt, collapse = '')
+
+```
+
+**Notes**
+These psites are clearly way off as they come from long reads, we do not trust the p-site imputation
+```{r}
+# quicly check the proportions
+#fwrite(reads.dt, ScriptAndDatedFileName('.OL.filteredEdits.csv.gz'))
+reads.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_02_.OL.filteredEdits.csv.gz')
+
+anno.dt <- create_annotation(gtfpath = './output/Dpea_1_genomic_cleanheaders_final.pipelineFiltered.gtf')
+anno.dt[transcript == 'PAC4GC:38551344']
+
+psite.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_01_editVsnoedit.annotated.pae.sites.csv.gz')
+psite.dt[transcript == 'PAC4GC:38551344' & grepl("optic_Edits_", sample)][,.N, by=end5][order(end5)]
+psite.dt[transcript == 'PAC4GC:38551344'][end5 == 747]
+
+
+```
+read in the periodicity data
+Just contains the summary of the psite offset for each of the read length bins
+```{r}
+psiteSummary <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_01_ribowaltz.psiteOccupancy.OL.EditandNoEdit.csv')
+psiteSummary[length == 67]
+periodicity.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_01_periodicity.csv.gz')
+codonCov.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_01_footprint.codon.coverage.csv.gz')
+codonCov.dt[transcript ==  'PAC4GC:38551344']
+
+psiteSummary
+periodicity.dt
+codonCov.dt
+```
+```{r}
+readsin.dt <- fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_29_readlengths.pSiteIdentificationInput.csv.gz')
+readsin.dt[transcript == 'PAC4GC:38551344' & sample == "RIBO_OPTIC_5_proteinCodingEdits.mdTags" ]
+
+readsin.dt$sample %>% 
+  unique()
+```
+Simple fix; dont trust the p-site assignment for long reads; drop anything over a certain threshold
+ONly keep things <= len 33; should fix this issues
+```{r}
+psiteSummary[!grepl('altprep', sample) & length <= 33, sum(total_percentage), by=sample]
+```
+
+```{r}
+fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_01_ribowaltz.psiteOccupancy.OL.EditandNoEdit.csv')
+fread('~/Documents/projects/020625_JMoen_RiboSeqRNAseq_SqiudEdits/040125_EditVsNoEditComparison_data/2025_04_01_editVsnoedit.annotated.pae.sites.csv.gz')
+```
+
+```{r}
+
+```
+
+
+

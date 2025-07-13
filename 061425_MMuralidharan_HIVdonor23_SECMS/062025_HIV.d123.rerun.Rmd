@@ -1,0 +1,297 @@
+---
+title: "062025_HIV.d123.rerun"
+author: "Martin Gordon"
+date: "2025-06-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+Review: not an issue of the rerun; this is due to 'real' detections in fraction 13, could be some kind of issue with the work-up?
+```{r}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(viridis)
+library(pracma)
+library(magick)
+library(eulerr)
+
+source("../../utils/bp_utils/ManageScriptData.R")
+source("../../utils/bp_utils/enrichmentTestFunctions.R")
+source("~/Documents/utils/bp_utils/SEC_MS_utils.R")
+source("../../utils/bp_utils/UniprotIDMapping.R") # map hu to mm 
+
+customTheme <-  theme_bw() +
+  theme(axis.text.x = element_text(angle=90),
+        panel.border = element_rect(color = "lightgrey",
+                                    fill = NA,
+                                    size = 1))
+```
+
+mw standards 
+same standards for all 3 files
+```{r}
+mw.standards <- fread('./data/HIV_Infection_CD4T_cells/SEC_Profiles/D1-D3-cal_SRT.txt')
+setnames(mw.standards, new=c('fraction', 'mw'))
+# want the standards in daltons (right?)
+mw.standards[, mw := mw*1000]
+mc <- calculateFractionMassConverters(mw.standards)
+```
+
+```{r}
+sec.long <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_sec.long.normalized.interpolated.filtered.csv.gz')
+sec.long[treatment == 'Challenged_Infected', treatment:= 'Infected']
+sec.long[treatment == 'Challenged_Uninfected', treatment := 'Challenged']
+sec.long[, sample.old := sample]
+sec.long[, sample := paste0(treatment, '_', replicate)]
+```
+
+```{r}
+idmapper <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061625_D3_MSstatsSmmarization_data/2025_06_16_hiv.d3.peptide.ints.long.csv.gz')[, .(gene, protein,mw, org)] %>% 
+  unique()
+```
+
+# peak detection
+```{r}
+# if we normalized, we have to catch the post-normalization matrices
+normInt.mats <- scaledIntensityMatrices(sec.long, useInterpolated = FALSE)
+peakTables <- lapply(normInt.mats, goodPeaksTableFromIntensityMatrix, minPeakHeight=0.05, minCV = -Inf)
+
+allPeaks <- rbindlist(peakTables, idcol = "sample")
+allPeaks[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+
+```
+
+
+```{r, fig.width = 8, fig.height = 7}
+# udpate height for more samples
+p <- ggplot(allPeaks, aes(x= peakLocation, fill = goodPeak)) + 
+  geom_bar() + 
+  facet_grid(treatment~replicate) +
+  theme_bw()
+p
+BackupAsPDF(p, "peakCounts.perfraction.barplot")
+```
+# fraction adjustments based on peaks
+This will update the peakTables sec.dt with new standardized fraction numbers
+```{r}
+# I don't trust hte alignment below about fraction 20, so update `startFitAtPeak` to skip it
+standardizeAllPeakTablesToStandard(peakTables, sec.long, standardIdx = "Uninfected_3", fitPortion = 0.65, minPeaksPerFraction = 45, startFitAtPeak = 20)
+sec.long[, standardFraction.global := standardFraction]
+```
+
+Donors seem too different to align. lets try another way
+Split the DT into, donor lists and process seperately. Then combine the output together
+
+```{r}
+peakTables.ls <- lapply(seq(1,3,1), function(x){
+  
+  mats.subset <- normInt.mats[grepl(paste0(x,'$'), names(normInt.mats))]
+  print(names(mats.subset))
+  peakTables <- lapply(mats.subset, goodPeaksTableFromIntensityMatrix, minCV = -Inf)
+  return(peakTables)
+})
+
+# now align peaks within each donor
+sec.dt <- lapply(seq(1,3,1), function(x){
+  subdt <- copy(sec.long[replicate == x,])
+  standardizeAllPeakTablesToStandard(peakTables.ls[[x]], subdt, standardIdx = 3, fitPortion = 0.65, minPeaksPerFraction = 45, startFitAtPeak = 20)
+  return(subdt)
+}) %>% rbindlist(.)
+```
+```{r}
+#standards <- loadStandardsFractionToMW ("~/Downloads/cal_biosep.txt")
+mc <- calculateFractionMassConverters(mw.standards)
+
+# label fractions by mass, and fraction/proteins by mass ratio, aka log2MassNumber
+sec.dt[, fractionMass := mc$fraction2Mass(standardFraction)]
+sec.dt[, log2MassNumber := log2(fractionMass/as.numeric(mw))]
+
+
+# pay attention to which cofmX.XXXX is used below: cofmN.standardized
+scorePeakByMassShift <- function(peak.dt, mw){
+  # the 150% fraction
+  peak.dt[sec.dt, fiftyPCFraction := mc$mass2Fraction(1.2 * as.numeric(mw)), on = "protein"]
+  peak.dt[!is.na(fiftyPCFraction), goodPeak.rm.monomers := goodPeak & cofmN.standardized < fiftyPCFraction]
+  peak.dt
+}
+
+# collapse to one list (1 level unnesting)
+peakTables <- do.call(c, peakTables.ls)
+
+purrr::walk(peakTables, scorePeakByMassShift, mw)
+
+allPeaks <- rbindlist(peakTables, idcol='sample')
+allPeaks[is.na(goodPeak.rm.monomers), goodPeak.rm.monomers := FALSE]
+#fwrite(allPeaks, ScriptAndDatedFileName('hiv.d123.detectedPeaks.csv.gz'))
+```
+```{r}
+allPeaks[, c('treatment', 'replicate') := tstrsplit(sample, '_', keep=c(1,2))]
+# udpate height for more samples
+p <- ggplot(allPeaks, aes(x= peakLocation, fill = goodPeak.rm.monomers)) + 
+  geom_bar() + 
+  facet_grid(treatment~replicate) +
+  theme_bw()
+p
+```
+
+```{r prepare-gs}
+# id mapper for protein -> string ID
+huString.mapper <- fread('~/Documents/projects/050625_RKakke_HIV_DonorNewSearch/050625_peakDetectionAndDifferentialExpression_data/2025_05_07_protein.string.idMapper.csv.gz')
+
+#need to merge our protein ids with 
+gs.interactors <- goldStandardPairs(huString.mapper[protein %in% sec.long$protein, unique(stringID)], 
+                                    corum.path = NULL,
+                                    string.links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                                    string.info.path =  NULL,
+                                    stringCombinedScoreThreshold = 400)
+
+gs.decoys <- decoysFromString(huString.mapper[protein %in% sec.long$protein, unique(stringID)], 
+                              links.path = "~/Documents/utils/mg_utils/data/stringDB/9606.protein.physical.links.detailed.v12.0.txt.gz",
+                              info.path =  NULL)
+gs.decoys[, source := 'string']
+
+gs.comb.interactors <- rbind(gs.interactors, gs.decoys)
+```
+
+## peak-peak correlations
+```{r, peak-correlations}
+# just ensure a refresh
+intMats <- scaledIntensityMatrices(sec.dt, useInterpolated = FALSE)
+
+peakMatrices <- purrr::map2(intMats, peakTables, goodPeaksMatFromPeaksTable)
+corPeaks.ls <- purrr::map2(intMats, peakMatrices, windowedCorrelation, outerRadius = 6)
+
+allPeakCorrs <- rbindlist(purrr::map(corPeaks.ls, "cor"), idcol = "sample")
+```
+
+```{r annotate-peakDT}
+# read in datatables
+allPeakCorrs[huString.mapper, gene1 := i.stringID, on = c(protein1 = "protein")]
+allPeakCorrs[huString.mapper, gene2 := i.stringID, on = c(protein2 = "protein")]
+allPeakCorrs[idmapper, alias1 := i.gene, on = c(protein1 = "protein")]
+allPeakCorrs[idmapper, alias2 := i.gene, on = c(protein2 = "protein")]
+
+
+# for now use protein as gene for the NA gene
+allPeakCorrs[is.na(gene1), gene1 := protein1]
+allPeakCorrs[is.na(gene2), gene2 := protein2]
+
+allPeakCorrs[is.na(alias1), alias1 := protein1]
+allPeakCorrs[is.na(alias2), alias2 := protein2]
+```
+add gs annotations 
+```{r}
+allPeakCorrs[, gs := "unknown"]
+allPeakCorrs[gs.interactors ,gs := "interactor" , on = c("gene1", "gene2")]
+allPeakCorrs[gs.decoys ,gs := "decoy" , on = c("gene1", "gene2")]
+```
+
+
+```{r}
+g <-  ggplot(allPeakCorrs[gene1 < gene2 & gs != 'unknown'], aes(x = sample, fill = gs)) +
+    geom_bar() + 
+    labs(title=paste0('Breakdown of detected interactors (R >= .9)')) +
+    theme_bw() + 
+    theme(axis.text.x=element_text(angle=90))+
+    scale_fill_manual(values=c('decoy'='grey70', 'interactor'='gold'))
+g
+```
+
+```{r}
+allGenes <- huString.mapper$stringID %>% 
+  unique()
+denomInteractor <- nrow(gs.interactors[gene1 %in% allGenes & gene2 %in% allGenes])
+denomDecoy <- nrow(gs.decoys[gene1 %in% allGenes & gene2 %in% allGenes])
+```
+Using log-likihood ratio approach; how more likey is the PPI derived from the truth set than the random set
+Looks liek a lot of decoys also correlate with
+```{r ppi-scoring}
+scoreByGS(allPeakCorrs, denomDecoy, denomInteractor, column = "corScore", groupByVariable = c("sample", "start"))
+```
+
+plot the LLR scores now with the rescored set
+
+```{r}
+g <- ggplot(allPeakCorrs, aes(x = corScore, y = log10RateRatioID, color = start)) + geom_hline(yintercept = 0.0, lty = "dotted") + 
+    geom_line(aes(group = start)) + 
+    facet_wrap(~sample, ncol=3) + 
+    scale_color_viridis_c(option = "H", name = "fraction") + 
+    theme_bw()
+g
+```
+I guess we want to compare the new set of detected peaks and the old
+
+```{r}
+allPeaks
+allPeaks.old <- fread('~/Documents/projects/061425_MMuralidharan_HIVdonor23_SECMS/061725_D123_BPSECMS_pipeline_data/2025_06_18_hiv.d123.detectedPeaks.csv.gz')
+
+allPeakCorrs[sample == 'Infected_3'& pearsonR == 1,.N, by=prot1Peak]
+ggplot(allPeakCorrs[sample == 'Infected_3'& pearsonR == 1], aes(x=prot1Peak)) +
+  geom_histogram(bins=72) +
+  scale_x_continuous(breaks=seq(1,72,1), labels = as.character(seq(1,72,1))) +
+  coord_cartesian(xlim=c(1,20))
+```
+12/13/14 peaks with perfect cor scores... what proteins are in here?
+```{r}
+perfectScores <- allPeakCorrs[sample == 'Infected_3'& pearsonR == 1 & prot1Peak %in% c(12,13,14), unique(c(protein1, protein2))]
+sdcols <- c('protein1', 'protein2')
+allPeakCorrs[, (sdcols) := lapply(.SD, as.character), .SDcols = sdcols]
+
+allPeakCorrs[protein1 %in% c('P20700','Q03252') & protein2 %in% c('P20700','Q03252'),]
+allPeakCorrs.f <- allPeakCorrs[protein1 < protein2]
+
+allPeakCorrs.f[pearsonR == 1, .N, by=protein1][N>100,]
+allPeakCorrs.f[pearsonR == 1, .N, by=protein2][order(-N)]
+
+# look at this protein 300 perfect scores in peak! (think its a peak with no surrounding measurmenets)
+allPeakCorrs[protein1 == 'O94905',]
+```
+```{r}
+sec.long
+ggplot(sec.long[sample == 'Infected_3' & protein %in% c('P35232','O94905'),], aes(x=fraction, y=log2(intensity), color=protein)) +
+  geom_point() +
+  geom_line(aes(group=protein))
+```
+I don't really understand how these peaks are picked up...lets look at the peak tables and maybe run windowed correlation alone.. strange, refer to BP
+Lots of peaks detected in Infected_3. Investigating...
+```{r}
+# 12, 13, 14,15 contain > 100 peaks..... particularily fraction 13 has a lot
+apply(peakMatrices[['Infected_3']], 2, sum)
+
+# what are these proteins?
+peakProts <- peakMatrices[['Infected_3']][,c(12,13,14,15)][apply(peakMatrices[['Infected_3']][,c(13,14)], 1, sum) > 0,] %>% 
+  rownames()
+
+# what do the protein intensity distributions look liek for these? clearly there is a spike in detections at fraction 13, and these are being picked up as peaks... filter out for further analysis
+ggplot(sec.long[sample == 'Infected_3' & fraction %in% c(13,14) & protein %in% peakProts,], aes(x=log2(intensity), color=as.character(fraction))) +
+         geom_density()
+
+```
+
+Not an issue with the algorithm; I think this is due to real detections in the data;
+I wonder if I want to write a fuction to iterate over the intensity matrix, and essentially scrub values flanked by a run of 0s? Or, 
+
+```{r}
+# sanity check good peaks; make sure they are flanked by measurements in both directions
+intMats[['Infected_3']]
+
+allPeaks[,.N,  by=peakLocation][order(peakLocation)]
+allPeaks[goodPeak == TRUE,.N,  by=peakLocation][order(peakLocation)]
+```
+
+
+```{r}
+ggplot(sec.long[protein %in% peakProts & fraction %in% c(12,13,14,15),], aes(x=log2(ori.intensity
+), fill=as.character(fraction))) +
+  geom_histogram(alpha=0.5, bins=72)
+```
+

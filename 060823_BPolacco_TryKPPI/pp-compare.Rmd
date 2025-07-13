@@ -1,0 +1,451 @@
+---
+title: "Untitled"
+author: "Martin Gordon"
+date: "2023-06-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+```{r}
+library (data.table)
+library (ComplexHeatmap)
+library (ggplot2)
+library(RCy3)
+library(ndexr)
+rotate.x.axis.text <- theme(axis.text.x = element_text(angle = 90,vjust = 0.5, hjust=1))
+
+source("../../utils/bp_utils/ManageScriptData.R")
+WriteSessionInfo()
+WriteInstalledPackages()
+```
+
+## Downloaded the CB PPI and plugged into Cytoscape. From cytoscape, export network in simple interaction format (*.sif) and also the node and edge table with more annotation information
+
+info on the network: 
+nodes: Baits yelow, prey are grey
+edges: Coloured based on differential interaction. Pink edges enriched in BC cell lines (unique to either MDA-MB-231 or MCF7) as compared to MCF10A. 
+Dotted line represents the physical protein-protein association (validated in other studies) with high Integrated Association Stringency score (think this is identified in another study?. 
+Dotted lines are not imported into our network as they are taken from a public PPI. Do we need these? Maybe best to import 
+How are these handled by the network? Seems they are treated as baits instead of prey eg XRCC2 & RAD51C interaction
+
+```{r}
+bc.ppi <- fread("./data/Breast cancer protein-protein interaction network.sif", header = F) #no header in file
+colnames(bc.ppi) <- c('Bait', 'relationship', 'Prey')              
+
+bc.ppi[, baitsPerPrey := .N, by=.(Prey)]
+
+
+#matches n nodes in cytoscape network
+length(unique(c(bc.ppi$Prey,bc.ppi$Bait)))
+```
+
+# compare with node and edge table 
+Note on the network encoding: the public ppi data (dotted lines) node interaction directionality is not important. This is an issue with our network as it distorts network centrality scores
+Example of RAD51C: public ppi interaction
+
+```{r CTNA1 example}
+bc.ppi[Bait == 'RAD51C',]
+bc.ppi[Bait == 'P40692',]
+```
+The *.sif file only contains edges between nodes and doesnt distinguish origin (experimental or public ppi) origin of the interactions
+Public PPI interactions: directionality not useful (baits vs prey not distingished). Lots of prey-prey interactions which are not of interest(?)
+Prepare our own data; Load the node and edge tables from cytoscape
+
+```{r}
+bc.ppi.edge <- fread("./data/Breast cancer protein-protein interaction network default edge.csv", header = T, na.strings = "", fill = T)
+bc.ppi.nodes <- fread("./data/Breast cancer protein-protein interaction network default node.csv", header = T, na.strings = "", fill = T)
+```
+
+
+Simplify the nodes & edges table. 
+Extract names of baits in the experiment for filtering
+```{r node-tab}
+# rm
+bc.ppi.nodes[, c('codelen','longname','shared name','Prey', 'selected','npat', 'nsam', 'p', 'pCL', 'pCV', 'pFN','q') := NULL]
+
+colnames(bc.ppi.nodes) <- c('Bait', 'BaitUniprot', 'Gene', 'PreyUniprot')
+
+
+#extract baits
+measured.baits <- bc.ppi.nodes[!is.na(Bait), Gene]
+#measured.baits.prey <- bc.ppi.nodes[!is.na(Bait) & !is.na(PreyUniprot), Gene]
+
+```
+
+Clean the edge table and  identify interacting nodes
+
+```{r edge-tab}
+# simplify edge tablee$name)
+bc.ppi.edge[, c('selected', 'interaction', 'shared interaction', 'name','info') := NULL]
+
+# split the shared name column into 3 and rm leading/trailing whitespace
+bc.ppi.edge[, c('Node1', 'Interaction', 'Node2') := tstrsplit(`shared name`, split='\\(|\\)') ]
+bc.ppi.edge[, Node1 := trimws(Node1) ]
+bc.ppi.edge[, Node2 := trimws(Node2) ]
+#drop shared name
+bc.ppi.edge[, `shared name` := NULL]
+```
+
+, preys and baits are mixed in the public PPI data and many rows only contain PPIs identified in public datasets. Clean/remove as required
+Nodes in the bc.ppi only record the interactions one way; for baits with other baits as preys, we also need to record the interaction in reverse to accurately count
+
+```{r dt-clean}
+#remove all rows with no baits as not of interest
+bc.ppi.edge <- bc.ppi.edge[!(!Node1 %in% measured.baits & !Node2 %in% measured.baits)]
+bc.ppi.edge[Node1 %in% measured.baits,unique(Node1)]
+# some baits are in col2 with none in col1; find these and swap the columns they are assigned to  
+# swap columns for rows matching i.. useful
+bc.ppi.edge[!Node1 %in% measured.baits & Node2 %in% measured.baits, `:=`(Node1 = Node2, Node2 = Node1) ] #swap node1 and node2 places
+
+
+# where both bait and prey are baits, duplicate the record and swap the cols they are assigned to 
+bc.ppi.edge[Node1 %in% measured.baits & Node2 %in% measured.baits,]
+# create a new row where both node values are swapped
+new.rows <- bc.ppi.edge[Node1 %in% measured.baits & Node2 %in% measured.baits,]
+new.rows <- new.rows[, `:=`(Node1=Node2, Node2=Node1)]
+
+bc.ppi.edge <- rbind(bc.ppi.edge,new.rows)
+bc.ppi.edge
+
+#sanity check
+bc.ppi.edge[Node2 %in% measured.baits, .N] # only 32 cases with bait also a node
+bc.ppi.edge[Node1 %in% measured.baits, .N, by=Node1][,length(Node1)]#39 baits detected 
+```
+Now that dataset is correctly ordered, format & create a baitsPerPrey column
+
+```{r}
+bc.ppi.edge[, c('bfdr', 'diff_score', 'Interaction') := NULL]
+colnames(bc.ppi.edge) <- c( "Cell","Public.PPI", "Bait","Prey")
+bc.ppi.edge[, baitsPerPrey := .N, by = Prey]
+
+#simplify name
+bc.ppi <- bc.ppi.edge
+```
+
+# Load in the k.ppi and pcmi.ppi networks
+
+```{r}
+pcmi.ppi <- fread ("./data/D_Final_v3.txt")
+k.ppi <- fread("./data/kaushikPPI.csv")
+```
+
+## Create a list of ppi data
+
+```{r}
+
+```
+
+
+
+## Calculate number of bait per prey for the PCMI PPI network
+
+```{r}
+pcmi.ppi <- pcmi.ppi[, .(Bait, Prey = PreyGene, Clusters)]
+pcmi.ppi[, baitsPerPrey := .N, by = Prey]
+
+#k.ppi <- k.ppi[, .(Bait, Prey = PreyGene, Clusters)]
+k.ppi[, baitsPerPrey := .N, by = Prey]
+```
+
+## What is the bait degree for each of the datasets
+
+```{r}
+
+```
+
+
+# Create histogram of the prey degree
+
+On first glance the bc network seems sparser; more nodes with fewer connections but likey due to size
+
+```{r}
+bc.ppi[,exp := 'bc']
+pcmi.ppi[,exp := 'pcmi']
+
+merge.ppi <- rbind(pcmi.ppi, bc.ppi, fill=TRUE)
+
+g <- ggplot(data=merge.ppi, aes(x=baitsPerPrey, fill=exp)) +
+  geom_bar(position = "dodge2") +
+  ggtitle('Prey Degree') +
+  theme_bw()
+g
+
+BackupAsPDF(g, 'prey-degree-')
+
+```
+
+```{r}
+hists <- rbindlist( list (bc = bc.ppi[, .(baitsPerPrey = unique(baitsPerPrey)), by= Prey][, .N, by= baitsPerPrey], 
+                          pcmi = pcmi.ppi[, .(baitsPerPrey = unique(baitsPerPrey)), by= Prey][, .N, by= baitsPerPrey]), idcol = "exp")
+
+
+
+hists[exp == "bc", fractionPrey := N/length(unique(bc.ppi$Prey))]
+hists[exp == "pcmi", fractionPrey := N/length(unique(pcmi.ppi$Prey))]
+
+p <- ggplot (hists, aes(x = baitsPerPrey, y = N, fill = exp)) + geom_col( position = "dodge2") + theme_classic()
+BackupAsPDF(p)
+
+
+p <- ggplot (hists, aes(x = baitsPerPrey, y = fractionPrey, color = exp, fill=exp)) +
+  geom_point() +
+  scale_y_log10() +
+  #scale_x_log10() +
+  geom_smooth(se = FALSE, lty = "dashed", lwd = 0.5, span = 2, data = hists[baitsPerPrey < 15]) +
+  xlab ("Prey Degree") +
+  ylab ("Fraction of Prey") +
+  scale_color_manual(values = c(bc = "orange", pcmi = "cornflowerblue")) +
+  theme_bw() + 
+  theme(legend.position="top")
+
+BackupAsPDF(p)
+```
+Pairwise Overlaps
+(Creating an adjacency matrix from bait prey relationships)
+```{r}
+pcmi.mat <- dcast (pcmi.ppi, Prey~Bait, value.var = "Bait", fun.aggregate = length) |> as.matrix(rownames= "Prey")
+pcmi.mat[pcmi.mat > 1] <- 1 #constrain to 1 for baits-bait connections
+Heatmap(pcmi.mat, col = c("white", "firebrick"), column_names_gp = gpar(fontsize =5))
+
+```
+## Pairwise Overlaps
+
+baitPrey matrix
+
+```{r}
+bc.mat <- dcast (bc.ppi, Prey~Bait, value.var = "Bait", fun.aggregate = length) |> as.matrix(rownames= "Prey")
+bc.mat[bc.mat > 1] <- 1
+Heatmap(bc.mat, col = c("white", "firebrick"), column_names_gp = gpar(fontsize =5))
+```
+Calculates the jaccard distance (dissimilarity between two sets) of the different baits (ratio of size of intersection vs size of union; 0 is identical, 1 no common elements)
+1-jaccard so only baits with common elements colored
+```{r}
+
+pcmi.jaccard <- dist (t(pcmi.mat), method = "binary") |> as.matrix()
+Heatmap (1-pcmi.jaccard, col = circlize::colorRamp2(breaks = c(0, 0.4), colors =  c("white", "firebrick")))
+
+```
+
+```{r}
+bc.jaccard <- dist (t(bc.mat), method = "binary") |> as.matrix()
+Heatmap (1-bc.jaccard, col = circlize::colorRamp2(breaks = c(0, 0.4), colors =  c("white", "firebrick")))
+```
+
+```{r pcmi-heatmap}
+#  File from Belinda, all HEK detectable proteins + PCMI prey
+#scan("/Users/ben/Downloads/hek293tProteome_BekkerJenwen2017_ASDppiPrey.csv", what = character()) |> unique() |> length()
+# 11169, use this number below as the background
+
+
+#this function calculates p-value from Fishers exact test for the contigency table comparison between bait1 ansd bait2 preys in the matrix
+pairwiseFisher <- function (bait1, bait2, matrix){
+  both <- sum(rowSums(matrix[, c(bait1, bait2)]) == 2) #totoal N occurances of b1 + b2 #calculates the number of occurrences where both bait1 and bait2 are present by summing the rows where the sum of values for bait1 and bait2 is equal to 2
+  firstOnly  <- sum(matrix[, c(bait1)]) - both #b1 only
+  secondOnly <- sum(matrix[, c(bait2)]) - both #b2 only
+  neither <- 11169 - both - firstOnly  -secondOnly
+ # neither <- nrow(matrix) - both- firstOnly- secondOnly
+  
+  fisher.test (matrix(c(both, firstOnly, secondOnly, neither), nrow = 2), alternative = "greater")$p.value #2*2 contigency table; test to see if there is dependency between the two baits
+}
+
+allByAll <- data.table(bait1 = colnames(pcmi.mat))[, .(bait2 = colnames(pcmi.mat)), by = bait1][bait1 < bait2] #only cases where bait 1 < bait 2?
+
+allByAll[ , fisherP := pairwiseFisher(bait1, bait2, pcmi.mat), by = .(bait1, bait2)] #fishers exact test applied to each pair
+
+allByAll[, pP := -log10(fisherP)]
+pcmi.fisher.dt <- allByAll
+
+#combine std dt and a modified version with bait1 and bait2 swapped
+#takes the allByAll datatable, appends a modified version of it with swapped columns, and then reshapes it into a matrix format where the rows represent the unique values of bait1, the columns represent the unique values of bait2, and the matrix cells pP values
+pcmi.fisher.mat <- dcast (rbind (allByAll, allByAll[, .(bait1 = bait2, bait2 = bait1, fisherP, pP)]),
+       bait1~bait2, value.var = "pP") |> as.matrix (rownames = "bait1")
+
+
+baitClusters <- unique(pcmi.ppi[, .(Bait, Clusters)])
+
+
+hm <- Heatmap (pcmi.fisher.mat,
+         #name = "-log10(P) fisher.test",
+         row_split = as.factor(baitClusters[rownames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+         column_split = as.factor(baitClusters[colnames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+         col = circlize::colorRamp2(breaks = c(0, 4), color = c("white", "firebrick")),
+         left_annotation = rowAnnotation(cluster = as.factor(baitClusters[rownames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+                                         col = list (cluster = setNames(c("#FF3333","#FF9900","#F6D80C","#0CB212","#4A56FD","#AA4AFD","#1CDDEB","black"), 1:8))),
+         top_annotation = columnAnnotation(cluster = as.factor(baitClusters[rownames(pcmi.fisher.mat), Clusters, on = "Bait"]),
+                                         col = list (cluster = setNames(c("#FF3333","#FF9900","#F6D80C","#0CB212","#4A56FD","#AA4AFD","#1CDDEB","black"), 1:8))),
+         border  = TRUE,
+         row_names_gp = gpar(fontsize = 2),
+         column_names_gp = gpar(fontsize = 2),
+         gap = unit(0.3, "mm"),
+         column_gap = unit(0.3, "mm"))
+
+BackupAsPDF(hm, 'pcmi.-log10p-fishertest')
+```
+
+```{r bc-heatmap}
+allByAll <- data.table(bait1 = colnames(bc.mat))[, .(bait2 = colnames(bc.mat)), by = bait1][bait1 < bait2]
+allByAll[ , fisherP := pairwiseFisher(bait1, bait2, bc.mat), by = .(bait1, bait2)]
+
+allByAll[, pP := -log10(fisherP)]
+
+bc.fisher.dt <- allByAll
+
+bc.fisher.mat <- dcast (rbind (allByAll, allByAll[, .(bait1 = bait2, bait2 = bait1, fisherP, pP)]),
+       bait1~bait2, value.var = "pP") |> as.matrix (rownames = "bait1")
+
+
+hm <- Heatmap (bc.fisher.mat, 
+        # name = "-log10(P)fisher.test",
+         col = circlize::colorRamp2(breaks = c(0, 4), color = c("white", "firebrick")))
+
+BackupAsPDF(hm, 'bc.-log10p-fishertest')
+
+hist(pcmi.fisher.mat[pcmi.fisher.mat > 0], breaks = 100)
+hist(bc.fisher.mat[bc.fisher.mat > 0], breaks = 100, add = TRUE)
+
+
+fisher.dt <- rbindlist(list (pcmi= pcmi.fisher.dt, bc = bc.fisher.dt), idcol = "exp")
+ggplot(fisher.dt, aes (x = pP, color = exp)) + geom_density(alpha  = 0.5) +theme_bw() 
+ggplot(fisher.dt, aes (x = pP, color = exp)) + geom_density(alpha  = 0.5) +theme_bw() + coord_cartesian(ylim = c(0, 0.1)) 
+ggplot(fisher.dt, aes (x = pP, color = exp)) + geom_density(alpha  = 0.5) +theme_bw() + coord_cartesian(xlim = c(0, 5), ylim = c(0, 0.1)) 
+p <- ggplot (fisher.dt[, 100 *sum(fisherP < 0.05)/.N, by = exp], aes(x = exp, y= V1, fill = exp)) +
+  geom_col(show.legend = FALSE, width = 0.5) +
+  geom_hline(yintercept = 5, color = "grey") +
+  ylab( "% of bait pairs with significant (p < 0.05)\n prey convergence") +
+  scale_fill_manual(values = c(bc = "orange", pcmi = "cornflowerblue")) +
+  theme_classic() +
+  coord_cartesian(ylim = c(5,15))
+  p
+  
+BackupAsPDF(p)
+
+```
+
+```{r}
+
+fisher.dt[baitClusters, cluster1 := i.Clusters, on = c(bait1 = "Bait")]
+fisher.dt[baitClusters, cluster2 := i.Clusters, on = c(bait2 = "Bait")]
+fisher.dt[!is.na(cluster2) & study == "kaushik"]
+p <- ggplot (fisher.dt[study== "kaushik" | (cluster1 !=   cluster2),
+                       100 *sum(fisherP < 0.05)/.N, by = study],
+             aes(x = study, y= V1, fill = study)) +
+  geom_hline(yintercept = 5, color = "grey") +
+  geom_col(show.legend = FALSE, width = 0.5) +
+  ylab( "% of bait pairs with significant (p < 0.05)\n prey convergence") +
+  scale_fill_manual(values = c(kaushik = "orange", pcmi = "cornflowerblue")) +
+  theme_classic() 
+  
+  
+BackupAsPDF(p)
+ggplot (fisher.dt[study== "kaushik" | (cluster1 !=   cluster2), sum(fisherP < 0.05)/.N, by = study], aes(x = study, y= V1)) + geom_col() + ylab( "% of bait pairs with signfiicant (p < 0.05) white balls") +
+  ggtitle("Ball-and-Urn tests between all pairs of baits")
+
+
+fisher.dt
+hist (kppi[, .(baitDegree = length(unique(Prey))), by = Bait]$baitDegree, breaks = 0:120)
+hist (pcmi.ppi[, .(baitDegree = length(unique(Prey))), by = Bait]$baitDegree, breaks = 0:120, add = TRUE, col = "red")
+
+baitDegrees <- rbindlist (list (kaushik = kppi[, .(baitDegree = length(unique(Prey))), by = Bait],
+                                pcmi = pcmi.ppi[, .(baitDegree = length(unique(Prey))), by = Bait]),
+                          idcol = "study")
+
+p <- ggplot (baitDegrees, aes(x = baitDegree, fill = study, color = study))  + 
+  geom_dotplot(method = "histodot", binwidth = 1.5) +
+  #geom_density(color = "black") +
+  facet_wrap(~study, ncol = 1) +
+  coord_cartesian(ylim = c(0,0.1)) +
+  theme_classic() +
+  geom_vline(xintercept = 33.5)
+BackupAsPDF(p)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+*Not Used*
+
+```{r}
+# seperage the dt by public & measured. data
+bc.ppi.edge.list <- split(bc.ppi.edge, by='public_ppi', keep.by = TRUE)
+names(bc.ppi.edge.list) <- c('public.ppi', 'measured.ppi')
+
+# all baits either in node1 or node2
+#bc.ppi.edge.list[["measured.ppi"]][!Node1 %in% measured.baits & !Node2 %in% measured.baits]
+
+# filtered out connections where neither node is a bait (rm 970 connections from the public DB) as not of interest
+bc.ppi.edge.list[['public.ppi']] <- bc.ppi.edge.list[['public.ppi']][!(Node1 %in% measured.baits | Node2 %in% measured.baits),]
+bc.ppi.edge.list[[1]]
+
+# add the nodes to clean dt where both prey and bait are nodes
+bc.ppi.edge.list[['measured.ppi']] <- rbind(bc.ppi.edge.list[['measured.ppi']],bc.ppi.edge.list[['public.ppi']][Node1 %in% measured.baits & Node2 %in% measured.baits])
+# rm
+bc.ppi.edge.list[['public.ppi']] <- bc.ppi.edge.list[['public.ppi']][!(Node1 %in% measured.baits & Node2 %in% measured.baits)]
+
+# find the rows where the baits are in node1
+bc.ppi.edge.list[['measured.ppi']] <-  rbind(bc.ppi.edge.list[['measured.ppi']],bc.ppi.edge.list[['public.ppi']][Node1 %in% measured.baits])
+#rm
+bc.ppi.edge.list[['public.ppi']] <-  bc.ppi.edge.list[['public.ppi']][!(Node1 %in% measured.baits)]
+
+# find baits in node 2 (could combine with above, could actually merge any rows with baits in node1 or node2)
+bc.ppi.edge.list[['measured.ppi']] <-  rbind(bc.ppi.edge.list[['measured.ppi']],bc.ppi.edge.list[['public.ppi']][Node2 %in% measured.baits])
+#has 1070 rows
+bc.ppi.edge
+test
+#filering out 940 rows
+
+bc.ppi.edge.list[[1]][Node1 %in% measured.baits | Node2 %in% measured.baits,]
+
+
+  # interactions between baits only encoded one-way; need to modify later, first lets clean and merge
+bc.ppi.edge.list[[2]][Node1 == 'BRIP1' | Node2 == 'BRIP1']
+```
+
+
+```{r}
+#these are the measured baits
+measured.baits <- bc.ppi.nodes[!is.na(BaitGene), BaitGene]
+measured.baits
+
+
+# most baits are not in our bait list...
+bc.ppi.edge.public[!Bait %in% measured.baits,]
+
+bc.ppi.edge.public[Bait == 'BRE']
+
+# sanity check is if Prey
+
+bc.ppi.edge.public
+bc.ppi.nodes
+
+bc.ppi.edge[, c('Bait', 'Interaction', 'Prey')
+```
+
+
+
+Plot of baits per prey for both networks
+```{r}
+ggplot(data=bc.ppi, aes(x=baitsPerPrey, fill='blue', alpha=0.5)) +
+  geom_bar( fill='blue') +
+  geom_bar(data=pcmi.ppi, aes(x=baitsPerPrey, fill='red')) +
+  ggtitle('Network Baits per Prey (BC=blue, PCMI=red)')
+```
+
+

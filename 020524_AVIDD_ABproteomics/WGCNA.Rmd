@@ -1,0 +1,353 @@
+---
+title: "WGCNA.exploratory"
+author: "Martin Gordon"
+date: "2024-02-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## WGCNA EDA;
+INterested in discovering the mechanisms involved in treatment group
+
+
+First lets, just read
+```{r}
+library(data.table)
+library(ggplot2)
+library(ComplexHeatmap)
+library(WGCNA)
+library(magrittr)
+library(preprocessCore) # quantile normalisation
+library(stringr)
+library(matrixStats)
+library(simplifyEnrichment)
+library(fmsb)
+library(readxl)
+library(ggbeeswarm)
+library(ggrepel)
+library(matrixStats)
+
+source("/Users/martingordon/Documents/utils/bp_utils/ManageScriptData.R")
+source("/Users/martingordon/Documents/utils//bp_utils/LinearModels.R")
+source("/Users/martingordon/Documents/utils/bp_utils/UniprotIDMapping.R")
+source ("/Users/martingordon/Documents/utils/bp_utils/enrichmentTestFunctions.R")
+
+```
+read in the normalised data 
+since we have a complete matrix and many
+
+
+```{r}
+p.quant <-fread('./output/AB.ProteinLevelData.csv')
+
+p.quant[GROUP == 'Mock', GROUP := 'Mock_ND']
+
+p.mat <-  dcast(p.quant,Protein~interaction(GROUP,SUBJECT), value.var = 'LogIntensities') %>% 
+  as.matrix(rownames='Protein')
+
+ncol(p.mat)
+# find rows with many NA values
+na.counts <- apply(p.mat, 1, function(x){ 
+  vec <- sum(is.na(x))
+  return(vec)})
+
+
+# drop proteins with more than half missing values
+# only keep rows with 80% completeness
+drop.rows <- names(na.counts)[na.counts > 10]
+p.mat <- p.mat[!rownames(p.mat) %in% drop.rows,]
+
+```
+
+
+```{r}
+hm <- Heatmap(p.mat, show_row_names = F, cluster_columns = F,
+              column_split = list(sub('_[74N]D[.][1-9]$', '', colnames(p.mat)),
+                                                       str_extract(colnames(p.mat), '[74N]D')
+                                                       ))
+BackupAsPDF(hm, 'wgcna.inputmat')
+
+
+# look at the data with the median subtracted
+submat <- sweep(p.mat, 1, apply(p.mat,1, median, na.rm=T))
+
+hm <- Heatmap(submat, show_row_names = F, cluster_columns = F,
+              name='Ints/Median',
+              column_split = list(sub('_[74N]D[.][1-9]$', '', colnames(submat)),
+                                                       str_extract(colnames(submat), '[74N]D')
+                                                       ))
+
+hm
+BackupAsPDF(hm, 'wgcna.inputmat.mediansweep.')
+
+```
+visualise mock vs all, this is what we will use for our clustering and drop the mock samples
+
+
+```{r}
+# subtract the Veh4 median from the other samples
+submat <- sweep(p.mat, 1, apply(p.mat[,grepl('Vehicle_4D', colnames(p.mat))], 1, median, na.rm=T))
+
+hm <- Heatmap(submat, show_row_names = F, cluster_columns = F,
+              name='Ints/Median',
+              cluster_rows = clusterWNA(submat),
+              column_split = list(sub('_[74N]D[.][1-9]$', '', colnames(submat)),
+                                                       str_extract(colnames(submat), '[74N]D')
+                                                       ))
+hm
+BackupAsPDF(hm, 'wgcna.inputmat.VehD4sweep.', dimensions=c(12,12))
+```
+Lets look at variance of each gene
+This would 
+```{r}
+var.dt <-  data.table(Protein = rownames(submat),
+                      Var = apply(submat, 1, var, na.rm=T))[order(-Var)]
+var.dt[, id := .I]
+
+g <- ggplot(var.dt, aes(x=id, y=log2(Var))) +
+  geom_line()
+g
+BackupAsPDF(g, 'ordered.Variance.decreasing')
+```
+```{r}
+submat <- submat[, grep('Vehicle_4D|Mock', colnames(submat), invert=T)]
+
+hm <- Heatmap(submat, show_row_names = F, cluster_columns = F,
+              name='Ints/Median',
+              cluster_rows = clusterWNA(submat),
+              column_split = list(sub('_[74N]D[.][1-9]$', '', colnames(submat)),
+                                                       str_extract(colnames(submat), '[74N]D')
+                                                       ))
+hm
+BackupAsPDF(hm, 'wgcna.inputmat.VehD4sweep.noMock.', dimensions=c(12,12))
+```
+QC
+----
+Check sample clustering based on our input gene list 
+One of the 4206 treatments is quite different but cant drop as important..
+
+```{r}
+#Group data in a dendogram to check outliers
+sampleTree = hclust(dist(t(submat)), method = "average")
+
+#pdf(file = "./WGCNA_data/sampleClustering.pdf", width = 12, height = 9); 
+par(cex = 0.6)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering", sub="", xlab="", cex.lab = 1.5, 
+     cex.axis = 1.5, cex.main = 2)
+
+#dev.off()
+```
+
+
+```{r}
+gsg <- goodSamplesGenes(t(submat))
+summary(gsg)
+gsg$allOK
+```
+
+All genes look good; lets cluster 
+
+```{r}
+net.in <- t(submat)
+
+s.thres <- data.table(pickSoftThreshold(net.in)$fitIndices)
+
+s.thres %>%  
+  ggplot(aes(x=Power, y=SFT.R.sq)) + 
+  geom_point() +
+  geom_hline(yintercept = 0.8, color='darkred') +
+  labs(y="Scale Free Topology Model Fit, signed R^2") +
+  theme_classic()
+
+s.thres %>%  
+  ggplot(aes(x=Power, y=mean.k.)) + 
+  geom_point() +
+  labs(y='Mean Connectivity') +
+  theme_classic() 
+
+s.thres
+```
+Creating adjacency matrix
+Our network is signed; 0 anti-correlated,1 is strongly correlated
+
+Adjusting to soft threshold of 4
+A balance between good R2 and a decent K score
+```{r}
+softPower = 6 #Chosen in the graphs before
+adj.mat = adjacency(net.in, power = softPower, corFnc = 'bicor', type = "signed") #Calculating the adjacency matrix
+#help(adjacency )
+
+subset <- sample(rownames(adj.mat), 3000)
+
+dim(adj.mat[rownames(adj.mat) %in% subset, colnames(adj.mat) %in% subset])
+
+# plot a subset of the adjacency matrix
+#Heatmap(adj.mat[rownames(adj.mat) %in% subset, colnames(adj.mat) %in% subset], show_row_names = F, show_column_names = F)
+```
+Create a topological oveerlpa matrix
+
+```{r}
+TOM <- TOMsimilarity(adj.mat)
+TOM.dissimilarity <- 1 - TOM
+```
+
+Identify modules in our data
+Perform hierarchical clustering of the TOM dissimiliarity measure to identify modules
+
+```{r}
+#TOM.dissimilarity <- 1-TOM
+adj.dissimilarity <- 1 - adj.mat
+
+#creating the dendrogram 
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average") 
+#plotting the dendrogram
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity", 
+labels = FALSE, hang = 0.04)
+```
+
+
+```{r}
+#only detected 4 modules... not enough variability in the data 
+Modules <- cutreeDynamic(dendro = geneTree, distM = TOM.dissimilarity, deepSplit = 4, pamRespectsDendro = FALSE, minClusterSize = 30)
+table(Modules)
+```
+
+```{r}
+Modules
+# convert to char vector
+modules <- as.character(Modules)
+```
+Heatmap of the modules 
+---
+```{r}
+col.pal <- randomcoloR::distinctColorPalette(length(unique(Modules)))
+
+
+# add wgcna module annotation
+row_ha <- rowAnnotation(wgcna.modules=modules, col=list(wgcna.modules = c("1"=col.pal[1], '2'=col.pal[2], '3'=col.pal[3], '4'=col.pal[4], '5'=col.pal[5], 
+                                                                              '6'=col.pal[6], '7'=col.pal[7], '8'=col.pal[8], '9'=col.pal[9])))
+# add split order
+split <- factor(modules, levels=c('1','2','3','4','5','6', '7','8','9'))
+
+hm <- Heatmap(submat, 
+              cluster_columns = FALSE, 
+              show_row_names = FALSE,
+              split = split, # split rows on module assignment
+              right_annotation = row_ha,
+              name = "log2(intensity/\nmean(Vehicle_D4))",
+              column_split = list(tstrsplit(colnames(submat), "[_.]")[[1]],
+                                  tstrsplit(colnames(submat), "[_.]")[[2]]),
+              na_col = 'darkgrey',
+              row_title =sprintf("%d Proteins",nrow(submat)),
+              # row_names_gp = gpar (fontsize= 1),
+              column_names_gp = gpar (fontsize= 3),
+              cluster_row_slices = F,
+              column_title_gp = gpar (fontsize= 7))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+
+BackupAsPDF(hm, 'heatmap.wgcna.modules.ordered', dimensions=c(10,14))
+```
+
+Might be something in these modules.. 
+lets try summarise the groups and visualise medians
+
+```{r}
+# find the 
+prots.oi <- rownames(submat)
+
+sum.p.mat <- dcast(p.quant, Protein~GROUP, value.var='LogIntensities', fun.aggregate = median, na.rm=T) %>% 
+  as.matrix(rownames='Protein')
+sum.submat <- sum.p.mat[rownames(sum.p.mat) %in% prots.oi,]
+
+# subtract the Veh4 median and rm the unwanted cols
+sum.submat <- sweep(sum.submat,1, sum.submat[, grepl('Vehicle_4D', colnames(sum.submat))])
+sum.submat <- sum.submat[, grep('Vehicle_4D|Mock', colnames(sum.submat), invert=T)]
+
+#sanity check...
+all(rownames(sum.submat) == rownames(submat))
+
+# create the plot
+hm <- Heatmap(sum.submat, 
+              cluster_columns = TRUE, 
+              cluster_rows = T,
+              show_row_names = FALSE,
+              #split = split, # split rows on module assignment
+              #right_annotation = row_ha,
+              name = "log2(intensity/\nmean(Vehicle_D4))",
+              na_col = 'black',
+              row_title =sprintf("%d Proteins",nrow(sum.submat)),
+              # row_names_gp = gpar (fontsize= 1),
+              column_names_gp = gpar (fontsize= 7),
+             # cluster_row_slices = T,
+              column_title_gp = gpar (fontsize= 7))
+
+hm <- draw(hm, column_title="WGCNA clusters",
+           column_title_gp=grid::gpar(fontsize=10))
+
+
+BackupAsPDF(hm, 'heatmap.wgcna.modules.ordered', dimensions=c(10,14))
+```
+Clustering doesnt look great... not enough variation in the dataset.. lets try quickly enrich to find anything interesting, else just leave as is..
+
+```{r}
+# helper functions including script to extract heatmap genes
+source("/Users/martingordon/Documents/utils/mg_utils/r_utils/HelperFunctions.R")
+
+clust.genes <- extractClustersfromHeatmap(hm, submat)
+clust.genes[,.N, by=cluster]
+
+# sanity check.. 
+all(clust.genes[cluster==7, feature] %in% rownames(submat)[Modules==7])
+clust.genes[, gene := multiUniprots2multiGenes(feature, species='MOUSE')]
+
+# load the GO table
+gmt.go <- loadGmtFromBioconductor(ontology = "ALL", keyType = "SYMBOL", dbName = 'org.Mm.eg.db')
+
+# our background? only proteins used for WGCNA analysis
+# maybe some interesting things in the smaller modules
+universe <- clust.genes[, unique(gene)]
+
+enrich.dt <- enricherOnGroups(clust.genes, groupColumns = 'cluster', geneColumn = "gene", term2gene.gmt = gmt.go, universe = universe)
+
+enrich.dt[p.adjust < 0.05 & !cluster %in% c('1','2')]
+simp.enrich <- simplifyEnrichBySimilarUniverseMembership(enrichResultsTable = enrich.dt, gmt=gmt.go, groupColumn = 'Cluster')
+
+ht <- enrichHeatmapBestPerGroup(simplifiedEnrichTable = enrich.dt, groupColumn = 'cluster', topN = 10, title='GO enrichment WGCNA modules', 
+                                  row_names_gp = gpar(fontsize = 7), column_names_gp= gpar(fontsize = 6), upperThreshold = 8, cluster_columns =F)
+
+BackupAsPDF(ht, 'go.enrichment.wgcna.modules.adj.mat.ordered', dimensions=c(8,12))
+```
+lets look at a heatmap of Module4; how does the expression profile of these proteins look?
+Actually this is kind of interesting.... seems that the response is much more strongly upregulated in our treatment OI than the other groups
+
+```{r}
+mod4.mat <-  submat[rownames(submat)[Modules==4], ]
+
+rownames(mod4.mat) <- multiUniprots2multiGenes(rownames(mod4.mat), species='MOUSE')
+
+hm <- Heatmap(mod4.mat, 
+        cluster_rows = T,
+        name='Ints. vs Veh D4',
+        row_names_gp = gpar(fontsize=5),
+        column_split = list(gsub("[_].+", "", colnames(mod4.mat)),
+                            str_extract(colnames(mod4.mat), "[47]D"))
+                            )
+
+hm <- draw(hm, column_title="WGCNA cluster 4",
+           column_title_gp=grid::gpar(fontsize=10))
+
+BackupAsPDF(hm, 'heatmap.wgcna.module4', dimensions=c(12,14))
+
+
+```
+
+
+
+
