@@ -6,8 +6,6 @@ Malaria proteome project that is under review at BMC Infectious Disease (Nevan k
 Aisha and Charles, students at the University of Ghana, are working on it. This work is part of Aisha’s masters thesis that she is trying to wrap up. 
 Aisha collected plasma from children in two areas of Ghana, one known to have high malaria transmission (HMT) and one with low malaria transmission (LMT).
  There are a total of 60 samples, 30 from each site, across 3 time points post-infection/diagnosis/hospital visit/treatment (0 days, 7 days, 21 days). 
- 
- So, all of these things happened on the same day? post-infection/diagnosis/hospital visit/treatment
 
  Patents received antimalarial treatment on day 0. The samples were processed for MS in two batches, 30 samples each, and run on the MS separately. 
 
