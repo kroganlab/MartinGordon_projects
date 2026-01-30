@@ -16,9 +16,9 @@ Naming convention are as follows:
 - All projects use standardized directory structure (data/, docs/, output/, script/)
 
 ## Folder Structure
-
+```
 MartinGordon_projects/
 ├── project1/
 ├── project2/
 └── README.md
-
+```
